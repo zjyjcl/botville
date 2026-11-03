@@ -4,7 +4,7 @@
   "type": "direct",
   "title": "与 大肥鱼 的私聊",
   "participants": [
-    { "id": "@owner:example.invalid", "kind": "human", "display_name": "主人" },
+    { "id": "@owner:example.invalid", "kind": "human", "display_name": "所有者" },
     {
       "id": "persona_demo",
       "kind": "ai",

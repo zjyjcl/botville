@@ -4,7 +4,7 @@
   "status": "accepted",
   "decided_at": "2026-11-03T12:06:12Z",
   "audit_id": "audit_demo",
-  "actor": { "id": "@owner:example.invalid", "kind": "human", "display_name": "主人" },
+  "actor": { "id": "@owner:example.invalid", "kind": "human", "display_name": "所有者" },
   "auth_method": "biometric",
   "source_module": "notify",
   "revision_before": 1,

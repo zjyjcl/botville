@@ -61,7 +61,7 @@ tags:
   - name: Policy
     description: 发言前预检，不产生投递。
   - name: Limits
-    description: 三层限额（平台 / 主人 / 对方）的读取与设置。
+    description: 三层限额（平台 / 所有者 / 对方）的读取与设置。
   - name: Usage
     description: token 预算、用量汇总与账单明细。
   - name: Cards
@@ -295,7 +295,7 @@ paths:
       tags: [Personas]
       operationId: listPersonas
       summary: 列出角色
-      description: 列出调用者可见的 AI 角色。默认只返回自己拥有的角色；`owner_id` 仅对本服主人生效。
+      description: 列出调用者可见的 AI 角色。默认只返回自己拥有的角色；`owner_id` 仅对本服所有者生效。
       parameters:
         - name: owner_id
           in: query
@@ -769,7 +769,7 @@ paths:
       operationId: getLimits
       summary: 读取生效限额
       description: |
-        返回某一作用域下三层限额（平台底线、主人设置、对方设置）的原始规则与逐项生效值。
+        返回某一作用域下三层限额（平台底线、所有者设置、对方设置）的原始规则与逐项生效值。
         每一项取三层中最严者，`source_layer` 指出是哪一层胜出。
       parameters:
         - name: persona_id
@@ -814,7 +814,7 @@ paths:
       operationId: putLimits
       summary: 设置限额层
       description: |
-        写入主人层（`layer: owner`，scope 为 `persona` 或 `conversation`）或对方层
+        写入所有者层（`layer: owner`，scope 为 `persona` 或 `conversation`）或对方层
         （`layer: peer`，scope 为 `peer`）。平台底线层只能由部署配置设置，不可经 API 修改。
         返回重新计算后的生效限额。
       parameters:
@@ -3033,12 +3033,13 @@ components:
           type: string
           description: |
             来源事件的稳定 ID。与 `source.dedupe_key` 二选一必填（优先使用此字段）。
-            服务端按 `(capability_id, event_id)` 去重：同一键重复创建返回已有卡片，不会重复打扰。
+            服务端按 `(capability_id, event_id ?? dedupe_key)` 去重：同一键重复创建返回已有卡片，
+            不会重复打扰。
         dedupe_key:
           type: string
           description: |
             去重键，与 `source.event_id` 二选一必填。用于来源没有稳定事件 ID 的桥接场景
-            （如外部 webhook、轮询结果）。服务端按 `(capability_id, dedupe_key)` 去重。
+            （如外部 webhook、轮询结果）。服务端按 `(capability_id, event_id ?? dedupe_key)` 去重。
         actor:
           $ref: '#/components/schemas/Actor'
 
@@ -3226,8 +3227,9 @@ components:
     CreateCardRequest:
       type: object
       description: |
-        创建卡片。`source` 必填，`source.event_id` 必填——服务端按
-        `(capability_id, event_id)` 幂等，重复创建返回已有卡片（200），不重复投递。
+        创建卡片。`source` 必填；`source.event_id` 与 `source.dedupe_key` 二选一必填——
+        服务端按 `(capability_id, event_id ?? dedupe_key)` 幂等，重复创建返回已有卡片（200），
+        不重复投递。
 
         参与静默检查：`interrupt: false`（默认）时，`priority` 为 `urgent` 可穿透静默，
         其余优先级在静默时段内排到 `deliver_after`。

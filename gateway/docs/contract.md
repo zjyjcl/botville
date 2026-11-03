@@ -237,7 +237,7 @@ App                          网关                        模块网页（WKWebV
 | GET | `/conversations/{conversation_id}/messages` | 读消息（带 trust 标记） | App |
 | POST | `/conversations/{conversation_id}/messages` | **请求以 AI 身份发言（核心）** | AI 运行时 |
 | POST | `/policy/evaluate` | 发言前预检（不投递、不扣额度） | AI 运行时 |
-| GET/PUT | `/limits` | 三层限额读取与设置 | 我的 AI、主人设置 |
+| GET/PUT | `/limits` | 三层限额读取与设置 | 我的 AI、所有者设置 |
 | GET | `/usage` | 用量汇总与预算 | 我的 AI、账单 |
 | GET | `/usage/events` | 账单明细 | 审计、对账 |
 | GET/POST | `/cards` | 卡片列表与创建 | App、通知/小镇模块 |
@@ -766,7 +766,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
         ┌──────────────────────────────┐
         │  平台底线  platform（只读）    │  部署配置，不可经 API 修改
         ├──────────────────────────────┤
-        │  主人设置  owner              │  AI 主人对自己角色/会话设的限制
+        │  所有者设置  owner              │  AI 所有者对自己角色/会话设的限制
         ├──────────────────────────────┤
         │  对方设置  peer               │  对方角色对「跟我说话」设的限制
         └──────────────────────────────┘
