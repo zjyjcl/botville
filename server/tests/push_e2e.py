@@ -8,7 +8,8 @@ with `make up HS=<hs> PUSH=1`:
   1. wait for the homeserver (GET /_matrix/client/versions) and for Sygnal:
      POST /_matrix/push/v1/notify with an unknown app_id must return 200 and
      reject the pushkey — the Push Gateway spec's rejection semantics double
-     as the readiness probe (the sygnal container has no healthcheck);
+     as the readiness probe (the compose healthcheck only proves /health;
+     this proves the notify path works);
   2. register alice/bob through generic UIA (reuses smoke.py helpers);
   3. alice opens a private chat and invites bob; bob joins;
   4. bob sets an http pusher: app_id org.botville.mock (the mock pushkin
@@ -18,8 +19,10 @@ with `make up HS=<hs> PUSH=1`:
   5. alice sends a message; the test records the wall-clock send time and
      polls the mock JSONL (--pushes-cmd `docker compose ... exec -T sygnal
      cat /data/mock-pushes.jsonl`, or --pushes-file on the host) until the
-     event_id shows up, then asserts HS -> Sygnal latency < --max-latency
-     (default 5s, the A1.2 acceptance budget) and prints it.
+     event_id shows up, then asserts the record's has_content is empty (an
+     event_id_only pusher must carry no message content — the A1.2 privacy
+     guardrail) and that 0 <= HS -> Sygnal latency < --max-latency (default
+     5s, the A1.2 acceptance budget) and prints it.
 
 Real APNs delivery (Sygnal -> device) is NOT covered here: it needs a real
 Apple developer account, a .p8 key and a physical device — see
@@ -237,6 +240,13 @@ def _send(alice, room_id):
 
 
 def _assert_latency(latency_s, budget_s):
+    # Containers share the host clock, so a sane latency is >= 0; a negative
+    # one means clock skew and must not pass by just being far under budget.
+    if latency_s < 0:
+        raise smoke.Failure(
+            "latency {:.2f}s is negative (clock skew between send time and "
+            "received_at_ms?); refusing to pass".format(latency_s)
+        )
     if latency_s >= budget_s:
         raise smoke.Failure("latency {:.2f}s >= budget {:.1f}s".format(latency_s, budget_s))
     return "{:.2f}s".format(latency_s)
@@ -322,9 +332,18 @@ def main():
             raise smoke.Failure(
                 "push record room_id {} != {}".format(record.get("room_id"), state["room"])
             )
+        has_content = record.get("has_content") or []
+        if has_content:
+            raise smoke.Failure(
+                "push record carries content keys {} — the pusher is not "
+                "event_id_only, message bodies must never reach the gateway "
+                "(docs/deploy/push-sygnal.md §8)".format(has_content)
+            )
         latency_ms = record["received_at_ms"] - sent_at_ms
         state["latency_ms"] = latency_ms
-        return "{:.2f}s ({} -> {})".format(latency_ms / 1000.0, event_id, record["pushkey"])
+        return "{:.2f}s ({} -> {}, no content)".format(
+            latency_ms / 1000.0, event_id, record["pushkey"]
+        )
 
     run_step("alice sends; push reaches sygnal", send_and_wait)
 

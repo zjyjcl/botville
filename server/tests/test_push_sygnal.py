@@ -26,6 +26,7 @@ from pathlib import Path
 
 SERVER_DIR = Path(__file__).resolve().parents[1]
 INIT = SERVER_DIR / "scripts" / "init.sh"
+RENDERER = SERVER_DIR / "scripts" / "render_push_denylist.py"
 COMPOSE_DIR = SERVER_DIR / "compose"
 MOCK_PUSHKIN = COMPOSE_DIR / "sygnal" / "botville_mock_pushkin.py"
 
@@ -131,6 +132,22 @@ class MockPushkinTest(unittest.TestCase):
         self.assertEqual(record["type"], "m.room.message")
         self.assertGreaterEqual(record["received_at_ms"], before)
 
+    def test_full_content_notification_records_content_key_names(self):
+        # A full-text (non event_id_only) pusher must be observable: the
+        # record lists the content KEY NAMES (never values) so push_e2e.py
+        # can assert has_content == [] on the event_id_only path.
+        tmp = tempfile.mkdtemp(prefix="botville-mockpush-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        pushkin, path = self.make_pushkin(tmp)
+        notification = make_notification(content={"body": "secret text", "msgtype": "m.text"})
+        asyncio.run(
+            pushkin.dispatch_notification(notification, make_device(), types.SimpleNamespace())
+        )
+        with open(path, encoding="utf-8") as f:
+            record = json.loads(f.read().splitlines()[0])
+        self.assertEqual(record["has_content"], ["body", "msgtype"])
+        self.assertNotIn("secret text", json.dumps(record))  # values never land
+
     def test_second_dispatch_appends_not_truncates(self):
         tmp = tempfile.mkdtemp(prefix="botville-mockpush-")
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
@@ -164,6 +181,7 @@ class MockPushkinTest(unittest.TestCase):
         self.assertIsNone(record["event_id"])
         self.assertIsNone(record["type"])
         self.assertEqual(record["room_id"], "!room:localhost")
+        self.assertEqual(record["has_content"], [])  # event_id_only: no content keys
 
     def test_default_pushes_path_constant(self):
         # The compose stack relies on the /data default documented in
@@ -209,6 +227,10 @@ APNS_REAL_ENV = SYGNAL_ENV + (
     "APNS_PLATFORM=sandbox\n"
 )
 
+# Same but with a capitalized "True": env_flag must accept it (an earlier
+# strict == "true" comparison silently skipped it with no WARNING).
+APNS_REAL_CAPITAL_ENV = APNS_REAL_ENV.replace("BOTVILLE_APNS_ENABLED=true", "BOTVILLE_APNS_ENABLED=True")
+
 SYNAPSE_TEMPLATE = "server_name: ${BOTVILLE_SERVER_NAME}\nmacaroon: ${SYNAPSE_MACAROON_SECRET}\n"
 
 
@@ -221,6 +243,8 @@ class SygnalInitScriptTest(unittest.TestCase):
         (self.tmp / "scripts").mkdir()
         (self.tmp / "compose" / "synapse").mkdir(parents=True)
         shutil.copy(INIT, self.tmp / "scripts" / "init.sh")
+        # init.sh calls the renderer for generated/push-denylist.env.
+        shutil.copy(RENDERER, self.tmp / "scripts" / "render_push_denylist.py")
         # The real templates: these tests double as a guard that the shipped
         # sygnal.yaml.tmpl / apns-app.yaml.part keep rendering cleanly.
         (self.tmp / "compose" / "sygnal").mkdir(parents=True)
@@ -250,7 +274,7 @@ class SygnalInitScriptTest(unittest.TestCase):
     def sygnal_yaml(self):
         return self.generated.read_text(encoding="utf-8")
 
-    def test_mock_only_by_default_and_data_dir_world_writable(self):
+    def test_mock_only_by_default_and_data_dir_mode(self):
         self.write_env(APNS_DISABLED_ENV)
         proc = self.run_init()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -259,11 +283,23 @@ class SygnalInitScriptTest(unittest.TestCase):
         self.assertIn("botville_mock_pushkin.MockPushkin", yaml_text)
         self.assertNotIn("type: apns", yaml_text)
         self.assertNotIn("${", yaml_text)
-        # The scratch dir bind-mounted at /data must stay writable whatever
-        # user the sygnal image runs as.
+        # The scratch dir bind-mounted at /data: 755 — the sygnal image runs
+        # as root (verified against the pinned v0.17.0), so world-writable
+        # would only widen the blast radius.
         data_dir = self.tmp / "compose" / "generated" / "sygnal-data"
         self.assertTrue(data_dir.is_dir())
-        self.assertEqual(stat.S_IMODE(data_dir.stat().st_mode), 0o777)
+        self.assertEqual(stat.S_IMODE(data_dir.stat().st_mode), 0o755)
+        # init.sh also creates the secrets dir for the future apns.p8.
+        secrets_dir = self.tmp / "compose" / "secrets"
+        self.assertTrue(secrets_dir.is_dir())
+        self.assertEqual(stat.S_IMODE(secrets_dir.stat().st_mode), 0o700)
+
+    def test_push_mock_false_skips_mock_app_and_warns_no_apps(self):
+        self.write_env(APNS_DISABLED_ENV + "BOTVILLE_PUSH_MOCK=false\n")
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn('"org.botville.mock":', self.sygnal_yaml())
+        self.assertIn("no apps at all", proc.stderr)
 
     def test_apns_enabled_with_placeholder_values_is_skipped_with_warning(self):
         self.write_env(APNS_PLACEHOLDER_ENV)
@@ -297,6 +333,29 @@ class SygnalInitScriptTest(unittest.TestCase):
         self.assertNotIn("${", yaml_text)
         self.assertNotIn("<", yaml_text)  # no placeholder ever gets rendered
         self.assertIn("rendered APNs app (org.botville.app.ios)", proc.stdout)
+
+    def test_apns_enabled_capitalized_true_is_accepted(self):
+        # true/1/yes in any case must enable; only genuinely unrecognized
+        # values may warn.
+        self.write_env(APNS_REAL_CAPITAL_ENV)
+        secrets_dir = self.tmp / "compose" / "secrets"
+        secrets_dir.mkdir()
+        (secrets_dir / "apns.p8").write_text("not-a-real-key-fixture\n", encoding="utf-8")
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("type: apns", self.sygnal_yaml())
+        self.assertNotIn("is not a boolean", proc.stderr)
+
+    def test_apns_enabled_garbage_value_warns_and_stays_enabled(self):
+        env = APNS_REAL_ENV.replace("BOTVILLE_APNS_ENABLED=true", "BOTVILLE_APNS_ENABLED=maybe")
+        self.write_env(env)
+        secrets_dir = self.tmp / "compose" / "secrets"
+        secrets_dir.mkdir()
+        (secrets_dir / "apns.p8").write_text("not-a-real-key-fixture\n", encoding="utf-8")
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("BOTVILLE_APNS_ENABLED=maybe is not a boolean", proc.stderr)
+        self.assertIn("type: apns", self.sygnal_yaml())  # truthy reading
 
     def test_apns_skipped_when_keyfile_missing(self):
         self.write_env(APNS_REAL_ENV)

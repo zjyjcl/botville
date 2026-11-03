@@ -9,14 +9,22 @@
 #        for keys .env.example marks as secrets, so a hand-copied .env.example
 #        never keeps placeholder secrets around;
 #   2. render server/compose/synapse/homeserver.yaml.tmpl into
-#      server/compose/generated/synapse/homeserver.yaml;
+#      server/compose/generated/synapse/homeserver.yaml, appending
+#      synapse/ip-range-whitelist.part only while BOTVILLE_SYGNAL_IP is set
+#      (the push allow is exactly that /32; empty = no whitelist at all);
 #   3. render server/compose/sygnal/sygnal.yaml.tmpl into
-#      server/compose/generated/sygnal/sygnal.yaml and, only when
-#      BOTVILLE_APNS_ENABLED=true AND every APNS_* value is real (no
-#      <placeholder>) AND server/compose/secrets/apns.p8 exists, append the
-#      APNs app from sygnal/apns-app.yaml.part. With prerequisites missing the
-#      APNs app is skipped with a WARNING — the org.botville.mock pushkin
-#      stays configured either way (A1.2, docs/deploy/push-sygnal.md).
+#      server/compose/generated/sygnal/sygnal.yaml, appending app parts:
+#      sygnal/mock-app.yaml.part (org.botville.mock) unless BOTVILLE_PUSH_MOCK
+#      is false/0/no (default true), and — only when BOTVILLE_APNS_ENABLED is
+#      truthy AND every APNS_* value is real (no <placeholder>) AND
+#      server/compose/secrets/apns.p8 exists — sygnal/apns-app.yaml.part.
+#      With APNs prerequisites missing the APNs app is skipped with a WARNING;
+#      with no app at all init.sh warns (sygnal could deliver nothing);
+#   4. render generated/push-denylist.env via scripts/render_push_denylist.py:
+#      the tuwunel v1.9.4 upstream default IP denylist (incl. 0.0.0.0/8 and
+#      ::/128) minus the sygnal container's /32 (BOTVILLE_SYGNAL_IP; empty =
+#      no carve-out). The script also validates BOTVILLE_DOCKER_SUBNET /
+#      BOTVILLE_SYGNAL_IP and exits with a friendly error (no traceback).
 #
 # All outputs (.env and everything under server/compose/generated/) are
 # gitignored and must never be committed. Existing .env files are kept as-is
@@ -29,13 +37,17 @@ compose_dir="${script_dir}/../compose"
 env_file="${compose_dir}/.env"
 env_example="${compose_dir}/.env.example"
 template="${compose_dir}/synapse/homeserver.yaml.tmpl"
+whitelist_template="${compose_dir}/synapse/ip-range-whitelist.part"
 generated_dir="${compose_dir}/generated/synapse"
 generated="${generated_dir}/homeserver.yaml"
 sygnal_template="${compose_dir}/sygnal/sygnal.yaml.tmpl"
+sygnal_mock_template="${compose_dir}/sygnal/mock-app.yaml.part"
 sygnal_apns_template="${compose_dir}/sygnal/apns-app.yaml.part"
 sygnal_generated_dir="${compose_dir}/generated/sygnal"
 sygnal_generated="${sygnal_generated_dir}/sygnal.yaml"
 sygnal_data_dir="${compose_dir}/generated/sygnal-data"
+secrets_dir="${compose_dir}/secrets"
+
 
 # The last line for a key wins everywhere (docker compose --env-file, the
 # renderer below); .env should not carry duplicate keys in the first place.
@@ -46,6 +58,29 @@ example_value() {
 env_value() {
     sed -n "s/^$1=//p" "${env_file}" | tail -n 1 || true
 }
+
+# Normalize a boolean-ish .env value (case-insensitive): true/1/yes resolve
+# to true, false/0/no to false, an unset/empty value to $2 (the default).
+# Any other value prints a WARNING and resolves to true — a typo like
+# BOTVILLE_APNS_ENABLED=True (once silently ignored by a strict == "true")
+# must be visible, never a quiet skip.
+env_flag() {
+    local key="$1" default="$2" value
+    value="$(env_value "${key}")"
+    if [[ -z "${value}" ]]; then
+        printf '%s\n' "${default}"
+        return 0
+    fi
+    case "$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')" in
+        true|1|yes) printf 'true\n' ;;
+        false|0|no) printf 'false\n' ;;
+        *)
+            echo "WARNING: ${env_file}: ${key}=${value} is not a boolean (true/1/yes/false/0/no); treating it as true." >&2
+            printf 'true\n'
+            ;;
+    esac
+}
+
 
 # True when the key's value in .env is still the literal '<change-me>'
 # placeholder and .env.example marks the same key as a secret (also
@@ -180,46 +215,27 @@ fi
 mkdir -p "${generated_dir}" "${sygnal_generated_dir}"
 
 # Push denylist for tuwunel/continuwuity: their outbound HTTP (pushes to
-# sygnal) refuses private ranges by default. Render the default denylist
-# minus BOTVILLE_DOCKER_SUBNET so only this stack's own network is reachable.
-python3 - "${env_file}" "${compose_dir}/generated/push-denylist.env" <<'PY'
-import ipaddress
-import sys
+# sygnal) refuses private ranges by default. render_push_denylist.py writes
+# the FULL upstream default denylist (tuwunel v1.9.4, incl. 0.0.0.0/8 and
+# ::/128) minus exactly the sygnal container's /32 (BOTVILLE_SYGNAL_IP;
+# empty = no carve-out at all) and validates BOTVILLE_DOCKER_SUBNET /
+# BOTVILLE_DOCKER_IP_RANGE / BOTVILLE_SYGNAL_IP — bad input exits with a
+# friendly one-line error instead of a Python traceback.
+python3 "${script_dir}/render_push_denylist.py" \
+    "${env_file}" "${compose_dir}/generated/push-denylist.env"
 
-env_path, out_path = sys.argv[1:3]
-subnet = "172.31.250.0/24"
-with open(env_path, encoding="utf-8") as f:
-    for raw in f:
-        key, sep, value = raw.strip().partition("=")
-        if sep and key == "BOTVILLE_DOCKER_SUBNET" and value:
-            subnet = value  # last one wins, like docker compose
-allowed = ipaddress.ip_network(subnet, strict=True)
-default = [
-    "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-    "100.64.0.0/10", "192.0.0.0/24", "169.254.0.0/16", "192.88.99.0/24",
-    "198.18.0.0/15", "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24",
-    "224.0.0.0/4", "::1/128", "fe80::/10", "fc00::/7", "2001:db8::/32",
-    "ff00::/8", "fec0::/10",
-]
-out = []
-for cidr in default:
-    net = ipaddress.ip_network(cidr)
-    if net.version == allowed.version and allowed.subnet_of(net):
-        out.extend(str(n) for n in net.address_exclude(allowed))
-    else:
-        out.append(cidr)
-value = "[" + ", ".join('"{}"'.format(c) for c in out) + "]"
-with open(out_path, "w", encoding="utf-8") as f:
-    f.write("# Generated by init.sh from BOTVILLE_DOCKER_SUBNET={}; do not edit.\n".format(subnet))
-    f.write("TUWUNEL_IP_RANGE_DENYLIST={}\n".format(value))
-    f.write("CONTINUWUITY_IP_RANGE_DENYLIST={}\n".format(value))
-print("init.sh: rendered {} (push allowed to {})".format(out_path, subnet))
-PY
+# Real APNs key lives here (secrets/apns.p8, mode 600, gitignored). Created
+# with 700 up front so a first `up` on Linux does not leave Docker creating
+# a root-owned, more permissive directory; docs/deploy/push-sygnal.md §3
+# then only has to copy the key in.
+mkdir -p -m 700 "${secrets_dir}"
+
 # Scratch dir for the mock pushkin's JSONL, bind-mounted at /data. The sygnal
-# image may run as a non-root user, so it must be world-writable (it only ever
-# holds mock push records for tests; gitignored like the rest of generated/).
+# image runs as root (verified against the pinned v0.17.0), so 755 is enough
+# (it only ever holds mock push records for tests; gitignored like the rest
+# of generated/).
 mkdir -p "${sygnal_data_dir}"
-chmod 0777 "${sygnal_data_dir}"
+chmod 0755 "${sygnal_data_dir}"
 
 # The renderer reads .env itself (no shell sourcing), so values with special
 # characters cannot break anything.
@@ -267,14 +283,42 @@ PY
 }
 
 render_template "${template}" "${generated}"
+# Synapse's ip_range_whitelist is appended (not templated) so it can be
+# omitted entirely: with BOTVILLE_SYGNAL_IP empty no private range is
+# allow-listed (production with a public push gateway). render_push_denylist
+# above has already validated the value by this point.
+if [[ -n "$(env_value BOTVILLE_SYGNAL_IP)" ]]; then
+    whitelist_part="${compose_dir}/generated/.ip-range-whitelist.part"
+    render_template "${whitelist_template}" "${whitelist_part}"
+    cat "${whitelist_part}" >> "${generated}"
+    rm -f "${whitelist_part}"
+fi
+
 render_template "${sygnal_template}" "${sygnal_generated}"
 
-# --- optional APNs app (A1.2) ------------------------------------------
-# Only rendered when BOTVILLE_APNS_ENABLED=true AND everything real is in
-# place. A half-configured APNs app (placeholder key ids, missing .p8) would
-# make sygnal fail to start and take the mock pushkin down with it, so it is
-# skipped with a WARNING instead — see docs/deploy/push-sygnal.md.
-if [[ "$(env_value BOTVILLE_APNS_ENABLED)" == "true" ]]; then
+# --- optional sygnal apps (A1.2) ----------------------------------------
+# App parts are appended under the top-level `apps:` mapping of sygnal.yaml
+# (part templates' first app key is indented accordingly) and render to
+# dotfiles outside the /config bind mount so sygnal never sees a stray
+# half-finished config file.
+
+# The org.botville.mock test pushkin: on by default (BOTVILLE_PUSH_MOCK),
+# off for a production sygnal that only serves the real APNs app.
+apps_rendered=0
+if [[ "$(env_flag BOTVILLE_PUSH_MOCK true)" == "true" ]]; then
+    mock_part="${compose_dir}/generated/.mock-app.part"
+    render_template "${sygnal_mock_template}" "${mock_part}"
+    cat "${mock_part}" >> "${sygnal_generated}"
+    rm -f "${mock_part}"
+    apps_rendered=1
+fi
+
+# The APNs app: only rendered when BOTVILLE_APNS_ENABLED is truthy AND
+# everything real is in place. A half-configured APNs app (placeholder key
+# ids, missing .p8) would make sygnal fail to start and take the mock
+# pushkin down with it, so it is skipped with a WARNING instead — see
+# docs/deploy/push-sygnal.md.
+if [[ "$(env_flag BOTVILLE_APNS_ENABLED false)" == "true" ]]; then
     missing=()
     for key in APNS_APP_ID APNS_KEY_ID APNS_TEAM_ID APNS_TOPIC; do
         value="$(env_value "${key}")"
@@ -287,7 +331,7 @@ if [[ "$(env_value BOTVILLE_APNS_ENABLED)" == "true" ]]; then
     if [[ "${platform}" != "sandbox" && "${platform}" != "production" ]]; then
         missing+=("APNS_PLATFORM (must be sandbox or production)")
     fi
-    apns_key_file="${compose_dir}/secrets/apns.p8"
+    apns_key_file="${secrets_dir}/apns.p8"
     if [[ ! -f "${apns_key_file}" ]]; then
         missing+=("secrets/apns.p8")
     fi
@@ -296,14 +340,16 @@ if [[ "$(env_value BOTVILLE_APNS_ENABLED)" == "true" ]]; then
         echo "WARNING: the APNs app is NOT rendered; sygnal runs with the mock pushkin only." >&2
         echo "WARNING: see docs/deploy/push-sygnal.md (place the real key, fill APNS_* in .env)." >&2
     else
-        # Appended under the top-level `apps:` mapping of sygnal.yaml; the
-        # part template's first app key is indented accordingly. Rendered to
-        # a dotfile outside the /config bind mount so sygnal never sees a
-        # stray half-finished config file.
         apns_part="${compose_dir}/generated/.apns-app.part"
         render_template "${sygnal_apns_template}" "${apns_part}"
         cat "${apns_part}" >> "${sygnal_generated}"
         rm -f "${apns_part}"
+        apps_rendered=1
         echo "init.sh: rendered APNs app ($(env_value APNS_APP_ID)) into ${sygnal_generated}"
     fi
+fi
+
+if [[ "${apps_rendered}" -eq 0 ]]; then
+    echo "WARNING: generated sygnal.yaml has no apps at all (BOTVILLE_PUSH_MOCK off, no APNs app)." >&2
+    echo "WARNING: sygnal cannot deliver anything as rendered; see docs/deploy/push-sygnal.md." >&2
 fi

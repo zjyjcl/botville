@@ -21,8 +21,14 @@ returning the list of rejected pushkeys (devices the homeserver should drop).
 
 Each JSONL record (one line per notification *device*):
 
-    {"app_id": ..., "event_id": ..., "prio": ..., "pushkey": ...,
-     "received_at_ms": ..., "room_id": ..., "type": ...}
+    {"app_id": ..., "event_id": ..., "has_content": [...], "prio": ...,
+     "pushkey": ..., "received_at_ms": ..., "room_id": ..., "type": ...}
+
+`has_content` lists the notification content's KEY NAMES (never the values)
+so the privacy requirement stays observable: with an event_id_only pusher it
+must be empty, and server/tests/push_e2e.py asserts exactly that — a
+homeserver falling back to full-text pushers fails the test instead of
+silently leaking bodies.
 
 server/tests/push_e2e.py polls this file (docker compose exec ... cat, or a
 host path via --pushes-file) and computes send -> receive latency from
@@ -63,6 +69,7 @@ class MockPushkin(Pushkin):
     async def dispatch_notification(self, n, device, context):
         # getattr everywhere: with format=event_id_only the homeserver omits
         # most fields; sygnal leaves the attributes None rather than raising.
+        content = getattr(n, "content", None)
         record = {
             "received_at_ms": int(time.time() * 1000),
             "app_id": getattr(device, "app_id", None),
@@ -71,16 +78,21 @@ class MockPushkin(Pushkin):
             "room_id": getattr(n, "room_id", None),
             "type": getattr(n, "type", None),
             "prio": getattr(n, "prio", None),
+            # Content KEY NAMES only, never values: this must stay [] for an
+            # event_id_only pusher (push_e2e.py asserts it).
+            "has_content": sorted(content) if content else [],
         }
         # One short append per dispatch; a blocking write is fine at push
         # volumes and keeps the file readable by `cat` from outside.
         with open(self.pushes_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, sort_keys=True) + "\n")
         log.info(
-            "mock push recorded: app_id=%s event_id=%s pushkey=%s -> %s",
+            "mock push recorded: app_id=%s event_id=%s pushkey=%s "
+            "has_content=%s -> %s",
             record["app_id"],
             record["event_id"],
             record["pushkey"],
+            record["has_content"],
             self.pushes_path,
         )
         # Nothing is ever invalid for the mock — no rejected pushkeys.

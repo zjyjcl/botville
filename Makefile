@@ -42,11 +42,14 @@ ifeq ($(strip $(PORT)),)
 PORT := 8008
 endif
 
-# Optional push gateway (A1.2): PUSH=1 on up/down/logs/ps adds --profile
-# push (sygnal; stacks onto any HS profile). Loopback port mirrors
+# Optional push gateway (A1.2): PUSH=1 (also true/yes) on up/logs/ps adds
+# --profile push (sygnal; stacks onto any HS profile). `down` always carries
+# --profile push so a PUSH=1 stack tears down fully (sygnal and the compose
+# network would otherwise linger; idempotent when push was never started —
+# PUSH=0 does not opt out of `down`). Loopback port mirrors
 # BOTVILLE_PUSH_PORT; homeservers reach sygnal in-network at sygnal:5000.
 PUSH ?=
-PUSH_PROFILE := $(if $(PUSH),--profile push,)
+PUSH_PROFILE := $(if $(filter 1 true yes,$(PUSH)),--profile push,)
 PUSH_PORT ?= $(shell sed -n 's/^BOTVILLE_PUSH_PORT=//p' $(ENV_FILE) 2>/dev/null | tail -n 1)
 ifeq ($(strip $(PUSH_PORT)),)
 PUSH_PORT := 8019
@@ -74,7 +77,7 @@ ifeq ($(HS),continuwuity)
 endif
 
 down:
-	$(COMPOSE) --profile $(HS) $(PUSH_PROFILE) down --remove-orphans
+	$(COMPOSE) --profile $(HS) --profile push down --remove-orphans
 
 logs:
 	$(COMPOSE) --profile $(HS) $(PUSH_PROFILE) logs -f --tail=200

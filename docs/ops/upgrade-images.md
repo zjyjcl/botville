@@ -37,8 +37,9 @@
 
 Sygnal 行备注（2026-11-04，A1.2 加入）：只有开 push profile（`make up PUSH=1`）
 才会拉取；digest 拼错会在 CI `push-e2e` job 实际拉镜像时暴露（同 §1 的 CI 兜底
-口径）。Sygnal 无 compat 文档条目，因此它的「同步处」是 §3 第 1/2/3/4 条
-共 4 处（第 5 条 homeserver-compat 不适用）。
+口径）。[compat](../compat/homeserver-compat.md) §2.3 有 Sygnal 的组件行（但不含
+版本号），因此它的「同步处」仍是 §3 第 1/2/3/4 条共 4 处（第 5 条
+homeserver-compat 的版本口径不适用）。
 
 版本口径与 [compat/homeserver-compat.md](../compat/homeserver-compat.md) §1.2
 一致（Synapse v1.164.1 即 matrix-docker-ansible-deploy defaults 当时停留的参考
@@ -94,9 +95,12 @@ Sygnal 行备注（2026-11-04，A1.2 加入）：只有开 push profile（`make 
    5. `docs/compat/homeserver-compat.md` §3.9 第 5 条括号里的「当前验证版本」。
    CI 的 pin guard 会断言 compose 默认值与 `.env.example` 同名变量相等，但其余
    副本仍靠本清单人工同步——改漏任何一处都会造成口径漂移。
-4. **本地自检**：三个 profile 各过一遍 `docker compose -f
-   server/compose/docker-compose.yml --env-file server/compose/.env --profile
-   <hs> config --quiet`；有疑虑再跑 `make smoke`（见 `server/README.md`）。
+4. **本地自检**：先 `make init`（生成 `server/compose/.env` 与
+   `generated/` 下的渲染物——`push-denylist.env` 等 compose 依赖的 env 文件；
+   未跑过 init 的 checkout 上 `--env-file` 会直接报错），再三个 profile 各过一遍
+   `docker compose -f server/compose/docker-compose.yml --env-file
+   server/compose/.env --profile <hs> config --quiet`；有疑虑再跑
+   `make smoke`（见 `server/README.md`）。
 5. **CI 全绿后提 PR**：lint 的「镜像必须 pin」「compose 默认值 = `.env.example`」
    与 allowlist 检查会兜底；smoke 会实际 pull 每个 profile 的全部镜像并走完
    注册→发消息→回读链路（digest 拼错会在 smoke 暴露；三个 profile 均为

@@ -1,0 +1,11 @@
+# Appended by server/scripts/init.sh to generated/synapse/homeserver.yaml
+# only while BOTVILLE_SYGNAL_IP is set (A1.2). Mind the scope: Synapse
+# consults ip_range_whitelist for EVERY outbound client that uses the
+# blacklist — pushes to sygnal, URL previews, remote media, federation — so
+# this stays a single /32 (the sygnal container's fixed address), never the
+# whole docker subnet (whose .1 gateway and other containers must stay
+# unreachable). With BOTVILLE_SYGNAL_IP empty this part is not appended at
+# all: production with a public push gateway keeps the blacklist closed.
+# See docs/deploy/push-sygnal.md (内网推送放行).
+ip_range_whitelist:
+  - "${BOTVILLE_SYGNAL_IP}/32"
