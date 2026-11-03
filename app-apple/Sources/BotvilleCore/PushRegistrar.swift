@@ -3,6 +3,11 @@
 
 import Foundation
 
+/// A1.2 requires metadata-only push payloads; unknown formats fail decoding.
+public enum PushPusherDataFormat: String, Codable, Equatable, Sendable {
+    case eventIDOnly = "event_id_only"
+}
+
 /// Parameters to send to the homeserver pusher endpoint once A1.2 provides a
 /// Sygnal+APNs deployment.  This app does not request push entitlement or APNs
 /// tokens in C2.1.
@@ -10,11 +15,13 @@ import Foundation
 /// intentionally a configuration value supplied only after A1.2 is ready.
 public struct PushPusherData: Codable, Equatable, Sendable {
     public let url: URL
+    public let format: PushPusherDataFormat
 
     /// The pusher endpoint receives device tokens. It must therefore use a
     /// credential-free HTTPS origin before this wire model can be created.
-    public init(url: URL) throws {
+    public init(url: URL, format: PushPusherDataFormat = .eventIDOnly) throws {
         self.url = try Self.validatedAndNormalizedURL(url)
+        self.format = format
     }
 
     public init(from decoder: Decoder) throws {
@@ -25,10 +32,11 @@ public struct PushPusherData: Codable, Equatable, Sendable {
             throw PushPusherDataError.invalidURL
         }
         self.url = try Self.validatedAndNormalizedURL(url, originalSource: source)
+        self.format = try container.decodeIfPresent(PushPusherDataFormat.self, forKey: .format) ?? .eventIDOnly
     }
 
     private enum CodingKeys: String, CodingKey {
-        case url
+        case url, format
     }
 
     private static func validatedAndNormalizedURL(_ url: URL, originalSource: String? = nil) throws -> URL {
