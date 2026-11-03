@@ -3,11 +3,12 @@
 # smoke: boot the Compose stack per homeserver profile and run the
 #         standard-library smoke test against 127.0.0.1:8008.
 #         All three profiles are required-green; images are pinned
-#         (continuwuity by digest), so failures are real failures.
+#         (tag@sha256 digest), so failures are real failures.
 # lint:   compose config for all three profiles, shellcheck, python syntax,
 #         stdlib unit tests for the bootstrap/init scripts (no Docker),
-#         notify/gateway contract validation, and a guard that .env.example
-#         only ever contains placeholders.
+#         notify/gateway contract validation, a guard that .env.example
+#         only ever contains placeholders, and a guard that every image
+#         defaults to tag@sha256 digest (no :latest).
 name: CI
 
 on:
@@ -119,8 +120,9 @@ jobs:
               "SYNAPSE_MACAROON_SECRET": "<change-me>",
               "SYNAPSE_FORM_SECRET": "<change-me>",
               "SYNAPSE_REGISTRATION_SHARED_SECRET": "<change-me>",
-              "SYNAPSE_IMAGE": "docker.io/matrixdotorg/synapse:v1.141.0",
-              "TUWUNEL_IMAGE": "ghcr.io/matrix-construct/tuwunel:latest",
+              "POSTGRES_IMAGE": "docker.io/library/postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab",
+              "SYNAPSE_IMAGE": "docker.io/matrixdotorg/synapse:v1.141.0@sha256:562adbfc3df12d1024c7277b9807086ed79d8d5fabe24187a31d787af050a6a4",
+              "TUWUNEL_IMAGE": "ghcr.io/matrix-construct/tuwunel:v1.9.4@sha256:0e86c6164d6c9f5b60291938eb61ad8395021c37fe58d47a963ea7edddbedaec",
               "CONTINUWUITY_IMAGE": "ghcr.io/continuwuity/continuwuity:v26.9.1@sha256:c9c62bc5c0a641f3f713945c701b069c7bc30d2612b54d4a5de80a5be19d5420",
           }
 
@@ -142,4 +144,55 @@ jobs:
               print("\n".join(problems))
               sys.exit(1)
           print(f"{path}: OK (placeholders only, no real values)")
+          EOF
+
+      - name: Images must be pinned (tag@sha256 digest, no :latest)
+        run: |
+          python3 - <<'EOF'
+          import re
+          import sys
+
+          # Every image reference must end with ":<tag>@sha256:<64 hex>" where
+          # tag is not "latest". See docs/ops/upgrade-images.md for the policy.
+          pin_re = re.compile(r":(?P<tag>[^:@\s]+)@sha256:(?P<digest>[0-9a-f]{64})$")
+
+          def check(ref, where):
+              m = pin_re.search(ref)
+              if not m:
+                  return [f"{where}: {ref!r} must end with ':<tag>@sha256:<64-hex>'"]
+              if m.group("tag").lower() == "latest":
+                  return [f"{where}: {ref!r} pins :latest; pin a real tag"]
+              return []
+
+          problems = []
+
+          # docker-compose.yml: every service image line — a bare value or the
+          # default inside ${VAR:-default}.
+          compose = "server/compose/docker-compose.yml"
+          var_re = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*):-(.+)\}$")
+          for n, raw in enumerate(open(compose, encoding="utf-8"), 1):
+              m = re.match(r"\s*image:\s*(\S+)", raw)
+              if not m:
+                  continue
+              ref = m.group(1)
+              v = var_re.match(ref)
+              if ref.startswith("${") and not v:
+                  problems.append(f"{compose}:{n}: {ref!r} has no :- default to pin")
+                  continue
+              problems += check(v.group(2) if v else ref, f"{compose}:{n}")
+
+          # .env.example: every *_IMAGE value.
+          env_example = "server/compose/.env.example"
+          for n, raw in enumerate(open(env_example, encoding="utf-8"), 1):
+              line = raw.strip()
+              if not line or line.startswith("#"):
+                  continue
+              key, sep, value = line.partition("=")
+              if sep and key.endswith("_IMAGE"):
+                  problems += check(value, f"{env_example}:{n}")
+
+          if problems:
+              print("\n".join(problems))
+              sys.exit(1)
+          print("image pins OK (tag@sha256 digest, no :latest)")
           EOF

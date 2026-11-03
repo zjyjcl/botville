@@ -192,7 +192,7 @@ Conduit (timokoesters/conduit, Rust)
 2. **容器细节**：continuwuity 镜像无 shell（排障用 `docker logs`/`docker attach` 控制台）；容器内命令名仍是 `/sbin/conduwuit`，Compose 里要写对。
 3. **Docker DNS**：continuwuity 官方文档警告 Docker 内建 DNS 会拖慢联邦，建议挂载自定义 `/etc/resolv.conf`——CI 内网联邦冒烟若超时先查这一点（同时影响按容器名连 appservice）。
 4. **well-known 服务位置**：见 §2.1 末行，统一由反代提供（含 `/.well-known/matrix/server` 委派），`.env.example` 已有 `BOTVILLE_PUBLIC_URL` 对应此用途。
-5. **版本节奏**：Tuwunel `:latest` 约月更、continuwuity 日历版本月更、Synapse 双周更；A0.2 的 Compose **pin 具体版本标签**（文档注明当前验证版本：Synapse v1.164.1 / Tuwunel 1.9.4 / continuwuity v26.9.1），升级策略归 A3.2。
+5. **版本节奏**：Tuwunel `:latest` 约月更、continuwuity 日历版本月更、Synapse 双周更；A0.2 的 Compose **默认 pin tag + digest**（当前：Synapse v1.141.0 / Tuwunel v1.9.4 / continuwuity v26.9.1 / Postgres 16-alpine，均为多架构 index digest），升级流程与风险见 [`docs/ops/upgrade-images.md`](../ops/upgrade-images.md)，策略细化归 A3.2。
 6. **行为细节差异**：`/sync` 长轮询参数钳制（Tuwunel 有 min/default/max）、profile 全局改名的房间传播策略、push 规则计算差异（如 Tuwunel 的 MSC3664 related-event 匹配默认关闭 `msc3664_related_event_match = false`、每账号推送规则集上限 10000 条）——全部列入 CI 断言点而非假设一致。
 
 ---
@@ -238,7 +238,7 @@ CI 目标：同一套脚本对每个服务器实现跑一遍，断言全部通�
 
 1. **只写标准接口**：CI 脚本与后续 `server/` 代码不得调用 `/_synapse/admin` 等私有 admin 端点（含 Tuwunel 的兼容子集）或 admin room 命令；部署层（向导/Compose 初始化）的分叉逻辑单独放 `server/deploy/` 一类的目录。
 2. **示例配置零真实值**：`as_token`/`hs_token`/注册令牌/Postgres 密码全部占位符（`<change-me>` 风格），CI 用脚本现场生成；与 `.env.example` 现状保持一致。
-3. **镜像 pin 版本**：`docker.io/matrixdotorg/synapse:v1.164.x`（或官方双源之一 `ghcr.io/element-hq/synapse`）、`ghcr.io/matrix-construct/tuwunel:1.9.x`（或 `:latest` 按官方建议，文档注明取舍）、`ghcr.io/continuwuity/continuwuity:v26.9.x`；不使用 Docker Hub 个人镜像作默认。
+3. **镜像 pin 版本（tag + digest）**：四个服务（Synapse、Tuwunel、continuwuity、Postgres）默认一律 pin `tag@sha256:<多架构 index digest>`——`docker.io/matrixdotorg/synapse`（或官方双源之一 `ghcr.io/element-hq/synapse`）、`ghcr.io/matrix-construct/tuwunel`、`ghcr.io/continuwuity/continuwuity`、`docker.io/library/postgres`；可在 `.env` 覆盖为 `:latest` 跟随上游但不推荐；不使用 Docker Hub 个人镜像作默认。升级流程与风险见 [`docs/ops/upgrade-images.md`](../ops/upgrade-images.md)。
 4. **单端口模型**：三家容器统一 `8008` 对内；`6167` 不出现；反代统一 8448/443 与 well-known。
 5. **注册引导分叉**：Synapse profile 预置管理员与注册策略；Rust 分支 profile 必须文档化「首个注册用户 = 管理员」并让 CI 先注册固定管理员账号。
 6. **Tuwunel 容器**`address` 改 `0.0.0.0`（默认 `127.0.0.1` 在容器内不可达）；continuwuity 挂载自定义 `/etc/resolv.conf` 缓解 Docker DNS 问题。
