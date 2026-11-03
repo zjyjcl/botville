@@ -12,8 +12,8 @@
 # registers a pusher with app_id "org.botville.mock" and measures
 # homeserver -> sygnal latency from the JSONL records it writes. See
 # docs/deploy/push-sygnal.md.
-sygnal:
-  logging:
+log:
+  setup:
     version: 1
     formatters:
       normal:
@@ -21,10 +21,21 @@ sygnal:
     handlers:
       console:
         class: logging.StreamHandler
+        formatter: normal
         stream: ext://sys.stdout
     root:
       level: INFO
       handlers: [console]
+    disable_existing_loggers: false
+  access:
+    x_forwarded_for: false
+
+# Listen on all interfaces inside the container (sygnal defaults to
+# 127.0.0.1, unreachable from the homeserver container); the host port is
+# bound to 127.0.0.1 only in docker-compose.yml.
+http:
+  bind_addresses: ["0.0.0.0"]
+  port: 5000
 
 apps:
   # Loaded from the file bind-mounted at /custom via PYTHONPATH (see
