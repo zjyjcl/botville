@@ -12,7 +12,8 @@
 #      server/compose/generated/synapse/homeserver.yaml.
 #
 # Both outputs are gitignored and must never be committed. Existing .env files
-# are kept as-is so user secrets survive re-runs.
+# are kept as-is so user secrets survive re-runs; *_IMAGE values that drifted
+# from the repo defaults only get a WARNING here (never rewritten).
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,6 +39,34 @@ env_value() {
 # '<change-me>') — only those are (re)generated.
 is_leftover_placeholder() {
     [[ "$(env_value "$1")" == "<change-me>" && "$(example_value "$1")" == *"<change-me>"* ]]
+}
+
+# An existing .env keeps overriding the compose image defaults, so a stale
+# *_IMAGE value (older pin, bare tag without digest, or :latest) silently
+# defeats the repo pin for that deployment. Warn only; the upgrade path —
+# including the mandatory backup — lives in docs/ops/upgrade-images.md.
+warn_image_overrides() {
+    local key default_value env_line env_value
+    while IFS='=' read -r key default_value; do
+        env_value=""
+        while IFS= read -r env_line || [[ -n "${env_line}" ]]; do
+            if [[ "${env_line}" == "${key}="* ]]; then
+                env_value="${env_line#"${key}="}"
+                break
+            fi
+        done < "${env_file}"
+        if [[ -z "${env_value}" || "${env_value}" == "${default_value}" ]]; then
+            continue
+        fi
+        if [[ "${env_value}" == *':latest' ]]; then
+            echo "WARNING: ${env_file}: ${key}=${env_value} follows :latest (not reproducible, not covered by CI)." >&2
+        elif [[ "${env_value}" != *'@sha256:'* ]]; then
+            echo "WARNING: ${env_file}: ${key}=${env_value} has no @sha256 digest; it can drift with upstream re-tags." >&2
+        else
+            echo "WARNING: ${env_file}: ${key} differs from the current default in ${env_example}." >&2
+        fi
+        echo "WARNING: ${key} is NOT updated automatically — back up, then update it per docs/ops/upgrade-images.md (§ existing deployments)." >&2
+    done < <(grep -E '^[A-Za-z_][A-Za-z0-9_]*_IMAGE=' "${env_example}")
 }
 
 if [[ ! -f "${env_file}" ]]; then
@@ -132,6 +161,7 @@ else
     else
         echo "init.sh: ${env_file} exists, keeping current values"
     fi
+    warn_image_overrides
 fi
 
 mkdir -p "${generated_dir}"

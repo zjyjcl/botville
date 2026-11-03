@@ -2,6 +2,9 @@
 .env
 .env.*
 !.env.example
+# local backups (docs/ops/upgrade-images.md) — private message data
+backups/
+*.tar.gz
 # rendered by server/scripts/init.sh from .env + templates
 server/compose/generated/
 *.pem

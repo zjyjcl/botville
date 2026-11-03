@@ -5,8 +5,11 @@
 # `make up` / `make up HS=tuwunel` in the repo root wraps this (see Makefile).
 #
 # Ports are bound to 127.0.0.1 only; expose via a reverse proxy when needed.
-# Images can be pinned/overridden via SYNAPSE_IMAGE / TUWUNEL_IMAGE /
-# CONTINUWUITY_IMAGE in server/compose/.env.
+# All four images are pinned by default to tag@sha256:<multi-arch index
+# digest>; the upgrade flow lives in docs/ops/upgrade-images.md. They can be
+# overridden via POSTGRES_IMAGE / SYNAPSE_IMAGE / TUWUNEL_IMAGE /
+# CONTINUWUITY_IMAGE in server/compose/.env — e.g. to :latest to track
+# upstream, which works but is not recommended (not reproducible).
 #
 # Readiness:
 #   - postgres, synapse: container healthchecks.
@@ -20,7 +23,8 @@ name: botville
 
 services:
   postgres:
-    image: docker.io/library/postgres:16-alpine
+    # Pinned tag@digest by default; override via POSTGRES_IMAGE.
+    image: ${POSTGRES_IMAGE:-docker.io/library/postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab}
     profiles: [synapse]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-botville}
@@ -38,9 +42,10 @@ services:
     restart: unless-stopped
 
   synapse:
-    # Pinned tag; v1.142.0 had a regression at the time of writing, 1.141.0 is
-    # what matrix-docker-ansible-deploy stayed on.
-    image: ${SYNAPSE_IMAGE:-docker.io/matrixdotorg/synapse:v1.141.0}
+    # Pinned tag@digest, kept in sync with the reference version tracked in
+    # docs/compat/homeserver-compat.md §1.2 (matrix-docker-ansible-deploy
+    # defaults); upgrade flow in docs/ops/upgrade-images.md.
+    image: ${SYNAPSE_IMAGE:-docker.io/matrixdotorg/synapse:v1.164.1@sha256:fa4aa980f279bcf26d4e7ecc2a2c9a701c73f2ebe8841da9bdcf3b2fdf693d75}
     profiles: [synapse]
     # homeserver.yaml is rendered from synapse/homeserver.yaml.tmpl by
     # server/scripts/init.sh into ./generated/synapse/ (gitignored).
@@ -70,9 +75,8 @@ services:
     restart: unless-stopped
 
   tuwunel:
-    # Registry also mirrored at docker.io/jevolk/tuwunel. `latest` is the most
-    # recent tagged release (~monthly); override TUWUNEL_IMAGE to pin.
-    image: ${TUWUNEL_IMAGE:-ghcr.io/matrix-construct/tuwunel:latest}
+    # Pinned tag@digest; registry also mirrored at docker.io/jevolk/tuwunel.
+    image: ${TUWUNEL_IMAGE:-ghcr.io/matrix-construct/tuwunel:v1.9.4@sha256:0e86c6164d6c9f5b60291938eb61ad8395021c37fe58d47a963ea7edddbedaec}
     profiles: [tuwunel]
     # First boot after an upgrade runs RocksDB migrations that must not be
     # interrupted; upstream recommends a long stop grace period.

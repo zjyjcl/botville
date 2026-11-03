@@ -15,7 +15,7 @@
 ## 0. 结论摘要（TL;DR）
 
 1. **Conduit 基本停更**（最后常规版本 v0.7.0，2024-04，其后仅零星安全修复），**conduwuit 已于 2025-05-30 停止维护并归档**（GitHub 仓库只读）；两者都不进入 botville 安装向导。
-2. **Tuwunel 与 continuwuity 是 conduwuit 的两个活跃继任分支**，截至 2026-11 都在频繁发版（Tuwunel 1.9.4 / 2026-10-10；continuwuity v26.9.1 / 2026-10-27，2026 年起改用日历版本号），均可作为 botville 的轻量服务器选项。
+2. **Tuwunel 与 continuwuity 是 conduwuit 的两个活跃继任分支**，截至 2026-11 都在频繁发版（Tuwunel v1.9.4 / 2026-10-10；continuwuity v26.9.1 / 2026-10-27，2026 年起改用日历版本号），均可作为 botville 的轻量服务器选项。
 3. botville 依赖的全部标准接口（Client-Server / Application Service / Push Gateway）三家均宣称支持；**差异集中在部署与运维层**：appservice 注册方式、注册令牌、SSO、默认房间版本、媒体 legacy 端点默认值、数据库引擎（Postgres vs RocksDB）。
 4. **`/_synapse/admin` 是 Synapse 私有 API，botville 运行时代码禁止依赖**（Tuwunel 1.7.0 起自带一个 Synapse 兼容 admin 子集，但覆盖可变、continuwuity 没有，同样不依赖）；Tuwunel/continuwuity 的 admin room 命令等私有管理面，只允许安装向导/运维脚本使用。
 5. 对 A0.2 的核心约束：CI 需覆盖 **Synapse + 两个 Rust 分支共三份容器配置**（或至少 Synapse + 其一，见 §4.2）；注册引导、appservice 注册、配置文件三处必须按服务器分叉；示例配置只含占位符。
@@ -42,7 +42,7 @@ Conduit (timokoesters/conduit, Rust)
 | Synapse | ✅ 活跃（参考实现） | `github.com/element-hq/synapse`（2023-12 起从 matrix-org 迁移） | v1.164.1（2026-10）；支持的规范版本以 CI `/versions` 实测为准 | Element HQ 维护；Python + Rust；参考实现，接口覆盖最全 |
 | Conduit | ❌ 停更 | `gitlab.com/famedly/conduit`（GitHub 为镜像） | v0.7.0（2024-04） | 最后常规版本；其后仅安全修复（2025-12 修复 CVE-2025-49090）；next 重写长期未出稳定版；**不进安装向导** |
 | conduwuit | ❌ 已归档 | `github.com/girlbossceo/conduwuit` | — | 2025-05-30 宣布放弃维护，仓库转只读；**不进安装向导** |
-| Tuwunel | ✅ 活跃 | `github.com/matrix-construct/tuwunel` | 1.9.4（2026-10-10） | 自称 conduwuit 官方继任者；专职团队维护，瑞士政府部署背书；conduwuit/Conduit 数据库可原地迁移，Synapse 迁移未支持 |
+| Tuwunel | ✅ 活跃 | `github.com/matrix-construct/tuwunel` | v1.9.4（2026-10-10） | 自称 conduwuit 官方继任者；专职团队维护，瑞士政府部署背书；conduwuit/Conduit 数据库可原地迁移，Synapse 迁移未支持 |
 | continuwuity | ✅ 活跃 | `forgejo.ellis.link/continuwuation/continuwuity`（自建 Forgejo；`codeberg.org/continuwuity/continuwuity` 与 `github.com/continuwuity/continuwuity` 为镜像） | v26.9.1（2026-10-27） | conduwuit 社区延续（Continuwuation 社区）；2026 年起改用 `v年.月` 日历版本 |
 
 ### 1.3 部署要点对照
@@ -54,7 +54,7 @@ Conduit (timokoesters/conduit, Rust)
 | 对外联邦端口 | 反代 `8448 → 8008`（或 `443` + `.well-known` 委派） | 同左 | 同左；官方 Docker 文档主推 `443 + CONTINUWUITY_WELL_KNOWN` 委派，可省 8448 |
 | 配置方式 | `homeserver.yaml`（生成于数据卷；`SYNAPSE_*` 环境变量支持有限） | `tuwunel.toml`（模板 `tuwunel-example.toml`，`[global]` 段；兼容 `CONDUWUIT_`/`CONDUIT_` 前缀环境变量） | `continuwuity.toml` 或全量 `CONTINUWUITY_*` 环境变量（`SERVER_NAME`/`DATABASE_PATH`/`ADDRESS`/`PORT`/`CONFIG`/`WELL_KNOWN`）；容器内可执行文件仍叫 `/sbin/conduwuit` |
 | 数据库 | SQLite（默认，生产不建议）/ **PostgreSQL（推荐）** | **RocksDB 内嵌**（无外部 DB；支持 RocksDB Backup 引擎在线备份 `database_backup_path`） | **RocksDB 内嵌**（数据目录 `/var/lib/continuwuity`） |
-| 管理面 | `/_synapse/admin` API（私有）+ CLI | admin room（`#admins`，`!admin` 命令）+ `--console` / `--execute`；另自 1.7.0 起实现 **`/_synapse/admin` 兼容子集**（共享密钥注册、用户/房间/媒体等端点，覆盖逐步扩大） | admin room（`!admin` 命令）+ `uwu>` 控制台（`docker attach`）+ `--execute` |
+| 管理面 | `/_synapse/admin` API（私有）+ CLI | admin room（`#admins`，`!admin` 命令）+ `--console` / `--execute`；另自 v1.7.0 起实现 **`/_synapse/admin` 兼容子集**（共享密钥注册、用户/房间/媒体等端点，覆盖逐步扩大） | admin room（`!admin` 命令）+ `uwu>` 控制台（`docker attach`）+ `--execute` |
 | 注册控制 | `enable_registration` + UIA；多注册令牌仅经私有 admin API | `allow_registration` + `registration_token` / `registration_token_file`（静态多令牌）；**首个注册用户自动成为管理员** | 首次启动自动生成一次性注册令牌（打印在日志）；另有 `registration_token` / `registration_token_file` 静态令牌与管理室 `!admin token` 运行期增发；**首个注册用户自动成为管理员**并加入 `#admins` |
 | 文档 | element-hq.github.io/synapse | matrix-construct.github.io/tuwunel（tuwunel.chat） | continuwuity.org |
 
@@ -81,12 +81,12 @@ Conduit (timokoesters/conduit, Rust)
 
 | 接口 / 端点 | Synapse | Tuwunel | continuwuity | 备注 |
 |---|---|---|---|---|
-| 版本协商 `GET /_matrix/client/versions` | ✅ | ✅ | ✅ | CI 健康检查第一步与能力协商；三家声明的规范版本不同（如 Tuwunel 1.8.2+ 已声明 v1.19），以 CI 实测回填 |
+| 版本协商 `GET /_matrix/client/versions` | ✅ | ✅ | ✅ | CI 健康检查第一步与能力协商；三家声明的规范版本不同（如 Tuwunel v1.8.2+ 已声明 v1.19），以 CI 实测回填 |
 | 登录 `POST /_matrix/client/v3/login`、`POST /v3/logout` | ✅ | ✅ | ✅ | Tuwunel 额外支持密码登录开关（`login_with_password`）与 refresh token TTL 配置；continuwuity OAuth「新一代登录」模式下传统密码登录的可用性受 `compatibility_mode` 影响 |
 | 注册 `POST /_matrix/client/v3/register`（UIA） | ✅ | ✅ | ✅ | 令牌机制差异见 §3.3；CI 用标准 UIA（`m.login.dummy` / `m.login.registration_token`）注册，不走任何 admin API |
 | 身份自检 `GET /_matrix/client/v3/account/whoami` | ✅ | ✅ | ✅ | CI 断言返回的 `user_id` 与注册/登录一致 |
 | 同步 `GET /_matrix/client/v3/sync` | ✅ | ✅ | ✅ | Tuwunel 有 sync 超时上下限配置；Rust 家族不做增量 state delta 的部分边缘行为需 CI 断言（`next_batch` 推进、`limited` 标志） |
-| 建房 `POST /_matrix/client/v3/createRoom` | ✅ | ✅ | ✅ | **三家默认 room version 不同**（Tuwunel 1.9.2+ 新房默认 v12；continuwuity 参考配置明示默认 `"12"`、支持 6–12；Synapse 以其文档为准），botville 建房**显式指定 `room_version`**（建议 10/11），CI 断言三家一致 |
+| 建房 `POST /_matrix/client/v3/createRoom` | ✅ | ✅ | ✅ | **三家默认 room version 不同**（Tuwunel v1.9.2+ 新房默认 v12；continuwuity 参考配置明示默认 `"12"`、支持 6–12；Synapse 以其文档为准），botville 建房**显式指定 `room_version`**（建议 10/11），CI 断言三家一致 |
 | 加入 `POST /v3/join/{roomIdOrAlias}`、`/_matrix/client/v3/rooms/{roomId}/join` | ✅ | ✅ | ✅ | |
 | 发送 `PUT /_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}` | ✅ | ✅ | ✅ | 事务 ID 去重行为 CI 断言 |
 | 拉取消息 `GET /_matrix/client/v3/rooms/{roomId}/messages`、`/context` | ✅ | ✅ | ✅ | 分页边界（`l/t/b`）行为 CI 断言 |
@@ -103,7 +103,7 @@ Conduit (timokoesters/conduit, Rust)
 | 事务推送 `PUT /_matrix/app/v1/transactions/{txnId}` | ✅ | ✅ | ✅ | HS→AS 事件批量推送，`hs_token` 鉴权；Tuwunel 支持透传 ephemeral（typing/回执，需注册文件声明）与 MSC3202 扩展；断点续传语义 CI 断言 |
 | 用户查询 `GET /_matrix/app/v1/users/{userId}`、房间别名查询 `GET /_matrix/app/v1/rooms/{roomAlias}` | ✅ | ✅ | ✅ | botville 网关侧需实现（虚拟用户/别名由网关回答） |
 | 命名空间独占（`exclusive: true`） | ✅ 普通用户不能注册冲突 ID | ✅（users/aliases 大小写不敏感；rooms 大小写敏感；exclusive 区间不得重叠） | ✅（同 conduwuit 语义） | botville 用 exclusive user namespace 承载 `@ai_*` 账号；两家 Rust 分支的 regex 为**非锚定**匹配，正则要自带 `^…$` |
-| Ping（MSC2659，spec v1.7+）HS→AS `POST /_matrix/app/v1/ping`；AS→HS `POST /_matrix/client/v1/appservice/{appserviceId}/ping` | ✅（1.73 起以实验开关引入，规范 v1.7 声明后转正默认启用） | ✅（conduwuit v0.4.6 起实现并继承） | ✅（同血统） | **botville 网关必须实现接收 HS 的 ping 并正确应答**——ping 参与事务投递的健康判定（Tuwunel 1.8.3 起 stalled transaction 会在 ping 后重试），不应答有被误判下线、停发事务的风险；CI 加 ping 往返用例 |
+| Ping（MSC2659，spec v1.7+）HS→AS `POST /_matrix/app/v1/ping`；AS→HS `POST /_matrix/client/v1/appservice/{appserviceId}/ping` | ✅（1.73 起以实验开关引入，规范 v1.7 声明后转正默认启用） | ✅（conduwuit v0.4.6 起实现并继承） | ✅（同血统） | **botville 网关必须实现接收 HS 的 ping 并正确应答**——ping 参与事务投递的健康判定（Tuwunel v1.8.3 起 stalled transaction 会在 ping 后重试），不应答有被误判下线、停发事务的风险；CI 加 ping 往返用例 |
 | 虚拟用户代发（`?user_id=` masquerade）、`m.login.application_service` 命名空间内免密注册、设备管理 MSC4190 | ✅ 基本代发 | ✅（另有 `rate_limited`、`device_management` 开关） | ✅/❓（MSC4190 支持度以变更日志为准） | CI 断言：网关以虚拟用户身份 send、被 namespace 接受；AI 账号由 AS 持 `as_token` 走 `POST /register` + `m.login.application_service` 免密创建（规范路径，A1.3 建号方式） |
 
 ### 2.3 Push Gateway（Sygnal）
@@ -135,7 +135,7 @@ Conduit (timokoesters/conduit, Rust)
 
 ### 3.2 管理 API 边界（硬性规则）
 
-- `/_synapse/admin/*` 是 **Synapse 私有 API**：注册令牌管理、用户管理、统计等都走它，无规范保证。Tuwunel 自 1.7.0 起自行实现了一个 **Synapse 兼容 admin API 子集**（`/_synapse/admin/v1/register` 共享密钥注册、用户/房间/媒体/设备/访问令牌等端点，覆盖仍在扩大），continuwuity 没有兼容层——覆盖度各家不同且随时可变，**botville 运行时代码仍然禁止调用任何 `/_synapse/admin` 端点或 admin room 命令**；该兼容子集只作为安装向导/运维脚本在 Tuwunel 上复用 Synapse 工具链的便利项；
+- `/_synapse/admin/*` 是 **Synapse 私有 API**：注册令牌管理、用户管理、统计等都走它，无规范保证。Tuwunel 自 v1.7.0 起自行实现了一个 **Synapse 兼容 admin API 子集**（`/_synapse/admin/v1/register` 共享密钥注册、用户/房间/媒体/设备/访问令牌等端点，覆盖仍在扩大），continuwuity 没有兼容层——覆盖度各家不同且随时可变，**botville 运行时代码仍然禁止调用任何 `/_synapse/admin` 端点或 admin room 命令**；该兼容子集只作为安装向导/运维脚本在 Tuwunel 上复用 Synapse 工具链的便利项；
 - 安装向导与运维脚本（部署期一次性动作）允许按服务器分叉使用各自管理面，但必须封装在 `server/` 部署层，不进入网关/App 代码路径；
 - CI 冒烟全部走标准 API（注册用 UIA，管理员引导用「首个注册用户即管理员」的 Rust 分支惯例 / Synapse 则由向导预置管理员）。
 
@@ -164,7 +164,7 @@ Conduit (timokoesters/conduit, Rust)
 | Spaces（MSC1772/层级 MSC2946） | ✅ 完整 | 基本支持（Tuwunel 有 spaces 层级缓存配置项） | 层级分页/可见性细节需 CI + Element 实测；botville 的「群组/动态」自建存储，不把 Spaces 当依赖 |
 | 线程（MSC3440/3856） | ✅ 完整 | 事件存储与 `/relations` 透传可用；线程订阅等细节 ❓ | botville 消息流不依赖线程聚合，App 侧暂不使用；若 M2+ 要用先补 CI 用例 |
 | E2EE（Megolm） | ✅ 完整（密钥备份、交叉签名、secret storage） | 基础 E2EE 可用（keys query/claim、to-device、加密房间；Tuwunel `allow_encryption` 默认开） | **服务器端密钥备份等高级特性的实现完整度 ❓**：botville 产品规则「含 AI 会话默认不加密、人与人私聊可开」，建议 C2.6 只在 Synapse 上首发放开 E2EE 开关，Rust 分支待 CI + 客户端实测后放开 |
-| 默认房间版本 | 以文档为准（较保守） | Tuwunel 1.9.2+ 新房默认 **v12**（`default_room_version = "11"` 可退回）；continuwuity 参考配置默认 `"12"`、支持 6–12（3–5 实验性） | botville 建房显式传 `room_version`（三家都支持 10/11），跨服房间版本一致由 CI 断言 |
+| 默认房间版本 | 以文档为准（较保守） | Tuwunel v1.9.2+ 新房默认 **v12**（`default_room_version = "11"` 可退回）；continuwuity 参考配置默认 `"12"`、支持 6–12（3–5 实验性） | botville 建房显式传 `room_version`（三家都支持 10/11），跨服房间版本一致由 CI 断言 |
 
 ### 3.6 媒体端点差异
 
@@ -192,7 +192,7 @@ Conduit (timokoesters/conduit, Rust)
 2. **容器细节**：continuwuity 镜像无 shell（排障用 `docker logs`/`docker attach` 控制台）；容器内命令名仍是 `/sbin/conduwuit`，Compose 里要写对。
 3. **Docker DNS**：continuwuity 官方文档警告 Docker 内建 DNS 会拖慢联邦，建议挂载自定义 `/etc/resolv.conf`——CI 内网联邦冒烟若超时先查这一点（同时影响按容器名连 appservice）。
 4. **well-known 服务位置**：见 §2.1 末行，统一由反代提供（含 `/.well-known/matrix/server` 委派），`.env.example` 已有 `BOTVILLE_PUBLIC_URL` 对应此用途。
-5. **版本节奏**：Tuwunel `:latest` 约月更、continuwuity 日历版本月更、Synapse 双周更；A0.2 的 Compose **pin 具体版本标签**（文档注明当前验证版本：Synapse v1.164.1 / Tuwunel 1.9.4 / continuwuity v26.9.1），升级策略归 A3.2。
+5. **版本节奏**：Tuwunel `:latest` 约月更、continuwuity 日历版本月更、Synapse 双周更；A0.2 的 Compose **默认 pin tag + digest**，文档注明当前验证版本（当前：Synapse v1.164.1 / Tuwunel v1.9.4 / continuwuity v26.9.1 / Postgres 16-alpine，均为多架构 index digest，pin 表以 [`docs/ops/upgrade-images.md`](../ops/upgrade-images.md) §2 为准），升级流程与风险亦见该文档，策略细化归 A3.2。
 6. **行为细节差异**：`/sync` 长轮询参数钳制（Tuwunel 有 min/default/max）、profile 全局改名的房间传播策略、push 规则计算差异（如 Tuwunel 的 MSC3664 related-event 匹配默认关闭 `msc3664_related_event_match = false`、每账号推送规则集上限 10000 条）——全部列入 CI 断言点而非假设一致。
 
 ---
@@ -238,7 +238,7 @@ CI 目标：同一套脚本对每个服务器实现跑一遍，断言全部通�
 
 1. **只写标准接口**：CI 脚本与后续 `server/` 代码不得调用 `/_synapse/admin` 等私有 admin 端点（含 Tuwunel 的兼容子集）或 admin room 命令；部署层（向导/Compose 初始化）的分叉逻辑单独放 `server/deploy/` 一类的目录。
 2. **示例配置零真实值**：`as_token`/`hs_token`/注册令牌/Postgres 密码全部占位符（`<change-me>` 风格），CI 用脚本现场生成；与 `.env.example` 现状保持一致。
-3. **镜像 pin 版本**：`docker.io/matrixdotorg/synapse:v1.164.x`（或官方双源之一 `ghcr.io/element-hq/synapse`）、`ghcr.io/matrix-construct/tuwunel:1.9.x`（或 `:latest` 按官方建议，文档注明取舍）、`ghcr.io/continuwuity/continuwuity:v26.9.x`；不使用 Docker Hub 个人镜像作默认。
+3. **镜像 pin 版本（tag + digest）**：四个服务（Synapse、Tuwunel、continuwuity、Postgres）默认一律 pin `tag@sha256:<多架构 index digest>`，且版本与本文档口径一致：**synapse v1.164.x**（`docker.io/matrixdotorg/synapse`，或官方双源之一 `ghcr.io/element-hq/synapse`）、**tuwunel v1.9.x**（`ghcr.io/matrix-construct/tuwunel`）、**continuwuity v26.9.x**（`ghcr.io/continuwuity/continuwuity`）、**postgres 16-alpine**（`docker.io/library/postgres`）；homeserver 的 tag 一律带 `v` 前缀（如 v1.164.1 / v1.9.4 / v26.9.1，Postgres 除外）；可在 `.env` 覆盖为 `:latest` 跟随上游但不推荐；不使用 Docker Hub 个人镜像作默认。当前 pin 表、备份与升级流程见 [`docs/ops/upgrade-images.md`](../ops/upgrade-images.md)。
 4. **单端口模型**：三家容器统一 `8008` 对内；`6167` 不出现；反代统一 8448/443 与 well-known。
 5. **注册引导分叉**：Synapse profile 预置管理员与注册策略；Rust 分支 profile 必须文档化「首个注册用户 = 管理员」并让 CI 先注册固定管理员账号。
 6. **Tuwunel 容器**`address` 改 `0.0.0.0`（默认 `127.0.0.1` 在容器内不可达）；continuwuity 挂载自定义 `/etc/resolv.conf` 缓解 Docker DNS 问题。
@@ -249,12 +249,12 @@ CI 目标：同一套脚本对每个服务器实现跑一遍，断言全部通�
 ## 5. 参考来源（访问日期 2026-11-04）
 
 - Tuwunel 仓库与文档：github.com/matrix-construct/tuwunel；matrix-construct.github.io/tuwunel；`docs/appservices.md`、`tuwunel-example.toml`（main 分支）
-- Tuwunel 版本：GitHub Releases（1.9.4，2026-10-10）；Waldur 部署文档（appservice 重复注册行为）
+- Tuwunel 版本：GitHub Releases（v1.9.4，2026-10-10）；Waldur 部署文档（appservice 重复注册行为）
 - continuwuity 官方文档：continuwuity.org（`/deploying/docker`、`/appservices`、`/authentication`、`/reference/config`（默认房间版本 `"12"`、`allow_legacy_media = false`、`[global.oauth]`、`forbidden/allowed_remote_server_names`、RocksDB 备份与缓存默认值）、`/guides/dns`）
 - continuwuity 仓库与版本：forgejo.ellis.link/continuwuation/continuwuity；GitHub Releases（v26.9.1，2026-10-27；2026 年起日历版本）
 - conduwuit 归档：github.com/girlbossceo/conduwuit（只读）；维护者博客（2025-05-30 放弃维护声明）
 - Conduit 停更：最后常规版本 v0.7.0（This Week in Matrix 2024-04-26）；后续安全发版见 conduit.rs 更新日志（2025-12-30 修复 CVE-2025-49090）；开发现托管于 gitlab.com/famedly/conduit（`next` 重写分支）
-- Tuwunel Releases（github.com/matrix-construct/tuwunel/releases）：1.8.2+ 声明 Matrix v1.19；1.9.2 起新房默认房间版本 v12；1.8.3 AS ping 与事务重试联动
+- Tuwunel Releases（github.com/matrix-construct/tuwunel/releases）：v1.8.2+ 声明 Matrix v1.19；v1.9.2 起新房默认房间版本 v12；v1.8.3 AS ping 与事务重试联动
 - conduwuit appservice ping：v0.4.6 发布说明（This Week in Matrix 2024-09-06）
 - Synapse：github.com/element-hq/synapse；[安装指南](https://element-hq.github.io/synapse/latest/setup/installation.html)（官方镜像双源 Docker Hub / GHCR，旧 `ghcr.io/matrix-org/synapse` 停用见 issue #2）；matrix-docker-ansible-deploy defaults（v1.164.1）；配置文档（`app_service_config_files`）；变更日志（1.73 实验引入 MSC2659、规范 v1.7 声明后转正；1.111 认证媒体/Matrix v1.11 时代）
 - Sygnal：github.com/element-hq/sygnal；Docker Hub matrixdotorg/sygnal

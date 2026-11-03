@@ -26,6 +26,9 @@ make down            # 停止（保留数据卷；手动 down -v 可清空）
 - 首次 `make up` 会执行 `server/scripts/init.sh`：从 `.env.example` 生成本地
   `server/compose/.env`（所有 `<change-me>` 用 `openssl rand -hex 32` 就地随机生成，
   不会提交），并把 `synapse/homeserver.yaml.tmpl` 渲染到 `generated/synapse/`（gitignore）。
+  `.env` 已存在时保留原值；其中的 `*_IMAGE` 与当前默认不同（如 `:latest`、无 digest）
+  只会打 WARNING，不会自动改写——迁移见
+  [docs/ops/upgrade-images.md](../docs/ops/upgrade-images.md) §5。
 - 三个 homeserver 容器内都监听 8008，宿主仅绑定 `127.0.0.1:${BOTVILLE_HTTP_PORT:-8008}`；
   需要外部访问时自行加反向代理。
 - 注册策略：tuwunel / continuwuity 始终令牌门控（`BOTVILLE_REGISTRATION_TOKEN`）；
@@ -62,8 +65,11 @@ make down            # 停止（保留数据卷；手动 down -v 可清空）
   shell 环境变量优先级高于 `.env`。
 - 就绪探测：postgres/synapse 用容器 healthcheck；tuwunel、continuwuity 镜像为
   OS-less（无 shell/curl），由 `server/tests/smoke.py` 轮询 `/_matrix/client/versions`。
-- 镜像可通过 `.env` 的 `SYNAPSE_IMAGE` / `TUWUNEL_IMAGE` / `CONTINUWUITY_IMAGE` 覆盖；
-  continuwuity 默认按 digest 锁定（实测版本与 digest 见 `docs/compat/homeserver-compat.md` §3.3）。
+- 镜像默认全部 pin 为 `tag@sha256:<digest>`（含 Postgres，digest 取多架构 index）；
+  可在 `.env` 用 `POSTGRES_IMAGE` / `SYNAPSE_IMAGE` / `TUWUNEL_IMAGE` /
+  `CONTINUWUITY_IMAGE` 覆盖（如临时跟 `:latest`，不推荐）。升级流程与风险见
+  [docs/ops/upgrade-images.md](../docs/ops/upgrade-images.md)；
+  continuwuity 的实测版本与 digest 另见 `docs/compat/homeserver-compat.md` §3.3。
 
 ## 布局
 
