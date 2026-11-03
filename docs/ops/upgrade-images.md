@@ -93,8 +93,8 @@
    <hs> config --quiet`；有疑虑再跑 `make smoke`（见 `server/README.md`）。
 5. **CI 全绿后提 PR**：lint 的「镜像必须 pin」「compose 默认值 = `.env.example`」
    与 allowlist 检查会兜底；smoke 会实际 pull 每个 profile 的全部镜像并走完
-   注册→发消息→回读链路（digest 拼错会在 smoke 暴露；continuwuity 目前为
-   continue-on-error，#70 将其改为必过）。
+   注册→发消息→回读链路（digest 拼错会在 smoke 暴露；三个 profile 均为
+   必过）。
 
 ## 4. 升级前备份（所有 profile 通用）
 

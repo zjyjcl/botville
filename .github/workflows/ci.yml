@@ -235,8 +235,7 @@ jobs:
           # Scope note: this is a format + consistency guard only — it does
           # NOT verify the digest resolves in a registry (no network here).
           # A typo'd digest surfaces in the smoke job, which pulls every
-          # image for each profile; continuwuity is continue-on-error in this
-          # branch and becomes required-green via #70.
+          # image for each profile (all three profiles are required-green).
           if problems:
               print("\n".join(problems))
               sys.exit(1)
