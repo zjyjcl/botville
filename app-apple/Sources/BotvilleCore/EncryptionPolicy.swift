@@ -41,9 +41,9 @@ public struct AIParticipantPolicy: Sendable {
         return AIParticipantPolicy(userIDPatterns: patterns.values, userIDPrefixes: prefixes.values)
     }
 
-    public func classify(memberIDs: [String]?, knownAIUserIDs: Set<String> = []) -> AIParticipantStatus {
+    public func classify(memberIDs: [String]?) -> AIParticipantStatus {
         guard let memberIDs, !memberIDs.isEmpty else { return .unknown }
-        if memberIDs.contains(where: { knownAIUserIDs.contains($0) || matchesAI($0) }) { return .containsAI }
+        if memberIDs.contains(where: matchesAI) { return .containsAI }
         return hasConfiguredRules ? .humanOnly : .unknown
     }
 
@@ -83,15 +83,32 @@ public struct EncryptionPresentation: Sendable, Hashable {
     public var systemImage: String { switch encryption { case .encrypted: return "lock.fill"; case .unknown: return "lock.questionmark"; case .unencrypted: return "lock.open" } }
     public var detail: String {
         switch encryption {
-        case .encrypted: return "此房间已端到端加密，开启后不能关闭。"
+        case .encrypted: return "此房间已端到端加密；本客户端不提供关闭入口。"
         case .unknown: return "正在读取房间加密状态与成员；按可能含 AI 保守处理。"
-        case .unencrypted where participants == .containsAI: return "此房间含 AI。AI 无法读取端到端加密消息，因此保持未加密。"
+        case .unencrypted where participants == .containsAI: return "此房间含 AI。botville 的 AI 接入目前不支持加密会话，因此保持未加密。"
         case .unencrypted where participants == .unknown: return "成员尚未加载或 AI 规则未配置，按可能含 AI 保守处理。"
-        case .unencrypted: return "此房间未加密。开启后不可关闭，AI 将无法读取消息。"
+        case .unencrypted: return "此房间未加密；本客户端开启后不提供关闭入口。botville 的 AI 接入目前不支持加密会话。"
         }
     }
     public var canEnable: Bool { encryption == .unencrypted && participants == .humanOnly }
     public var canDisable: Bool { false }
+}
+
+/// Keeps a new-room encryption request valid only while the current draft can
+/// still be encrypted. This prevents a changed invitee from leaving a disabled
+/// toggle selected and blocking plaintext creation.
+public struct NewRoomEncryptionSelection: Equatable, Sendable {
+    public private(set) var isRequested = false
+
+    public init() {}
+
+    public mutating func setRequested(_ requested: Bool, presentation: EncryptionPresentation) {
+        isRequested = requested && presentation.canEnable
+    }
+
+    public mutating func reconcile(presentation: EncryptionPresentation) {
+        if !presentation.canEnable { isRequested = false }
+    }
 }
 
 public enum RoomCreationValidationError: Error, Equatable, LocalizedError, Sendable {
@@ -174,7 +191,7 @@ public enum EncryptionAuthorizationError: Error, Equatable, LocalizedError, Send
     case confirmationRequired, containsAI, participantsUnknown, stateUnknown
     public var errorDescription: String? {
         switch self {
-        case .confirmationRequired: return "请先确认：开启端到端加密后不可关闭，AI 将无法读取消息，并应验证设备和设置密钥备份。"
+        case .confirmationRequired: return "请先确认：本客户端在开启后不提供关闭入口；botville 的 AI 接入目前不支持加密会话。当前也尚未配置只向可信设备分享密钥；请验证设备并设置密钥备份。"
         case .containsAI: return "房间含 AI，不能开启端到端加密。"
         case .participantsUnknown: return "成员或 AI 识别规则尚未确认，暂不能开启端到端加密。"
         case .stateUnknown: return "房间加密状态尚未读取完成，暂不能更改。"

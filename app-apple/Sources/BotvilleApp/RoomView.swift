@@ -151,7 +151,7 @@ struct RoomView: View {
             Button("开启加密") { enableEncryptionAfterConfirmation() }
             Button("返回", role: .cancel) { encryptionConsent.cancel() }
         } message: {
-            Text("开启后不可关闭，AI 将无法读取消息；未验证设备或未设置密钥备份时，换设备可能无法查看历史消息。")
+            Text("本客户端在开启后不提供关闭入口。botville 的 AI 接入目前不支持加密会话；当前尚未配置只向可信设备分享密钥。未验证设备或未设置密钥备份时，换设备可能无法查看历史消息。")
         }
     }
 
@@ -183,7 +183,7 @@ struct RoomView: View {
                 .disabled(isEnablingEncryption)
             }
             if currentRoom.encryption == .encrypted {
-                Text("加密已开启且不能关闭。")
+                Text("加密已开启；本客户端不提供关闭入口。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                 ForEach(service.cryptoSafetyWarnings, id: \.self) { warning in
@@ -209,11 +209,13 @@ struct RoomView: View {
     private func enableEncryptionAfterConfirmation() {
         let target = EncryptionTarget.existingRoom(room.id)
         guard encryptionConsent.confirm(for: target), !isEnablingEncryption else { return }
+        let confirmedConsent = encryptionConsent
+        encryptionConsent.cancel()
         isEnablingEncryption = true
         Task {
             defer { isEnablingEncryption = false }
             do {
-                try await service.enableEncryption(roomID: room.id, consent: encryptionConsent)
+                try await service.enableEncryption(roomID: room.id, consent: confirmedConsent)
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -353,17 +355,6 @@ private struct InviteMemberSheet: View {
     @State private var userID = ""
     @State private var isInviting = false
     @State private var errorMessage: String?
-    @State private var isShowingEncryptionWarning = false
-    @State private var warningUserID: String?
-
-    private var invitedParticipantStatus: AIParticipantStatus {
-        service.aiParticipantPolicy.classify(memberIDs: [userID])
-    }
-
-    private var mustAcknowledgeEncryptionWarning: Bool {
-        room.encryption == .encrypted && invitedParticipantStatus != .humanOnly
-    }
-
     var body: some View {
         NavigationStack {
             Form {
@@ -376,12 +367,10 @@ private struct InviteMemberSheet: View {
                 }
                 if room.encryption == .encrypted {
                     Section("加密房间限制") {
-                        Label("已加密房间不能降级；AI 无法读取其中消息。", systemImage: "lock.fill")
+                        Label("本客户端不提供关闭入口；botville 的 AI 接入目前不支持加密会话。", systemImage: "lock.fill")
                             .font(.footnote)
-                        if invitedParticipantStatus != .humanOnly {
-                            Label("此 ID 是 AI 或尚无法确认是否为 AI。邀请前需要确认其无法读取加密消息。", systemImage: "exclamationmark.triangle")
-                                .font(.footnote)
-                        }
+                        Label("AI 或身份未确认的成员不能加入此房间。", systemImage: "exclamationmark.triangle")
+                            .font(.footnote)
                     }
                 }
                 if let errorMessage { Text(errorMessage).foregroundStyle(.red) }
@@ -396,16 +385,6 @@ private struct InviteMemberSheet: View {
                         .disabled(isInviting || userID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
-            .alert("确认邀请可能为 AI 的成员？", isPresented: $isShowingEncryptionWarning) {
-                Button("确认邀请") { inviteAfterWarning() }
-                Button("返回", role: .cancel) { warningUserID = nil }
-            } message: {
-                Text("该房间已启用端对端加密，AI 将无法读取消息；加密也不能关闭。请确认此邀请符合会话用途。")
-            }
-            .onChange(of: userID) { _, _ in
-                warningUserID = nil
-                isShowingEncryptionWarning = false
-            }
         }
     }
 
@@ -413,40 +392,20 @@ private struct InviteMemberSheet: View {
         errorMessage = nil
         let trimmed = userID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        if mustAcknowledgeEncryptionWarning {
-            warningUserID = trimmed
-            isShowingEncryptionWarning = true
-        } else {
-            invite(acknowledgedWarning: false)
-        }
+        invite()
     }
 
-    private func inviteAfterWarning() {
-        let target = userID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard warningUserID == target else {
-            errorMessage = "邀请对象已变化，请重新确认。"
-            return
-        }
-        warningUserID = nil
-        invite(acknowledgedWarning: true)
-    }
-
-    private func invite(acknowledgedWarning: Bool) {
+    private func invite() {
         guard !isInviting else { return }
         isInviting = true
         let target = userID.trimmingCharacters(in: .whitespacesAndNewlines)
         Task {
             defer { isInviting = false }
             do {
-                try await service.inviteUser(target, to: room.id, acknowledgedEncryptionWarning: acknowledgedWarning)
+                try await service.inviteUser(target, to: room.id)
                 dismiss()
             } catch {
-                if case MatrixServiceError.aiInvitationConfirmationRequired = error {
-                    warningUserID = target
-                    isShowingEncryptionWarning = true
-                } else {
-                    errorMessage = error.localizedDescription
-                }
+                errorMessage = error.localizedDescription
             }
         }
     }

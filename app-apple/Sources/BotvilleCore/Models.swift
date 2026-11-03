@@ -54,7 +54,7 @@ public struct MatrixMessage: Identifiable, Equatable, Sendable {
 
 public enum MatrixServiceError: LocalizedError {
     case invalidHomeserver, missingCredentials, notLoggedIn, roomUnavailable, emptyMessage, busy, sendNoLongerFailed, storageUnavailable, sessionExpired, operationFailed
-    case encryptionConfirmationRequired, aiInvitationConfirmationRequired
+    case encryptionConfirmationRequired, encryptedRoomParticipantNotAllowed
 
     public var errorDescription: String? {
         switch self {
@@ -69,7 +69,7 @@ public enum MatrixServiceError: LocalizedError {
         case .operationFailed: return "操作失败，请稍后重试。"
         case .busy: return "操作正在进行，请稍候。"
         case .encryptionConfirmationRequired: return "开启加密需要重新确认；房间和成员状态可能已变化。"
-        case .aiInvitationConfirmationRequired: return "此房间已加密或加密状态尚未确认。AI 将无法读取加密消息，请确认后再邀请。"
+        case .encryptedRoomParticipantNotAllowed: return "加密状态已启用或尚未确认；当前成员和受邀成员必须都能确认为真人，不能邀请 AI 或身份未确认的账号。"
         }
     }
 }

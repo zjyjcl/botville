@@ -27,8 +27,7 @@ enum SDKEncryptionState {
     ) -> AIParticipantStatus {
         let expectedTotal = iterator.len()
         var members: [RoomMember] = []
-        while let chunk = iterator.nextChunk(chunkSize: 100) {
-            guard !chunk.isEmpty else { return .unknown }
+        while let chunk = iterator.nextChunk(chunkSize: 100), !chunk.isEmpty {
             members.append(contentsOf: chunk)
         }
         // FFI conversion can drop an invalid member. Never accept that as a

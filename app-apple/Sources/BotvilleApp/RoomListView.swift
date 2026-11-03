@@ -171,7 +171,7 @@ private struct NewConversationSheet: View {
     @State private var isDirect = true
     @State private var roomName = ""
     @State private var inviteesText = ""
-    @State private var wantsEncryption = false
+    @State private var encryptionSelection = NewRoomEncryptionSelection()
     @State private var consent = EncryptionConsent()
     @State private var isCreating = false
     @State private var errorMessage: String?
@@ -192,6 +192,13 @@ private struct NewConversationSheet: View {
 
     private var encryptionPresentation: EncryptionPresentation {
         EncryptionPresentation(encryption: .unencrypted, participants: participantStatus)
+    }
+
+    private var wantsEncryption: Binding<Bool> {
+        Binding(
+            get: { encryptionSelection.isRequested },
+            set: { encryptionSelection.setRequested($0, presentation: encryptionPresentation) }
+        )
     }
 
     var body: some View {
@@ -220,17 +227,21 @@ private struct NewConversationSheet: View {
                 }
 
                 Section("加密") {
-                    Toggle("启用端对端加密", isOn: $wantsEncryption)
+                    Toggle("启用端对端加密", isOn: wantsEncryption)
                         .disabled(!encryptionPresentation.canEnable || isCreating)
                     Label(encryptionPresentation.detail, systemImage: encryptionPresentation.systemImage)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
-                    if !service.aiParticipantPolicy.hasConfiguredRules {
-                        Text("尚未完成 AI 账号识别设置；为避免误加密，含成员的会话按可能含 AI 处理。")
+                    if let configurationNotice = service.aiParticipantPolicy.configurationNotice {
+                        Text(configurationNotice)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("按部署的 AI 账号规则检查；规则需覆盖所有 AI，未命中不等于已验证真人。")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
-                    Text("加密一旦开启不能关闭；AI 无法读取消息。开启前请确认设备验证和密钥备份。")
+                    Text("本客户端在开启后不提供关闭入口。botville 的 AI 接入目前不支持加密会话；当前尚未配置只向可信设备分享密钥。开启前请确认设备验证和密钥备份。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -253,11 +264,17 @@ private struct NewConversationSheet: View {
                 Button("开启并创建") { createAfterConfirmation() }
                 Button("返回", role: .cancel) { consent.cancel() }
             } message: {
-                Text("开启后不可关闭，AI 将无法读取消息；未验证设备或未设置密钥备份时，换设备可能无法查看历史消息。")
+                Text("本客户端在开启后不提供关闭入口。botville 的 AI 接入目前不支持加密会话；当前尚未配置只向可信设备分享密钥。未验证设备或未设置密钥备份时，换设备可能无法查看历史消息。")
             }
             .onChange(of: isDirect) { _, _ in consent.contextChanged(to: .newRoom(draft)) }
             .onChange(of: roomName) { _, _ in consent.contextChanged(to: .newRoom(draft)) }
             .onChange(of: inviteesText) { _, _ in consent.contextChanged(to: .newRoom(draft)) }
+            .onChange(of: encryptionPresentation.canEnable) { _, canEnable in
+                if !canEnable {
+                    encryptionSelection.reconcile(presentation: encryptionPresentation)
+                    consent.cancel()
+                }
+            }
         }
     }
 
@@ -265,7 +282,7 @@ private struct NewConversationSheet: View {
         errorMessage = nil
         do {
             try draft.validate()
-            guard wantsEncryption else { create(draft: draft, consent: EncryptionConsent()); return }
+            guard encryptionSelection.isRequested else { create(draft: draft, consent: EncryptionConsent()); return }
             guard encryptionPresentation.canEnable else {
                 errorMessage = encryptionPresentation.detail
                 return
@@ -285,6 +302,9 @@ private struct NewConversationSheet: View {
 
     private func create(draft: RoomCreationDraft, consent: EncryptionConsent) {
         guard !isCreating else { return }
+        if consent.allowsEncryption(for: .newRoom(draft)) {
+            self.consent.cancel()
+        }
         isCreating = true
         Task {
             defer { isCreating = false }

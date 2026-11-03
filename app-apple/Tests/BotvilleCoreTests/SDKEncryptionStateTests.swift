@@ -104,6 +104,19 @@ final class SDKEncryptionStateTests: XCTestCase {
         )
     }
 
+    func testCompleteIteratorAcceptsEmptyChunkAsEndWhenReportedCountMatches() {
+        let iterator = SDKTestMembersIterator(reportedCount: 1, chunks: [
+            [member("@person:example.org", .join)], []
+        ])
+
+        XCTAssertEqual(
+            SDKEncryptionState.participants(iterator, expectedActiveCount: 1,
+                                            policy: AIParticipantPolicy(userIDPrefixes: ["@ai-"]),
+                                            membersAreComplete: true),
+            .humanOnly
+        )
+    }
+
     private func member(
         _ userID: String,
         _ membership: MembershipState,

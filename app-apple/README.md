@@ -92,9 +92,9 @@ Tests/BotvilleCoreTests/       认证、会话、发送和重连的单元测试
 
 ## 加密策略（C2.6）
 
-新建会话支持输入 MXID 开私聊或建群，均默认不加密。确认全部为真人后可主动开启，需二次确认“不可关闭、AI 无法读取、设备验证和备份风险”；已有真人房间同样可开启。含 AI 或成员未知时禁用开启。列表和房间内持续显示文字和图标状态；已加密房间没有关闭入口，邀请 AI 前会提示限制。
+新建会话支持输入 MXID 开私聊或建群，均默认不加密。成员通过部署 AI 规则检查后可二次确认开启；含 AI 或身份未知时禁用开启，编辑成员导致不再符合策略时会复位开关，仍可创建明文会话。botville 的 AI 接入目前不支持加密会话；已加密或状态未知房间拒绝 AI／身份未确认的邀请，没有确认后放行的接口。本客户端不提供关闭入口，也不保证 AI 或未验证设备无法解密。
 
-AI 判定集中在 `AIParticipantPolicy`，使用部署配置的 MXID 正则/前缀。当前 A1.3 尚未提供命名空间，默认空占位并保守处理，需按部署规则配置后才能确认纯真人。加密房显示 SDK 的设备验证/备份风险，完整恢复流程由 [C11-09 / #97](https://github.com/zjyjcl/botville/issues/97) 跟进。配置方法、数据来源和限制见[加密策略文档](docs/encryption-policy.md)。
+AI 判定集中在 `AIParticipantPolicy`，使用部署配置的 MXID 正则/前缀；未命中规则不等于已验证真人身份。修订时已核对 [#99](https://github.com/zjyjcl/botville/pull/99) 尚未合入，默认规则保持空占位；未配置或配置无效时保守拒绝开启。加密房显示 SDK 的设备验证/备份风险，完整恢复流程由 [C11-09 / #97](https://github.com/zjyjcl/botville/issues/97) 跟进。配置方法、数据来源和限制见[加密策略文档](docs/encryption-policy.md)。
 
 ## 发送语义
 
@@ -107,34 +107,13 @@ AI 判定集中在 `AIParticipantPolicy`，使用部署配置的 MXID 正则/前
 
 ## 验证与验收
 
-### C2.6 本轮验证（2026-11-04）
+### C2.6 验证范围
 
-| 检查 | 结果 |
-| --- | --- |
-| `swift build` | 通过 |
-| `swift test` | 88 项：86 通过、2 项门控集成测试跳过、0 失败；另通过 `--skip KeychainSessionStoreTests.testRealKeychainRoundTripUsesUniqueServiceAndDeletesIt` 排除真实 Keychain 往返，遵守本轮只写工作树的边界 |
-| iOS Simulator `xcodebuild` | `BUILD SUCCEEDED`，arm64 + x86_64，`CODE_SIGNING_ALLOWED=NO`、`CODE_SIGNING_REQUIRED=NO`；未请求签名或 Apple 账号 |
-| C2.6 本地 Synapse 集成 | 1 项通过、0 失败；默认明文创建、确认加密创建、已有房间开启及重复调用保持加密，API 状态与 SDK 标识均验证 |
+[PR #98](https://github.com/zjyjcl/botville/pull/98) 记录本次修订的构建、测试数量、回归复现及无签名模拟器编译结果。单测覆盖新建私聊／群聊邀请列表、加密房后续邀请的服务层硬拒绝、已观测加密不降级、成员完整性、配置提示和修改成员后的加密开关复位。普通房间同步只读成员缓存，安全操作按需完整读取。
 
-实测修复了标准 `/sync` 对不存在的加密状态保留 unknown、以及成员摘要人数为零的问题：在线补查 SDK 加密状态；完整成员查询以实际迭代器长度校验，缓存仍保守处理。相关回归覆盖最后分块中的受邀 AI、成员转换缺失及零摘要人数。
+按本次任务边界，测试使用占位凭据和 fake SDK，排除真实 Keychain 往返，并保持需要真实账号的 Synapse 集成门控关闭。缓存和临时数据留在本 worktree 的 `.build/`。操作日志和机器环境细节不作为产品文档维护，具体证据见 PR 评论。
 
-集成使用独立 `botville-codex` 项目、`127.0.0.1:8028` 和本工作树已有 Synapse `v1.141.0`。各轮共 8 个 `c26_` 测试账号均已 `deactivate` + `erase:true`，数据库汇总确认全部停用/擦除、密码哈希及 access token 均为 0；其中一次失败轮的重登验证遇到 429，以数据库补证，最终成功轮两账号重登均为 403。测试 SQLite 已删除，仅本项目执行不带 `-v` 的 `down`，保留卷。未操作其他 Compose 项目。
-
-构建和测试日志在本地 `.build/c26-artifacts/`，不入库。上游 Rust 对象的 macOS 最低版本/调试符号警告仍存在；最低系统、真实 UI 和跨设备恢复未验收，完整 C11-09 由 [#97](https://github.com/zjyjcl/botville/issues/97) 跟进。
-
-仅重跑 C2.6 本地测试时，先启动自己的测试 Synapse，在 `app-apple/` 下运行（本测试本身不启停容器）：
-
-```sh
-mkdir -p .build/c26-tmp .build/c26-artifacts
-env BOTVILLE_E2E_HOMESERVER=http://127.0.0.1:8028 \
-  BOTVILLE_E2E_ARTIFACT_ROOT="$PWD/.build/c26-artifacts/e2e" \
-  TMPDIR=.build/c26-tmp/ \
-  CLANG_MODULE_CACHE_PATH="$PWD/.build/ModuleCache" \
-  SWIFTPM_MODULECACHE_OVERRIDE="$PWD/.build/ModuleCache" \
-  swift test --disable-sandbox --cache-path .build/cache \
-  --config-path .build/config --security-path .build/security \
-  --filter SynapseIntegrationTests.testLocalSynapseC26EncryptionOptIn
-```
+无签名编译和单元测试不代表双设备加密收发、UI 或历史恢复已经验收；完整验证／恢复由 [#97](https://github.com/zjyjcl/botville/issues/97) 跟进。上游 Rust 对象的最低系统与调试符号警告仍需独立兼容性验收。
 
 ### 可选的本地 Synapse 集成测试
 

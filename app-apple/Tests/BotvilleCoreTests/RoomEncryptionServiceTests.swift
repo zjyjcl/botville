@@ -33,6 +33,46 @@ final class RoomEncryptionServiceTests: XCTestCase {
         XCTAssertEqual(unknownClient.createRequests.last?.isEncrypted, false)
     }
 
+    func testConfirmedEncryptedCreationRejectsAIDMAndGroupInviteListInService() async throws {
+        let policy = AIParticipantPolicy(userIDPrefixes: ["@ai-"])
+
+        let directClient = SecurityClient()
+        let directService = try await readyService(client: directClient, policy: policy)
+        let directDraft = RoomCreationDraft(isDirect: true, invitees: ["@ai-helper:matrix.test"])
+        var directConsent = EncryptionConsent()
+        directConsent.request(for: .newRoom(directDraft))
+        XCTAssertTrue(directConsent.confirm(for: .newRoom(directDraft)))
+        await XCTAssertThrowsErrorAsync(try await directService.createRoom(draft: directDraft, consent: directConsent)) { error in
+            XCTAssertEqual(error as? EncryptionAuthorizationError, .containsAI)
+        }
+        XCTAssertTrue(directClient.createRequests.isEmpty)
+
+        let groupClient = SecurityClient()
+        let groupService = try await readyService(client: groupClient, policy: policy)
+        let groupDraft = RoomCreationDraft(isDirect: false, invitees: ["@person:matrix.test", "@ai-helper:matrix.test"])
+        var groupConsent = EncryptionConsent()
+        groupConsent.request(for: .newRoom(groupDraft))
+        XCTAssertTrue(groupConsent.confirm(for: .newRoom(groupDraft)))
+        await XCTAssertThrowsErrorAsync(try await groupService.createRoom(draft: groupDraft, consent: groupConsent)) { error in
+            XCTAssertEqual(error as? EncryptionAuthorizationError, .containsAI)
+        }
+        XCTAssertTrue(groupClient.createRequests.isEmpty)
+    }
+
+    func testConfirmedEncryptedCreationRejectsUnknownPolicyInService() async throws {
+        let client = SecurityClient()
+        let service = try await readyService(client: client, policy: AIParticipantPolicy())
+        let draft = RoomCreationDraft(isDirect: true, invitees: ["@person:matrix.test"])
+        var consent = EncryptionConsent()
+        consent.request(for: .newRoom(draft))
+        XCTAssertTrue(consent.confirm(for: .newRoom(draft)))
+
+        await XCTAssertThrowsErrorAsync(try await service.createRoom(draft: draft, consent: consent)) { error in
+            XCTAssertEqual(error as? EncryptionAuthorizationError, .participantsUnknown)
+        }
+        XCTAssertTrue(client.createRequests.isEmpty)
+    }
+
     func testConfirmedHumanDraftCreatesEncryptedAndChangingDraftDoesNotReuseConsent() async throws {
         let client = SecurityClient()
         let policy = AIParticipantPolicy(userIDPrefixes: ["@ai-"])
@@ -85,7 +125,7 @@ final class RoomEncryptionServiceTests: XCTestCase {
         XCTAssertEqual(room.enableCalls, 1)
     }
 
-    func testEncryptedRoomDoesNotEnableAgainAndAIInviteNeedsAcknowledgement() async throws {
+    func testEncryptedRoomDoesNotEnableAgainAndRejectsAIInvitationInService() async throws {
         let room = SecurityRoom(state: .encrypted, members: [securityMember("@person:matrix.test", .join)], activeCount: 1)
         let client = SecurityClient(room: room)
         let service = try await readyService(client: client, policy: AIParticipantPolicy(userIDPrefixes: ["@ai-"]))
@@ -94,12 +134,98 @@ final class RoomEncryptionServiceTests: XCTestCase {
         XCTAssertEqual(room.enableCalls, 0)
 
         await XCTAssertThrowsErrorAsync(try await service.inviteUser("@ai-helper:matrix.test", to: room.id())) { error in
-            guard case MatrixServiceError.aiInvitationConfirmationRequired = error else {
-                return XCTFail("Expected AI invitation confirmation, got \(error)")
+            guard case MatrixServiceError.encryptedRoomParticipantNotAllowed = error else {
+                return XCTFail("Expected encrypted-room participant rejection, got \(error)")
             }
         }
-        try await service.inviteUser("@ai-helper:matrix.test", to: room.id(), acknowledgedEncryptionWarning: true)
+        XCTAssertTrue(room.invitedUsers.isEmpty)
+    }
+
+    func testEncryptedOrUnknownRoomRequiresCompleteHumanSnapshotForInvitation() async throws {
+        let encrypted = SecurityRoom(
+            state: .encrypted,
+            members: [securityMember("@owner:matrix.test", .join), securityMember("@ai-helper:matrix.test", .invite)],
+            activeCount: 2
+        )
+        let encryptedService = try await readyService(
+            client: SecurityClient(room: encrypted), policy: AIParticipantPolicy(userIDPrefixes: ["@ai-"])
+        )
+        await XCTAssertThrowsErrorAsync(try await encryptedService.inviteUser("@person:matrix.test", to: encrypted.id())) { error in
+            guard case MatrixServiceError.encryptedRoomParticipantNotAllowed = error else {
+                return XCTFail("Expected encrypted-room participant rejection, got \(error)")
+            }
+        }
+        XCTAssertTrue(encrypted.invitedUsers.isEmpty)
+
+        let unknown = SecurityRoom(state: .unknown, members: [securityMember("@owner:matrix.test", .join)], activeCount: 1)
+        let unknownService = try await readyService(
+            client: SecurityClient(room: unknown), policy: AIParticipantPolicy(userIDPrefixes: ["@ai-"])
+        )
+        await XCTAssertThrowsErrorAsync(try await unknownService.inviteUser("@ai-helper:matrix.test", to: unknown.id())) { error in
+            guard case MatrixServiceError.encryptedRoomParticipantNotAllowed = error else {
+                return XCTFail("Expected encrypted-room participant rejection, got \(error)")
+            }
+        }
+        XCTAssertTrue(unknown.invitedUsers.isEmpty)
+    }
+
+    func testEncryptedRoomRejectsUnknownIdentityButAllowsConfiguredHumanInvite() async throws {
+        let unknown = SecurityRoom(state: .encrypted)
+        let unknownService = try await readyService(client: SecurityClient(room: unknown), policy: AIParticipantPolicy())
+        await XCTAssertThrowsErrorAsync(try await unknownService.inviteUser("@person:matrix.test", to: unknown.id())) { error in
+            guard case MatrixServiceError.encryptedRoomParticipantNotAllowed = error else {
+                return XCTFail("Expected unknown identity rejection, got \(error)")
+            }
+        }
+        XCTAssertTrue(unknown.invitedUsers.isEmpty)
+
+        let human = SecurityRoom(state: .encrypted)
+        let humanService = try await readyService(client: SecurityClient(room: human), policy: AIParticipantPolicy(userIDPrefixes: ["@ai-"]))
+        try await humanService.inviteUser("@person:matrix.test", to: human.id())
+        XCTAssertEqual(human.invitedUsers, ["@person:matrix.test"])
+    }
+
+    func testPlaintextRoomStillAllowsAIInvitation() async throws {
+        let room = SecurityRoom(state: .notEncrypted, members: [securityMember("@owner:matrix.test", .join)], activeCount: 1)
+        let service = try await readyService(client: SecurityClient(room: room), policy: AIParticipantPolicy(userIDPrefixes: ["@ai-"]))
+
+        try await service.inviteUser("@ai-helper:matrix.test", to: room.id())
+
         XCTAssertEqual(room.invitedUsers, ["@ai-helper:matrix.test"])
+    }
+
+    func testObservedEncryptedRoomDoesNotLaterAllowAIInviteAfterMemberReadFailure() async throws {
+        let room = SecurityRoom(state: .encrypted, members: [securityMember("@owner:matrix.test", .join)], activeCount: 1)
+        room.membersError = ClientError.Generic(msg: "unavailable", details: nil)
+        let service = try await readyService(client: SecurityClient(room: room), policy: AIParticipantPolicy(userIDPrefixes: ["@ai-"]))
+
+        await XCTAssertThrowsErrorAsync(try await service.inviteUser("@person:matrix.test", to: room.id()))
+        room.membersError = nil
+        room.state = .notEncrypted
+        await XCTAssertThrowsErrorAsync(try await service.inviteUser("@ai-helper:matrix.test", to: room.id())) { error in
+            guard case MatrixServiceError.encryptedRoomParticipantNotAllowed = error else {
+                return XCTFail("Expected observed encrypted-room participant rejection, got \(error)")
+            }
+        }
+        XCTAssertTrue(room.invitedUsers.isEmpty)
+    }
+
+    func testSecurityPublicationDuringRoomRefreshWinsOverStaleSnapshot() {
+        let stale = MatrixRoom(id: "!room:matrix.test", name: "Fresh metadata", unreadCount: 4,
+                               encryption: .unencrypted, participants: .humanOnly)
+        let published = MatrixRoom(id: "!room:matrix.test", name: "Old metadata", unreadCount: 1,
+                                   encryption: .encrypted, participants: .unknown)
+        let startingRevision = UUID()
+
+        let merged = MatrixService.mergingSecurityUpdates(
+            refreshed: [stale], current: [published],
+            revisionsAtStart: [stale.id: startingRevision],
+            currentRevisions: [stale.id: UUID()],
+            observedEncryptedRooms: [stale.id]
+        )
+
+        XCTAssertEqual(merged, [MatrixRoom(id: stale.id, name: stale.name, unreadCount: stale.unreadCount,
+                                           encryption: .encrypted, participants: .unknown)])
     }
 
     func testRefreshUsesSDKReadbackForBadgeAndCryptoWarnings() async throws {
