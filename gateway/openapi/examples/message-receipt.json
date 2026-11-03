@@ -51,7 +51,7 @@
         "limit": 60,
         "used": 23,
         "remaining": 37,
-        "reset_at": "2026-11-04T00:00:00+08:00",
+        "reset_at": "2026-11-03T16:00:00Z",
         "source_id": "persona_demo"
       },
       {
@@ -61,7 +61,7 @@
         "limit": 200000,
         "used": 18000,
         "remaining": 182000,
-        "reset_at": "2026-11-04T00:00:00+08:00",
+        "reset_at": "2026-11-03T16:00:00Z",
         "source_id": "platform_default"
       },
       {

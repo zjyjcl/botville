@@ -212,7 +212,9 @@ def _check_format(value, fmt):
         except ValueError:
             return "not a valid RFC 3339 date-time"
         if parsed.tzinfo is None:
-            return "date-time must carry a timezone (Z or +HH:MM)"
+            return "date-time must carry a timezone (UTC 'Z' required)"
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", value):
+            return "date-time must be UTC with a trailing 'Z'; offsets such as +08:00 are not allowed"
         return None
     if fmt in ("uri", "uri-reference"):
         if " " in value:

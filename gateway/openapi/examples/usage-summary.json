@@ -18,7 +18,7 @@
     "limit": 200000,
     "used": 21720,
     "remaining": 178280,
-    "reset_at": "2026-11-04T00:00:00+08:00",
+    "reset_at": "2026-11-03T16:00:00Z",
     "source_layer": "platform"
   },
   "breakdown": [

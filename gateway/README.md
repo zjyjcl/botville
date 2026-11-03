@@ -40,7 +40,7 @@ python3 gateway/scripts/validate_openapi.py
    每个示例文件必须有映射，每个映射必须有文件。
 3. **占位扫描** — 疑似真实密钥（`sk-…`、`AKIA…`、私钥块、长字面量密码等）即失败，
    契约与 `examples/*.json` 都会扫描。所有示例只允许 `<change-me>` 与 `example.invalid`。
-   `date-time` 必须带时区（`Z` 或 `+HH:MM`）。
+   `date-time` 必须是 UTC 并以 `Z` 结尾（带 `+HH:MM` 偏移视为失败）。
 
 常用变体：
 
@@ -62,8 +62,10 @@ npx --yes @redocly/cli lint gateway/openapi/gateway.v1.yaml
   PASS  card.json matches GET /cards/{card_id} 200
   ...
 [3/3] Summary
-  All 29 checks passed. Contract is consistent with its examples.
+  All checks passed. Contract is consistent with its examples.
 ```
+
+（实际检查项数量以脚本输出为准，不在此写死。）
 
 ## 约定 / Conventions
 

@@ -39,8 +39,10 @@
 ### 1.1 基本形态
 
 - 基础路径 `/v1`，资源名为复数，JSON 请求与响应（UTF-8）。
-- 时间一律 **RFC 3339 / ISO 8601，带时区**（`2026-11-03T12:00:30Z` 或 `+08:00`）。
-  只有「面向人的日历边界」（如每日主动发言重置）才额外带 `timezone` 字段，用 IANA 名称。
+- 时间一律 **RFC 3339 / ISO 8601，UTC（`Z` 结尾）**（如 `2026-11-03T12:00:30Z`）。
+  带偏移的写法（`+08:00`）一律不接受，示例与校验脚本都强制 `Z`，避免同一天在不同文件里
+  出现 8 小时偏差。「面向人的日历边界」（如每日主动发言重置）额外带 `timezone` 字段，
+  用 IANA 名称表示含义，时间值本身仍是 UTC。
 - ID 是不透明字符串，客户端不得解析其内部结构。
 - 列表分页统一用 `cursor` + `limit`，响应带 `next_cursor` / `has_more`。
   `next_cursor` 为 `null` 表示到底；客户端不得构造游标。
@@ -152,7 +154,7 @@ App                          网关                        模块网页（WKWebV
 
 ```json
 { "outcome": "blocked", "retryable": false, "retry_after_seconds": null,
-  "may_clear_at": "2026-11-03T14:00:00Z", "same_content_allowed": false, "queue_id": null,
+  "may_clear_at": "2026-11-03T14:00:00Z", "same_content_allowed": true, "queue_id": null,
   "message": null, "delivery": null,
   "decision": { "decision": "block", "allowed": false, "winner_layer": "platform",
                 "reasons": [{ "code": "ai_loop.breaker_open", "layer": "platform",
@@ -182,11 +184,13 @@ App                          网关                        模块网页（WKWebV
   内的同名字段仅在 `POST /policy/evaluate` 单独使用时有意义，两处语义相同但不互相引用。
 - **200 响应不附带 `Retry-After` HTTP 头**；重试时机放 body 里。`Retry-After` 头只在
   4xx / 5xx 传输层错误（`TooManyRequests` 等）出现。
-- `blocked` 始终 `retryable: false`；若额度会恢复，用 `may_clear_at` 与
-  `same_content_allowed: false` 表达，不要把 `retryable` 改成 `true`。
+- `blocked` 始终 `retryable: false`；若额度会恢复，用 `may_clear_at` 表达（额度恢复后
+  同一内容可重发，`same_content_allowed: true`）；若是关系策略或内容本身被拒，则
+  `same_content_allowed: false`——两者都不要把 `retryable` 改成 `true`。
 - `deferred` 始终 `retryable: false`（服务端排程，客户端不自行重试），并返回 `queue_id`。
-- 幂等缓存只对**终态**（`delivered` / `blocked`）生效；`deferred` 重用同一
-  `Idempotency-Key` 返回同一 `queue_id`，服务端会在允许时段投递。
+- 幂等缓存对 `queued` / `deferred` **同样生效**：重用同一 `Idempotency-Key` 返回同一
+  `queue_id` 与当前状态，不会新建排程；排程进入终态后，重放返回终态回执
+  （`delivered` / `blocked`）。
 
 ### 1.5 幂等
 
@@ -196,8 +200,12 @@ App                          网关                        模块网页（WKWebV
   都用同一个 key。同 key 重放返回**原回执**，不会返回 `409`。
 - **新的用户意图用新的 key**：用户第二次点击（哪怕是同一张卡片的另一个操作）
   必须换新 key。同 key + 不同请求体返回 `409 idempotency.conflict`。
-- 服务端建议保留 24 小时；**缓存只对终态生效**（`delivered` / `blocked` /
-  `accepted` / `rejected` / `failed`）。
+- 服务端建议保留 24 小时。缓存覆盖**所有结果**，不区分是否终态：
+  - 请求已被接受但仍在排程（`queued` / `deferred`）：重放返回**同一 `queue_id`** 与
+    当前状态，不会新建第二个排程。
+  - 已到终态（`delivered` / `blocked` / `accepted` / `rejected` / `failed`）：重放返回
+    终态回执，不会重新执行。
+  - 因此客户端可以用同一个 key 安全重试，无需先判断上一次走到哪一步。
 - 卡片操作（`POST /cards/{card_id}/actions/{action_id}`）的 `Idempotency-Key`
   **必填**，其余写接口强烈建议。`POST /messages`、创建类接口必须支持。
 - 本规则取代此前「卡片操作必须用新 key」的说法——那条与重试复用相矛盾，已作废。
@@ -287,7 +295,7 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 | `contract_version` | ✅ | 生成该清单的网关契约版本 |
 | `generated_at` | ✅ | 生成时间 |
 | `cache_ttl_seconds` | ❌ | 建议缓存时长，默认 300 |
-| `defaults.unknown_capability` | ❌ | 遇到未知能力 ID 时 `hidden`（忽略）或 `disabled`（显示为不可用） |
+| `defaults.unknown_capability` | ❌ | 遇到未知能力 ID 时 `hidden`（忽略）或 `disabled`（显示为不可用）。仅适用 native 入口（无法路由到对应能力时） |
 | `defaults.card_fallback` | ❌ | 卡片渲染失败时降级为 `text` |
 | `capabilities[]` | ✅ | 能力数组，按 `id` 唯一 |
 
@@ -403,7 +411,7 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 | `status` | ✅ | 开放枚举：`active`/`read`/`dismissed`/`expired`/`acted`。未知 → 按 `disabled`（不可操作） |
 | `blocks[]` | ✅ | 内容块，见 4.3；`maxItems: 50` |
 | `actions[]` | ✅ | 操作，可为空数组；`maxItems: 10` |
-| `source` | ✅ | `{module, event_id, capability_id, actor}`，标明谁发的；`event_id` 必填，见 4.8 |
+| `source` | ✅ | `{module, event_id, dedupe_key, capability_id, actor}`，标明谁发的；`event_id` 与 `dedupe_key` 二选一必填，见 4.8 |
 | `context` | ❌ | `{conversation_id, deep_link, metadata}`，打开卡片时的上下文 |
 | `i18n` | ❌ | 语言 → `{title, subtitle, fallback_text}` |
 | `delivery[]` | ❌ | 各渠道投递状态，见 4.8 |
@@ -551,10 +559,12 @@ challenge 见 [`examples/card-action-challenge.json`](../openapi/examples/card-a
 4. 有效 risk 为 `high` 的操作必须带生物识别确认（`confirmation.biometric: true`）。
 5. `payload`、`context.metadata` 做密钥与个人信息扫描；命中拒绝。
 6. 卡片数量与推送频率受平台防刷屏约束（例如每人每小时 ≤ 20 张 `urgent`）。
-7. `source` 必填，`source.event_id` 必填；按 `(capability_id, event_id)` 幂等。
+7. `source` 必填；`source.event_id` 与 `source.dedupe_key` 二选一必填；按
+   `(capability_id, event_id ?? dedupe_key)` 去重。
 8. 创建时校验 `source.capability_id` 与调用方 scope 一致，`source.module` 对齐
    Capability 的 module 枚举，防止伪造 `notify.approvals` 之类的高风险来源。
 9. `approval` 卡片或有效 risk=high 时，`expires_at` 必填。
+10. 去重命中已有卡片时返回 `200`（不是错误，也不是 `201`）；`201` 只用于首次创建。
 
 ### 4.7 向前兼容与版本协商
 
@@ -611,10 +621,14 @@ major（可在 `/v1` 内共存）。
 
 #### 去重
 
-- `source` 必填，`source.event_id`（或顶层 `dedupe_key`）必填。
-- 服务端按 **`(capability_id, event_id)`** 幂等：重复创建返回**已有卡片**（200），
-  不重复投递。这样生产者重启、多实例、多渠道重放都不会重复打扰。
-- `Idempotency-Key`（24h 缓存）是传输层幂等，**不能替代** `event_id` 的业务级去重。
+- `source` 必填。`source.event_id` 与 `source.dedupe_key` **二选一必填**：
+  有稳定事件 ID 时用 `event_id`；没有时（桥接、外部 webhook、轮询结果）用 `dedupe_key`。
+  两个都不给 → `422 card.missing_event_id`。
+- 服务端按 **`(capability_id, event_id ?? dedupe_key)`** 去重：重复创建返回**已有卡片**
+  （`200`，首次创建是 `201`），不重复投递。这样生产者重启、多实例、多渠道重放都不会
+  重复打扰。
+- `Idempotency-Key`（24h 缓存）是传输层幂等，**不能替代**来源键的业务级去重：
+  前者只管同一个 HTTP 重试，后者管「同一事件被重新发起」。
 
 #### 投递状态 `delivery[]`
 
@@ -665,8 +679,8 @@ major（可在 `/v1` 内共存）。
 - `outcome: queued` 与 `deferred` 的回执**必须带 `queue_id`**。
 - `deferred` 是**服务端排程**（不是客户端重试）：客户端拿到 `queue_id` 后等待推送，
   不要自行重试。
-- 幂等缓存只对终态生效；`deferred` 重用同一 `Idempotency-Key` 返回同一 `queue_id`，
-  服务端会在允许时段投递。
+- 幂等缓存对 `queued` / `deferred` 同样生效：重用同一 `Idempotency-Key` 返回同一
+  `queue_id` 与当前状态，不会新建排程；进入终态后重放返回终态回执。
 
 ---
 
@@ -801,7 +815,8 @@ python3 gateway/scripts/validate_openapi.py
 operationId 唯一、路径参数声明与必填、错误响应统一 `application/problem+json`、
 bearer 占位、`info.license` 为 Apache-2.0、示例 JSON 逐个对 schema 校验、
 占位扫描（契约与 `examples/*.json` 都扫描，疑似密钥即失败）、
-`date-time` 必须带时区（`Z` 或 `+HH:MM`）。
+`date-time` 必须是 UTC，**以 `Z` 结尾**；带 `+HH:MM` 偏移的写法视为失败（保证示例之间
+不出现时区偏差）。
 
 可选的外部 lint（需要网络，非 CI 必需）：
 
@@ -847,7 +862,7 @@ npx --yes @redocly/cli lint gateway/openapi/gateway.v1.yaml
 gateway/
 ├── openapi/
 │   ├── gateway.v1.yaml              # 契约（唯一事实源）
-│   └── examples/                    # 23 个示例，全部对 schema 校验
+│   └── examples/                    # 请求/响应示例，全部对 schema 校验（数量见脚本输出）
 │       ├── health.json
 │       ├── capability-manifest.json
 │       ├── session-token.json

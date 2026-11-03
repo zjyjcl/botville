@@ -30,7 +30,7 @@
         "limit": 6,
         "used": 2,
         "remaining": 4,
-        "reset_at": "2026-11-04T00:00:00Z",
+        "reset_at": "2026-11-03T16:00:00Z",
         "source_id": "persona_demo"
       }
     ]

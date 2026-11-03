@@ -978,7 +978,7 @@ paths:
             type: string
         - name: updated_since
           in: query
-          description: 只返回此时间之后更新的卡片，用于增量同步（RFC 3339，带时区）。
+          description: 只返回此时间之后更新的卡片，用于增量同步（RFC 3339 UTC，以 `Z` 结尾）。
           schema:
             type: string
             format: date-time
@@ -1030,6 +1030,11 @@ paths:
       description: |
         由通知、小镇等模块创建卡片。网关校验 schema、来源能力 scope 与 payload 中的敏感信息，
         通过后推送给 App。`fallback_text` 必填，供旧客户端或不支持的类型降级展示。
+
+        **业务级去重**：`source.event_id` 与 `source.dedupe_key` 二选一必填，服务端按
+        `(capability_id, event_id ?? dedupe_key)` 去重。命中已有键时**不新建、不重复投递**，
+        返回 `200` 与已有卡片；首次创建返回 `201`。因此客户端必须同时处理 200 与 201，
+        响应体都是同一个 `Card` schema。
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -1039,6 +1044,19 @@ paths:
             schema:
               $ref: '#/components/schemas/CreateCardRequest'
       responses:
+        '200':
+          description: |
+            去重命中：该来源键已有卡片，返回**已有卡片**，未新建、未重复投递。
+            响应体与 201 相同（`Card`）。
+          headers:
+            Location:
+              description: 已有卡片资源地址。
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Card'
         '201':
           description: 卡片已创建。
           headers:
@@ -1355,6 +1373,11 @@ components:
       description: |
         幂等键，建议使用随机值并在重试时复用。同一 key 相同请求体返回同一结果；
         同一 key 不同请求体返回 409 `idempotency.conflict`。
+
+        缓存对**所有 `outcome` 生效**，包括 `queued` / `deferred`：重放返回同一
+        `queue_id` 与当前状态，不会新建排程；排程进入终态（`delivered` / `blocked`）后，
+        重放返回终态回执。因此客户端在任何情况下都可以安全重试。
+
         卡片操作接口另有必填版本 `CardActionIdempotencyKey`。
       schema:
         type: string
@@ -2273,14 +2296,16 @@ components:
         same_content_allowed:
           type: boolean
           description: |
-            `blocked` 时为 `false`：当前内容即使额度恢复也不允许（例如关系策略）；
-            `true` 或省略表示额度恢复后同一内容可重发。
+            `false`：同一内容即使额度恢复也不允许再发（例如关系策略永久拒绝，或
+            内容本身触发了策略）。`true` 或省略：额度/窗口恢复后同一内容可重发
+            （例如限额触发了熔断，内容本身没有问题）。
         queue_id:
           type: [string, 'null']
           description: |
             `queued` / `deferred` 时为服务端排程 ID（必填，用于追踪投递状态）。
-            幂等缓存只对终态（`delivered` / `blocked`）生效；
-            `deferred` 重用同一 `Idempotency-Key` 返回同一 `queue_id`，服务端会在允许时段投递。
+            幂等缓存对 `queued` / `deferred` **同样生效**：用同一 `Idempotency-Key` 重放
+            返回同一 `queue_id` 与当前状态，不会新建排程；排程进入终态后，重放返回终态回执
+            （`delivered` / `blocked`）。
         message:
           anyOf:
             - $ref: '#/components/schemas/Message'
@@ -2758,6 +2783,9 @@ components:
               type: string
               enum: [hidden, disabled]
               default: hidden
+              description: |
+                遇到未知能力 ID 时的处理方式：`hidden`（忽略，不显示入口）或
+                `disabled`（显示为不可用）。仅适用 native 入口（无法路由到对应能力时）。
             card_fallback:
               type: string
               enum: [text]
@@ -2984,7 +3012,10 @@ components:
 
     CardSource:
       type: object
-      required: [module, event_id]
+      required: [module]
+      anyOf:
+        - required: [event_id]
+        - required: [dedupe_key]
       properties:
         module:
           description: |
@@ -3001,11 +3032,13 @@ components:
         event_id:
           type: string
           description: |
-            来源事件的稳定 ID（必填）。服务端按 `(capability_id, event_id)` 幂等：
-            同一来源事件重复创建返回已有卡片，不会重复打扰。
+            来源事件的稳定 ID。与 `source.dedupe_key` 二选一必填（优先使用此字段）。
+            服务端按 `(capability_id, event_id)` 去重：同一键重复创建返回已有卡片，不会重复打扰。
         dedupe_key:
           type: string
-          description: 可选去重键，缺省等于 `event_id`；用于来源没有稳定事件 ID 的桥接场景。
+          description: |
+            去重键，与 `source.event_id` 二选一必填。用于来源没有稳定事件 ID 的桥接场景
+            （如外部 webhook、轮询结果）。服务端按 `(capability_id, dedupe_key)` 去重。
         actor:
           $ref: '#/components/schemas/Actor'
 
