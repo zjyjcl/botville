@@ -7,7 +7,7 @@ from __future__ import annotations
 import sys
 
 from .config import ConfigError, load_config
-from .http_server import build_server
+from .http_server import build_server, build_transport
 
 
 def main(argv=None) -> int:
@@ -25,8 +25,22 @@ def main(argv=None) -> int:
             file=sys.stderr,
         )
 
+    # 传输选择收敛在 http_server.build_transport（与 build_server 同一逻辑）。
+    transport = build_transport(config)
+
+    # appservice 模式启动即校验可达性与 AS token（whoami）：配错就 fail fast，
+    # 不带病运行到第一条消息才失败，也不让 /health 一开始就误报 degraded。
+    if config.matrix_transport == "appservice" and not transport.healthy():
+        print(
+            "config error: homeserver health check failed (whoami with the appservice "
+            "token); check GATEWAY_HOMESERVER_URL / GATEWAY_AS_TOKEN and that the "
+            "homeserver loaded the appservice registration",
+            file=sys.stderr,
+        )
+        return 2
+
     try:
-        server = build_server(config)
+        server = build_server(config, transport)
     except OSError as exc:
         print(f"config error: cannot bind {config.host}:{config.port}: {exc}", file=sys.stderr)
         return 2
@@ -38,7 +52,7 @@ def main(argv=None) -> int:
     print("  POST /v1/conversations/{conversation_id}/messages")
     if config.auth_token is None:
         print("  (dev mode: Authorization is not checked)")
-    print("transport: InMemoryMatrixTransport (A1.3 appservice not wired yet)")
+    print(f"transport: {type(transport).__name__} (GATEWAY_MATRIX_TRANSPORT={config.matrix_transport})")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

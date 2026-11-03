@@ -9,6 +9,7 @@
 #   make e2e             # register/chat/group acceptance test; E2E_PHASE=seed|verify (A1.1)
 #   make push-e2e        # HS -> sygnal push latency acceptance (<5s, A1.2);
 #                        # needs the stack up with PUSH=1 (mock pushkin, no APNs)
+#   make appservice-e2e  # appservice acceptance: gateway sends as an @ai_* user (A1.3)
 #
 # Everything wraps docker compose on server/compose/docker-compose.yml with
 # server/compose/.env (created by server/scripts/init.sh on first run).
@@ -59,7 +60,7 @@ endif
 E2E_PHASE ?= seed
 E2E_STATE ?= backups/e2e-state.json
 
-.PHONY: init up down logs smoke ps backup restore e2e push-e2e
+.PHONY: init up down logs smoke ps backup restore e2e push-e2e appservice-e2e
 
 init:
 	bash server/scripts/init.sh
@@ -128,3 +129,15 @@ push-e2e: init
 		--sygnal-base-url http://127.0.0.1:$(PUSH_PORT) \
 		--max-latency $(E2E_MAX_PUSH_LATENCY) \
 		--pushes-cmd '$(COMPOSE) --profile push exec -T sygnal cat /data/mock-pushes.jsonl'
+
+# --- appservice acceptance (A1.3, synapse + tuwunel) -----------------------
+# Gateway-side acceptance: the homeserver runs with the botville-gateway
+# appservice registered (init.sh renders it from .env), and the real gateway
+# transport (gateway/src) registers an @ai_* user, joins an invited room and
+# delivers as that identity; exclusive-namespace rejections asserted both
+# ways. continuwuity is not covered yet (no file-based registration) — see
+# docs/deploy/appservice.md.
+appservice-e2e: init
+	python3 server/tests/appservice_e2e.py \
+		--base-url http://127.0.0.1:$(PORT) \
+		--env-file $(ENV_FILE)

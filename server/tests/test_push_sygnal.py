@@ -205,6 +205,12 @@ POSTGRES_DB=synapse
 SYNAPSE_MACAROON_SECRET=fixture
 SYNAPSE_FORM_SECRET=fixture
 SYNAPSE_REGISTRATION_SHARED_SECRET=fixture
+APPSERVICE_AS_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+APPSERVICE_HS_TOKEN=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+BOTVILLE_DOCKER_SUBNET=172.31.250.0/24
+BOTVILLE_DOCKER_IP_RANGE=172.31.250.64/26
+BOTVILLE_SYGNAL_IP=
+BOTVILLE_PUSH_MOCK=true
 """
 
 APNS_DISABLED_ENV = SYGNAL_ENV + "BOTVILLE_APNS_ENABLED=false\n"
@@ -251,6 +257,24 @@ class SygnalInitScriptTest(unittest.TestCase):
         shutil.copytree(COMPOSE_DIR / "sygnal", self.tmp / "compose" / "sygnal", dirs_exist_ok=True)
         (self.tmp / "compose" / "synapse" / "homeserver.yaml.tmpl").write_text(
             SYNAPSE_TEMPLATE, encoding="utf-8"
+        )
+
+        # A1.3 appservice registration (init.sh always renders it).
+        appservice_dir = self.tmp / "compose" / "appservice"
+        appservice_dir.mkdir(parents=True)
+        (appservice_dir / "botville-gateway.yaml.tmpl").write_text(
+            "id: botville-gateway\n"
+            'as_token: "${APPSERVICE_AS_TOKEN}"\n'
+            'hs_token: "${APPSERVICE_HS_TOKEN}"\n'
+            "namespaces:\n"
+            "  users:\n"
+            "    - exclusive: true\n"
+            "      regex: '^@ai_.*:${BOTVILLE_SERVER_NAME_REGEX}$'\n",
+            encoding="utf-8",
+        )
+
+        (self.tmp / "compose" / "synapse" / "ip-range-whitelist.part").write_text(
+            'ip_range_whitelist:\n  - "${BOTVILLE_SYGNAL_IP}/32"\n', encoding="utf-8"
         )
         self.env_file = self.tmp / "compose" / ".env"
         self.generated = self.tmp / "compose" / "generated" / "sygnal" / "sygnal.yaml"

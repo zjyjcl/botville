@@ -69,6 +69,10 @@ services:
       - "127.0.0.1:${BOTVILLE_HTTP_PORT:-8008}:8008"
     volumes:
       - ./generated/synapse:/config:ro
+      # Appservice registrations (A1.3) — rendered by init.sh, listed in
+      # homeserver.yaml.tmpl's app_service_config_files. The container runs
+      # as root, so it can read the 0600 file.
+      - ./generated/appservice:/appservice:ro
       - synapse-data:/data
     depends_on:
       postgres:
@@ -99,6 +103,9 @@ services:
       TUWUNEL_REGISTRATION_TOKEN: ${BOTVILLE_REGISTRATION_TOKEN:?set in server/compose/.env}
       TUWUNEL_ALLOW_FEDERATION: "false"
       TUWUNEL_TRUSTED_SERVERS: "[]"
+      # File-based appservice registration (A1.3): same YAML format as
+      # Synapse; changes require a container restart (no hot reload).
+      TUWUNEL_APPSERVICE_DIR: /appservice
     # TUWUNEL_IP_RANGE_DENYLIST: full upstream default private-range denylist
     # minus the sygnal container's /32 (BOTVILLE_SYGNAL_IP), rendered by
     # init.sh so pushes reach sygnal and nothing else. required: false keeps
@@ -110,6 +117,8 @@ services:
     ports:
       - "127.0.0.1:${BOTVILLE_HTTP_PORT:-8008}:8008"
     volumes:
+      # Rendered by init.sh; carries the as_token (0600, readable by root).
+      - ./generated/appservice:/appservice:ro
       - tuwunel-data:/var/lib/tuwunel
     restart: unless-stopped
 

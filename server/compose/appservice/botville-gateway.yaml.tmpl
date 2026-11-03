@@ -1,0 +1,32 @@
+# Botville gateway appservice registration (A1.3).
+#
+# server/scripts/init.sh renders this file into
+# server/compose/generated/appservice/botville-gateway.yaml (gitignored,
+# mode 0600) by substituting $VAR-style placeholders from server/compose/.env.
+# Edit this template, never the generated file.
+#
+# The same YAML registration format is shared by the homeservers we deploy:
+#   - Synapse: listed in app_service_config_files (synapse/homeserver.yaml.tmpl,
+#     mounted at /appservice, restart to apply);
+#   - Tuwunel: TUWUNEL_APPSERVICE_DIR=/appservice (same file, restart to apply);
+#   - continuwuity: no file-based registration yet (admin room only) — not
+#     wired up, see docs/deploy/appservice.md.
+#
+# url: null on purpose — M1 does not accept HS->AS transactions, so there is
+# no endpoint for the homeserver to push to (and nothing to retry against).
+# A2 flips this to http://gateway:<port> once the gateway starts receiving
+# transactions.
+id: botville-gateway
+url: null
+as_token: "${APPSERVICE_AS_TOKEN}"
+hs_token: "${APPSERVICE_HS_TOKEN}"
+sender_localpart: botville-gateway
+rate_limited: false
+namespaces:
+  users:
+    - exclusive: true
+      # Anchored, and the server name is regex-escaped by init.sh
+      # (BOTVILLE_SERVER_NAME_REGEX), so e.g. "example.com" cannot match
+      # "examplexcom". Single-quoted on purpose: backslashes must survive
+      # YAML parsing.
+      regex: '^@ai_.*:${BOTVILLE_SERVER_NAME_REGEX}$'
