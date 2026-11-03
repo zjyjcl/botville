@@ -655,7 +655,7 @@ major（可在 `/v1` 内共存）。
 |---|---|
 | `deliver_after` | 服务端最早投递时间；`null` 表示立即（仍受静默检查） |
 | `scheduled_at` | 期望展示时间（如提醒触发时刻），与 `deliver_after` 二选一 |
-| `interrupt` | 是否穿透静默立即打断；默认 `false` |
+| `interrupt` | 是否穿透静默立即打断；**无默认值**（见下），省略时按 `priority` 决定 |
 | `collapse_key` / `group_id` | 合并键 / 合并展示组，同键未读卡片折叠为摘要 |
 
 `priority` → 打断级别：
@@ -667,7 +667,16 @@ major（可在 `/v1` 内共存）。
 | `normal` | 延后 | 常规 |
 | `low` | 延后 | 静默/摘要里出现 |
 
-`interrupt: false` 显式关闭穿透时，即使 `priority: urgent` 也不打断。
+`interrupt` 是三态字段：**省略** / `true` / `false`。
+
+- 省略时由 `priority` 决定：`urgent` → 穿透；其余优先级 → 顺延。
+- 显式 `true` → 无论优先级都穿透。
+- 显式 `false` → 即使 `priority: urgent` 也不打断，静默期间顺延到 `deliver_after`。
+
+因此 `interrupt` **不得有 `default`**（`Card` 与 `CreateCardRequest` 两处均已移除
+`default: false`）。若 schema 层补默认值，「未显式给出」与「显式 false」就不可区分，
+`urgent` + 省略 `interrupt` 是否打断将取决于客户端实现——这正是本节要消除的歧义。
+代码生成/校验器请把该字段当作可选三态（`boolean | undefined`）处理。
 
 #### 增量同步
 
@@ -752,6 +761,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.1.0 | 2026-11-04 | `Card.interrupt` 与 `CreateCardRequest.interrupt` 移除 `default: false`，改为三态（省略 / `true` / `false`）：省略时由 `priority` 决定（`urgent`→穿透，其余→顺延），显式 `false` 即使 `urgent` 也不打断。属「改默认值」=准破坏，按 §5.3 minor + 公告处理；同主版本内字段语义未变，仅澄清三态。 |
 | 0.1.0 | 2026-11-03 | 初稿：健康、功能清单、角色与状态、会话、消息与发言裁决、策略预检、三层限额、用量与账单、卡片与授权操作。评审：C/D 线（B0.1） |
 
 新增条目追加在本表顶部；同一版本内的编辑合并到该版本行。

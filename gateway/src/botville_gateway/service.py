@@ -8,6 +8,12 @@
 - `deferred` 必须带 `queue_id`，表示服务端排程，客户端不要自行重试；
 - 被拦截要记 `usage_events kind=blocked`。
 
+请求校验（保持零依赖，手写最小 schema 校验，对齐 OpenAPI）：
+- `OutgoingMessageRequest.additionalProperties: false` → 未知字段拒绝；
+- `OutgoingContent.type` ∈ {text, markdown}（必填）；
+- `reply_to` 必须是 string；`mentions` 原样透传；
+- `PolicyEvaluateRequest.kind` ∈ {message, proactive, town_action}。
+
 幂等：同一 `Idempotency-Key` + 相同请求体返回缓存回执；同 key 不同请求体
 抛 `IdempotencyConflict`（HTTP 层映射 409 `idempotency.conflict`）。
 `queued` / `deferred` 同样进缓存（契约 §1.5）。
@@ -34,6 +40,17 @@ from .policy import (
 from .store import EventKind, UsageEvent, UsageStore
 from .timeutil import iso_utc, utcnow
 
+CONTENT_TYPES = frozenset({"text", "markdown"})
+EVALUATE_KINDS = frozenset({"message", "proactive", "town_action"})
+# 与 OpenAPI OutgoingMessageRequest / OutgoingContent 的 properties 对齐。
+_SEND_FIELDS = frozenset(
+    {"sender_persona_id", "content", "reply_to", "token_estimate", "allow_deferred", "metadata"}
+)
+_CONTENT_FIELDS = frozenset({"type", "text", "mentions"})
+_EVALUATE_FIELDS = frozenset(
+    {"persona_id", "conversation_id", "kind", "content", "token_estimate"}
+)
+
 
 class IdempotencyConflict(Exception):
     """同一 Idempotency-Key 配了不同请求体。"""
@@ -54,7 +71,11 @@ class ValidationError(Exception):
 
 
 class GatewayDeliveryError(Exception):
-    """transport 投递失败（映射为 502 problem+json，不是策略结论）。"""
+    """transport 投递失败（映射为 500 internal.error，不是策略结论）。
+
+    注意：契约状态码集合不含 502/`matrix.unavailable`；B6 选方案(a)，
+    统一映射为 500 internal.error，不改契约状态码集合。
+    """
 
     def __init__(self, code: str, detail: str) -> None:
         super().__init__(f"{code}: {detail}")
@@ -102,12 +123,24 @@ class GatewayService:
     def started_at(self) -> datetime:
         return self._started_at
 
+    @property
+    def now(self) -> datetime:
+        """当前时钟值（供 /health uptime 计算）。"""
+        return self._now()
+
     def pending_queue(self) -> List[_QueueItem]:
         with self._lock:
             return list(self._queue.values())
 
     # ----------------------------------------------------------- policy only
     def evaluate_policy(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        # B5: 拒绝未知字段（additionalProperties: false）
+        unknown = set(payload.keys()) - _EVALUATE_FIELDS
+        if unknown:
+            raise ValidationError(
+                "request.invalid",
+                f"unexpected fields: {', '.join(sorted(unknown))}",
+            )
         persona_id = payload.get("persona_id")
         if not isinstance(persona_id, str) or not persona_id:
             raise ValidationError("request.invalid", "'persona_id' is required", "persona_id")
@@ -121,12 +154,19 @@ class GatewayService:
             raise ValidationError(
                 "request.invalid", "'token_estimate' must be a non-negative integer", "token_estimate"
             )
+        kind = payload.get("kind", "message")
+        if kind not in EVALUATE_KINDS:
+            raise ValidationError(
+                "request.invalid",
+                f"'kind' must be one of {sorted(EVALUATE_KINDS)}, got {kind!r}",
+                "kind",
+            )
         decision = self._engine.evaluate(
             persona_id=persona_id,
             conversation_id=payload.get("conversation_id"),
             text=text,
             token_estimate=token_estimate,
-            kind=payload.get("kind", "message"),
+            kind=kind,
         )
         return decision.to_dict()
 
@@ -141,6 +181,14 @@ class GatewayService:
         if not isinstance(conversation_id, str) or not conversation_id:
             raise ValidationError("request.invalid", "conversation_id is required", "conversation_id")
 
+        # B5: additionalProperties: false —— 未知字段直接拒绝
+        unknown = set(payload.keys()) - _SEND_FIELDS
+        if unknown:
+            raise ValidationError(
+                "request.invalid",
+                f"unexpected fields: {', '.join(sorted(unknown))}",
+            )
+
         sender = payload.get("sender_persona_id")
         if not isinstance(sender, str) or not sender:
             raise ValidationError(
@@ -150,6 +198,20 @@ class GatewayService:
         content = payload.get("content")
         if not isinstance(content, dict):
             raise ValidationError("request.invalid", "'content' must be an object", "content")
+        unknown_content = set(content.keys()) - _CONTENT_FIELDS
+        if unknown_content:
+            raise ValidationError(
+                "request.invalid",
+                f"unexpected content fields: {', '.join(sorted(unknown_content))}",
+                "content",
+            )
+        content_type = content.get("type")
+        if content_type not in CONTENT_TYPES:
+            raise ValidationError(
+                "request.invalid",
+                f"'content.type' must be one of {sorted(CONTENT_TYPES)}, got {content_type!r}",
+                "content.type",
+            )
         text = content.get("text")
         if not isinstance(text, str) or not text:
             raise ValidationError("request.invalid", "'content.text' is required", "content.text")
@@ -158,6 +220,26 @@ class GatewayService:
                 "request.invalid",
                 f"'content.text' exceeds {self._config.max_message_chars} characters",
                 "content.text",
+            )
+        mentions = content.get("mentions")
+        if mentions is not None:
+            if not isinstance(mentions, list) or not all(isinstance(m, str) for m in mentions):
+                raise ValidationError(
+                    "request.invalid",
+                    "'content.mentions' must be an array of strings",
+                    "content.mentions",
+                )
+
+        reply_to = payload.get("reply_to")
+        if reply_to is not None and not isinstance(reply_to, str):
+            raise ValidationError(
+                "request.invalid", "'reply_to' must be a string", "reply_to"
+            )
+
+        metadata = payload.get("metadata")
+        if metadata is not None and not isinstance(metadata, dict):
+            raise ValidationError(
+                "request.invalid", "'metadata' must be an object", "metadata"
             )
 
         allow_deferred = payload.get("allow_deferred", True)
@@ -190,7 +272,8 @@ class GatewayService:
                 conversation_id=conversation_id,
                 sender=sender,
                 text=text,
-                reply_to=payload.get("reply_to"),
+                reply_to=reply_to,
+                mentions=list(mentions) if mentions else None,
                 token_estimate=token_estimate,
                 allow_deferred=allow_deferred,
             )
@@ -207,6 +290,7 @@ class GatewayService:
         sender: str,
         text: str,
         reply_to: Optional[str],
+        mentions: Optional[List[str]] = None,
         token_estimate: Optional[int],
         allow_deferred: bool,
     ) -> Dict[str, Any]:
@@ -286,6 +370,7 @@ class GatewayService:
                 sender=sender,
                 text=text,
                 reply_to=reply_to,
+                mentions=mentions,
                 event_id=event.event_id,
                 created_at=event.sent_at,
             ),
@@ -333,10 +418,13 @@ class GatewayService:
         sender: str,
         text: str,
         reply_to: Optional[str],
+        mentions: Optional[List[str]] = None,
         event_id: str,
         created_at: datetime,
     ) -> Dict[str, Any]:
         content: Dict[str, Any] = {"type": "text", "text": text}
+        if mentions:
+            content["mentions"] = list(mentions)
         msg: Dict[str, Any] = {
             "id": f"msg_{uuid.uuid4().hex}",
             "matrix_event_id": event_id,

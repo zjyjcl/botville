@@ -51,8 +51,10 @@ gateway/src/botville_gateway/
 # 1) 跑测试（在仓库根目录）
 python3 -m unittest discover -s gateway/tests -v
 
-# 2) 起雏形（开发模式，不校验 Authorization）
-PYTHONPATH=gateway/src python3 -m botville_gateway
+# 2) 起雏形（显式开发模式，不校验 Authorization）
+GATEWAY_DEV_MODE=true PYTHONPATH=gateway/src python3 -m botville_gateway
+#    生产/联调：必须设置真实 token
+#    GATEWAY_AUTH_TOKEN=<random> PYTHONPATH=gateway/src python3 -m botville_gateway
 #    或安装后：pip install -e gateway && botville-gateway
 
 # 3) 冒烟
@@ -93,12 +95,23 @@ curl -s -X POST localhost:8080/v1/conversations/conv_demo/messages \
 | 拦截记 `usage_events kind=blocked` | ✅ `UsageStore`，可查询 |
 | `decision.reasons[]` / `checks[]` 字段名与取值 | ✅ 对齐 `PolicyReason` / `PolicyCheck` |
 | `date-time` 一律 UTC、`Z` 结尾 | ✅ `timeutil.iso_utc()` |
-| `Idempotency-Key` 同 key 同体返回原回执、异体 409 | ✅ 内存缓存 |
+| `Idempotency-Key` 同 key 同体返回原回执、异体 409 | ✅ 内存缓存；长度 8–128（超长 → 400） |
 | `PolicyDecision` **不含** `may_clear_at` / `same_content_allowed` | ✅ 只在 `MessageReceipt` 上（`to_dict()` 剔除了内部字段） |
+| 无效令牌 → `401 auth.invalid_token`；每个响应带 `X-Request-Id` | ✅ 统一由 `_send_json()` 注入 |
+| `/health` 的 `status` 非 `ok` → `503`（结构相同） | ✅ 未接入的依赖不报假 `ok` |
+| 请求体：顶层必须是对象、`Content-Type: application/json`、大小上限 | ✅ 400 problem+json（`MAX_BODY_BYTES` = 1 MiB） |
+| 出站 schema：`content.type ∈ {text, markdown}`、`reply_to` 为 string、`mentions` 透传、未知字段拒绝 | ✅ `service.send_ai_message()` 手写最小校验 |
+| 传输失败 | ✅ **500 `internal.error`**（契约无 502/`matrix.unavailable`） |
 
 **未做**（非目标）：三层 owner/peer 限额（B2.1）、token 预算、防刷屏、互聊熔断、
-关系策略、E2EE、真正的 deferred 定时投递（目前只登记排程，`service.pending_queue()`
-可查）。接 B2.1 时在 `PolicyEngine.evaluate()` 追加检查项即可，数据结构无需改。
+关系策略、E2EE、卡片创建链路（§4.8 的卡片 `interrupt` 语义已对齐契约，但 `POST /cards`
+不在本 PR 范围）、真正的 deferred 定时投递（目前只登记排程，`service.pending_queue()`
+可查；B1.2 接入调度器前 deferred 会一直停留在 `deferred`）。接 B2.1 时在
+`PolicyEngine.evaluate()` 追加检查项即可，数据结构无需改。
+
+**安全边界（已知，待 B2.x）**：当前为单 token 设备级鉴权——任何持有该 token 者都可以
+冒充任意 `sender_persona_id` 向任意 conversation 发送。按 persona 所有权的
+`persona.not_owned`（403）校验留待 B2.x 会话/令牌模型。
 
 ### 策略算法
 
@@ -145,8 +158,9 @@ m.room.message/{txnId}` + AS token），**service / policy / 测试都不用改*
 | 环境变量 | 默认 | 说明 |
 |---|---|---|
 | `GATEWAY_HOST` | `127.0.0.1` | 监听地址 |
-| `GATEWAY_PORT` | `8080` | 监听端口 |
-| `GATEWAY_AUTH_TOKEN` | *(空)* | 空 = 开发模式不校验；生产必须设置为随机值，请求需 `Authorization: Bearer <token>` |
+| `GATEWAY_PORT` | `8080` | 监听端口（1–65535；环境变量给 0 或超范围会启动失败） |
+| `GATEWAY_AUTH_TOKEN` | *(空)* | **必填**：留空或仍为 `<change-me>` 时**拒绝启动**（fail closed）；生产设为随机值，请求需 `Authorization: Bearer <token>`；用 `hmac.compare_digest` 常数时间比较 |
+| `GATEWAY_DEV_MODE` | `false` | 仅本地开发：`true` 时允许无 token 启动并免鉴权（启动横幅打 WARNING）；设了真实 token 永远优先 |
 | `RATE_LIMIT_MESSAGES` | `60` | 窗口内每个 persona 最多消息数；`0` = 关闭限速 |
 | `RATE_LIMIT_WINDOW_SECONDS` | `3600` | 滑动窗口长度（秒，≥1） |
 | `SILENT_HOURS_ENABLED` | `true` | 是否启用深夜静默 |

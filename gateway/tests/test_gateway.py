@@ -28,8 +28,8 @@ _SRC = os.path.join(GATEWAY_ROOT, "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from botville_gateway.config import Config, load_config  # noqa: E402
-from botville_gateway.http_server import build_server  # noqa: E402
+from botville_gateway.config import Config, ConfigError, load_config  # noqa: E402
+from botville_gateway.http_server import MAX_BODY_BYTES, build_server  # noqa: E402
 from botville_gateway.matrix import InMemoryMatrixTransport  # noqa: E402
 from botville_gateway.service import (  # noqa: E402
     GatewayService,
@@ -42,6 +42,7 @@ from botville_gateway.policy import PolicyEngine, estimate_tokens  # noqa: E402
 
 def _cfg(**overrides):
     base = dict(
+        dev_mode=True,  # 单元测试不打 token；见 TestAuthHardening 的 fail-closed 测试
         rate_limit_messages=3,
         rate_limit_window_seconds=3600,
         silent_hours_enabled=True,
@@ -359,6 +360,65 @@ class TestIdempotency(unittest.TestCase):
                 "content": {"type": "text", "text": "x" * 11},
             })
 
+    def test_mentions_passed_through(self):
+        """B5: content.mentions 原样进入回执 message.content。"""
+        svc, transport, store, now = _make_service()
+        r = svc.send_ai_message("c", {
+            "sender_persona_id": "p",
+            "content": {"type": "text", "text": "hi", "mentions": ["@a:example.invalid"]},
+        })
+        self.assertEqual(r["outcome"], "delivered")
+        self.assertEqual(r["message"]["content"]["mentions"], ["@a:example.invalid"])
+
+    def test_reply_to_must_be_string(self):
+        """B5: reply_to 非 string → ValidationError（403 前先卡住）。"""
+        svc, transport, store, now = _make_service()
+        with self.assertRaises(ValidationError):
+            svc.send_ai_message("c", {
+                "sender_persona_id": "p",
+                "content": {"type": "text", "text": "hi"},
+                "reply_to": {"evil": 1},
+            })
+
+    def test_reply_to_passed_through(self):
+        svc, transport, store, now = _make_service()
+        r = svc.send_ai_message("c", {
+            "sender_persona_id": "p",
+            "content": {"type": "text", "text": "hi"},
+            "reply_to": "msg_prev",
+        })
+        self.assertEqual(r["message"]["reply_to"], "msg_prev")
+        self.assertEqual(transport.sent[0].reply_to, "msg_prev")
+
+    def test_unknown_send_field_rejected_at_service(self):
+        """B5: additionalProperties: false。"""
+        svc, transport, store, now = _make_service()
+        with self.assertRaises(ValidationError):
+            svc.send_ai_message("c", {
+                "sender_persona_id": "p",
+                "content": {"type": "text", "text": "hi"},
+                "bogus": True,
+            })
+
+    def test_markdown_content_type_accepted(self):
+        svc, transport, store, now = _make_service()
+        r = svc.send_ai_message("c", {
+            "sender_persona_id": "p",
+            "content": {"type": "markdown", "text": "**hi**"},
+        })
+        self.assertEqual(r["outcome"], "delivered")
+
+    def test_evaluate_policy_rejects_bad_kind(self):
+        """B5: PolicyEvaluateRequest.kind enum 校验。"""
+        svc, transport, store, now = _make_service()
+        with self.assertRaises(ValidationError):
+            svc.evaluate_policy({"persona_id": "p", "kind": "bogus"})
+
+    def test_evaluate_policy_rejects_unknown_field(self):
+        svc, transport, store, now = _make_service()
+        with self.assertRaises(ValidationError):
+            svc.evaluate_policy({"persona_id": "p", "bogus": 1})
+
 
 # ---------------------------------------------------------------------------
 # 5. PolicyEngine 直接测试（不经过 transport）
@@ -413,11 +473,14 @@ class TestPolicyEngine(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestConfig(unittest.TestCase):
     def test_defaults(self):
-        env = {}
+        env = {"GATEWAY_DEV_MODE": "true"}
         cfg = load_config(env)
         self.assertEqual(cfg.rate_limit_messages, 60)
         self.assertEqual(cfg.silent_hours_start, "23:00")
         self.assertTrue(cfg.silent_hours_enabled)
+        # 无 token 且非 dev 模式必须拒绝启动
+        with self.assertRaises(ConfigError):
+            load_config({})
 
     def test_env_override(self):
         env = {
@@ -425,21 +488,47 @@ class TestConfig(unittest.TestCase):
             "SILENT_HOURS_START": "22:00",
             "SILENT_HOURS_END": "08:00",
             "GATEWAY_PORT": "9000",
-            "GATEWAY_AUTH_TOKEN": "<change-me>",
+            "GATEWAY_AUTH_TOKEN": "a-strong-random-token",
         }
         cfg = load_config(env)
         self.assertEqual(cfg.rate_limit_messages, 10)
         self.assertEqual(cfg.silent_hours_start, "22:00")
         self.assertEqual(cfg.port, 9000)
-        self.assertEqual(cfg.auth_token, "<change-me>")
+        self.assertEqual(cfg.auth_token, "a-strong-random-token")
 
     def test_invalid_port_raises(self):
         with self.assertRaises(Exception):
             load_config({"GATEWAY_PORT": "not-a-number"})
 
+    def test_port_out_of_range_raises(self):
+        # 建议 9: GATEWAY_PORT 0–65535 校验
+        with self.assertRaises(ConfigError):
+            load_config({"GATEWAY_PORT": "70000", "GATEWAY_AUTH_TOKEN": "t"})
+        with self.assertRaises(ConfigError):
+            load_config({"GATEWAY_PORT": "0", "GATEWAY_AUTH_TOKEN": "t"})
+
     def test_unknown_timezone_raises(self):
         with self.assertRaises(Exception):
-            load_config({"SILENT_HOURS_TIMEZONE": "Not/A_Real_Zone"})
+            load_config({"SILENT_HOURS_TIMEZONE": "Not/A_Real_Zone", "GATEWAY_AUTH_TOKEN": "t"})
+
+    def test_change_me_token_rejected_without_dev_mode(self):
+        """建议7: <change-me> 必须拒绝启动，即使显式设置也当未配置。"""
+        with self.assertRaises(ConfigError):
+            load_config({"GATEWAY_AUTH_TOKEN": "<change-me>"})
+        with self.assertRaises(ConfigError):
+            load_config({"GATEWAY_AUTH_TOKEN": ""})
+
+    def test_dev_mode_allows_no_token(self):
+        """建议7: 显式 dev 模式可免鉴权启动。"""
+        cfg = load_config({"GATEWAY_DEV_MODE": "true"})
+        self.assertIsNone(cfg.auth_token)
+        self.assertTrue(cfg.dev_mode)
+
+    def test_real_token_overrides_dev_mode(self):
+        """设置真实 token 永远优先于 dev 模式。"""
+        cfg = load_config({"GATEWAY_DEV_MODE": "true", "GATEWAY_AUTH_TOKEN": "real-token-xyz"})
+        self.assertEqual(cfg.auth_token, "real-token-xyz")
+        self.assertTrue(cfg.dev_mode)
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +623,7 @@ class TestHttpServer(unittest.TestCase):
         base = dict(
             host="127.0.0.1",
             port=0,
+            dev_mode=True,
             rate_limit_messages=60,
             silent_hours_enabled=False,  # 让 HTTP 测试不受当前真实时刻影响
             auth_token=None,
@@ -609,7 +699,8 @@ class TestHttpServer(unittest.TestCase):
         self.assertEqual(s2, 409)
         self.assertEqual(body["code"], "idempotency.conflict")
 
-    def test_transport_failure_is_502(self):
+    def test_transport_failure_is_500(self):
+        """B6: 传输失败映射为 500 internal.error（非契约 502）。"""
         with _ServerFixture(self._cfg()) as fixture:
             fixture.server.transport.fail = True
             status, body = _http(
@@ -618,26 +709,207 @@ class TestHttpServer(unittest.TestCase):
             )
             # 投递失败不占名额
             store_count = len(fixture.server.service.store)
-        self.assertEqual(status, 502)
-        self.assertEqual(body["code"], "matrix.unavailable")
+        self.assertEqual(status, 500)
+        self.assertEqual(body["code"], "internal.error")
         self.assertEqual(store_count, 0)
+        # X-Request-Id 在每个响应上（含 5xx）
+        self.assertIn("request_id", body)
 
     def test_auth_enforced_when_token_set(self):
-        with _ServerFixture(self._cfg(auth_token="<change-me>")) as server:
+        """B2: 无效 token 返回 401 auth.invalid_token（非 403）；每个响应带 X-Request-Id。"""
+        with _ServerFixture(self._cfg(dev_mode=False, auth_token="strongtoken12345")) as server:
             url = f"{server.base}/v1/conversations/c/messages"
             payload = {"sender_persona_id": "p", "content": {"type": "text", "text": "x"}}
-            s_missing, _ = _http("POST", url, payload)
-            s_wrong, _ = _http("POST", url, payload, headers={"Authorization": "Bearer nope"})
+            s_missing, b_missing = _http("POST", url, payload)
+            s_wrong, b_wrong = _http("POST", url, payload, headers={"Authorization": "Bearer nope"})
             s_ok, body = _http(
-                "POST", url, payload, headers={"Authorization": "Bearer <change-me>"}
+                "POST", url, payload, headers={"Authorization": "Bearer strongtoken12345"}
             )
             # /health 免鉴权
             s_health, _ = _http("GET", f"{server.base}/health")
+        # 缺 Authorization → 401 auth.missing
         self.assertEqual(s_missing, 401)
-        self.assertEqual(s_wrong, 403)
+        self.assertEqual(b_missing["code"], "auth.missing")
+        self.assertIn("request_id", b_missing)
+        # 错误 token → 401 auth.invalid_token（不是 403）
+        self.assertEqual(s_wrong, 401)
+        self.assertEqual(b_wrong["code"], "auth.invalid_token")
+        self.assertIn("request_id", b_wrong)
+        # 正确 token → 200
         self.assertEqual(s_ok, 200)
         self.assertEqual(body["outcome"], "delivered")
+        # /health 不需鉴权
         self.assertEqual(s_health, 200)
+
+
+    def test_health_503_when_degraded(self):
+        """B3: status != ok 时返回 503（结构相同），且不伪造 database: ok。"""
+        with _ServerFixture(self._cfg()) as fixture:
+            fixture.server.transport.fail = True
+            status, body = _http("GET", f"{fixture.base}/health")
+        self.assertEqual(status, 503)
+        self.assertEqual(body["status"], "degraded")
+        names = [c["name"] for c in body["checks"]]
+        # 未接入的依赖不得报 ok
+        self.assertNotIn("database", names)
+        matrix = [c for c in body["checks"] if c["name"] == "matrix"][0]
+        self.assertEqual(matrix["status"], "degraded")
+
+    def test_health_has_x_request_id(self):
+        """B2: 每个响应（含 /health）带 X-Request-Id。"""
+        with _ServerFixture(self._cfg()) as server:
+            import urllib.request as _ur
+            req = _ur.Request(f"{server.base}/health")
+            with _ur.urlopen(req, timeout=5) as resp:
+                self.assertIn("X-Request-Id", resp.headers)
+                self.assertTrue(resp.headers["X-Request-Id"])
+
+    def test_non_object_body_rejected(self):
+        """B4: JSON 顶层非对象（数组/字符串/数字）→ 400 problem+json。"""
+        with _ServerFixture(self._cfg()) as server:
+            url = f"{server.base}/v1/conversations/c/messages"
+            for raw_body in (b"[]", b'"hi"', b"123"):
+                data = raw_body
+                req = urllib.request.Request(url, data=data, method="POST")
+                req.add_header("Content-Type", "application/json")
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        status = resp.status
+                        raw = resp.read()
+                except urllib.error.HTTPError as exc:
+                    status = exc.code
+                    raw = exc.read()
+                resp_body = json.loads(raw) if raw else None
+                self.assertEqual(status, 400, f"body {raw_body!r} should be 400")
+                self.assertEqual(resp_body["code"], "request.invalid")
+
+    def test_oversized_body_rejected(self):
+        """B4: Content-Length 超过 MAX_BODY_BYTES → 400（不读入全部内容）。"""
+        with _ServerFixture(self._cfg()) as server:
+            url = f"{server.base}/v1/conversations/c/messages"
+            # 构造一个声称很大的请求（实际 body 就 10 字节，但 Content-Length 超限）
+            fake_big = b'{"x":"y"}'
+            req = urllib.request.Request(url, data=fake_big, method="POST")
+            req.add_header("Content-Type", "application/json")
+            req.add_header("Content-Length", str(MAX_BODY_BYTES + 1))
+            try:
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    status = resp.status
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+        self.assertEqual(status, 400)
+
+    def test_unknown_field_rejected(self):
+        """B5: OutgoingMessageRequest additionalProperties: false → 拒绝未知字段。"""
+        with _ServerFixture(self._cfg()) as server:
+            url = f"{server.base}/v1/conversations/c/messages"
+            status, body = _http("POST", url, {
+                "sender_persona_id": "p",
+                "content": {"type": "text", "text": "hi"},
+                "evil": 1,
+            })
+        self.assertEqual(status, 400)
+        self.assertEqual(body["code"], "request.invalid")
+
+    def test_invalid_content_type_rejected(self):
+        """B5: content.type 只接受 text/markdown。"""
+        with _ServerFixture(self._cfg()) as server:
+            url = f"{server.base}/v1/conversations/c/messages"
+            status, body = _http("POST", url, {
+                "sender_persona_id": "p",
+                "content": {"type": "card", "text": "hi"},
+            })
+        self.assertEqual(status, 400)
+        self.assertEqual(body["code"], "request.invalid")
+
+    def test_missing_content_type_rejected(self):
+        """B4: Content-Type 非 application/json → 400。"""
+        with _ServerFixture(self._cfg()) as server:
+            url = f"{server.base}/v1/conversations/c/messages"
+            data = json.dumps({"sender_persona_id": "p",
+                               "content": {"type": "text", "text": "x"}}).encode()
+            req = urllib.request.Request(url, data=data, method="POST")
+            req.add_header("Content-Type", "text/plain")
+            try:
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    status = resp.status
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+        self.assertEqual(status, 400)
+
+    def test_method_not_allowed_is_problem_json(self):
+        """建议8: 不支持的方法返回 405 problem+json（非 stdlib 501 HTML）。"""
+        with _ServerFixture(self._cfg()) as server:
+            status, body = _http("DELETE", f"{server.base}/v1/conversations/c/messages")
+        self.assertEqual(status, 405)
+        self.assertEqual(body["code"], "request.invalid")
+        self.assertTrue(body["type"].startswith("urn:botville:error:"))
+
+    def test_idempotency_key_too_long_rejected(self):
+        """建议2: Idempotency-Key 超 128 字符 → 400。"""
+        with _ServerFixture(self._cfg()) as server:
+            url = f"{server.base}/v1/conversations/c/messages"
+            headers = {"Idempotency-Key": "k" * 200}
+            status, body = _http("POST", url, {
+                "sender_persona_id": "p", "content": {"type": "text", "text": "x"},
+            }, headers=headers)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["code"], "request.invalid")
+
+
+# ---------------------------------------------------------------------------
+# 10. B1 契约校验：interrupt 三态、无 default
+# ---------------------------------------------------------------------------
+class TestContractInterrupt(unittest.TestCase):
+    """B1: OpenAPI 的 Card.interrupt 与 CreateCardRequest.interrupt 都去掉 default，
+    描述明确三态语义。校验脚本会拒绝重复键，所以用文本搜索更稳。"""
+
+    def setUp(self):
+        try:
+            import yaml  # noqa
+        except ImportError:
+            self.skipTest("pyyaml not installed")
+        contract = os.path.join(GATEWAY_ROOT, "openapi", "gateway.v1.yaml")
+        with open(contract, "r", encoding="utf-8") as fh:
+            self.text = fh.read()
+
+    def _interrupt_blocks(self):
+        blocks = []
+        idx = 0
+        while True:
+            pos = self.text.find("interrupt:", idx)
+            if pos == -1:
+                break
+            blocks.append(self.text[pos:pos + 400])
+            idx = pos + 1
+        return blocks
+
+    def test_card_and_createcard_interrupt_have_no_default(self):
+        blocks = self._interrupt_blocks()
+        # 至少两处 interrupt 字段（Card + CreateCardRequest）
+        self.assertGreaterEqual(len(blocks), 2)
+        for block in blocks:
+            # 取每个 interrupt 块的前 250 字符，不应出现 default: false
+            snippet = block[:250]
+            self.assertNotIn("default: false", snippet,
+                              f"interrupt 不应再有 default: false:\n{snippet}")
+
+    def test_interrupt_mentions_three_state_semantics(self):
+        joined = "\n".join(self._interrupt_blocks())
+        # 描述要明确「省略时由 priority 决定」与「显式 false」
+        self.assertIn("priority", joined)
+        self.assertIn("urgent", joined)
+
+    def test_contract_md_documents_three_state(self):
+        contract_md = os.path.join(GATEWAY_ROOT, "docs", "contract.md")
+        with open(contract_md, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        # §4.8 描述三态且说明无默认值
+        self.assertIn("无默认值", text)
+        self.assertIn("三态", text)
+        # changelog 记一笔（默认值变更 = minor + 公告）
+        self.assertIn("移除", text)
+        self.assertIn("minor", text)
 
 
 if __name__ == "__main__":

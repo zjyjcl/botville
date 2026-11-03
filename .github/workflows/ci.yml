@@ -77,6 +77,11 @@ jobs:
           python3 notify/scripts/validate_examples.py
           python3 gateway/scripts/validate_openapi.py
 
+      - name: Gateway unit tests
+        run: |
+          pip install pyyaml
+          python3 -m unittest discover -s gateway/tests -v
+
       - name: Compose config validates for every profile
         run: |
           bash server/scripts/init.sh

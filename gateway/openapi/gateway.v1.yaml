@@ -3195,8 +3195,16 @@ components:
           description: 最早投递时间（服务端排程）；`null` 表示立即。
         interrupt:
           type: boolean
-          default: false
-          description: 是否穿透静默时段立即打断。
+          description: |
+            是否穿透静默时段立即打断（三态语义：省略 / true / false）。
+
+            省略时由 `priority` 决定：`priority: urgent` → 穿透；其余优先级 → 顺延。
+            显式 `true` → 无论优先级都穿透；显式 `false` → 即使 `urgent` 也不打断，
+            在静默期间顺延到 `deliver_after`。
+
+            **本字段没有默认值**（0.1.0 起移除 `default: false`）：在 JSON Schema 层面
+            区分「未显式给出」与「显式 false」是本节语义的前提，下游代码生成/校验器
+            不得补默认值。见 contract.md §4.8。
         created_at:
           type: string
           format: date-time
@@ -3290,10 +3298,16 @@ components:
           description: 期望展示时间（例如提醒卡片的触发时刻）；与 `deliver_after` 二选一。
         interrupt:
           type: boolean
-          default: false
           description: |
-            是否穿透静默时段立即打断。`priority: urgent` 未显式给出时按穿透处理；
-            显式 `false` 则即使 `urgent` 也在静默期间顺延。
+            是否穿透静默时段立即打断（三态语义：省略 / true / false）。
+
+            省略时由 `priority` 决定：`priority: urgent` → 穿透；其余优先级 → 顺延。
+            显式 `true` → 无论优先级都穿透；显式 `false` → 即使 `urgent` 也不打断，
+            在静默期间顺延到 `deliver_after`。
+
+            **本字段没有默认值**（0.1.0 起移除 `default: false`）：在 JSON Schema 层面
+            区分「未显式给出」与「显式 false」是本节语义的前提，下游代码生成/校验器
+            不得补默认值。见 contract.md §4.8。
         collapse_key:
           type: [string, 'null']
           description: 合并键；同键未读卡片由客户端折叠展示。
