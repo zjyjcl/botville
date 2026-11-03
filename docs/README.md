@@ -2,4 +2,5 @@
 
 - roadmap.md：M0–M4 路线图与任务
 - 产品方案（来源：方案页 v0.6）
+- compat/：外部组件兼容性核实与实测记录（索引见 [compat/README.md](compat/README.md)）
 - openapi/：开放 API 规范（带版本号、只增不删，CI 校验与实现一致）
