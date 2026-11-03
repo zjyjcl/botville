@@ -300,6 +300,10 @@ jobs:
               "SYNAPSE_MACAROON_SECRET": "<change-me>",
               "SYNAPSE_FORM_SECRET": "<change-me>",
               "SYNAPSE_REGISTRATION_SHARED_SECRET": "<change-me>",
+              # A1.3 appservice tokens (as_token / hs_token); init.sh
+              # regenerates empty/<change-me> to 64-hex and refuses anything else.
+              "APPSERVICE_AS_TOKEN": "<change-me>",
+              "APPSERVICE_HS_TOKEN": "<change-me>",
               "POSTGRES_IMAGE": "docker.io/library/postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab",
               "SYNAPSE_IMAGE": "docker.io/matrixdotorg/synapse:v1.164.1@sha256:fa4aa980f279bcf26d4e7ecc2a2c9a701c73f2ebe8841da9bdcf3b2fdf693d75",
               "TUWUNEL_IMAGE": "ghcr.io/matrix-construct/tuwunel:v1.9.4@sha256:0e86c6164d6c9f5b60291938eb61ad8395021c37fe58d47a963ea7edddbedaec",
