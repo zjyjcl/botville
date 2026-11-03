@@ -1,0 +1,31 @@
+# secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p8
+*.p12
+secrets/
+# build / deps
+node_modules/
+dist/
+build/
+target/
+__pycache__/
+*.pyc
+.venv/
+# Apple
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.build/
+.swiftpm/
+# data
+data/
+*.db
+*.sqlite
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
