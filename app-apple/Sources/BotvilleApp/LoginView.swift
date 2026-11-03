@@ -13,6 +13,9 @@ struct LoginView: View {
     @State private var password = ""
     @State private var isLoggingIn = false
     @State private var errorMessage: String?
+#if DEBUG
+    @State private var allowLocalHTTP = false
+#endif
 
     private var canLogIn: Bool {
         !homeserver.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -47,15 +50,23 @@ struct LoginView: View {
                     .textInputAutocapitalization(.never)
 #endif
                 SecureField("密码", text: $password)
+#if DEBUG
+                Toggle("允许本机 HTTP（仅 localhost/127.0.0.1）", isOn: $allowLocalHTTP)
+#endif
             }
             .frame(maxWidth: 480)
 
-            if let errorMessage {
+            if let errorMessage = errorMessage ?? service.sessionError {
                 Text(errorMessage)
                     .font(.footnote)
                     .foregroundStyle(.red)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 480)
+            }
+
+            if service.sessionError != nil {
+                Button("重试恢复会话") { Task { await service.restoreSession() } }
+                    .disabled(isLoggingIn)
             }
 
             Button(action: logIn) {
@@ -79,12 +90,19 @@ struct LoginView: View {
         isLoggingIn = true
         errorMessage = nil
         Task {
-            defer { isLoggingIn = false }
+            defer { isLoggingIn = false; password = "" }
             do {
                 try await service.login(
                     homeserver: homeserver.trimmingCharacters(in: .whitespacesAndNewlines),
                     username: username.trimmingCharacters(in: .whitespacesAndNewlines),
-                    password: password
+                    password: password,
+                    allowLocalHTTP: {
+#if DEBUG
+                        allowLocalHTTP
+#else
+                        false
+#endif
+                    }()
                 )
                 password = ""
             } catch {

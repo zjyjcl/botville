@@ -3,6 +3,11 @@
 
 import BotvilleCore
 import SwiftUI
+#if os(iOS)
+import UIKit
+#elseif os(macOS)
+import AppKit
+#endif
 
 @main
 @MainActor
@@ -29,11 +34,14 @@ private struct AppRootView: View {
 
     var body: some View {
         Group {
-            if service.isLoggedIn {
+            if service.isRestoring {
+                ProgressView("正在恢复会话…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if service.isLoggedIn {
                 NavigationSplitView {
                     RoomListView(service: service, selection: $selectedRoomID)
                 } detail: {
-                    if let selectedRoom = service.rooms.first(where: { $0.id == selectedRoomID }) {
+                    if let selectedRoom = service.rooms.first(where: { $0.id == selectedRoomID && $0.membership == .joined }) {
                         RoomView(service: service, room: selectedRoom)
                             .id(selectedRoom.id)
                     } else {
@@ -45,13 +53,28 @@ private struct AppRootView: View {
                     }
                 }
                 .task(id: service.rooms.map(\.id)) {
-                    if selectedRoomID == nil || !service.rooms.contains(where: { $0.id == selectedRoomID }) {
-                        selectedRoomID = service.rooms.first?.id
+                    if selectedRoomID == nil || !service.rooms.contains(where: { $0.id == selectedRoomID && $0.membership == .joined }) {
+                        selectedRoomID = service.rooms.first(where: { $0.membership == .joined })?.id
                     }
                 }
             } else {
                 LoginView(service: service)
             }
         }
+        .task {
+            await service.restoreSession()
+        }
+        .onChange(of: service.isLoggedIn) { _, loggedIn in
+            if !loggedIn { selectedRoomID = nil }
+        }
+#if os(iOS)
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            Task { await service.applicationDidBecomeActive() }
+        }
+#elseif os(macOS)
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await service.applicationDidBecomeActive() }
+        }
+#endif
     }
 }

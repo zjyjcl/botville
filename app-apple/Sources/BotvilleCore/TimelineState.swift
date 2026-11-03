@@ -38,13 +38,7 @@ struct TimelineState {
             case .text, .notice, .emote: break
             default: return nil
             }
-            let delivery: String?
-            switch event.localSendState {
-            case .notSentYet: delivery = "等待发送"
-            case .sendingFailed: delivery = "发送失败（消息保留在本次会话中）"
-            case .sent: delivery = "已发送"
-            case nil: delivery = nil
-            }
+            let delivery = MessageDeliveryState(event.localSendState)
             return MatrixMessage(
                 id: item.uniqueId().id,
                 sender: event.sender,
@@ -53,6 +47,32 @@ struct TimelineState {
                 isOwn: event.isOwn,
                 deliveryState: delivery
             )
+        }
+    }
+
+    /// Produces the exact identifier the SDK expects for retry/cancel.  It is
+    /// derived from the current local echo rather than guessed from message
+    /// order or display text.  Only failed own messages are actionable.
+    func failedSendTransactionID(for messageID: String) -> String? {
+        guard let item = items.first(where: { $0.uniqueId().id == messageID }),
+              let event = item.asEvent(), event.isOwn else {
+            return nil
+        }
+        guard case .sendingFailed(error: _, isRecoverable: _) = event.localSendState else { return nil }
+        guard case .transactionId(let transactionID) = event.eventOrTransactionId else {
+            return nil
+        }
+        return transactionID
+    }
+}
+
+extension MessageDeliveryState {
+    init?(_ sdkState: EventSendState?) {
+        switch sdkState {
+        case .notSentYet(progress: _): self = .queued
+        case .sendingFailed(error: _, isRecoverable: _): self = .failed
+        case .sent(eventId: _): self = .sent
+        case nil: return nil
         }
     }
 }
