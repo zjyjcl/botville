@@ -3291,7 +3291,9 @@ components:
         interrupt:
           type: boolean
           default: false
-          description: 是否穿透静默时段立即打断。`priority: urgent` 未显式给出时按穿透处理；显式 `false` 则即使 `urgent` 也在静默期间顺延。
+          description: |
+            是否穿透静默时段立即打断。`priority: urgent` 未显式给出时按穿透处理；
+            显式 `false` 则即使 `urgent` 也在静默期间顺延。
         collapse_key:
           type: [string, 'null']
           description: 合并键；同键未读卡片由客户端折叠展示。
