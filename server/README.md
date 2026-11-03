@@ -26,6 +26,9 @@ make down            # 停止（保留数据卷；手动 down -v 可清空）
 - 首次 `make up` 会执行 `server/scripts/init.sh`：从 `.env.example` 生成本地
   `server/compose/.env`（所有 `<change-me>` 用 `openssl rand -hex 32` 就地随机生成，
   不会提交），并把 `synapse/homeserver.yaml.tmpl` 渲染到 `generated/synapse/`（gitignore）。
+  `.env` 已存在时保留原值；其中的 `*_IMAGE` 与当前默认不同（如 `:latest`、无 digest）
+  只会打 WARNING，不会自动改写——迁移见
+  [docs/ops/upgrade-images.md](../docs/ops/upgrade-images.md) §5。
 - 三个 homeserver 容器内都监听 8008，宿主仅绑定 `127.0.0.1:${BOTVILLE_HTTP_PORT:-8008}`；
   需要外部访问时自行加反向代理。
 - 注册策略：tuwunel / continuwuity 始终令牌门控（`BOTVILLE_REGISTRATION_TOKEN`）；

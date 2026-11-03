@@ -8,7 +8,8 @@
 #         stdlib unit tests for the bootstrap/init scripts (no Docker),
 #         notify/gateway contract validation, a guard that .env.example
 #         only ever contains placeholders, and a guard that every image
-#         defaults to tag@sha256 digest (no :latest).
+#         defaults to tag@sha256 digest (no :latest) identically in compose
+#         and .env.example.
 name: CI
 
 on:
@@ -121,7 +122,7 @@ jobs:
               "SYNAPSE_FORM_SECRET": "<change-me>",
               "SYNAPSE_REGISTRATION_SHARED_SECRET": "<change-me>",
               "POSTGRES_IMAGE": "docker.io/library/postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab",
-              "SYNAPSE_IMAGE": "docker.io/matrixdotorg/synapse:v1.141.0@sha256:562adbfc3df12d1024c7277b9807086ed79d8d5fabe24187a31d787af050a6a4",
+              "SYNAPSE_IMAGE": "docker.io/matrixdotorg/synapse:v1.164.1@sha256:fa4aa980f279bcf26d4e7ecc2a2c9a701c73f2ebe8841da9bdcf3b2fdf693d75",
               "TUWUNEL_IMAGE": "ghcr.io/matrix-construct/tuwunel:v1.9.4@sha256:0e86c6164d6c9f5b60291938eb61ad8395021c37fe58d47a963ea7edddbedaec",
               "CONTINUWUITY_IMAGE": "ghcr.io/continuwuity/continuwuity:v26.9.1@sha256:c9c62bc5c0a641f3f713945c701b069c7bc30d2612b54d4a5de80a5be19d5420",
           }
@@ -146,15 +147,27 @@ jobs:
           print(f"{path}: OK (placeholders only, no real values)")
           EOF
 
-      - name: Images must be pinned (tag@sha256 digest, no :latest)
+      - name: Images must be pinned (tag@sha256 digest, no :latest, compose == .env.example)
         run: |
           python3 - <<'EOF'
           import re
           import sys
 
           # Every image reference must end with ":<tag>@sha256:<64 hex>" where
-          # tag is not "latest". See docs/ops/upgrade-images.md for the policy.
+          # tag is not "latest". See docs/ops/upgrade-images.md for the policy
+          # and for the 5 places a pin must be kept in sync — this check
+          # guards the compose-defaults ↔ .env.example pair for equality.
           pin_re = re.compile(r":(?P<tag>[^:@\s]+)@sha256:(?P<digest>[0-9a-f]{64})$")
+
+          def strip_inline_comment(text):
+              # Drop a trailing " # ..." comment; a '#' inside a value (never
+              # valid in an image ref) without preceding whitespace is kept.
+              return re.split(r"\s+#", text, maxsplit=1)[0].strip()
+
+          def unquote(value):
+              if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                  return value[1:-1]
+              return value
 
           def check(ref, where):
               m = pin_re.search(ref)
@@ -167,32 +180,65 @@ jobs:
           problems = []
 
           # docker-compose.yml: every service image line — a bare value or the
-          # default inside ${VAR:-default}.
+          # default inside ${VAR:-default}. Quoted values are unwrapped;
+          # ${VAR} without a :- default cannot be pinned and is rejected.
           compose = "server/compose/docker-compose.yml"
+          compose_defaults = {}
           var_re = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*):-(.+)\}$")
           for n, raw in enumerate(open(compose, encoding="utf-8"), 1):
-              m = re.match(r"\s*image:\s*(\S+)", raw)
+              m = re.match(r"\s*image:\s*(.+?)\s*(?:#.*)?$", raw)
               if not m:
                   continue
-              ref = m.group(1)
+              ref = unquote(m.group(1).strip())
               v = var_re.match(ref)
-              if ref.startswith("${") and not v:
+              if v:
+                  compose_defaults[v.group(1)] = v.group(2)
+                  problems += check(v.group(2), f"{compose}:{n}")
+              elif ref.startswith("${"):
                   problems.append(f"{compose}:{n}: {ref!r} has no :- default to pin")
-                  continue
-              problems += check(v.group(2) if v else ref, f"{compose}:{n}")
+              else:
+                  problems += check(ref, f"{compose}:{n}")
 
-          # .env.example: every *_IMAGE value.
+          # .env.example: every *_IMAGE value — tolerates spaces around '=',
+          # quotes, and trailing inline comments.
           env_example = "server/compose/.env.example"
+          env_values = {}
           for n, raw in enumerate(open(env_example, encoding="utf-8"), 1):
-              line = raw.strip()
+              line = strip_inline_comment(raw)
               if not line or line.startswith("#"):
                   continue
               key, sep, value = line.partition("=")
-              if sep and key.endswith("_IMAGE"):
+              key, value = key.strip(), unquote(value.strip())
+              if not sep or not key:
+                  problems.append(f"{env_example}:{n}: not a KEY=VALUE line: {raw!r}")
+              elif key.endswith("_IMAGE"):
+                  env_values[key] = value
                   problems += check(value, f"{env_example}:{n}")
 
+          # Equality guard: compose default and .env.example must carry the
+          # exact same pin for every *_IMAGE variable (both directions).
+          for key in sorted(set(compose_defaults) | set(env_values)):
+              if key not in compose_defaults:
+                  problems.append(
+                      f"{env_example}: {key} has no matching default in {compose}"
+                  )
+              elif key not in env_values:
+                  problems.append(
+                      f"{compose}: {key} default is not mirrored in {env_example}"
+                  )
+              elif compose_defaults[key] != env_values[key]:
+                  problems.append(
+                      f"{key}: compose default {compose_defaults[key]!r} != "
+                      f".env.example {env_values[key]!r}"
+                  )
+
+          # Scope note: this is a format + consistency guard only — it does
+          # NOT verify the digest resolves in a registry (no network here).
+          # A typo'd digest surfaces in the smoke job, which pulls every
+          # image for each profile; continuwuity is continue-on-error in this
+          # branch and becomes required-green via #70.
           if problems:
               print("\n".join(problems))
               sys.exit(1)
-          print("image pins OK (tag@sha256 digest, no :latest)")
+          print("image pins OK (tag@sha256 digest, no :latest, compose == .env.example)")
           EOF
