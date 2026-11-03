@@ -12,14 +12,15 @@ ENV_FILE := server/compose/.env
 COMPOSE := docker compose -f $(COMPOSE_FILE) --env-file $(ENV_FILE)
 
 # Active homeserver profile: command line (make up HS=tuwunel) wins, then
-# BOTVILLE_HOMESERVER from .env, then synapse.
-HS ?= $(shell sed -n 's/^BOTVILLE_HOMESERVER=//p' $(ENV_FILE) 2>/dev/null | head -n 1)
+# BOTVILLE_HOMESERVER from .env, then synapse. The last assignment of a key
+# in .env wins, matching docker compose's --env-file handling.
+HS ?= $(shell sed -n 's/^BOTVILLE_HOMESERVER=//p' $(ENV_FILE) 2>/dev/null | tail -n 1)
 ifeq ($(strip $(HS)),)
 HS := synapse
 endif
 
-# Host port of the homeserver (mirrors BOTVILLE_HTTP_PORT).
-PORT ?= $(shell sed -n 's/^BOTVILLE_HTTP_PORT=//p' $(ENV_FILE) 2>/dev/null | head -n 1)
+# Host port of the homeserver (mirrors BOTVILLE_HTTP_PORT; last one wins).
+PORT ?= $(shell sed -n 's/^BOTVILLE_HTTP_PORT=//p' $(ENV_FILE) 2>/dev/null | tail -n 1)
 ifeq ($(strip $(PORT)),)
 PORT := 8008
 endif
@@ -30,10 +31,15 @@ init:
 	bash server/scripts/init.sh
 
 # Core one-button startup: bootstrap .env + rendered synapse config, then
-# start the selected homeserver profile detached.
+# start the selected homeserver profile detached. continuwuity additionally
+# registers its first-boot admin account (one-time token from the container
+# logs; see server/scripts/bootstrap-continuwuity.sh).
 up:
 	bash server/scripts/init.sh
 	$(COMPOSE) --profile $(HS) up -d
+ifeq ($(HS),continuwuity)
+	COMPOSE='$(COMPOSE)' bash server/scripts/bootstrap-continuwuity.sh
+endif
 
 down:
 	$(COMPOSE) --profile $(HS) down --remove-orphans
@@ -47,4 +53,4 @@ ps:
 smoke: init
 	python3 server/tests/smoke.py \
 		--base-url http://127.0.0.1:$(PORT) \
-		--registration-token "$$(sed -n 's/^BOTVILLE_REGISTRATION_TOKEN=//p' $(ENV_FILE))"
+		--registration-token "$$(sed -n 's/^BOTVILLE_REGISTRATION_TOKEN=//p' $(ENV_FILE) | tail -n 1)"
