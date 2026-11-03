@@ -30,10 +30,15 @@ init:
 	bash server/scripts/init.sh
 
 # Core one-button startup: bootstrap .env + rendered synapse config, then
-# start the selected homeserver profile detached.
+# start the selected homeserver profile detached. continuwuity additionally
+# registers its first-boot admin account (one-time token from the container
+# logs; see server/scripts/bootstrap-continuwuity.sh).
 up:
 	bash server/scripts/init.sh
 	$(COMPOSE) --profile $(HS) up -d
+ifeq ($(HS),continuwuity)
+	COMPOSE='$(COMPOSE)' bash server/scripts/bootstrap-continuwuity.sh
+endif
 
 down:
 	$(COMPOSE) --profile $(HS) down --remove-orphans

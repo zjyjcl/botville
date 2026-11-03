@@ -66,8 +66,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: shellcheck init.sh
-        run: shellcheck server/scripts/init.sh
+      - name: shellcheck scripts
+        run: |
+          shellcheck server/scripts/init.sh
+          shellcheck server/scripts/bootstrap-continuwuity.sh
 
       - name: Python syntax
         run: python3 -m py_compile server/tests/smoke.py
@@ -100,6 +102,8 @@ jobs:
               "BOTVILLE_HTTP_PORT": "8008",
               "BOTVILLE_OPEN_REGISTRATION": "false",
               "BOTVILLE_REGISTRATION_TOKEN": "<change-me>",
+              "BOTVILLE_ADMIN_USER": "botville-admin",
+              "BOTVILLE_ADMIN_PASSWORD": "<change-me>",
               "POSTGRES_USER": "botville",
               "POSTGRES_PASSWORD": "<change-me>",
               "POSTGRES_DB": "synapse",

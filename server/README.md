@@ -31,6 +31,12 @@ make down            # 停止（保留数据卷；手动 down -v 可清空）
 - 注册策略：tuwunel / continuwuity 始终令牌门控（`BOTVILLE_REGISTRATION_TOKEN`）；
   Synapse 默认关闭注册，CI 中通过 `BOTVILLE_OPEN_REGISTRATION=true` 走 dummy 流程。
   本地想对 Synapse 跑 `make smoke` 时，把 `.env` 里该值改为 `true` 再 `make up`。
+- continuwuity 首启引导：全新数据库上一次性引导令牌只打印在容器日志，配置的
+  `BOTVILLE_REGISTRATION_TOKEN` 在首个账号创建前无效（401 `M_FORBIDDEN`）。
+  `make up HS=continuwuity` 启动后会自动执行 `server/scripts/bootstrap-continuwuity.sh`：
+  从日志提取引导令牌，以标准 UIA（`m.login.registration_token`）注册 `.env` 里的
+  `BOTVILLE_ADMIN_USER` 作为首个账号（continuwuity 惯例：首用户即管理员），此后配置令牌生效。
+  日志中找不到引导令牌（已引导过）时脚本提示后跳过；`M_USER_IN_USE` 视为已完成。
 - 就绪探测：postgres/synapse 用容器 healthcheck；tuwunel、continuwuity 镜像为
   OS-less（无 shell/curl），由 `server/tests/smoke.py` 轮询 `/_matrix/client/versions`。
 - 镜像可通过 `.env` 的 `SYNAPSE_IMAGE` / `TUWUNEL_IMAGE` / `CONTINUWUITY_IMAGE` 覆盖。
@@ -44,7 +50,9 @@ server/
 │   ├── .env.example              # 仅占位符（CI 有 lint 守卫）
 │   ├── synapse/homeserver.yaml.tmpl
 │   └── generated/                # 渲染产物，gitignore
-├── scripts/init.sh               # .env 引导 + 模板渲染
+├── scripts/
+│   ├── init.sh                   # .env 引导/补齐缺失键 + 模板渲染
+│   └── bootstrap-continuwuity.sh # continuwuity 首启引导注册（标准 UIA，仅 CS API）
 └── tests/smoke.py                # 仅标准库的 CS API 冒烟测试
 ```
 

@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Botville server bootstrap (A0.2):
 #   1. create server/compose/.env from .env.example, replacing every
-#      <change-me> with a locally generated random value (openssl rand -hex 32);
+#      <change-me> with a locally generated random value (openssl rand -hex 32).
+#      When .env already exists, keep every current value but append keys that
+#      .env.example has and .env lacks (new keys from upgrades), generating
+#      their <change-me> values the same way;
 #   2. render server/compose/synapse/homeserver.yaml.tmpl into
 #      server/compose/generated/synapse/homeserver.yaml.
 #
@@ -17,11 +20,12 @@ template="${compose_dir}/synapse/homeserver.yaml.tmpl"
 generated_dir="${compose_dir}/generated/synapse"
 generated="${generated_dir}/homeserver.yaml"
 
+if ! command -v openssl >/dev/null 2>&1; then
+    echo "init.sh: openssl is required to generate local secrets" >&2
+    exit 1
+fi
+
 if [[ ! -f "${env_file}" ]]; then
-    if ! command -v openssl >/dev/null 2>&1; then
-        echo "init.sh: openssl is required to generate local secrets" >&2
-        exit 1
-    fi
     # Each secret placeholder sits on its own line; give every line a fresh
     # random value instead of reusing one secret for all of them.
     while IFS= read -r line || [[ -n "${line}" ]]; do
@@ -33,7 +37,33 @@ if [[ ! -f "${env_file}" ]]; then
     chmod 600 "${env_file}"
     echo "init.sh: created ${env_file} with locally generated secrets"
 else
-    echo "init.sh: ${env_file} exists, keeping current values"
+    # Missing keys are appended in .env.example order; current values always win.
+    missing_keys=()
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        case "${line}" in ''|\#*) continue ;; esac
+        [[ "${line}" == *=* ]] || continue
+        key="${line%%=*}"
+        if ! grep -q "^${key}=" "${env_file}"; then
+            missing_keys+=("${key}")
+        fi
+    done < "${env_example}"
+
+    if [[ "${#missing_keys[@]}" -gt 0 ]]; then
+        # Guard the append below: add a newline when .env lacks a trailing one.
+        if [[ -n "$(tail -c 1 "${env_file}")" ]]; then
+            printf '\n' >> "${env_file}"
+        fi
+        for key in "${missing_keys[@]}"; do
+            line="$(grep "^${key}=" "${env_example}" | head -n 1)"
+            if [[ "${line}" == *'<change-me>'* ]]; then
+                line="${line//<change-me>/$(openssl rand -hex 32)}"
+            fi
+            printf '%s\n' "${line}" >> "${env_file}"
+        done
+        echo "init.sh: appended missing keys to ${env_file}: ${missing_keys[*]} (<change-me> values randomly generated)"
+    else
+        echo "init.sh: ${env_file} exists, keeping current values"
+    fi
 fi
 
 mkdir -p "${generated_dir}"
