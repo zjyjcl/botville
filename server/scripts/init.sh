@@ -9,11 +9,19 @@
 #        for keys .env.example marks as secrets, so a hand-copied .env.example
 #        never keeps placeholder secrets around;
 #   2. render server/compose/synapse/homeserver.yaml.tmpl into
-#      server/compose/generated/synapse/homeserver.yaml.
+#      server/compose/generated/synapse/homeserver.yaml;
+#   3. render server/compose/sygnal/sygnal.yaml.tmpl into
+#      server/compose/generated/sygnal/sygnal.yaml and, only when
+#      BOTVILLE_APNS_ENABLED=true AND every APNS_* value is real (no
+#      <placeholder>) AND server/compose/secrets/apns.p8 exists, append the
+#      APNs app from sygnal/apns-app.yaml.part. With prerequisites missing the
+#      APNs app is skipped with a WARNING — the org.botville.mock pushkin
+#      stays configured either way (A1.2, docs/deploy/push-sygnal.md).
 #
-# Both outputs are gitignored and must never be committed. Existing .env files
-# are kept as-is so user secrets survive re-runs; *_IMAGE values that drifted
-# from the repo defaults only get a WARNING here (never rewritten).
+# All outputs (.env and everything under server/compose/generated/) are
+# gitignored and must never be committed. Existing .env files are kept as-is
+# so user secrets survive re-runs; *_IMAGE values that drifted from the repo
+# defaults only get a WARNING here (never rewritten).
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,6 +31,11 @@ env_example="${compose_dir}/.env.example"
 template="${compose_dir}/synapse/homeserver.yaml.tmpl"
 generated_dir="${compose_dir}/generated/synapse"
 generated="${generated_dir}/homeserver.yaml"
+sygnal_template="${compose_dir}/sygnal/sygnal.yaml.tmpl"
+sygnal_apns_template="${compose_dir}/sygnal/apns-app.yaml.part"
+sygnal_generated_dir="${compose_dir}/generated/sygnal"
+sygnal_generated="${sygnal_generated_dir}/sygnal.yaml"
+sygnal_data_dir="${compose_dir}/generated/sygnal-data"
 
 # The last line for a key wins everywhere (docker compose --env-file, the
 # renderer below); .env should not carry duplicate keys in the first place.
@@ -164,11 +177,17 @@ else
     warn_image_overrides
 fi
 
-mkdir -p "${generated_dir}"
+mkdir -p "${generated_dir}" "${sygnal_generated_dir}"
+# Scratch dir for the mock pushkin's JSONL, bind-mounted at /data. The sygnal
+# image may run as a non-root user, so it must be world-writable (it only ever
+# holds mock push records for tests; gitignored like the rest of generated/).
+mkdir -p "${sygnal_data_dir}"
+chmod 0777 "${sygnal_data_dir}"
 
 # The renderer reads .env itself (no shell sourcing), so values with special
 # characters cannot break anything.
-python3 - "${env_file}" "${template}" "${generated}" <<'PY'
+render_template() {
+    python3 - "${env_file}" "$1" "$2" <<'PY'
 import re
 import sys
 
@@ -208,3 +227,46 @@ with open(out_path, "w", encoding="utf-8") as f:
     f.write(rendered)
 print(f"init.sh: rendered {out_path}")
 PY
+}
+
+render_template "${template}" "${generated}"
+render_template "${sygnal_template}" "${sygnal_generated}"
+
+# --- optional APNs app (A1.2) ------------------------------------------
+# Only rendered when BOTVILLE_APNS_ENABLED=true AND everything real is in
+# place. A half-configured APNs app (placeholder key ids, missing .p8) would
+# make sygnal fail to start and take the mock pushkin down with it, so it is
+# skipped with a WARNING instead — see docs/deploy/push-sygnal.md.
+if [[ "$(env_value BOTVILLE_APNS_ENABLED)" == "true" ]]; then
+    missing=()
+    for key in APNS_APP_ID APNS_KEY_ID APNS_TEAM_ID APNS_TOPIC; do
+        value="$(env_value "${key}")"
+        # Empty or still a <placeholder> (incl. <change-me>): not usable.
+        if [[ -z "${value}" || "${value}" == '<'* ]]; then
+            missing+=("${key}")
+        fi
+    done
+    platform="$(env_value APNS_PLATFORM)"
+    if [[ "${platform}" != "sandbox" && "${platform}" != "production" ]]; then
+        missing+=("APNS_PLATFORM (must be sandbox or production)")
+    fi
+    apns_key_file="${compose_dir}/secrets/apns.p8"
+    if [[ ! -f "${apns_key_file}" ]]; then
+        missing+=("secrets/apns.p8")
+    fi
+    if [[ "${#missing[@]}" -gt 0 ]]; then
+        echo "WARNING: BOTVILLE_APNS_ENABLED=true but ${missing[*]} missing or placeholder." >&2
+        echo "WARNING: the APNs app is NOT rendered; sygnal runs with the mock pushkin only." >&2
+        echo "WARNING: see docs/deploy/push-sygnal.md (place the real key, fill APNS_* in .env)." >&2
+    else
+        # Appended under the top-level `apps:` mapping of sygnal.yaml; the
+        # part template's first app key is indented accordingly. Rendered to
+        # a dotfile outside the /config bind mount so sygnal never sees a
+        # stray half-finished config file.
+        apns_part="${compose_dir}/generated/.apns-app.part"
+        render_template "${sygnal_apns_template}" "${apns_part}"
+        cat "${apns_part}" >> "${sygnal_generated}"
+        rm -f "${apns_part}"
+        echo "init.sh: rendered APNs app ($(env_value APNS_APP_ID)) into ${sygnal_generated}"
+    fi
+fi

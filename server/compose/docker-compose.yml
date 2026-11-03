@@ -5,11 +5,16 @@
 # `make up` / `make up HS=tuwunel` in the repo root wraps this (see Makefile).
 #
 # Ports are bound to 127.0.0.1 only; expose via a reverse proxy when needed.
-# All four images are pinned by default to tag@sha256:<multi-arch index
-# digest>; the upgrade flow lives in docs/ops/upgrade-images.md. They can be
-# overridden via POSTGRES_IMAGE / SYNAPSE_IMAGE / TUWUNEL_IMAGE /
-# CONTINUWUITY_IMAGE in server/compose/.env — e.g. to :latest to track
-# upstream, which works but is not recommended (not reproducible).
+# All homeserver-profile images plus the optional sygnal push gateway (five
+# total) are pinned by default to tag@sha256:<multi-arch index digest>; the
+# upgrade flow lives in docs/ops/upgrade-images.md. They can be overridden via
+# POSTGRES_IMAGE / SYNAPSE_IMAGE / TUWUNEL_IMAGE / CONTINUWUITY_IMAGE /
+# SYGNAL_IMAGE in server/compose/.env — e.g. to :latest to track upstream,
+# which works but is not recommended (not reproducible).
+#
+# The `push` profile (sygnal, A1.2) stacks onto any homeserver profile:
+#   make up PUSH=1   /   make up HS=tuwunel PUSH=1
+# It is the only cross-stack profile; see docs/deploy/push-sygnal.md.
 #
 # Readiness:
 #   - postgres, synapse: container healthchecks.
@@ -95,6 +100,40 @@ services:
       - "127.0.0.1:${BOTVILLE_HTTP_PORT:-8008}:8008"
     volumes:
       - tuwunel-data:/var/lib/tuwunel
+    restart: unless-stopped
+
+  sygnal:
+    # Sygnal push gateway (A1.2), `push` profile — stacks onto any homeserver
+    # profile via `make up HS=<hs> PUSH=1`. Pinned tag@digest like the rest;
+    # override via SYGNAL_IMAGE. Homeservers reach it inside the compose
+    # network at http://sygnal:5000 (pusher data.url); the host mapping below
+    # is a loopback-only convenience for poking /_matrix/push/v1/notify.
+    image: ${SYGNAL_IMAGE:-docker.io/matrixdotorg/sygnal:v0.17.0@sha256:141f5e72fdf99a28e29ca87f3a46c19ed1cf21d5074aa3ef9df7c067e0c1c46a}
+    profiles: [push]
+    environment:
+      # Rendered from sygnal/sygnal.yaml.tmpl by server/scripts/init.sh into
+      # ./generated/sygnal/ (gitignored); SYGNAL_CONF is how the image locates
+      # its config.
+      SYGNAL_CONF: /config/sygnal.yaml
+      # Makes the mock pushkin (bind-mounted below at /custom) importable for
+      # type: botville_mock_pushkin.MockPushkin in the app config.
+      PYTHONPATH: /custom
+    ports:
+      - "127.0.0.1:${BOTVILLE_PUSH_PORT:-8019}:5000"
+    volumes:
+      - ./generated/sygnal:/config:ro
+      - ./sygnal:/custom:ro
+      # Scratch dir for the mock pushkin's JSONL; a bind mount (created 0777
+      # by init.sh) rather than a named volume because the image may run as a
+      # non-root user that could not write a fresh root-owned volume.
+      - ./generated/sygnal-data:/data
+      # Real APNs key goes here (secrets/apns.p8, mode 600, gitignored);
+      # mounted read-only. With no key, only the mock app is configured.
+      - ./secrets:/secrets:ro
+    # No in-container healthcheck: readiness is asserted by
+    # server/tests/push_e2e.py, which POSTs an unknown-app_id notification to
+    # /_matrix/push/v1/notify and expects 200 + rejected=[pushkey] (the same
+    # rejection semantics the Matrix Push Gateway spec defines).
     restart: unless-stopped
 
   continuwuity:

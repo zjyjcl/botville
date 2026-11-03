@@ -357,6 +357,19 @@ class InitScriptTest(unittest.TestCase):
         (self.tmp / "compose" / "synapse" / "homeserver.yaml.tmpl").write_text(
             TEMPLATE, encoding="utf-8"
         )
+        # init.sh also renders the sygnal templates (A1.2); placeholder-free
+        # one-liners keep these tests focused on the .env logic. The sygnal
+        # rendering itself has its own tests in test_push_sygnal.py.
+        sygnal_dir = self.tmp / "compose" / "sygnal"
+        sygnal_dir.mkdir()
+        (sygnal_dir / "sygnal.yaml.tmpl").write_text(
+            "sygnal:\n  logging: {}\napps:\n  org.botville.mock:\n"
+            "    type: botville_mock_pushkin.MockPushkin\n",
+            encoding="utf-8",
+        )
+        (sygnal_dir / "apns-app.yaml.part").write_text(
+            '  "${APNS_APP_ID}":\n    type: apns\n', encoding="utf-8"
+        )
         self.env_file = self.tmp / "compose" / ".env"
         self.generated = self.tmp / "compose" / "generated" / "synapse" / "homeserver.yaml"
 

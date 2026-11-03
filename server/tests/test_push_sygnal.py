@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""Hermetic tests for the A1.2 push gateway pieces: the mock pushkin and
+init.sh's sygnal rendering.
+
+No Docker and no sygnal install required: botville_mock_pushkin.py is loaded
+from server/compose/sygnal/ with a minimal `sygnal.notifications` stub (the
+real package is used instead when it happens to be importable, e.g. inside
+the sygnal image), and init.sh runs against sandboxed copies of the real
+.env.example/sygnal templates. Standard library only.
+
+Run:  python3 -m unittest discover -s server/tests -p "test_*.py" -v
+"""
+
+import asyncio
+import importlib.util
+import json
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import types
+import unittest
+from pathlib import Path
+
+SERVER_DIR = Path(__file__).resolve().parents[1]
+INIT = SERVER_DIR / "scripts" / "init.sh"
+COMPOSE_DIR = SERVER_DIR / "compose"
+MOCK_PUSHKIN = COMPOSE_DIR / "sygnal" / "botville_mock_pushkin.py"
+
+
+def _install_sygnal_stub_if_needed():
+    """Ensure `sygnal.notifications.Pushkin` is importable.
+
+    Returns the base class used (real when sygnal is installed, stub here
+    otherwise) — the stub mirrors the 0.17.0 interface the pushkin relies on:
+    Pushkin(name, sygnal, config) storing .cfg.
+    """
+    try:
+        from sygnal.notifications import Pushkin
+
+        return Pushkin
+    except ImportError:
+        pass
+
+    stub_pushkin = type(
+        "Pushkin",
+        (object,),
+        {
+            "__init__": lambda self, name, sygnal, config: setattr(
+                self, "__dict__", {"name": name, "sygnal": sygnal, "cfg": config}
+            )
+        },
+    )
+    sygnal_pkg = types.ModuleType("sygnal")
+    notifications = types.ModuleType("sygnal.notifications")
+    notifications.Pushkin = stub_pushkin
+    sygnal_pkg.notifications = notifications
+    sys.modules.setdefault("sygnal", sygnal_pkg)
+    sys.modules.setdefault("sygnal.notifications", notifications)
+    return stub_pushkin
+
+
+def load_mock_pushkin_module():
+    """Import botville_mock_pushkin.py by path with the (stubbed) sygnal."""
+    _install_sygnal_stub_if_needed()
+    spec = importlib.util.spec_from_file_location("botville_mock_pushkin", MOCK_PUSHKIN)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def make_notification(**overrides):
+    """A stand-in for sygnal.notifications.Notification (attributes only)."""
+    fields = {
+        "event_id": "$push-e2e-test",
+        "room_id": "!room:localhost",
+        "type": "m.room.message",
+        "prio": "high",
+    }
+    fields.update(overrides)
+    return types.SimpleNamespace(**fields)
+
+
+def make_device(**overrides):
+    """A stand-in for sygnal.notifications.Device (attributes only)."""
+    fields = {"app_id": "org.botville.mock", "pushkey": "mock-deadbeef", "data": {}}
+    fields.update(overrides)
+    return types.SimpleNamespace(**fields)
+
+
+class MockPushkinTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.base = _install_sygnal_stub_if_needed()
+        cls.module = load_mock_pushkin_module()
+
+    def make_pushkin(self, tmp, config=None):
+        path = str(Path(tmp) / "mock-pushes.jsonl")
+        cfg = {"pushes_path": path}
+        if config is not None:
+            cfg.update(config)
+        return self.module.MockPushkin("org.botville.mock", None, cfg), path
+
+    def test_subclasses_pushkin(self):
+        self.assertTrue(issubclass(self.module.MockPushkin, self.base))
+
+    def test_dispatch_writes_one_jsonl_line_and_rejects_nothing(self):
+        tmp = tempfile.mkdtemp(prefix="botville-mockpush-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        pushkin, path = self.make_pushkin(tmp)
+        before = int(time.time() * 1000)
+        record_notification = make_notification()
+
+        result = asyncio.run(
+            pushkin.dispatch_notification(
+                record_notification, make_device(), types.SimpleNamespace()
+            )
+        )
+
+        self.assertEqual(result, [])  # the mock never rejects a pushkey
+        with open(path, encoding="utf-8") as f:
+            lines = [line for line in f.read().splitlines() if line]
+        self.assertEqual(len(lines), 1)
+        record = json.loads(lines[0])
+        self.assertEqual(record["event_id"], "$push-e2e-test")
+        self.assertEqual(record["room_id"], "!room:localhost")
+        self.assertEqual(record["pushkey"], "mock-deadbeef")
+        self.assertEqual(record["app_id"], "org.botville.mock")
+        self.assertEqual(record["type"], "m.room.message")
+        self.assertGreaterEqual(record["received_at_ms"], before)
+
+    def test_second_dispatch_appends_not_truncates(self):
+        tmp = tempfile.mkdtemp(prefix="botville-mockpush-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        pushkin, path = self.make_pushkin(tmp)
+        context = types.SimpleNamespace()
+        for event_id in ("$one", "$two"):
+            asyncio.run(
+                pushkin.dispatch_notification(
+                    make_notification(event_id=event_id), make_device(), context
+                )
+            )
+        with open(path, encoding="utf-8") as f:
+            events = [json.loads(line)["event_id"] for line in f if line.strip()]
+        self.assertEqual(events, ["$one", "$two"])
+
+    def test_event_id_only_notification_renders_nulls(self):
+        # With format=event_id_only the homeserver omits most fields; sygnal
+        # leaves them None, and the record must still be written.
+        tmp = tempfile.mkdtemp(prefix="botville-mockpush-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        pushkin, path = self.make_pushkin(tmp)
+        sparse = make_notification(
+            event_id=None, type=None, prio=None, room_id="!room:localhost"
+        )
+        result = asyncio.run(
+            pushkin.dispatch_notification(sparse, make_device(), types.SimpleNamespace())
+        )
+        self.assertEqual(result, [])
+        with open(path, encoding="utf-8") as f:
+            record = json.loads(f.read().splitlines()[0])
+        self.assertIsNone(record["event_id"])
+        self.assertIsNone(record["type"])
+        self.assertEqual(record["room_id"], "!room:localhost")
+
+    def test_default_pushes_path_constant(self):
+        # The compose stack relies on the /data default documented in
+        # docs/deploy/push-sygnal.md; sygnal.yaml.tmpl sets it explicitly, so
+        # a change here must be synced with both.
+        self.assertEqual(self.module.DEFAULT_PUSHES_PATH, "/data/mock-pushes.jsonl")
+
+
+# --- init.sh: sygnal rendering + conditional APNs app ----------------------
+
+SYGNAL_ENV = """\
+# fixture .env for the sygnal rendering tests (all values are fakes)
+BOTVILLE_HOMESERVER=synapse
+BOTVILLE_SERVER_NAME=localhost
+BOTVILLE_HTTP_PORT=8008
+BOTVILLE_REGISTRATION_TOKEN=fixture-token
+BOTVILLE_PUSH_PORT=8019
+POSTGRES_USER=botville
+POSTGRES_PASSWORD=fixture
+POSTGRES_DB=synapse
+SYNAPSE_MACAROON_SECRET=fixture
+SYNAPSE_FORM_SECRET=fixture
+SYNAPSE_REGISTRATION_SHARED_SECRET=fixture
+"""
+
+APNS_DISABLED_ENV = SYGNAL_ENV + "BOTVILLE_APNS_ENABLED=false\n"
+
+APNS_PLACEHOLDER_ENV = SYGNAL_ENV + (
+    "BOTVILLE_APNS_ENABLED=true\n"
+    "APNS_APP_ID=org.botville.app.ios\n"
+    "APNS_TOPIC=<bundle-id>\n"
+    "APNS_KEY_ID=<key-id>\n"
+    "APNS_TEAM_ID=<team-id>\n"
+    "APNS_PLATFORM=sandbox\n"
+)
+
+APNS_REAL_ENV = SYGNAL_ENV + (
+    "BOTVILLE_APNS_ENABLED=true\n"
+    "APNS_APP_ID=org.botville.app.ios\n"
+    "APNS_TOPIC=org.botville.app.ios\n"
+    "APNS_KEY_ID=AB12CD34EF\n"
+    "APNS_TEAM_ID=WXYZ1234AB\n"
+    "APNS_PLATFORM=sandbox\n"
+)
+
+SYNAPSE_TEMPLATE = "server_name: ${BOTVILLE_SERVER_NAME}\nmacaroon: ${SYNAPSE_MACAROON_SECRET}\n"
+
+
+class SygnalInitScriptTest(unittest.TestCase):
+    maxDiff = None
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="botville-sygnal-init-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        (self.tmp / "scripts").mkdir()
+        (self.tmp / "compose" / "synapse").mkdir(parents=True)
+        shutil.copy(INIT, self.tmp / "scripts" / "init.sh")
+        # The real templates: these tests double as a guard that the shipped
+        # sygnal.yaml.tmpl / apns-app.yaml.part keep rendering cleanly.
+        (self.tmp / "compose" / "sygnal").mkdir(parents=True)
+        shutil.copytree(COMPOSE_DIR / "sygnal", self.tmp / "compose" / "sygnal", dirs_exist_ok=True)
+        (self.tmp / "compose" / "synapse" / "homeserver.yaml.tmpl").write_text(
+            SYNAPSE_TEMPLATE, encoding="utf-8"
+        )
+        self.env_file = self.tmp / "compose" / ".env"
+        self.generated = self.tmp / "compose" / "generated" / "sygnal" / "sygnal.yaml"
+
+    def run_init(self):
+        return subprocess.run(
+            ["bash", str(self.tmp / "scripts" / "init.sh")],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    def write_env(self, env_text):
+        """Write .env and a matching .env.example: the existing-.env path in
+        init.sh reads .env.example (missing-key merge, image-override
+        warnings), so it must exist and list the same keys to keep these
+        tests focused on the sygnal rendering."""
+        self.env_file.write_text(env_text, encoding="utf-8")
+        (self.tmp / "compose" / ".env.example").write_text(env_text, encoding="utf-8")
+
+    def sygnal_yaml(self):
+        return self.generated.read_text(encoding="utf-8")
+
+    def test_mock_only_by_default_and_data_dir_world_writable(self):
+        self.write_env(APNS_DISABLED_ENV)
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        yaml_text = self.sygnal_yaml()
+        self.assertIn('"org.botville.mock":', yaml_text)
+        self.assertIn("botville_mock_pushkin.MockPushkin", yaml_text)
+        self.assertNotIn("type: apns", yaml_text)
+        self.assertNotIn("${", yaml_text)
+        # The scratch dir bind-mounted at /data must stay writable whatever
+        # user the sygnal image runs as.
+        data_dir = self.tmp / "compose" / "generated" / "sygnal-data"
+        self.assertTrue(data_dir.is_dir())
+        self.assertEqual(stat.S_IMODE(data_dir.stat().st_mode), 0o777)
+
+    def test_apns_enabled_with_placeholder_values_is_skipped_with_warning(self):
+        self.write_env(APNS_PLACEHOLDER_ENV)
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        yaml_text = self.sygnal_yaml()
+        self.assertIn('"org.botville.mock":', yaml_text)
+        self.assertNotIn("type: apns", yaml_text)
+        # Names the missing pieces so the operator knows what to fill in.
+        warnings = proc.stderr
+        for key in ("APNS_TOPIC", "APNS_KEY_ID", "APNS_TEAM_ID", "secrets/apns.p8"):
+            self.assertIn(key, warnings)
+        self.assertIn("NOT rendered", warnings)
+
+    def test_apns_rendered_when_enabled_and_key_present(self):
+        self.write_env(APNS_REAL_ENV)
+        secrets_dir = self.tmp / "compose" / "secrets"
+        secrets_dir.mkdir()
+        (secrets_dir / "apns.p8").write_text("not-a-real-key-fixture\n", encoding="utf-8")
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        yaml_text = self.sygnal_yaml()
+        self.assertIn('"org.botville.mock":', yaml_text)  # mock stays available
+        self.assertIn('"org.botville.app.ios":', yaml_text)
+        self.assertIn("type: apns", yaml_text)
+        self.assertIn("keyfile: /secrets/apns.p8", yaml_text)
+        self.assertIn('key_id: "AB12CD34EF"', yaml_text)
+        self.assertIn('team_id: "WXYZ1234AB"', yaml_text)
+        self.assertIn('topic: "org.botville.app.ios"', yaml_text)
+        self.assertIn('platform: "sandbox"', yaml_text)
+        self.assertNotIn("${", yaml_text)
+        self.assertNotIn("<", yaml_text)  # no placeholder ever gets rendered
+        self.assertIn("rendered APNs app (org.botville.app.ios)", proc.stdout)
+
+    def test_apns_skipped_when_keyfile_missing(self):
+        self.write_env(APNS_REAL_ENV)
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("type: apns", self.sygnal_yaml())
+        self.assertIn("secrets/apns.p8", proc.stderr)
+
+    def test_re_run_does_not_duplicate_apns_app(self):
+        # init.sh rewrites sygnal.yaml from the template on every run, so a
+        # second run must not append the APNs app twice.
+        self.write_env(APNS_REAL_ENV)
+        secrets_dir = self.tmp / "compose" / "secrets"
+        secrets_dir.mkdir()
+        (secrets_dir / "apns.p8").write_text("not-a-real-key-fixture\n", encoding="utf-8")
+        self.run_init()
+        self.run_init()
+        self.assertEqual(self.sygnal_yaml().count("type: apns"), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -2,14 +2,14 @@
 
 | 项 | 内容 |
 |---|---|
-| 任务 | issue #69 —— Compose 四个服务镜像统一 pin tag + digest |
-| 适用范围 | `server/compose/docker-compose.yml` 与 `server/compose/.env.example` 中的全部镜像（Postgres、Synapse、Tuwunel、continuwuity） |
-| 信息截止 | 2026-11-04（当前 pin 表当日核实，均为多架构 index digest） |
-| 相关文档 | [compat/homeserver-compat.md](../compat/homeserver-compat.md) §1.2 / §3.9 第 5 条 / §4.3 第 3 条 |
+| 任务 | issue #69 —— Compose 服务镜像统一 pin tag + digest |
+| 适用范围 | `server/compose/docker-compose.yml` 与 `server/compose/.env.example` 中的全部镜像（Postgres、Synapse、Tuwunel、continuwuity，以及 push profile 的 Sygnal） |
+| 信息截止 | 2026-11-04（当前 pin 表当日核实，均为多架构 index digest；Sygnal 行见下方备注） |
+| 相关文档 | [compat/homeserver-compat.md](../compat/homeserver-compat.md) §1.2 / §3.9 第 5 条 / §4.3 第 3 条；Sygnal 部署见 [deploy/push-sygnal.md](../deploy/push-sygnal.md) |
 
 ## 1. 口径：默认 pin，可选跟 latest
 
-- **默认 pin**：四个服务的镜像默认写成 `tag@sha256:<digest>`，digest 取**多架构
+- **默认 pin**：上述服务的镜像默认写成 `tag@sha256:<digest>`，digest 取**多架构
   index digest**（不是单平台 manifest digest），同一份配置在任何架构上拉到的都是
   同一组镜像。升级因此是显式动作：改配置 → CI 全绿 → PR，不随上游 re-tag 漂移。
 - **可选跟 latest**：本地部署可在 `server/compose/.env` 把任一 `*_IMAGE` 覆盖为
@@ -33,6 +33,12 @@
 | synapse | `docker.io/matrixdotorg/synapse:v1.164.1@sha256:fa4aa980f279bcf26d4e7ecc2a2c9a701c73f2ebe8841da9bdcf3b2fdf693d75` |
 | tuwunel | `ghcr.io/matrix-construct/tuwunel:v1.9.4@sha256:0e86c6164d6c9f5b60291938eb61ad8395021c37fe58d47a963ea7edddbedaec` |
 | continuwuity | `ghcr.io/continuwuity/continuwuity:v26.9.1@sha256:c9c62bc5c0a641f3f713945c701b069c7bc30d2612b54d4a5de80a5be19d5420` |
+| sygnal（push profile，A1.2） | `docker.io/matrixdotorg/sygnal:v0.17.0@sha256:141f5e72fdf99a28e29ca87f3a46c19ed1cf21d5074aa3ef9df7c067e0c1c46a` |
+
+Sygnal 行备注（2026-11-04，A1.2 加入）：只有开 push profile（`make up PUSH=1`）
+才会拉取；digest 拼错会在 CI `push-e2e` job 实际拉镜像时暴露（同 §1 的 CI 兜底
+口径）。Sygnal 无 compat 文档条目，因此它的「同步处」是 §3 第 1/2/3/4 条
+共 4 处（第 5 条 homeserver-compat 不适用）。
 
 版本口径与 [compat/homeserver-compat.md](../compat/homeserver-compat.md) §1.2
 一致（Synapse v1.164.1 即 matrix-docker-ansible-deploy defaults 当时停留的参考

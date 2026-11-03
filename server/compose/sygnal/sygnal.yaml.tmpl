@@ -1,0 +1,35 @@
+# Sygnal push gateway configuration template (A1.2).
+#
+# server/scripts/init.sh renders this file into
+# server/compose/generated/sygnal/sygnal.yaml (gitignored). This template
+# intentionally references no $VAR-style placeholders; when
+# BOTVILLE_APNS_ENABLED=true and the prerequisites are in place (real
+# APNS_KEY_ID/APNS_TEAM_ID/APNS_TOPIC plus server/compose/secrets/apns.p8),
+# init.sh additionally appends the APNs app from sygnal/apns-app.yaml.part.
+# Edit this template, never the generated file.
+#
+# The mock app is the CI/local stand-in for APNs: server/tests/push_e2e.py
+# registers a pusher with app_id "org.botville.mock" and measures
+# homeserver -> sygnal latency from the JSONL records it writes. See
+# docs/deploy/push-sygnal.md.
+sygnal:
+  logging:
+    version: 1
+    formatters:
+      normal:
+        format: "%(asctime)s %(levelname)s:%(name)s:%(message)s"
+    handlers:
+      console:
+        class: logging.StreamHandler
+        stream: ext://sys.stdout
+    root:
+      level: INFO
+      handlers: [console]
+
+apps:
+  # Loaded from the file bind-mounted at /custom via PYTHONPATH (see
+  # docker-compose.yml, sygnal service); records every dispatch as one
+  # JSONL line at pushes_path instead of contacting a push backend.
+  "org.botville.mock":
+    type: botville_mock_pushkin.MockPushkin
+    pushes_path: /data/mock-pushes.jsonl
