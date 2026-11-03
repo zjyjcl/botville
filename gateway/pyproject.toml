@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 botville contributors
+#
+# 打包元数据与运行时依赖声明。
+# Windows (PEP 517) 用 setuptools 构建；标准库之外**没有**运行时依赖
+# （HTTP 服务器用 http.server，时区用 zoneinfo，Python 3.9+）。
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "botville-gateway"
+version = "0.1.0"
+description = "botville AI Gateway — 消息收发、平台限速、深夜静默（B1.1 雏形）"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "botville contributors" }]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+]
+dependencies = []
+
+[project.optional-dependencies]
+# 无运行时依赖。测试只用标准库 unittest。
+test = []
+
+[project.scripts]
+botville-gateway = "botville_gateway.__main__:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+botville_gateway = ["py.typed"]
