@@ -22,6 +22,10 @@
   GATEWAY_AUTH_TOKEN=<random> python3 -m botville_gateway
   GATEWAY_DEV_MODE=true python3 -m botville_gateway   # 显式开发模式，免鉴权
   GATEWAY_AUTH_TOKEN=<random> GATEWAY_PORT=9000 python3 -m botville_gateway
+
+`build_server(config, transport=None)` 的 `transport` 可选：测试/嵌入场景可以
+注入自定义 `MatrixTransport`（例如会 sleep 的假传输来验证锁外投递），
+不传时经 `build_transport(config)` 按配置选择 memory / appservice。
 """
 
 from __future__ import annotations
@@ -647,9 +651,10 @@ def build_server(
     config: Optional[Config] = None,
     transport: Optional[MatrixTransport] = None,
 ) -> GatewayServer:
-    """transport 缺省时按 config 构建（memory→内存假后端，B1.1 行为；
+    """transport 缺省时按 config 构建（memory→内存假后端；
     appservice→AppServiceMatrixTransport，不静默降级）；显式传入的
-    transport 优先（测试注入用）。"""
+    transport 优先（测试注入用，例如会 sleep 的假传输验证锁外投递）。
+    同时装配 UsageStore / LimitStore（B2.1）。"""
     cfg = config or load_config()
     if transport is None:
         transport = build_transport(cfg)

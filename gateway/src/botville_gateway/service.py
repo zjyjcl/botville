@@ -16,7 +16,17 @@
 
 幂等：同一 `Idempotency-Key` + 相同请求体返回缓存回执；同 key 不同请求体
 抛 `IdempotencyConflict`（HTTP 层映射 409 `idempotency.conflict`）。
-`queued` / `deferred` 同样进缓存（契约 §1.5）。
+`queued` / `deferred` 同样进缓存（契约 §1.5）。同 key 的**并发**请求靠一把
+按 key 拆分的互斥锁串行化（`_idempotency_guard`），不同 key / 无 key 的请求
+互不阻塞。
+
+**锁外投递（本提交）**：`send_ai_message` 拆成三段——
+
+1. 锁内：幂等查缓存 → 策略判断 → 预留名额（消息数 / token 预扣 / 最小间隔，
+   见 `policy.ReservationBook`）；
+2. 释放锁：调用 `transport.send_text`，慢的 Matrix 调用不再阻塞其它请求；
+3. 重新进锁：成功则提交（写 `UsageEvent`、计费、清预留），失败则回滚预留
+   （投递失败不计费、不占名额），然后抛出 `GatewayDeliveryError`。
 
 **容量上限**（#92）：幂等缓存 / deferred 队列 / 用量事件日志都有界
 （`MAX_IDEMPOTENCY_ENTRIES` / `MAX_QUEUE_ENTRIES` / `MAX_USAGE_EVENTS`），
@@ -38,13 +48,15 @@ from typing import Any, Dict, List, Optional, Tuple
 from .config import Config
 from .errors import GatewayDeliveryError, IdempotencyConflict, LimitError, ValidationError
 from .limits import LAYER_PLATFORM, LimitStore, PLATFORM_SCOPE_ID
-from .matrix import DeliveryError, MatrixTransport
+from .matrix import DeliveryError, MatrixTransport, SentEvent
 from .policy import (
     CODE_SILENT_HOURS,
     DECISION_BLOCK,
     DECISION_DEFER,
     PolicyDecision,
     PolicyEngine,
+    Reservation,
+    ReservationBook,
 )
 from .store import EventKind, UsageEvent, UsageStore
 from .timeutil import iso_utc, utcnow
@@ -83,6 +95,35 @@ class _IdempotencyEntry:
     created_at: datetime
 
 
+class _KeyGuard:
+    """同一 Idempotency-Key 的互斥闸门。
+
+    只有「同 key」的请求会被串行化（第二个请求等到第一个写完缓存后直接命中），
+    投递本身不持有 service 全局锁，因此不同 key / 无 key 的请求照常并行。
+    `waiters` 用于在最后一个请求离开时回收闸门，避免字典无界增长。
+    """
+
+    __slots__ = ("lock", "waiters")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.waiters = 0
+
+
+@dataclass(frozen=True)
+class _PreparedSend:
+    """锁内判断的产物：要么已是终态回执（blocked/deferred），要么带着预留去投递。"""
+
+    decision: PolicyDecision
+    receipt: Optional[Dict[str, Any]] = None
+    reservation: Optional[Reservation] = None
+    tokens_out: int = 0
+
+    @property
+    def needs_delivery(self) -> bool:
+        return self.reservation is not None
+
+
 class GatewayService:
     def __init__(
         self,
@@ -92,6 +133,7 @@ class GatewayService:
         limit_store: Optional[LimitStore] = None,
         *,
         now_fn=utcnow,
+        reservations: Optional[ReservationBook] = None,
     ) -> None:
         self._config = config
         self._transport = transport
@@ -99,10 +141,20 @@ class GatewayService:
         self._limits = (
             limit_store if limit_store is not None else LimitStore(config)
         )
-        self._engine = PolicyEngine(config, self._store, self._limits, now_fn=now_fn)
+        self._reservations = (
+            reservations if reservations is not None else ReservationBook()
+        )
+        self._engine = PolicyEngine(
+            config,
+            self._store,
+            self._limits,
+            now_fn=now_fn,
+            reservations=self._reservations,
+        )
         self._now = now_fn
         self._lock = threading.RLock()
         self._idempotency: "OrderedDict[str, _IdempotencyEntry]" = OrderedDict()
+        self._idempotency_guards: Dict[str, _KeyGuard] = {}
         self._queue: "OrderedDict[str, _QueueItem]" = OrderedDict()
         self._started_at = now_fn()
 
@@ -118,6 +170,11 @@ class GatewayService:
     @property
     def started_at(self) -> datetime:
         return self._started_at
+
+    @property
+    def pending_reservations(self) -> int:
+        """当前在途（已预留、尚未提交/回滚）的名额数。"""
+        return len(self._reservations)
 
     @property
     def now(self) -> datetime:
@@ -346,23 +403,108 @@ class GatewayService:
             raise ValidationError("request.invalid", "conversation_id is required", "conversation_id")
 
         validated = self._validate_send(payload)
-
         fingerprint = self._fingerprint(conversation_id, payload)
-        # 幂等查缓存 → 评估 → 投递/记账 → 写缓存，全程持同一把可重入锁：
-        # 否则两个同 key 并发请求会都 miss 缓存、都投递，幂等就失效了。
+
+        # 同 key 的并发请求在这里排队（只按 key 串行，不影响其它请求）。
+        guard = self._enter_idempotency_guard(idempotency_key)
+        try:
+            # ---- 第一段：锁内策略判断 + 预留名额 -------------------------
+            with self._lock:
+                if idempotency_key:
+                    entry = self._idempotency_get(idempotency_key)
+                    if entry is not None:
+                        if entry.fingerprint != fingerprint:
+                            raise IdempotencyConflict(idempotency_key)
+                        return json.loads(json.dumps(entry.receipt))  # 深拷贝，调用方改不坏缓存
+
+                prepared = self._prepare_send(
+                    conversation_id=conversation_id, **validated
+                )
+                if not prepared.needs_delivery:
+                    receipt = prepared.receipt
+                    assert receipt is not None
+                    if idempotency_key:
+                        self._idempotency_put(idempotency_key, fingerprint, receipt)
+                    return json.loads(json.dumps(receipt))
+
+                reservation = prepared.reservation
+                assert reservation is not None
+                decision = prepared.decision
+
+            # ---- 第二段：锁外投递（慢的 Matrix 调用不阻塞其它请求） ------
+            try:
+                event = self._transport.send_text(
+                    room_id=conversation_id,
+                    sender_id=validated["sender"],
+                    text=validated["text"],
+                    reply_to=validated["reply_to"],
+                    content_type=validated["content_type"],
+                )
+            except DeliveryError as exc:
+                # 投递失败：回滚预留，不记账、不占名额；再映射为 5xx 传输错误。
+                self._rollback(reservation)
+                raise GatewayDeliveryError(exc.code, exc.detail) from exc
+            except BaseException:
+                # 任何意外异常都不能把名额永久泄漏在账上。
+                self._rollback(reservation)
+                raise
+
+            # ---- 第三段：重新进锁提交（写 usage、计费、清预留） ----------
+            with self._lock:
+                self._reservations.release(reservation)
+                receipt = self._commit_send(
+                    decision=decision,
+                    reservation=reservation,
+                    event=event,
+                    conversation_id=conversation_id,
+                    sender=validated["sender"],
+                    text=validated["text"],
+                    content_type=validated["content_type"],
+                    reply_to=validated["reply_to"],
+                    mentions=validated["mentions"],
+                    metadata=validated["metadata"],
+                )
+                if idempotency_key:
+                    self._idempotency_put(idempotency_key, fingerprint, receipt)
+                return json.loads(json.dumps(receipt))
+        finally:
+            self._leave_idempotency_guard(idempotency_key, guard)
+
+    # ---------------------------------------------------- idempotency guards
+    def _enter_idempotency_guard(self, key: Optional[str]) -> Optional[_KeyGuard]:
+        """按 key 取互斥闸门并加锁；无 key 时返回 None（不做串行化）。"""
+        if not key:
+            return None
         with self._lock:
-            if idempotency_key:
-                entry = self._idempotency_get(idempotency_key)
-                if entry is not None:
-                    if entry.fingerprint != fingerprint:
-                        raise IdempotencyConflict(idempotency_key)
-                    return json.loads(json.dumps(entry.receipt))  # 深拷贝，调用方改不坏缓存
+            guard = self._idempotency_guards.get(key)
+            if guard is None:
+                guard = _KeyGuard()
+                self._idempotency_guards[key] = guard
+            guard.waiters += 1
+        try:
+            guard.lock.acquire()
+        except BaseException:
+            with self._lock:
+                self._discard_guard_locked(key, guard)
+            raise
+        return guard
 
-            receipt = self._send_locked(conversation_id=conversation_id, **validated)
+    def _leave_idempotency_guard(
+        self, key: Optional[str], guard: Optional[_KeyGuard]
+    ) -> None:
+        if guard is None or key is None:
+            return
+        try:
+            guard.lock.release()
+        finally:
+            with self._lock:
+                self._discard_guard_locked(key, guard)
 
-            if idempotency_key:
-                self._idempotency_put(idempotency_key, fingerprint, receipt)
-            return json.loads(json.dumps(receipt))
+    def _discard_guard_locked(self, key: str, guard: _KeyGuard) -> None:
+        """调用方须持有 `self._lock`；最后一个等待者离开时回收闸门。"""
+        guard.waiters -= 1
+        if guard.waiters <= 0 and self._idempotency_guards.get(key) is guard:
+            self._idempotency_guards.pop(key, None)
 
     # ------------------------------------------------------------ internals
     def _validate_send(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -463,7 +605,7 @@ class GatewayService:
             "allow_deferred": allow_deferred,
         }
 
-    def _send_locked(
+    def _prepare_send(
         self,
         *,
         conversation_id: str,
@@ -475,8 +617,13 @@ class GatewayService:
         metadata: Optional[Dict[str, str]],
         token_estimate: Optional[int],
         allow_deferred: bool,
-    ) -> Dict[str, Any]:
-        """调用方必须已持有 `self._lock`（RLock，可重入）。"""
+    ) -> _PreparedSend:
+        """锁内阶段：策略判断 + 预留名额。调用方必须已持有 `self._lock`。
+
+        - block / defer 在这里直接产出终态回执（不需要投递，也就没有预留）；
+        - allow 只**预留**名额并返回，真正的 `send_text` 必须在锁外调用，
+          否则一条慢投递会把所有请求挡在锁后面。
+        """
         now = self._now()
         decision = self._engine.evaluate(
             persona_id=sender,
@@ -498,7 +645,7 @@ class GatewayService:
                     at=now,
                 )
             )
-            return self._receipt(decision, outcome="blocked")
+            return _PreparedSend(decision, receipt=self._receipt(decision, outcome="blocked"))
 
         if decision.decision == DECISION_DEFER:
             queue_id = f"queue_{uuid.uuid4().hex}"
@@ -523,21 +670,43 @@ class GatewayService:
                     at=now,
                 )
             )
-            return self._receipt(decision, outcome="deferred", queue_id=queue_id)
-
-        # allow：先投递再记账。投递失败不占名额（名额只记实际送达的消息）。
-        try:
-            event = self._transport.send_text(
-                room_id=conversation_id,
-                sender_id=sender,
-                text=text,
-                reply_to=reply_to,
-                content_type=content_type,
+            return _PreparedSend(
+                decision,
+                receipt=self._receipt(decision, outcome="deferred", queue_id=queue_id),
             )
-        except DeliveryError as exc:
-            # 传输失败是 5xx 传输层错误，不是策略结论；不记 usage，不占名额。
-            raise GatewayDeliveryError(exc.code, exc.detail) from exc
 
+        # allow：先预留名额（消息数 / token 预扣 / 最小间隔），投递完成后再提交。
+        reservation = self._reservations.reserve(
+            persona_id=sender, tokens=decision.estimated_tokens, at=now
+        )
+        return _PreparedSend(
+            decision, reservation=reservation, tokens_out=decision.estimated_tokens
+        )
+
+    def _rollback(self, reservation: Reservation) -> None:
+        """锁外投递失败：丢弃预留（不写 usage、不占名额）。"""
+        with self._lock:
+            self._reservations.release(reservation)
+
+    def _commit_send(
+        self,
+        *,
+        decision: PolicyDecision,
+        reservation: Reservation,
+        event: SentEvent,
+        conversation_id: str,
+        sender: str,
+        text: str,
+        content_type: str,
+        reply_to: Optional[str],
+        mentions: Optional[List[str]],
+        metadata: Optional[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        """锁内提交：调用方须持锁，且已释放（或即将释放）该预留。
+
+        以预留时刻 `reservation.at` 作为 `recorded_at`：策略判断发生在那一刻，
+        投递耗时不应改变这条消息落在哪个滑动窗口里。
+        """
         tokens_out = decision.estimated_tokens
         self._store.append(
             UsageEvent.make(
@@ -545,7 +714,7 @@ class GatewayService:
                 persona_id=sender,
                 conversation_id=conversation_id,
                 text=text,
-                at=now,
+                at=reservation.at,
                 tokens_out=tokens_out,
             )
         )

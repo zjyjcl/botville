@@ -17,6 +17,11 @@
 **token 预算**：窗口内 `tokens_in + tokens_out` 之和 + 本次 `token_estimate`
 （预扣）不得超过 `tokens_per_window`。实际入账由 service 在投递成功后写入。
 
+**在途预留（锁外投递）**：send 流程在锁内判断并预留名额，释放锁调用 transport，
+回到锁内提交（写 UsageEvent）或回滚（丢弃预留）。投递期间这条消息已经「占了
+名额」，因此 `ReservationBook` 里的在途预留必须计入消息数、token 与最小间隔，
+否则并发请求会同时通过同一条限额。没有 ReservationBook（单测旧路径）时行为不变。
+
 **静默时段**按 IANA 时区把 `now` 转到本地时间，用分钟数判断是否落在
 `[start, end)` 内；`start > end` 表示跨午夜。三层中任意一层开启即生效。
 
@@ -32,6 +37,8 @@
 from __future__ import annotations
 
 import math
+import threading
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -149,6 +156,58 @@ class _SilentView:
     source_id: str
 
 
+@dataclass(frozen=True)
+class Reservation:
+    """锁外投递期间占用的名额（一条在途消息）。
+
+    `at` 是预留时刻：它同时充当「这条消息进入滑动窗口的时间」，提交时会成为
+    UsageEvent 的 `recorded_at`，所以投递耗时不会被算进窗口起点之前。
+    """
+
+    id: str
+    persona_id: str
+    tokens: int
+    at: datetime
+
+
+class ReservationBook:
+    """在途预留的临时账本（线程安全）。
+
+    service 在锁内 `reserve()`、锁外投递、回到锁内 `commit()` / `release()`。
+    评估时把在途预留当作已用额度，因此：
+    - 消息数：`limit=N` 时最多 N 条同时在途/已送达；
+    - token：在途的 `tokens` 先占预算，失败回滚后额度立刻可用；
+    - 最小间隔：在途消息的 `at` 也算「最近一次发言」，避免并发击穿间隔限制。
+
+    预留条目是内存里的临时状态，不写 UsageEvent、不进账单（投递失败不计费）。
+    """
+
+    def __init__(self) -> None:
+        self._items: Dict[str, Reservation] = {}
+        self._lock = threading.Lock()
+
+    def reserve(self, *, persona_id: str, tokens: int, at: datetime) -> Reservation:
+        reservation = Reservation(
+            id=f"res_{uuid.uuid4().hex}", persona_id=persona_id, tokens=tokens, at=at
+        )
+        with self._lock:
+            self._items[reservation.id] = reservation
+        return reservation
+
+    def release(self, reservation: Reservation) -> bool:
+        """回滚预留；返回该预留是否仍在账上（重复回滚返回 False）。"""
+        with self._lock:
+            return self._items.pop(reservation.id, None) is not None
+
+    def for_persona(self, persona_id: str) -> List[Reservation]:
+        with self._lock:
+            return [r for r in self._items.values() if r.persona_id == persona_id]
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+
 class PolicyEngine:
     def __init__(
         self,
@@ -157,11 +216,14 @@ class PolicyEngine:
         limit_store: Optional[LimitStore] = None,
         *,
         now_fn=utcnow,
+        reservations: Optional[ReservationBook] = None,
     ) -> None:
         self._config = config
         self._store = store
         self._limit_store = limit_store
         self._now = now_fn
+        # 锁外投递时的在途预留；None 时走旧路径（不把在途算进已用额度）。
+        self._reservations = reservations
 
     # ------------------------------------------------------------------ API
     def evaluate(
@@ -387,7 +449,6 @@ class PolicyEngine:
         if effective is not None:
             item = self._limits_for(effective, "messages_per_window")
             if item is None:
-                # 平台层省略 = 不限；owner/peer 不可能放宽，故整体不限。
                 return PolicyCheck(
                     key="messages.window",
                     layer=LAYER_PLATFORM,
@@ -396,7 +457,6 @@ class PolicyEngine:
                 )
             limit, layer, source_id = item
         else:
-            # 无 LimitStore：沿用 Config 语义（0 = 关闭限速）
             if self._config.rate_limit_messages <= 0:
                 return PolicyCheck(
                     key="messages.window",
@@ -415,10 +475,15 @@ class PolicyEngine:
             key=lambda e: e.recorded_at,
         )
         used = len(events)
+
+        # 把在途预留（锁外投递中）也算作已用名额，防止并发击穿。
+        if self._reservations is not None:
+            inflight = len(self._reservations.for_persona(persona_id))
+            used += inflight
+
         allowed = used < limit
         remaining = max(0, limit - used)
         if events:
-            # 第 used−limit+1 早的事件离开窗口时，名额才腾出来（used>limit 时跳过前几条）
             release_index = min(len(events) - 1, max(0, used - limit))
             release_at = events[release_index].recorded_at + timedelta(seconds=window)
         else:
@@ -466,6 +531,9 @@ class PolicyEngine:
             key=lambda e: e.recorded_at,
         )
         used = sum(e.tokens_in + e.tokens_out for e in events)
+        # 在途预留先占预算：并发请求不能各自看到同一份剩余额度。
+        if self._reservations is not None:
+            used += sum(r.tokens for r in self._reservations.for_persona(persona_id))
         allowed = used + estimated <= budget
         remaining = max(0, budget - used)
 
@@ -520,12 +588,23 @@ class PolicyEngine:
                 limit=min_seconds,
                 source_id=source_id,
             )
+        since = now - timedelta(seconds=min_seconds)
         events = self._store.events_in_window(
             persona_id=persona_id,
             kind=EventKind.SENT,
-            since=now - timedelta(seconds=min_seconds),
+            since=since,
         )
-        if not events:
+        # 在途预留同样算「最近一次发言」：并发请求不能在间隔窗口内同时放行。
+        latest_at: Optional[datetime] = None
+        if events:
+            latest_at = max(e.recorded_at for e in events)
+        if self._reservations is not None:
+            for reservation in self._reservations.for_persona(persona_id):
+                if reservation.at > since and (
+                    latest_at is None or reservation.at > latest_at
+                ):
+                    latest_at = reservation.at
+        if latest_at is None:
             return PolicyCheck(
                 key="min_interval",
                 layer=layer,
@@ -533,8 +612,7 @@ class PolicyEngine:
                 limit=min_seconds,
                 source_id=source_id,
             )
-        latest = max(events, key=lambda e: e.recorded_at)
-        release_at = latest.recorded_at + timedelta(seconds=min_seconds)
+        release_at = latest_at + timedelta(seconds=min_seconds)
         return PolicyCheck(
             key="min_interval",
             layer=layer,
