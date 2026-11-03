@@ -16,6 +16,9 @@
 make up              # core 一键启动：Synapse + Postgres，http://127.0.0.1:8008
 make up HS=tuwunel   # 换 Tuwunel（continuwuity 同理）
 make smoke           # 标准库冒烟测试：注册→登录→建房(v10)→发消息→回读→sync
+make backup          # 备份到 ./backups/<UTC时间戳>/（目录 700、文件 600，A1.1）
+make restore RESTORE_DIR=backups/<时间戳>   # 破坏性恢复（自动 --yes）
+make e2e             # 验收：注册→私聊→建群；E2E_PHASE=verify 复核备份恢复
 make logs            # 跟踪日志
 make ps              # 容器状态
 make down            # 停止（保留数据卷；手动 down -v 可清空）
@@ -31,6 +34,10 @@ make down            # 停止（保留数据卷；手动 down -v 可清空）
   [docs/ops/upgrade-images.md](../docs/ops/upgrade-images.md) §5。
 - 三个 homeserver 容器内都监听 8008，宿主仅绑定 `127.0.0.1:${BOTVILLE_HTTP_PORT:-8008}`；
   需要外部访问时自行加反向代理。
+- **compose 项目名**：make 与备份/恢复脚本都带 `-p ${COMPOSE_PROJECT_NAME}`（`.env`
+  提供，默认 `botville`，卷名 `<project>_*`）。同机多实例必须每套用独立项目名 +
+  独立 `BOTVILLE_HTTP_PORT`，否则 `down -v` 会误删彼此的卷；详见
+  [docs/deploy/z423-synapse.md](../docs/deploy/z423-synapse.md) 的多实例一节。
 - 注册策略：tuwunel / continuwuity 始终令牌门控（`BOTVILLE_REGISTRATION_TOKEN`）；
   Synapse 默认关闭注册，CI 中通过 `BOTVILLE_OPEN_REGISTRATION=true` 走 dummy 流程。
   本地想对 Synapse 跑 `make smoke` 时，把 `.env` 里该值改为 `true` 再 `make up`。
@@ -82,9 +89,13 @@ server/
 │   └── generated/                # 渲染产物，gitignore
 ├── scripts/
 │   ├── init.sh                   # .env 引导/补齐缺失键 + 模板渲染
-│   └── bootstrap-continuwuity.sh # continuwuity 首启引导注册（标准 UIA，仅 CS API）
+│   ├── bootstrap-continuwuity.sh # continuwuity 首启引导注册（标准 UIA，仅 CS API）
+│   ├── lib.sh                    # backup/restore 共享辅助函数
+│   ├── backup-synapse.sh         # DB dump + 数据卷归档 + manifest（A1.1）
+│   └── restore-synapse.sh        # 校验 sha256 后破坏性恢复（需 --yes，A1.1）
 └── tests/
     ├── smoke.py                  # 仅标准库的 CS API 冒烟测试
+    ├── e2e_synapse.py            # seed/verify 两阶段验收测试（A1.1）
     └── test_bootstrap_continuwuity.py  # bootstrap/init 脚本 mock 单测（CI lint 跑）
 ```
 

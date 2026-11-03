@@ -4,6 +4,9 @@
 #         standard-library smoke test against 127.0.0.1:8008.
 #         All three profiles are required-green; images are pinned
 #         (tag@sha256 digest), so failures are real failures.
+# backup-restore (A1.1, synapse only): init -> open registration -> up ->
+#         e2e seed -> backup -> down -v (wipe volumes) -> up (fresh stack) ->
+#         restore -> e2e verify, proving the backup is actually restorable.
 # lint:   compose config for all three profiles, shellcheck, python syntax,
 #         stdlib unit tests for the bootstrap/init scripts (no Docker),
 #         notify/gateway contract validation, a guard that .env.example
@@ -62,6 +65,62 @@ jobs:
             --env-file server/compose/.env --profile ${{ matrix.homeserver }} \
             down -v --remove-orphans
 
+  backup-restore:
+    name: backup-restore (synapse)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Init .env and open registration
+        run: |
+          bash server/scripts/init.sh
+          # CI-only: open registration so e2e seed can register users
+          # (same escape hatch as the smoke job).
+          sed -i "s/^BOTVILLE_OPEN_REGISTRATION=.*/BOTVILLE_OPEN_REGISTRATION=true/" server/compose/.env
+
+      - name: Start stack
+        run: make up HS=synapse
+
+      - name: Seed e2e data (alice/bob/carol, DM, group)
+        run: make e2e E2E_PHASE=seed
+
+      - name: Backup
+        run: |
+          set -o pipefail
+          bash server/scripts/backup-synapse.sh
+          # The script records its target dir in backups/.last-backup; reading
+          # it from there (instead of piping to tail) cannot swallow a failure.
+          backup_dir="$(cat backups/.last-backup)"
+          echo "backup dir: ${backup_dir}"
+          echo "RESTORE_DIR=${backup_dir}" >> "$GITHUB_ENV"
+
+      - name: Wipe volumes (simulated disaster)
+        run: |
+          docker compose -f server/compose/docker-compose.yml \
+            --env-file server/compose/.env --profile synapse down -v --remove-orphans
+
+      - name: Restart empty stack
+        run: make up HS=synapse
+
+      - name: Restore backup
+        run: make restore RESTORE_DIR="$RESTORE_DIR"
+
+      - name: Verify e2e data survived
+        run: make e2e E2E_PHASE=verify
+
+      - name: Dump logs
+        if: failure()
+        run: |
+          docker compose -f server/compose/docker-compose.yml \
+            --env-file server/compose/.env --profile synapse logs --no-color
+
+      - name: Teardown
+        if: always()
+        run: |
+          docker compose -f server/compose/docker-compose.yml \
+            --env-file server/compose/.env --profile synapse down -v --remove-orphans
+
   lint:
     name: lint
     runs-on: ubuntu-latest
@@ -71,11 +130,11 @@ jobs:
 
       - name: shellcheck scripts
         run: |
-          shellcheck server/scripts/init.sh
-          shellcheck server/scripts/bootstrap-continuwuity.sh
+          shellcheck -x server/scripts/init.sh server/scripts/bootstrap-continuwuity.sh \
+            server/scripts/lib.sh server/scripts/backup-synapse.sh server/scripts/restore-synapse.sh
 
       - name: Python syntax
-        run: python3 -m py_compile server/tests/smoke.py
+        run: python3 -m py_compile server/tests/smoke.py server/tests/e2e_synapse.py
 
       - name: Bootstrap/init script unit tests (stdlib mock, no Docker)
         run: python3 -m unittest discover -s server/tests -p "test_*.py" -v
@@ -115,6 +174,7 @@ jobs:
               "BOTVILLE_REGISTRATION_TOKEN": "<change-me>",
               "BOTVILLE_ADMIN_USER": "botville-admin",
               "BOTVILLE_ADMIN_PASSWORD": "<change-me>",
+              "COMPOSE_PROJECT_NAME": "botville",
               "POSTGRES_USER": "botville",
               "POSTGRES_PASSWORD": "<change-me>",
               "POSTGRES_DB": "synapse",
