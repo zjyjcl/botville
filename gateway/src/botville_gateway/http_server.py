@@ -7,9 +7,16 @@
   GET  /health
   POST /v1/policy/evaluate
   POST /v1/conversations/{id}/messages
+  GET  /v1/limits
+  PUT  /v1/limits
+  GET  /v1/usage
+  GET  /v1/usage/events
 
 错误体遵循 RFC 9457 problem+json（契约 §1.3）。所有响应（含 4xx/5xx）都带
 `X-Request-Id`，且 `Cache-Control: no-store`。
+
+**请求体上限 1 MiB**（契约 §1.1）：超限返回 400 `request.invalid`，
+`errors[].code` 为 `too_large`；不新增 413 状态码（契约状态码集合不变）。
 
 使用方式：
   GATEWAY_AUTH_TOKEN=<random> python3 -m botville_gateway
@@ -25,16 +32,18 @@ import json
 import re
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .config import Config, load_config
-from .matrix import InMemoryMatrixTransport, MatrixTransport
-from .service import (
+from .errors import (
     GatewayDeliveryError,
-    GatewayService,
     IdempotencyConflict,
+    LimitError,
     ValidationError,
 )
+from .limits import LimitStore
+from .matrix import InMemoryMatrixTransport, MatrixTransport
+from .service import GatewayService
 from .store import UsageStore
 from .timeutil import iso_utc
 
@@ -44,6 +53,7 @@ _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 _JSON_MEDIA_TYPE = "application/json"
 
 # 请求体上限：远大于 max_message_chars（8000），同时防止内存拖垮。
+# 契约 §1.1 明确该上限（1 MiB）；超限 → 400 problem.invalid + errors[].code=too_large。
 MAX_BODY_BYTES = 1_048_576  # 1 MiB
 
 
@@ -147,7 +157,6 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             problem=True,
             extra_headers=extra_headers,
         )
-
     def _send_json(
         self,
         status: int,
@@ -212,11 +221,19 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 detail="Content-Length must not be negative",
             )
         if length > MAX_BODY_BYTES:
+            # 契约 §1.1：不新增 413；用 400 request.invalid，errors[].code = too_large。
             return None, self._problem_body(
                 400,
                 "request.invalid",
                 "Request body too large",
-                detail=f"body exceeds {MAX_BODY_BYTES} bytes",
+                detail=f"body exceeds {MAX_BODY_BYTES} bytes (1 MiB)",
+                errors=[
+                    {
+                        "field": "body",
+                        "code": "too_large",
+                        "message": f"request body must not exceed {MAX_BODY_BYTES} bytes",
+                    }
+                ],
             )
 
         if length == 0:
@@ -274,9 +291,19 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         self._request_id()
         try:
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
             if path in ("/health", "/v1/health"):
                 self._handle_health()
+                return
+            if not self._auth_ok():
+                return
+            if path == "/v1/limits":
+                self._handle_get_limits(parsed.query)
+            elif path == "/v1/usage":
+                self._handle_get_usage(parsed.query)
+            elif path == "/v1/usage/events":
+                self._handle_list_usage_events(parsed.query)
             else:
                 self._send_problem(404, "not_found", "Not Found")
         except (BrokenPipeError, ConnectionResetError):
@@ -315,7 +342,27 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             detail=f"{self.command} is not supported on this endpoint",
         )
 
-    do_PUT = _method_not_allowed
+    def do_PUT(self) -> None:
+        """只有 `PUT /v1/limits` 支持 PUT；其余路径 405。"""
+        self._request_id()
+        try:
+            path = urlparse(self.path).path
+            if not self._auth_ok():
+                return
+            if path != "/v1/limits":
+                self._send_problem(
+                    405,
+                    "request.invalid",
+                    "Method Not Allowed",
+                    detail=f"PUT is not supported on {path}",
+                )
+                return
+            self._handle_put_limits()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception as exc:  # pragma: no cover - 兜底
+            self._internal_error(exc)
+
     do_PATCH = _method_not_allowed
     do_DELETE = _method_not_allowed
     do_OPTIONS = _method_not_allowed
@@ -446,6 +493,123 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             return
         self._send_json(200, receipt)
 
+    # ------------------------------------------------------- limits / usage
+    def _handle_get_limits(self, query: str) -> None:
+        svc: GatewayService = self.server.service  # type: ignore[attr-defined]
+        params = parse_qs(query, keep_blank_values=True)
+        try:
+            result = svc.get_limits(
+                persona_id=_single(params, "persona_id"),
+                conversation_id=_single(params, "conversation_id"),
+                peer_id=_single(params, "peer_id"),
+                include_platform=_bool_param(params, "include_platform", True),
+            )
+        except ValidationError as exc:
+            self._send_validation_error(exc)
+            return
+        self._send_json(200, result)
+
+    def _handle_put_limits(self) -> None:
+        svc: GatewayService = self.server.service  # type: ignore[attr-defined]
+        body, err = self._read_json()
+        if err:
+            self._send_json(400, err, problem=True)
+            return
+        assert body is not None
+        try:
+            result = svc.put_limits(body)
+        except ValidationError as exc:
+            self._send_validation_error(exc)
+            return
+        except LimitError as exc:
+            self._send_problem(
+                422,
+                exc.code,
+                "Limit out of range",
+                detail=exc.detail,
+                errors=exc.errors or None,
+            )
+            return
+        self._send_json(200, result)
+
+    def _handle_get_usage(self, query: str) -> None:
+        svc: GatewayService = self.server.service  # type: ignore[attr-defined]
+        params = parse_qs(query, keep_blank_values=True)
+        try:
+            result = svc.get_usage(
+                persona_id=_single(params, "persona_id"),
+                conversation_id=_single(params, "conversation_id"),
+                from_=_single(params, "from"),
+                to=_single(params, "to"),
+                timezone_name=_single(params, "timezone"),
+                group_by=_single(params, "group_by") or "conversation",
+            )
+        except ValidationError as exc:
+            self._send_validation_error(exc)
+            return
+        self._send_json(200, result)
+
+    def _handle_list_usage_events(self, query: str) -> None:
+        svc: GatewayService = self.server.service  # type: ignore[attr-defined]
+        params = parse_qs(query, keep_blank_values=True)
+        try:
+            limit = _int_param(params, "limit", 20)
+            result = svc.list_usage_events(
+                persona_id=_single(params, "persona_id"),
+                kind=_single(params, "kind"),
+                from_=_single(params, "from"),
+                to=_single(params, "to"),
+                cursor=_single(params, "cursor"),
+                limit=limit,
+            )
+        except ValidationError as exc:
+            self._send_validation_error(exc)
+            return
+        self._send_json(200, result)
+
+    def _send_validation_error(self, exc: ValidationError) -> None:
+        errors = None
+        if exc.field:
+            errors = [{"field": exc.field, "code": exc.code, "message": exc.detail}]
+        self._send_problem(
+            400, exc.code, "Request validation failed",
+            detail=exc.detail, errors=errors,
+        )
+
+
+def _single(params: Dict[str, List[str]], name: str) -> Optional[str]:
+    values = params.get(name)
+    if not values:
+        return None
+    return values[-1]
+
+
+def _bool_param(params: Dict[str, List[str]], name: str, default: bool) -> bool:
+    raw = _single(params, name)
+    if raw is None or raw == "":
+        return default
+    lowered = raw.strip().lower()
+    if lowered in ("1", "true", "yes", "on"):
+        return True
+    if lowered in ("0", "false", "no", "off"):
+        return False
+    raise ValidationError(
+        "request.invalid", f"'{name}' must be a boolean", name
+    )
+
+
+def _int_param(params: Dict[str, List[str]], name: str, default: int) -> int:
+    raw = _single(params, name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValidationError(
+            "request.invalid", f"'{name}' must be an integer", name
+        ) from exc
+    return value
+
 
 class GatewayServer(http.server.ThreadingHTTPServer):
     """注入 config / service / transport，供 handler 访问。"""
@@ -489,6 +653,7 @@ def build_server(
     cfg = config or load_config()
     if transport is None:
         transport = build_transport(cfg)
-    store = UsageStore()
-    svc = GatewayService(cfg, transport, store)
+    store = UsageStore(cfg.max_usage_events)
+    limit_store = LimitStore(cfg)
+    svc = GatewayService(cfg, transport, store, limit_store)
     return GatewayServer(cfg, svc, transport)

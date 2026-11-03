@@ -15,32 +15,36 @@
 | `openapi/examples/` | 26 个请求/响应示例，全部对 schema 校验 |
 | `docs/contract.md` | 人类可读契约说明：功能清单规范、卡片描述规范、版本规则、评审清单 |
 | `scripts/validate_openapi.py` | 离线校验脚本（文档结构 + 示例 schema） |
-| `src/botville_gateway/` | **B1.1 网关雏形 + A1.3 appservice 传输 Python 包**（见下节） |
+| `scripts/coverage_check.py` | 零依赖行覆盖率脚本（`sys.settrace`，阈值默认 80%） |
+| `src/botville_gateway/` | **B2.1 网关实现 + A1.3 appservice 传输**（见下节） |
 | `tests/` | 单元/集成测试（stdlib `unittest`，无第三方依赖） |
 | `pyproject.toml` | 打包元数据；**运行时零依赖**（仅标准库） |
 | `.env.example` | 环境变量占位（不含真实密钥） |
 
 ---
 
-## B1.1 网关雏形 / Gateway skeleton
+## B2.1 网关实现 / Gateway
 
-> 任务：Issue #15「超限拦截并记录」的最小可合并实现（B1.1）；
+> 任务：Issue #15「超限拦截并记录」+ Issue #17「三层限额与 token 预算」；
 > A1.3 起新增 appservice 传输（真实 homeserver 代发）。
-> 收发、平台级限速、深夜静默；默认仍是内存假后端，不依赖真 Matrix homeserver。
+> 收发、三层限额（platform/owner/peer）、token 预算、深夜静默、用量账单；
+> 默认仍是内存假后端，appservice 模式下对接真实 homeserver。
 
 ### 包结构
 
 ```
 gateway/src/botville_gateway/
-├── __init__.py          导出 Config / PolicyEngine / GatewayService 等
+├── __init__.py          导出 Config / LimitStore / PolicyEngine / GatewayService 等
 ├── __main__.py          python -m botville_gateway 本地启动（含启动健康校验）
 ├── config.py            环境变量 → 不可变 Config（构造时校验）
+├── errors.py            异常类（ValidationError / LimitError / IdempotencyConflict）
+├── limits.py            三层限额存储、规则校验、逐项取最严（EffectiveLimits）
 ├── matrix.py            MatrixTransport Protocol + InMemoryMatrixTransport
 ├── matrix_appservice.py AppServiceMatrixTransport（AS token masquerade，A1.3）
-├── policy.py            限速（滑动窗口）+ 深夜静默 → PolicyDecision
-├── service.py           send_ai_message() 编排、幂等、回执组装
-├── store.py             内存 UsageEvent 日志（append-only、线程安全）
-├── http_server.py       stdlib HTTP 雏形 + build_transport 工厂（按 config 选传输）
+├── policy.py            三层限速（消息/token/间隔）+ 按日预算 + 静默 → PolicyDecision
+├── service.py           send_ai_message() 编排、幂等、/limits 与 /usage 查询
+├── store.py             内存 UsageEvent 日志（append-only、容量有界、不存正文）
+├── http_server.py       stdlib HTTP + build_transport 工厂（/health、/policy、/messages、/limits、/usage）
 └── timeutil.py          UTC `Z` 结尾的 RFC 3339 格式化
 ```
 
@@ -80,9 +84,16 @@ curl -s -X POST localhost:8080/v1/conversations/conv_demo/messages \
 | GET | `/health` | `getHealth` | 免鉴权；返回 Health 形态 |
 | POST | `/v1/policy/evaluate` | `evaluatePolicy` | 预检，不投递、不占额度 |
 | POST | `/v1/conversations/{id}/messages` | `sendMessage` | 完整裁决 + 投递 |
+| GET | `/v1/limits` | `getLimits` | 三层限额原始规则与逐项生效值 |
+| PUT | `/v1/limits` | `putLimits` | 写入 owner / peer 层（平台层只读） |
+| GET | `/v1/usage` | `getUsage` | 用量汇总、预算与分桶 |
+| GET | `/v1/usage/events` | `listUsageEvents` | 用量账单明细分页（不含正文） |
 
 错误统一 `application/problem+json`（RFC 9457）。**策略拦截不是 HTTP 错误**：
 `blocked` 返回 **200**，不是 429/403（契约 `docs/contract.md` §1.4）。
+
+**请求体上限 1 MiB**：超限返回 `400 request.invalid`，`errors[].code` 为 `too_large`
+（契约 §1.1.1，不新增 413）。
 
 ### 与 B0.1 契约的对齐
 
@@ -97,19 +108,28 @@ curl -s -X POST localhost:8080/v1/conversations/conv_demo/messages \
 | 拦截记 `usage_events kind=blocked` | ✅ `UsageStore`，可查询 |
 | `decision.reasons[]` / `checks[]` 字段名与取值 | ✅ 对齐 `PolicyReason` / `PolicyCheck` |
 | `date-time` 一律 UTC、`Z` 结尾 | ✅ `timeutil.iso_utc()` |
-| `Idempotency-Key` 同 key 同体返回原回执、异体 409 | ✅ 内存缓存；长度 8–128（超长 → 400） |
-| `PolicyDecision` **不含** `may_clear_at` / `same_content_allowed` | ✅ 只在 `MessageReceipt` 上（`to_dict()` 剔除了内部字段） |
+| `Idempotency-Key` 同 key 同体返回原回执、异体 409 | ✅ 内存缓存（有界，LRU 淘汰）；长度 8–128（超长 → 400） |
+| `PolicyDecision` **不含** `may_clear_at` / `same_content_allowed` | ✅ 只在 `MessageReceipt` 上 |
 | 无效令牌 → `401 auth.invalid_token`；每个响应带 `X-Request-Id` | ✅ 统一由 `_send_json()` 注入 |
 | `/health` 的 `status` 非 `ok` → `503`（结构相同） | ✅ 未接入的依赖不报假 `ok` |
-| 请求体：顶层必须是对象、`Content-Type: application/json`、大小上限 | ✅ 400 problem+json（`MAX_BODY_BYTES` = 1 MiB） |
+| 请求体：顶层必须是对象、`Content-Type: application/json`、大小上限 1 MiB | ✅ 400 problem+json，`errors[].code: too_large` |
 | 出站 schema：`content.type ∈ {text, markdown}`、`reply_to` 为 string、`mentions` 透传、未知字段拒绝 | ✅ `service.send_ai_message()` 手写最小校验 |
 | 传输失败 | ✅ **500 `internal.error`**（契约无 502/`matrix.unavailable`） |
+| **B2.1：三层限额**（platform/owner/peer）逐项取最严 | ✅ `LimitStore`；`GET/PUT /v1/limits` |
+| **B2.1：token 预算**预扣 + 结算 | ✅ `tokens.window` check；`usage_delta.tokens_out` |
+| **B2.1：限速窗口开区间 + 释放时刻向上取整** | ✅ `store.events_in_window` 左开右闭；`_ceil_to_second` |
+| **B2.1：UsageEvent 不存正文** | ✅ `text_length` + `text_sha256`；无 `text_preview` |
+| **B2.1：`GET /usage` + `GET /usage/events`** | ✅ 含 budget、breakdown、分页 |
+| **B2.1：内存容量上限 + LRU 淘汰** | ✅ store / idempotency / queue 均有界 |
+| `422 limit.out_of_range`（owner/peer 比平台宽松） | ✅ `LimitStore._check_not_looser()` |
+| `min_seconds_between_messages`（逐层取最严）| ✅ `min_interval` check |
+| `proactive.per_day` / `town.tokens_per_day` 生效值 | ✅ 参与 `GET /limits`；评估 kind=proactive/town_action 时 check |
 
-**未做**（非目标）：三层 owner/peer 限额（B2.1）、token 预算、防刷屏、互聊熔断、
-关系策略、E2EE、卡片创建链路（§4.8 的卡片 `interrupt` 语义已对齐契约，但 `POST /cards`
-不在本 PR 范围）、真正的 deferred 定时投递（目前只登记排程，`service.pending_queue()`
-可查；B1.2 接入调度器前 deferred 会一直停留在 `deferred`）。接 B2.1 时在
-`PolicyEngine.evaluate()` 追加检查项即可，数据结构无需改。
+**未做**（非目标）：防刷屏（`anti_spam.consecutive`）与互聊熔断（`ai_loop.per_hour`）
+的执行——两者的**生效值**已在 `GET /limits` 中逐项计算，但策略评估尚未据此拦截，
+留待 B2.2；关系策略、E2EE、卡片创建链路（§4.8 的卡片 `interrupt` 语义已对齐契约，
+但 `POST /cards` 不在本 PR 范围）、真正的 deferred 定时投递（目前只登记排程，
+`service.pending_queue()` 可查；B1.2 接入调度器前 deferred 会一直停留在 `deferred`）。
 
 **安全边界（已知，待 B2.x）**：当前为单 token 设备级鉴权——任何持有该 token 者都可以
 冒充任意 `sender_persona_id` 向任意 conversation 发送。按 persona 所有权的
@@ -117,27 +137,51 @@ curl -s -X POST localhost:8080/v1/conversations/conv_demo/messages \
 
 ### 策略算法
 
-**限速：滑动窗口（sliding window）。**
-统计 `[now - RATE_LIMIT_WINDOW_SECONDS, now]` 内该 persona 的 `kind=sent` 事件数；
-`used < RATE_LIMIT_MESSAGES` 才允许。`reset_at` = 窗口内最早事件的过期时刻
-（即「下一个名额何时释放」）。
+**限速：滑动窗口（左开右闭区间）。**
+统计 `(now - WINDOW, now]` 内该 persona 的 `kind=sent` 事件数；`used < LIMIT` 才允许。
+`reset_at` = 「第 `used − limit + 1` 早」的事件过期时刻（`used == limit` 时即最早那条），
+**向上取整到秒**——23:59:59.5 释放报 00:00:00，否则调用方在 23:59:59 重试仍会被拦，
+形成差一秒的活锁（#92）。
 *为何不用固定窗口*：固定窗口在边界两侧可以连发两倍额度（整点前一秒发满、整点后
 再发满），滑动窗口没有这个问题，实现代价也只是存时间戳。
 
-`RATE_LIMIT_MESSAGES=0` 表示关闭平台限速（文档化行为）。
+`RATE_LIMIT_MESSAGES=0` 表示关闭平台限速（文档化行为）；
+而 `PUT /limits` 写入的 `messages_per_window: 0` 是「一条都不允许」——
+两者语义不同，前者由 `LimitStore` 在平台层**省略**该键来表达。
 
-**深夜静默。** 按 `SILENT_HOURS_TIMEZONE`（IANA）把当前时刻转本地时间，用分钟数判断
-是否落在 `[start, end)`。`start > end` 自动视为跨午夜。`start == end` 视为零长度窗口 =
-不静默（避免配置事故变成全天静默）。
+**token 预算。** `tokens.window` 用窗口内 `tokens_in + tokens_out` 之和加本次
+`token_estimate`（预扣）与生效预算比较。投递成功后实际入账到 `UsageEvent.tokens_out`。
+恢复时刻 = 最早让「剩余额度 ≥ 本次请求」的事件过期时刻；单次请求就超过总预算时
+`reset_at` 省略（等多久都不会恢复）。
+
+**最小发言间隔。** `min_seconds_between_messages` 取三层中最严（**越大越严**）；
+距上一条 `SENT` 不足时 block，`reset_at` = 上一条 + 间隔。
+
+**主动发言 / 小镇 token（按日）。** `kind: proactive` 评估 `proactive.per_day`，
+`kind: town_action` 评估 `town.tokens_per_day`；日界按生效静默时区的日历日计算，
+`reset_at` 为次日零点。
+
+**深夜静默。** 按生效层的 IANA 时区把当前时刻转本地时间，用分钟数判断是否落在
+`[start, end)`。`start > end` 自动视为跨午夜；`start == end` 视为零长度窗口 = 不静默
+（避免配置事故变成全天静默）。**任一层开启即生效**，平台已开启时 owner/peer 不得关闭。
 - `allow_deferred=true`（默认）→ `defer`，`queue_id` 必填，`retry_after_seconds` 为到
   静默结束的秒数（仅供展示，客户端**不要**据此自动重试）。
 - `allow_deferred=false` → `block`。
 
-**优先级：限速 block 优于静默 defer。** 一条已经超限的消息延后到静默结束仍发不出去，
-直接 block 更诚实；两项未通过的检查会同时出现在 `checks[]` 和 `reasons[]` 里。
+**三层取最严（逐项）。** `messages.window` / `tokens.window` / `min_interval` /
+`silent_hours` / `proactive.per_day` / `town.tokens_per_day` 各自比较，`PolicyCheck.layer`
+记录该项的胜出层，`winner_layer` 记录导致 block/defer 的那一项。同值时归 platform
+（结果稳定、可复现）。
+
+**优先级：block 优于 defer。** 一条已经超限的消息延后到静默结束仍发不出去，
+直接 block 更诚实；所有未通过的检查会同时出现在 `checks[]` 和 `reasons[]` 里。
 
 **并发安全。** `GatewayService` 在「评估 + 记账」全程持锁，避免并发请求同时通过
 `used < limit` 的 check-then-act 竞态造成超额。
+
+**容量与淘汰（#92）。** 用量事件（最旧优先）、幂等缓存（LRU + TTL）、deferred
+队列（LRU）都有可配置上限；长时间运行的进程不会因请求量线性增长而耗尽内存。
+`UsageEvent` **不存正文**，只存 `text_length` 与 `text_sha256`。
 
 ### Matrix Transport
 
@@ -195,6 +239,12 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `SILENT_HOURS_END` | `07:30` | 静默结束（`HH:MM`；`START > END` 表示跨午夜） |
 | `SILENT_HOURS_TIMEZONE` | `Asia/Shanghai` | IANA 时区名 |
 | `MAX_MESSAGE_CHARS` | `8000` | 单条正文上限（超限 → 400，不是 blocked） |
+| `PLATFORM_TOKEN_BUDGET` | `200000` | 平台层 token 预算（窗口同 `RATE_LIMIT_WINDOW_SECONDS`）；`0` = 平台不设该限额 |
+| `PLATFORM_PROACTIVE_PER_DAY` | `6` | 平台层主动发言/日上限；`0` = 平台不设该限额 |
+| `MAX_USAGE_EVENTS` | `10000` | 内存用量事件条数上限（超出按最旧优先淘汰，≥1） |
+| `MAX_IDEMPOTENCY_ENTRIES` | `2000` | 幂等缓存条目上限（LRU 淘汰，≥1） |
+| `IDEMPOTENCY_TTL_SECONDS` | `86400` | 幂等缓存保留时长（秒，`0` = 不过期） |
+| `MAX_QUEUE_ENTRIES` | `1000` | deferred 排程条目上限（LRU 淘汰，≥1） |
 | `GATEWAY_ACCESS_LOG` | `false` | 是否打印访问日志 |
 | `GATEWAY_MATRIX_TRANSPORT` | `memory` | `memory`=内存假后端（B1.1 现状）；`appservice`=真实 homeserver 代发（A1.3，见 [docs/deploy/appservice.md](../docs/deploy/appservice.md)） |
 | `GATEWAY_HOMESERVER_URL` | *(空)* | appservice 模式必填：homeserver 的 CS API 地址（`http(s)://…`）；明文 `http://` 只允许 loopback / 无点单标签容器名，跨主机要 `https://`（`GATEWAY_ALLOW_INSECURE_HS=true` 可显式放开） |
@@ -238,10 +288,27 @@ python3 -m unittest discover -s gateway/tests -v
   config 构建：appservice 配置不回落内存、memory 保持现状、显式注入优先；
   投递错误映射：`appservice.namespace`/`conversation.invalid` → 400、
   `conversation.not_found` → 404、其余 → 500
-- **密钥扫描** — 递归扫描 `gateway/`，禁止 `sk-…`/`AKIA…`/私钥块/GitHub/ Slack token
+- **B2.1 三层限额**（`tests/test_b21_limits.py`）— 逐项取最严、`source_layer` 归属、
+  平台底线只读、放宽 → 422 `limit.out_of_range`、token 预扣与结算、`min_interval`、
+  `proactive.per_day`、`town.tokens_per_day`、`GET/PUT /limits`、`GET /usage`、
+  `GET /usage/events`
+- **#92 剩余项** — 窗口左开右闭边界、`reset_at` 向上取整（含 `used > limit`）、
+  `UsageEvent` 不存正文（`text_length` + `text_sha256`）、store / 幂等 / 队列容量上限、
+  1 MiB 请求体 → 400 `too_large`
+- **密钥扫描** — 递归扫描 `gateway/`，禁止 `sk-…`/`AKIA…`/私钥块/GitHub/Slack token
   等真实凭据指纹（`<change-me>`、`example.invalid` 放行）
 
 测试用注入时钟（`_FixedClock`）而非 `sleep`，全部瞬间完成。
+
+### 覆盖率
+
+```bash
+python3 gateway/scripts/coverage_check.py            # 报告 src 行覆盖率
+python3 gateway/scripts/coverage_check.py --show-missing   # 附未覆盖行号
+```
+
+零依赖（`sys.settrace` + `threading.settrace`），统计 `gateway/src/botville_gateway/`
+的行覆盖率，阈值默认 80%（`--threshold` 可调）。当前结果见 PR 描述。
 
 ---
 

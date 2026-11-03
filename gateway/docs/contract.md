@@ -68,6 +68,18 @@ AI 发言（`POST /conversations/{id}/messages`）或预检（`POST /policy/eval
 - 未在 schema 中声明的字段，客户端**必须忽略**（前向兼容）；服务端对请求体
   用 `additionalProperties: false` 严格拒绝未知字段，避免拼写错误被静默吞掉。
 
+#### 1.1.1 请求体上限（B2.1 / #92）
+
+任何 `POST` / `PUT` 请求体不得超过 **1 MiB（1048576 字节）**。
+
+- 超限返回 **`400 request.invalid`**，`errors[]` 含一项
+  `{ "field": "body", "code": "too_large", "message": … }`。
+- **不新增 413 状态码**：契约的状态码集合保持不变（见 §1.3），客户端只需按
+  `code` 分支即可。
+- 服务端在读取 `Content-Length` 后即可拒绝，不必把超大请求体读入内存；
+  `Transfer-Encoding: chunked` 不被支持（同样 400 `request.invalid`）。
+- 单条正文另有更小的业务上限 `content.text` ≤ 8000 字符（`OutgoingContent.maxLength`）。
+
 ### 1.2 鉴权（占位）
 
 ```http
@@ -806,16 +818,39 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 - 「取最严」是**逐项**的，不是整层覆盖：消息数可能由 owner 胜出，token 可能由
   platform 胜出。`EffectiveLimit.source_layer` 指明每一项的胜出层。
+- **`0` 是有效限额**（`messages_per_window: 0` 表示一条都不允许），不是「不限」；
+  「该层不限制」用**省略字段**表达。部署配置 `RATE_LIMIT_MESSAGES=0` /
+  `PLATFORM_TOKEN_BUDGET=0` 才是「平台关闭该项限额」（历史语义，两者不可混用）。
+- **严格方向**：`messages_per_window` / `tokens_per_window` / `proactive_per_day` /
+  `town_tokens_per_day` / `max_message_chars` / `window_seconds` 越小越严；
+  `min_seconds_between_messages` 越大越严；`silent_hours.enabled: true` 比 `false` 严。
+- **平台层是底线，只读**：`PUT /limits` 只能写 owner / peer；任何一项比平台层宽松
+  → **422 `limit.out_of_range`**（`errors[]` 逐项给出字段与平台底线值）。
+  平台已开启的静默，owner/peer 不得关闭。
 - 静默时段、防刷屏、互聊熔断也各自参与，`checks[]` 里逐项给出 `allowed`/`limit`/`used`/`remaining`/`reset_at`。
 - `PolicyCheck.key` 推荐取值：`messages.window`、`tokens.window`、`proactive.per_day`、
   `town.tokens_per_day`、`silent_hours`、`min_interval`、`anti_spam.consecutive`、
   `ai_loop.per_hour`、`message.length`、`relation.chat_allowed`。
+- **B2.1 已实现**的检查项：`messages.window`、`tokens.window`、`min_interval`、
+  `silent_hours`（每项都取三层中最严者，`source_layer` 落在 `PolicyCheck.layer` 上）。
+  `proactive.per_day` / `town.tokens_per_day` 的生效值已在 `GET /limits` 中计算，
+  执行留待 B2.2（主动发言调度）。
+- **token 预算**：评估时按 `token_estimate`（缺省按正文长度估算）**预扣**，
+  投递成功后实际入账（`usage_delta.tokens_out`）。`tokens.window` 检查的
+  `used` 是窗口内已入账之和，`allowed = used + estimated <= limit`。
 
 ### 6.2 预算与账单
 
 - 预算以 token 计，窗口默认 24h（`window_seconds`）。
 - 账单是 append-only 的 `usage_events`，`kind` 覆盖模型调用、发送、拦截、主动发言、
   小镇行为、图像生成。
+- **消息正文不落入账单**（B2.1 / #92）：`UsageEvent` **不存储**消息正文，只存
+  `text_length`（字符数）与 `text_sha256`（SHA-256 摘要）用于对账。旧字段
+  `text_preview` 从 B2.1 起**不再写入**，客户端必须忽略历史事件中该字段（前向兼容）。
+- **限速窗口开区间 + 释放时刻向上取整**（#92）：窗口过滤使用左开右闭区间
+  `(now - window_seconds, now]`，保证「过期」的名额在 `reset_at` 之后**严格**
+  可用；`reset_at` 向上取整到秒，避免差一秒的活锁。`used > limit` 时
+  `reset_at` 取第 `used − limit + 1` 早的事件的过期时刻（足够让一个名额腾出来）。
 - **小镇消耗单列**（`town_tokens`、`kind: town_action`）：小镇行为受 `town_tokens_per_day`
   约束，预算用尽后只走动不聊天（B4.2）。D 线做账目展示时请把它与聊天分开。
 
