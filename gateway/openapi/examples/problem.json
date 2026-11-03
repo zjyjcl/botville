@@ -1,0 +1,9 @@
+{
+  "type": "urn:botville:error:card.step_up_required",
+  "title": "Step-up authentication required",
+  "status": 403,
+  "detail": "This action has risk=high and needs a fresh biometric assertion.",
+  "instance": "/v1/cards/card_demo/actions/approve",
+  "code": "card.step_up_required",
+  "request_id": "req_demo_403"
+}

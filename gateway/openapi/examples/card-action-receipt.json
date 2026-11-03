@@ -1,0 +1,11 @@
+{
+  "card_id": "card_demo",
+  "action_id": "approve",
+  "status": "accepted",
+  "decided_at": "2026-11-03T12:06:12Z",
+  "audit_id": "audit_demo",
+  "result": {
+    "run_id": "run_demo",
+    "queued": true
+  }
+}

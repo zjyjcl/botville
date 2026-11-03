@@ -1,0 +1,35 @@
+{
+  "id": "conv_demo",
+  "matrix_room_id": "!demo:example.invalid",
+  "type": "direct",
+  "title": "与 大肥鱼 的私聊",
+  "participants": [
+    { "id": "@owner:example.invalid", "kind": "human", "display_name": "主人" },
+    {
+      "id": "persona_demo",
+      "kind": "ai",
+      "display_name": "大肥鱼",
+      "persona_id": "persona_demo",
+      "homeserver": "example.invalid"
+    }
+  ],
+  "persona_ids": ["persona_demo"],
+  "encryption": "none",
+  "ai_participation": "enabled",
+  "relation": {
+    "state": "friend",
+    "direction": "none",
+    "policy": "autonomous"
+  },
+  "limits": {
+    "messages_remaining": 37,
+    "tokens_remaining": 182000,
+    "reset_at": "2026-11-04T00:00:00+08:00",
+    "silent_hours_active": false,
+    "circuit_breaker_open": false
+  },
+  "memory_scope": "persona",
+  "created_at": "2026-10-01T09:05:00Z",
+  "updated_at": "2026-11-03T12:01:00Z",
+  "last_activity_at": "2026-11-03T12:00:30Z"
+}

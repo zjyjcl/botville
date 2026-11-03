@@ -1,0 +1,31 @@
+{
+  "type": "notification",
+  "title": "今晚 20:00 记得吃药",
+  "subtitle": "来自 大肥鱼",
+  "fallback_text": "提醒：今晚 20:00 记得吃药。",
+  "priority": "normal",
+  "risk": "low",
+  "blocks": [
+    { "type": "text", "text": "你把这件事交给我记着，到点了。", "level": "success" },
+    {
+      "type": "key_value",
+      "items": [
+        { "label": "时间", "value": "20:00" },
+        { "label": "重复", "value": "仅今天" }
+      ]
+    }
+  ],
+  "actions": [
+    { "id": "done", "label": "已完成", "kind": "callback", "style": "primary", "payload": { "reminder_id": "rem_demo" } },
+    { "id": "snooze", "label": "稍后提醒", "kind": "callback", "style": "secondary", "payload": { "snooze_minutes": "30" } }
+  ],
+  "source": {
+    "module": "role",
+    "capability_id": "role.proactive",
+    "actor": { "id": "persona_demo", "kind": "ai", "display_name": "大肥鱼" }
+  },
+  "context": {
+    "conversation_id": "conv_demo"
+  },
+  "expires_at": "2026-11-04T04:00:00Z"
+}

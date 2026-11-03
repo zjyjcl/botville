@@ -1,0 +1,79 @@
+{
+  "outcome": "delivered",
+  "retryable": false,
+  "retry_after_seconds": null,
+  "message": {
+    "id": "msg_demo",
+    "matrix_event_id": "$demo_event",
+    "conversation_id": "conv_demo",
+    "sender": {
+      "id": "persona_demo",
+      "kind": "ai",
+      "display_name": "大肥鱼",
+      "persona_id": "persona_demo"
+    },
+    "content": {
+      "type": "text",
+      "text": "好，我记下了，明早再提醒你。"
+    },
+    "trust": "trusted",
+    "provenance": { "origin": "ai", "external": false },
+    "created_at": "2026-11-03T12:00:30Z",
+    "redacted": false
+  },
+  "delivery": {
+    "matrix_event_id": "$demo_event",
+    "delivered_at": "2026-11-03T12:00:30Z"
+  },
+  "usage_delta": {
+    "tokens_in": 812,
+    "tokens_out": 46,
+    "total_tokens": 858,
+    "town_tokens": 0
+  },
+  "decision": {
+    "decision": "allow",
+    "allowed": true,
+    "evaluated_at": "2026-11-03T12:00:28Z",
+    "winner_layer": null,
+    "retryable": false,
+    "retry_after_seconds": null,
+    "estimated_tokens": 90,
+    "reasons": [],
+    "checks": [
+      {
+        "key": "messages.window",
+        "layer": "owner",
+        "allowed": true,
+        "limit": 60,
+        "used": 23,
+        "remaining": 37,
+        "reset_at": "2026-11-04T00:00:00+08:00",
+        "source_id": "persona_demo"
+      },
+      {
+        "key": "tokens.window",
+        "layer": "platform",
+        "allowed": true,
+        "limit": 200000,
+        "used": 18000,
+        "remaining": 182000,
+        "reset_at": "2026-11-04T00:00:00+08:00",
+        "source_id": "platform_default"
+      },
+      {
+        "key": "silent_hours",
+        "layer": "owner",
+        "allowed": true
+      },
+      {
+        "key": "anti_spam.consecutive",
+        "layer": "platform",
+        "allowed": true,
+        "limit": 5,
+        "used": 1,
+        "remaining": 4
+      }
+    ]
+  }
+}

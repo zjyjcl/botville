@@ -1,0 +1,7 @@
+{
+  "persona_id": "persona_demo",
+  "conversation_id": "conv_demo",
+  "kind": "message",
+  "content": "在吗？今天的事我想问问你怎么看。",
+  "token_estimate": 120
+}
