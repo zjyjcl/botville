@@ -24,6 +24,7 @@ final class PushRegistrationTests: XCTestCase {
         XCTAssertEqual(json["kind"] as? String, "http")
         XCTAssertEqual(json["append"] as? Bool, true)
         XCTAssertEqual((json["data"] as? [String: Any])?["url"] as? String, "https://push.example.org/_matrix/push/v1/notify")
+        XCTAssertEqual((json["data"] as? [String: Any])?["format"] as? String, "event_id_only")
         XCTAssertEqual(json["device_display_name"] as? String, "iPhone")
         XCTAssertEqual(json["lang"] as? String, "zh-Hans")
     }
@@ -92,7 +93,7 @@ final class PushRegistrationTests: XCTestCase {
     }
 
     func testPusherDataAndRegistrationRoundTrip() throws {
-        let data = try PushPusherData(url: XCTUnwrap(URL(string: "https://push.example.org/notify")))
+        let data = try PushPusherData(url: XCTUnwrap(URL(string: "https://push.example.org/notify")), format: .eventIDOnly)
         let registration = PushRegistration(
             appID: "org.example.botville",
             pushKey: "placeholder-device-key",
@@ -102,6 +103,49 @@ final class PushRegistrationTests: XCTestCase {
 
         XCTAssertEqual(try JSONDecoder().decode(PushPusherData.self, from: JSONEncoder().encode(data)), data)
         XCTAssertEqual(try JSONDecoder().decode(PushRegistration.self, from: JSONEncoder().encode(registration)), registration)
+    }
+
+    func testPusherDataDefaultsToEventIDOnly() throws {
+        let data = try PushPusherData(url: XCTUnwrap(URL(string: "https://push.example.org/notify")))
+
+        XCTAssertEqual(data.format, .eventIDOnly)
+    }
+
+    func testPusherDataDecodesMissingOrNullFormatAsEventIDOnly() throws {
+        for json in [
+            #"{"url":"https://push.example.org/notify"}"#,
+            #"{"url":"https://push.example.org/notify","format":null}"#
+        ] {
+            let data = try JSONDecoder().decode(PushPusherData.self, from: Data(json.utf8))
+            let encoded = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(data)) as? [String: Any])
+
+            XCTAssertEqual(data.format, .eventIDOnly)
+            XCTAssertEqual(encoded["format"] as? String, "event_id_only")
+        }
+    }
+
+    func testPusherDataRejectsUnknownFormat() throws {
+        let json = Data(#"{"url":"https://push.example.org/notify","format":"future_format"}"#.utf8)
+
+        XCTAssertThrowsError(try JSONDecoder().decode(PushPusherData.self, from: json)) { error in
+            guard case DecodingError.dataCorrupted(let context) = error else {
+                return XCTFail("Expected unknown format to fail decoding, got \(error)")
+            }
+            XCTAssertEqual(context.codingPath.map(\.stringValue), ["format"])
+        }
+    }
+
+    func testRegistrationRejectsNestedUnknownPusherFormat() throws {
+        let json = Data("""
+        {"app_id":"org.example.botville","pushkey":"placeholder-device-key","app_display_name":"botville","kind":"http","append":false,"data":{"url":"https://push.example.org/notify","format":"future_format"}}
+        """.utf8)
+
+        XCTAssertThrowsError(try JSONDecoder().decode(PushRegistration.self, from: json)) { error in
+            guard case DecodingError.dataCorrupted(let context) = error else {
+                return XCTFail("Expected unknown format to fail decoding, got \(error)")
+            }
+            XCTAssertEqual(context.codingPath.map(\.stringValue), ["data", "format"])
+        }
     }
 
     func testPusherDataAcceptsCaseInsensitiveHTTPSAndMaximumValidPort() throws {

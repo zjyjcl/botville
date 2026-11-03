@@ -88,7 +88,7 @@ Tests/BotvilleCoreTests/       认证、会话、发送和重连的单元测试
 - 房间列表同时展示 joined 与邀请，按最新活动排序。DM/群区分使用 SDK 的 `Room.isDirect()`（`m.direct` 语义），加入/邀请分别按 membership 展示，不以显示名猜测；未读数优先使用 SDK 给出的计数。
 - 文本消息区分排队、已发送、可恢复失败的发送暂停和不可恢复失败的发送暂停，详细操作边界见下方“发送语义”。
 - `/sync` 失败按有限退避重连，网络恢复和 App 回前台会触发补拉；界面显示离线或重连状态。
-- 推送只定义 `PushRegistrar`、pusher 注册参数模型和 `NoopPushRegistrar`；pusher URL 在构造与解码时只接受无凭据、含 host 的 HTTPS 地址。没有添加 Push entitlement、证书或真机注册；真实 APNs/Sygnal 接入依赖 A1.2。
+- 推送只定义 `PushRegistrar`、pusher 注册参数模型和 `NoopPushRegistrar`；pusher URL 在构造与解码时只接受无凭据、含 host 的 HTTPS 地址。按 A 线 A1.2（#96）要求，注册默认携带 `data.format=event_id_only`，推送载荷不带消息内容；解码缺省或 null 时使用该默认值，未知格式拒绝解码。没有添加 Push entitlement、证书或真机注册；真实 APNs/Sygnal 接入依赖 A1.2。
 
 ## 发送语义
 
