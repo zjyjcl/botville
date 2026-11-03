@@ -144,7 +144,9 @@ Conduit (timokoesters/conduit, Rust)
 - **Synapse**：多注册令牌的增删只存在于私有 admin API（`/_synapse/admin/v1/registration_tokens`）；标准路径只有 UIA（dummy/3PID/reCAPTCHA 等）与 `registration_shared_secret`（同样是私有注册接口）。向导若要发邀请码，需在部署层调私有 API 或预生成令牌写进配置。
 - **Tuwunel**：`allow_registration` + 静态 `registration_token`（或 `registration_token_file` 存多个令牌）；**首个注册用户自动获得管理员**（`grant_admin_to_first_user` 默认 true）——向导须提醒用户第一个注册的必须是主人本人。
 - **continuwuity**：首次启动在日志打印**一次性注册令牌**；之后可用 `registration_token` / `registration_token_file` 静态令牌，或管理室 `!admin token` 命令运行期增发；同样首用户即管理员并自动进 `#admins`。
-- **实测（2026-11，#68）**：continuwuity 首启引导令牌**只出现在容器日志**（带 ANSI 色码），配置令牌（`CONTINUWUITY_REGISTRATION_TOKEN`）在首个账号创建前无效（UIA 返回 401 `M_FORBIDDEN` "Invalid registration token"，flows 仅 `["m.login.registration_token"]`）；botville 用 `server/scripts/bootstrap-continuwuity.sh`（`make up HS=continuwuity` 自动执行）从日志提取引导令牌，以标准 UIA 注册 `BOTVILLE_ADMIN_USER` 作为首个（管理员）账号，之后配置令牌才生效。
+- **实测（2026-11，#68）**：continuwuity 首启引导令牌**只出现在容器日志**（带 ANSI 色码），配置令牌（`CONTINUWUITY_REGISTRATION_TOKEN`）在首个账号创建前无效（UIA 返回 401 `M_FORBIDDEN` "Invalid registration token"，flows 仅 `["m.login.registration_token"]`）。
+  botville 用 `server/scripts/bootstrap-continuwuity.sh`（`make up HS=continuwuity` 每次自动执行，幂等）从日志提取引导令牌，以标准 UIA 注册 `BOTVILLE_ADMIN_USER` 作为首个（管理员）账号，之后配置令牌才生效；日志无令牌时改用标准接口 `GET /_matrix/client/v1/register/m.login.registration_token/validity`（spec v1.2，MSC3231）核验引导状态，不再静默放行；一次性令牌被拒（`M_FORBIDDEN`）视为已有其他首个用户，成功退出（升级安全）。
+  实测镜像锁定 `ghcr.io/continuwuity/continuwuity:v26.9.1@sha256:c9c62bc5c0a641f3f713945c701b069c7bc30d2612b54d4a5de80a5be19d5420`（docker-compose.yml 默认、`.env.example` 与 CI allowlist 同步此值）。
 - **默认值差异（向导与 CI 都不得依赖默认）**：Tuwunel `allow_registration` 默认 **false**；continuwuity 默认 **true**（且无令牌的完全开放注册需显式确认开关，官方镜像另要求 `openreg` 编译特性）。三家配置一律显式写注册开关与令牌策略。
 - 对 botville 的含义：「邀请注册」产品能力在三家的实现路径不同，统一方案：**向导预置静态注册令牌写进三家配置**（Synapse 用共享密钥/预生成令牌；Rust 家族用 `registration_token`），运行时 App 不感知差异。
 

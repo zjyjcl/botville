@@ -13,6 +13,8 @@
 #   - tuwunel, continuwuity: their OCI images are OS-less (no shell, no curl),
 #     so no in-container healthcheck is possible; server/tests/smoke.py waits
 #     for GET /_matrix/client/versions instead.
+# Images are pinned (continuwuity by digest); override via .env to test a
+# different build.
 
 name: botville
 
@@ -92,9 +94,10 @@ services:
     restart: unless-stopped
 
   continuwuity:
-    # Experimental in CI (continue-on-error); image is FROM scratch with CMD
-    # /sbin/conduwuit, so no command override is needed.
-    image: ${CONTINUWUITY_IMAGE:-ghcr.io/continuwuity/continuwuity:latest}
+    # Pinned to the digest CI actually tests (docs/compat/homeserver-compat.md
+    # §3.3); the image is FROM scratch with CMD /sbin/conduwuit, so no command
+    # override is needed.
+    image: ${CONTINUWUITY_IMAGE:-ghcr.io/continuwuity/continuwuity:v26.9.1@sha256:c9c62bc5c0a641f3f713945c701b069c7bc30d2612b54d4a5de80a5be19d5420}
     profiles: [continuwuity]
     stop_grace_period: 10m
     environment:
