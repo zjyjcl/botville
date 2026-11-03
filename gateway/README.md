@@ -12,7 +12,7 @@
 | 路径 | 内容 |
 |---|---|
 | `openapi/gateway.v1.yaml` | 网关契约（OpenAPI 3.1，唯一事实源） |
-| `openapi/examples/` | 23 个请求/响应示例，全部对 schema 校验 |
+| `openapi/examples/` | 24 个请求/响应示例，全部对 schema 校验 |
 | `docs/contract.md` | 人类可读契约说明：功能清单规范、卡片描述规范、版本规则、评审清单 |
 | `scripts/validate_openapi.py` | 离线校验脚本（文档结构 + 示例 schema） |
 
