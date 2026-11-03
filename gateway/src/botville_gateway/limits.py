@@ -10,8 +10,18 @@
 1. **逐项取最严**，不是整层覆盖：消息数可能由 owner 胜出，token 可能由 platform
    胜出。每一项的 `source_layer` 单独记录。同值时按 platform → owner → peer 的
    顺序归属（平台底线优先，结果稳定且可复现）。
+
+   **窗口类限额按「速率对」比较（B1）**：`messages_per_window` 与
+   `tokens_per_window` 各自和它的 `window_seconds` 是一个整体——比较的是
+   `count / window`（交叉相乘，整数运算），胜出层**成对采用**自己的 count 与
+   window；该层省略 `window_seconds` 时回退平台窗口。`window_seconds` 本身
+   **不再单独取 min**：否则单写一个 `window_seconds: 60` 就能把平台
+   `2 条/3600s` 放大成 `2 条/60s`（评审 B1）。生效结果里分别记录
+   `messages.window_seconds` / `tokens.window_seconds`，因为两个速率对的胜出层
+   可能不同、窗口也就可能不同。
 2. **平台层是底线，只读**：`PUT /limits` 只能写 owner / peer；owner/peer 的任何
-   一项比平台层更宽松 → 422 `limit.out_of_range`。
+   一项比平台层更宽松 → 422 `limit.out_of_range`。窗口类按速率对校验：
+   `count/window` 不得大于平台的 `count/window`，**只缩短窗口**同样算放宽。
 3. **0 就是 0**：`messages_per_window: 0` 表示一条都不允许，不是「不限」。
    「该层不额外限制」用**省略字段**表达（契约 LimitRules 描述）。
 
@@ -45,8 +55,10 @@ PLATFORM_SCOPE_ID = "platform_default"
 CODE_OUT_OF_RANGE = "limit.out_of_range"
 
 # key → (unit, 方向)。方向 min = 数值越小越严；max = 数值越大越严。
+# `window_seconds` **不在**这里：它不与任何计数独立比较，而是作为速率对的
+# 一部分（见 `RATE_PAIRS`）。单独取 min 会让「2 条/3600s」被一个
+# `window_seconds: 60` 放大成「2 条/60s」（评审 B1）。
 SCALAR_RULES: Tuple[Tuple[str, str, str], ...] = (
-    ("window_seconds", "seconds", "min"),
     ("messages_per_window", "count", "min"),
     ("tokens_per_window", "tokens", "min"),
     ("proactive_per_day", "count", "min"),
@@ -54,6 +66,14 @@ SCALAR_RULES: Tuple[Tuple[str, str, str], ...] = (
     ("max_message_chars", "chars", "min"),
     ("min_seconds_between_messages", "seconds", "max"),
 )
+
+# 速率对：每个计数项与其窗口是一个整体，按 `count / window` 比较（交叉相乘）。
+# 胜出层成对采用自己的 `count` + `window`；该层省略 `window_seconds` 时回退平台窗口。
+RATE_PAIRS: Tuple[Tuple[str, str, str], ...] = (
+    ("messages_per_window", "messages", "count"),
+    ("tokens_per_window", "tokens", "tokens"),
+)
+_WINDOW_KEY = "window_seconds"
 
 # key → (minimum, maximum or None)
 _SCALAR_RANGES: Dict[str, Tuple[int, Optional[int]]] = {
@@ -77,7 +97,7 @@ _AI_LOOP_ON_BREAK = frozenset({"stop", "notify"})
 
 _RULES_FIELDS = frozenset(
     {name for name, _, _ in SCALAR_RULES}
-    | {"silent_hours", "anti_spam", "ai_loop"}
+    | {_WINDOW_KEY, "silent_hours", "anti_spam", "ai_loop"}
 )
 _SILENT_FIELDS = frozenset({"enabled", "start", "end", "timezone"})
 _POLICY_FIELDS = frozenset({"layer", "scope", "scope_id", "rules"})
@@ -167,6 +187,12 @@ def validate_rules(raw: Any) -> Dict[str, Any]:
         if name in raw:
             minimum, maximum = _SCALAR_RANGES[name]
             out[name] = _check_int(f"rules.{name}", raw[name], minimum, maximum)
+    if _WINDOW_KEY in raw:
+        # 仍然接受该字段（契约声明了它），只是不再独立参与「取最严」。
+        minimum, maximum = _SCALAR_RANGES[_WINDOW_KEY]
+        out[_WINDOW_KEY] = _check_int(
+            f"rules.{_WINDOW_KEY}", raw[_WINDOW_KEY], minimum, maximum
+        )
 
     if "silent_hours" in raw:
         out["silent_hours"] = validate_silent_hours(raw["silent_hours"])
@@ -240,6 +266,28 @@ class LimitLayer:
         if self.updated_at is not None:
             body["updated_at"] = iso_utc(self.updated_at)
         return body
+
+
+def _layer_rate(
+    layer: LimitLayer, count_key: str, fallback_window: int
+) -> Optional[Tuple[int, int]]:
+    """该层的 `(count, window)`；该层没写该计数项时返回 None。
+
+    `window_seconds` 省略时回退 `fallback_window`（通常是平台窗口）——这正是
+    「窗口与计数成对」的含义：窗口只对同一层写下的计数项生效。
+    """
+    count = layer.rules.get(count_key)
+    if count is None:
+        return None
+    window = layer.rules.get(_WINDOW_KEY, fallback_window)
+    return int(count), int(window)
+
+
+def rate_is_looser(
+    count: int, window: int, floor_count: int, floor_window: int
+) -> bool:
+    """`count/window` 是否比 `floor_count/floor_window` 更宽松（交叉相乘，无浮点）。"""
+    return count * floor_window > floor_count * window
 
 
 def _copy_rules(rules: Dict[str, Any]) -> Dict[str, Any]:
@@ -422,9 +470,43 @@ class LimitStore:
         return stored
 
     def _check_not_looser(self, rules: Dict[str, Any], *, scope: str, scope_id: str) -> None:
-        """owner/peer 的任何一项都不得比平台层更宽松（422 limit.out_of_range）。"""
+        """owner/peer 的任何一项都不得比平台层更宽松（422 limit.out_of_range）。
+
+        窗口类（messages / tokens）按**速率对**校验：`count / window` 不得大于
+        平台的 `count / window`。因此 `messages_per_window: 1` 配平台窗口是收紧，
+        而只写 `window_seconds: 60`（计数沿用平台值、窗口变短）会被判为放宽。
+        """
         platform_rules = self._platform.rules
         errors: List[Dict[str, Any]] = []
+
+        # 窗口类：先算出该层两个速率对的窗口（缺省回退平台窗口）。
+        platform_window = int(
+            platform_rules.get(_WINDOW_KEY, self._config.rate_limit_window_seconds)
+        )
+        candidate_window = int(rules.get(_WINDOW_KEY, platform_window))
+        for count_key, label, _unit in RATE_PAIRS:
+            platform_count = platform_rules.get(count_key)
+            if platform_count is None:
+                continue
+            # 如果 owner/peer 既没写 count_key 也没写 window_seconds → 没变化 → 跳过。
+            if count_key not in rules and _WINDOW_KEY not in rules:
+                continue
+            # 否则，「缺省用平台值」：该层省略 count 时继承平台 count，
+            # 省略 window 时继承平台 window（已在 candidate_window 里处理）。
+            candidate_count = int(rules.get(count_key, platform_count))
+            if rate_is_looser(candidate_count, candidate_window, platform_count, platform_window):
+                errors.append(
+                    {
+                        "field": f"rules.{count_key}",
+                        "code": "out_of_range",
+                        "message": (
+                            f"{label} rate {candidate_count}/{candidate_window}s is looser than "
+                            f"the platform floor {platform_count}/{platform_window}s; "
+                            f"the pair must not exceed it"
+                        ),
+                    }
+                )
+
         for key, _, direction in SCALAR_RULES:
             if key not in rules or key not in platform_rules:
                 continue
@@ -511,8 +593,40 @@ class LimitStore:
             scope, scope_id = SCOPE_PEER, PLATFORM_SCOPE_ID
 
         values: List[EffectiveValue] = []
+
+        platform_window = int(
+            self._platform.rules.get(
+                _WINDOW_KEY, self._config.rate_limit_window_seconds
+            )
+        )
+
+        # 速率对：按 `count / window` 取最小 rate 的层，成对采用该层 count + window。
+        # 同 rate 时保留先出现（更靠平台）的层，与其它标量的归属顺序一致。
+        for count_key, label, unit in RATE_PAIRS:
+            winner: Optional[Tuple[int, int, LimitLayer]] = None
+            for layer in layers:
+                pair = _layer_rate(layer, count_key, platform_window)
+                if pair is None:
+                    continue
+                count, window = pair
+                if winner is None or rate_is_looser(winner[0], winner[1], count, window):
+                    # 候选层的 rate 比当前胜出者更严格 → 整对换层。
+                    winner = (count, window, layer)
+            if winner is None:
+                continue
+            count, window, layer = winner
+            values.append(
+                EffectiveValue(count_key, count, unit, layer.layer, layer.scope_id)
+            )
+            # 窗口与计数分开暴露：两个速率对的胜出层可能不同，窗口也可能不同。
+            values.append(
+                EffectiveValue(
+                    f"{label}.{_WINDOW_KEY}", window, "seconds", layer.layer, layer.scope_id
+                )
+            )
+
         for key, unit, direction in SCALAR_RULES:
-            winner: Optional[EffectiveValue] = None
+            winner = None
             for layer in layers:
                 if key not in layer.rules:
                     continue

@@ -66,7 +66,7 @@ class TestMainEntryPoint(unittest.TestCase):
         fake = _FakeServer()
         stdout, stderr = io.StringIO(), io.StringIO()
         old = gateway_main.build_server
-        gateway_main.build_server = lambda cfg: fake
+        gateway_main.build_server = lambda cfg, transport: fake
         # `main()` 读真实环境变量：显式给 dev 模式，否则 load_config 直接拒绝启动。
         saved = {k: os.environ.get(k) for k in ("GATEWAY_DEV_MODE", "GATEWAY_AUTH_TOKEN")}
         os.environ["GATEWAY_DEV_MODE"] = "true"

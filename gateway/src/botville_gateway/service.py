@@ -66,7 +66,15 @@ EVALUATE_KINDS = frozenset({"message", "proactive", "town_action"})
 USAGE_GROUP_BY = frozenset({"conversation", "day", "capability", "model"})
 # 与 OpenAPI OutgoingMessageRequest / OutgoingContent 的 properties 对齐。
 _SEND_FIELDS = frozenset(
-    {"sender_persona_id", "content", "reply_to", "token_estimate", "allow_deferred", "metadata"}
+    {
+        "sender_persona_id",
+        "content",
+        "reply_to",
+        "token_estimate",
+        "allow_deferred",
+        "metadata",
+        "peer_id",
+    }
 )
 _CONTENT_FIELDS = frozenset({"type", "text", "mentions"})
 _EVALUATE_FIELDS = frozenset(
@@ -439,6 +447,7 @@ class GatewayService:
                     text=validated["text"],
                     reply_to=validated["reply_to"],
                     content_type=validated["content_type"],
+                    txn_id=self._txn_id_for(idempotency_key),
                 )
             except DeliveryError as exc:
                 # 投递失败：回滚预留，不记账、不占名额；再映射为 5xx 传输错误。
@@ -563,6 +572,10 @@ class GatewayService:
                 "request.invalid", "'reply_to' must be a string", "reply_to"
             )
 
+        peer_id = payload.get("peer_id")
+        if peer_id is not None and not isinstance(peer_id, str):
+            raise ValidationError("request.invalid", "'peer_id' must be a string", "peer_id")
+
         metadata = payload.get("metadata")
         if metadata is not None:
             if not isinstance(metadata, dict):
@@ -603,6 +616,7 @@ class GatewayService:
             "metadata": dict(metadata) if metadata else None,
             "token_estimate": token_estimate,
             "allow_deferred": allow_deferred,
+            "peer_id": peer_id or None,
         }
 
     def _prepare_send(
@@ -617,17 +631,22 @@ class GatewayService:
         metadata: Optional[Dict[str, str]],
         token_estimate: Optional[int],
         allow_deferred: bool,
+        peer_id: Optional[str] = None,
     ) -> _PreparedSend:
         """锁内阶段：策略判断 + 预留名额。调用方必须已持有 `self._lock`。
 
         - block / defer 在这里直接产出终态回执（不需要投递，也就没有预留）；
         - allow 只**预留**名额并返回，真正的 `send_text` 必须在锁外调用，
           否则一条慢投递会把所有请求挡在锁后面。
+
+        `peer_id` 必须传进 `evaluate()`（B2）：否则 peer 层的 messages/tokens
+        限额只在预检里生效，实发会把三层退化成两层。
         """
         now = self._now()
         decision = self._engine.evaluate(
             persona_id=sender,
             conversation_id=conversation_id,
+            peer_id=peer_id,
             text=text,
             token_estimate=token_estimate,
             allow_deferred=allow_deferred,
@@ -849,7 +868,9 @@ class GatewayService:
             effective = self._limits.effective(conversation_id=conversation_id, now=now)
 
         token = effective.get("tokens_per_window")
-        window = effective.get("window_seconds")
+        # 窗口与 token 计数成对（B1）：用 token 速率对胜出层的窗口，而不是
+        # 单独取过 min 的 `window_seconds`。
+        window = effective.get("tokens.window_seconds")
         window_seconds = int(window.value) if window is not None else self._config.rate_limit_window_seconds
         since = now - timedelta(seconds=window_seconds)
         events = self._store.events_in_window(
@@ -880,6 +901,21 @@ class GatewayService:
         }
 
     # ------------------------------------------------------------- helpers
+    @staticmethod
+    def _txn_id_for(idempotency_key: Optional[str]) -> str:
+        """Matrix 事务 ID（#99 加固 1）：由幂等键稳定推导，重试落在同一 txnId。
+
+        同一 `Idempotency-Key` 的重试必须打到同一个 Matrix 事务上，HS 才能按
+        `(room, sender, txnId)` 去重；每次随机 uuid4 会让重试变成两条消息。
+        无 key 时仍用 uuid4（本来就没有重试语义）。
+
+        Matrix txnId 允许 `[A-Za-z0-9._=-]`；`sha256` 的 hexdigest 正好是 64 个
+        `[0-9a-f]`，无需转义。
+        """
+        if not idempotency_key:
+            return uuid.uuid4().hex
+        return hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:64]
+
     @staticmethod
     def _fingerprint(conversation_id: str, payload: Dict[str, Any]) -> str:
         canonical = json.dumps(

@@ -139,9 +139,11 @@ class PolicyDecision:
 
 
 def estimate_tokens(text: str) -> int:
-    """粗略 token 估算（≈4 字符/token，中文按字算更保守取 max）。
+    """粗略 token 估算（≈4 字符/token，最少 1）。
 
-    仅供预算展示；接真实模型后应改用实际 token 计数。
+    这是**下限**估算，不是精确计数：对中文（常见 1–2 字符/token）会低估，
+    但 B3 起它是客户端 `token_estimate` 的地板，保证 `token_estimate: 0` 无法
+    把非空正文计成 0 token。接真实模型后应改用实际 token 计数。
     """
     if not text:
         return 0
@@ -239,7 +241,13 @@ class PolicyEngine:
         now: Optional[datetime] = None,
     ) -> PolicyDecision:
         now = now or self._now()
-        estimated = token_estimate if token_estimate is not None else estimate_tokens(text)
+        # 计量取 max（B3）：客户端给的 token_estimate 只是**下限**，不能低于按
+        # 正文估算的值；否则 `token_estimate: 0` 可以完全绕过 token 预算
+        # （`tokens_per_window: 0` 也挡不住非空正文）。
+        estimated = max(
+            token_estimate if token_estimate is not None else 0,
+            estimate_tokens(text),
+        )
 
         effective: Optional[EffectiveLimits] = None
         if self._limit_store is not None:
@@ -436,8 +444,15 @@ class PolicyEngine:
             return item.value, item.source_layer, item.source_id
         return None
 
-    def _window_seconds(self, effective: Optional[EffectiveLimits]) -> int:
-        item = self._limits_for(effective, "window_seconds")
+    def _window_seconds(
+        self, effective: Optional[EffectiveLimits], *, pair: str
+    ) -> int:
+        """速率对的生效窗口（B1）：消息数与 token 各自用胜出层的窗口。
+
+        `effective` 里由 `LimitStore` 分别写下 `messages.window_seconds` /
+        `tokens.window_seconds`；没有该键时回退部署配置的窗口。
+        """
+        item = self._limits_for(effective, f"{pair}.window_seconds")
         if item is not None:
             return int(item[0])
         return self._config.rate_limit_window_seconds
@@ -445,7 +460,7 @@ class PolicyEngine:
     def _rate_view(
         self, persona_id: str, now: datetime, effective: Optional[EffectiveLimits]
     ) -> PolicyCheck:
-        window = self._window_seconds(effective)
+        window = self._window_seconds(effective, pair="messages")
         if effective is not None:
             item = self._limits_for(effective, "messages_per_window")
             if item is None:
@@ -508,7 +523,7 @@ class PolicyEngine:
         estimated: int,
         effective: Optional[EffectiveLimits],
     ) -> Optional[PolicyCheck]:
-        window = self._window_seconds(effective)
+        window = self._window_seconds(effective, pair="tokens")
         if effective is not None:
             item = self._limits_for(effective, "tokens_per_window")
             if item is None:

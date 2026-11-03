@@ -794,7 +794,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 |---|---|---|
 | 0.1.0 | 2026-11-04 | 澄清会话加密与 AI 参与：E2EE/`ai_participation=disabled` 下 AI 发言与预检返回 `403 conversation.e2ee`（硬约束，非 §1.4 blocked）；`createConversation` 禁止 `e2ee`+`enabled`（`422 request.invalid`），省略 `ai_participation` 时按 `encryption` 推导；苹果端细节改为外链。属文档澄清，不改字段集合。 |
 | 0.1.0 | 2026-11-04 | `Card.interrupt` 与 `CreateCardRequest.interrupt` 移除 `default: false`，改为三态（省略 / `true` / `false`）：省略时由 `priority` 决定（`urgent`→穿透，其余→顺延），显式 `false` 即使 `urgent` 也不打断。属「改默认值」=准破坏，按 §5.3 minor + 公告处理；同主版本内字段语义未变，仅澄清三态。 |
-| 0.1.0 | 2026-11-03 | 初稿：健康、功能清单、角色与状态、会话、消息与发言裁决、策略预检、三层限额、用量与账单、卡片与授权操作。评审：C/D 线（B0.1） |
+| 0.1.0 | 2026-11-04 | [B2.1] 修 DeepSeek B1–B4。**取舍：补契约、不删实现**——`Message.metadata` 是 #92 已实现并测试的透传字段，`peer_id` 是三层限额在实发路径生效的必需输入，删掉会回退功能，因此把两者补进 OpenAPI 而不是从实现里移除。(1) 窗口类限额改为速率对取最严，`window_seconds` 不独立比较（B1）；(2) `PolicyEvaluateRequest` / `OutgoingMessageRequest` 增加可选 `peer_id`，实发路径据此触发 peer 层（B2）；(3) `Message` 增加可选 `metadata`（string 值，maxProperties 8，B4）；(4) token 估算取 `max(client, estimate_tokens(text))`，`token_estimate:0` 不可绕过（B3）；同步修 §6.1。#99 加固：txnId 由 Idempotency-Key 稳定推导（重试命中同一事务）；/health whoami 短超时 + 5s 缓存；ensure_user 读写加锁（double-check，网络请求仍在锁外）。 |
 
 新增条目追加在本表顶部；同一版本内的编辑合并到该版本行。
 
@@ -821,12 +821,21 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 - **`0` 是有效限额**（`messages_per_window: 0` 表示一条都不允许），不是「不限」；
   「该层不限制」用**省略字段**表达。部署配置 `RATE_LIMIT_MESSAGES=0` /
   `PLATFORM_TOKEN_BUDGET=0` 才是「平台关闭该项限额」（历史语义，两者不可混用）。
-- **严格方向**：`messages_per_window` / `tokens_per_window` / `proactive_per_day` /
-  `town_tokens_per_day` / `max_message_chars` / `window_seconds` 越小越严；
-  `min_seconds_between_messages` 越大越严；`silent_hours.enabled: true` 比 `false` 严。
+- **严格方向**：`proactive_per_day` / `town_tokens_per_day` / `max_message_chars`
+  越小越严；`min_seconds_between_messages` 越大越严；`silent_hours.enabled: true`
+  比 `false` 严。
+- **窗口类限额按「速率对」取最严**（B1）：`messages_per_window` 与
+  `tokens_per_window` 各自与它的 `window_seconds` 是**一个整体**，比较的是
+  `count / window`；胜出层**成对采用**自己的 `count` 与 `window`（该层省略
+  `window_seconds` 时回退平台窗口）。**`window_seconds` 不单独比较**——否则只写
+  `window_seconds: 60` 就能把平台「2 条/3600s」放大成「2 条/60s」。两个速率对的
+  胜出层可能不同，因此生效值分别给出 `messages.window_seconds` 与
+  `tokens.window_seconds`。
 - **平台层是底线，只读**：`PUT /limits` 只能写 owner / peer；任何一项比平台层宽松
   → **422 `limit.out_of_range`**（`errors[]` 逐项给出字段与平台底线值）。
-  平台已开启的静默，owner/peer 不得关闭。
+  窗口类按速率对校验：`count/window` 不得大于平台的 `count/window`，**只缩短
+  窗口**（计数不变、`window_seconds` 变小）同样算放宽。平台已开启的静默，
+  owner/peer 不得关闭。
 - 静默时段、防刷屏、互聊熔断也各自参与，`checks[]` 里逐项给出 `allowed`/`limit`/`used`/`remaining`/`reset_at`。
 - `PolicyCheck.key` 推荐取值：`messages.window`、`tokens.window`、`proactive.per_day`、
   `town.tokens_per_day`、`silent_hours`、`min_interval`、`anti_spam.consecutive`、
@@ -836,8 +845,11 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
   `proactive.per_day` / `town.tokens_per_day` 的生效值已在 `GET /limits` 中计算，
   执行留待 B2.2（主动发言调度）。
 - **token 预算**：评估时按 `token_estimate`（缺省按正文长度估算）**预扣**，
-  投递成功后实际入账（`usage_delta.tokens_out`）。`tokens.window` 检查的
-  `used` 是窗口内已入账之和，`allowed = used + estimated <= limit`。
+  投递成功后实际入账（`usage_delta.tokens_out`）。计量取
+  `max(token_estimate, estimate_tokens(content))`（B3）：客户端给的值只是**下限**，
+  不能低于按正文的估算，否则 `token_estimate: 0` 能绕过预算（`tokens_per_window: 0`
+  也挡不住非空正文）。`tokens.window` 检查的 `used` 是窗口内已入账之和，
+  `allowed = used + estimated <= limit`。
 
 ### 6.2 预算与账单
 

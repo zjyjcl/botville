@@ -224,7 +224,9 @@ class TestLimitStore(unittest.TestCase):
             self.put("owner", "persona", "p", {"messages_per_window": 6})
         self.assertEqual(ctx.exception.code, "limit.out_of_range")
         self.assertEqual(ctx.exception.errors[0]["field"], "rules.messages_per_window")
-        self.assertIn("must be <= 5", ctx.exception.errors[0]["message"])
+        # B1：消息数是速率对，错误信息按 `count/window` 给出
+        self.assertIn("looser than the platform floor 5/3600s",
+                      ctx.exception.errors[0]["message"])
 
     def test_loosening_nested_rules_is_rejected(self):
         cfg = make_config()

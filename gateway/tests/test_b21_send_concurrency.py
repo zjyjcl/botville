@@ -85,6 +85,7 @@ class SlowTransport:
         text: str,
         reply_to: Optional[str] = None,
         content_type: str = "text",
+        txn_id: Optional[str] = None,
     ) -> SentEvent:
         with self._lock:
             self.calls += 1
