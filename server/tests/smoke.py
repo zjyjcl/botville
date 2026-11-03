@@ -113,7 +113,7 @@ class Smoke:
             time.sleep(POLL_INTERVAL)
 
     def register(self):
-        body = {"username": self.username, "password": self.password, "auth": {}}
+        body = {"username": self.username, "password": self.password}
         flow = None
         for _ in range(12):
             status, resp = request_json(
