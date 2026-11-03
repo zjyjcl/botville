@@ -1,0 +1,79 @@
+{
+  "manifest_version": "1.2.0",
+  "contract_version": "0.1.0",
+  "generated_at": "2026-11-03T12:00:00Z",
+  "cache_ttl_seconds": 300,
+  "defaults": {
+    "unknown_capability": "hidden",
+    "card_fallback": "text"
+  },
+  "capabilities": [
+    {
+      "id": "chat.direct",
+      "module": "core",
+      "version": "1.0.0",
+      "title": "私聊",
+      "summary": "与 AI 或好友一对一对话。",
+      "description": "所有消息经网关裁决后以角色身份投递到 Matrix。",
+      "icon": { "type": "sf_symbol", "value": "bubble.left.and.bubble.right" },
+      "status": "enabled",
+      "entry": { "type": "native", "deep_link": "botville://chat" },
+      "scopes": ["chat.read", "chat.write"],
+      "session_token": { "supported": false },
+      "updated_at": "2026-11-01T08:00:00Z"
+    },
+    {
+      "id": "memory.search",
+      "module": "memory",
+      "version": "0.9.0",
+      "title": "记忆检索",
+      "summary": "按语义检索角色的四层记忆。",
+      "icon": { "type": "sf_symbol", "value": "brain" },
+      "status": "enabled",
+      "entry": {
+        "type": "web",
+        "web_url": "https://gateway.example.invalid/modules/memory/"
+      },
+      "scopes": ["memory.read"],
+      "requires": ["chat.direct"],
+      "session_token": { "supported": true, "ttl_seconds": 300 },
+      "min_app_version": "0.4.0",
+      "i18n": {
+        "en": {
+          "title": "Memory search",
+          "summary": "Semantic search across the persona's four memory layers."
+        }
+      },
+      "updated_at": "2026-11-01T08:00:00Z"
+    },
+    {
+      "id": "notify.approvals",
+      "module": "notify",
+      "version": "0.5.0",
+      "title": "通知与授权",
+      "summary": "工作通知与高风险操作授权。",
+      "status": "degraded",
+      "unavailable_reason": "push_channel_degraded",
+      "entry": {
+        "type": "card_list",
+        "card_types": ["notification", "approval"],
+        "web_url": "https://gateway.example.invalid/modules/ci/"
+      },
+      "scopes": ["notify.read", "card.act"],
+      "session_token": { "supported": true, "ttl_seconds": 300 },
+      "updated_at": "2026-11-02T09:30:00Z"
+    },
+    {
+      "id": "town.enter",
+      "module": "town",
+      "version": "0.1.0",
+      "title": "小镇",
+      "summary": "进入俯视小镇，与小人们互动。",
+      "status": "disabled",
+      "unavailable_reason": "module_disabled",
+      "entry": { "type": "none" },
+      "scopes": ["town.read"],
+      "updated_at": "2026-11-01T08:00:00Z"
+    }
+  ]
+}
