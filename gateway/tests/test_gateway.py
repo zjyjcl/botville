@@ -408,6 +408,32 @@ class TestIdempotency(unittest.TestCase):
         })
         self.assertEqual(r["outcome"], "delivered")
 
+    def test_markdown_content_type_preserved(self):
+        """#92: content.type=markdown 必须原样到 transport 与回执，不得降级为 text。"""
+        svc, transport, store, now = _make_service()
+        r = svc.send_ai_message("c", {
+            "sender_persona_id": "p",
+            "content": {"type": "markdown", "text": "**bold** and `code`"},
+            "metadata": {"source": "test"},
+        })
+        self.assertEqual(r["outcome"], "delivered")
+        # 回执：content.type 保持 markdown
+        self.assertEqual(r["message"]["content"]["type"], "markdown")
+        self.assertEqual(r["message"]["content"]["text"], "**bold** and `code`")
+        # transport：类型原样透传
+        self.assertEqual(transport.sent[0].content_type, "markdown")
+        self.assertEqual(transport.sent[0].text, "**bold** and `code`")
+
+    def test_plain_text_content_type_preserved(self):
+        """对照组：#92 的修复不能反过来把 text 改成 markdown。"""
+        svc, transport, store, now = _make_service()
+        r = svc.send_ai_message("c", {
+            "sender_persona_id": "p",
+            "content": {"type": "text", "text": "plain"},
+        })
+        self.assertEqual(r["message"]["content"]["type"], "text")
+        self.assertEqual(transport.sent[0].content_type, "text")
+
     def test_evaluate_policy_rejects_bad_kind(self):
         """B5: PolicyEvaluateRequest.kind enum 校验。"""
         svc, transport, store, now = _make_service()
@@ -529,6 +555,44 @@ class TestConfig(unittest.TestCase):
         cfg = load_config({"GATEWAY_DEV_MODE": "true", "GATEWAY_AUTH_TOKEN": "real-token-xyz"})
         self.assertEqual(cfg.auth_token, "real-token-xyz")
         self.assertTrue(cfg.dev_mode)
+
+    def test_dev_mode_rejects_non_loopback_host(self):
+        """#92: GATEWAY_DEV_MODE=true 且 GATEWAY_HOST 非 loopback → 拒绝启动。"""
+        for host in ("0.0.0.0", "::", "192.168.1.10", "gateway.example.invalid"):
+            with self.assertRaises(ConfigError, msg=f"host {host!r} should be rejected"):
+                load_config({"GATEWAY_DEV_MODE": "true", "GATEWAY_HOST": host})
+
+    def test_dev_mode_allows_loopback_hosts(self):
+        """#92: 三种 loopback 写法都放行。"""
+        for host in ("127.0.0.1", "::1", "localhost"):
+            cfg = load_config({"GATEWAY_DEV_MODE": "true", "GATEWAY_HOST": host})
+            self.assertTrue(cfg.dev_mode)
+            self.assertEqual(cfg.host, host)
+
+    def test_non_dev_mode_may_bind_any_host(self):
+        """#92: 非 dev 模式（有真实 token）不受 loopback 限制——否则生产无法对外监听。"""
+        cfg = load_config(
+            {"GATEWAY_HOST": "0.0.0.0", "GATEWAY_AUTH_TOKEN": "a-strong-random-token"}
+        )
+        self.assertFalse(cfg.dev_mode)
+        self.assertEqual(cfg.host, "0.0.0.0")
+
+    def test_dev_mode_non_loopback_exits_2(self):
+        """#92: 该 ConfigError 走 `__main__` 的 ConfigError 分支，退出码为 2。"""
+        code = subprocess.run(
+            [sys.executable, "-m", "botville_gateway"],
+            env={
+                "PYTHONPATH": _SRC,
+                "GATEWAY_DEV_MODE": "true",
+                "GATEWAY_HOST": "0.0.0.0",
+                "GATEWAY_PORT": "8080",
+            },
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+        self.assertEqual(code.returncode, 2)
+        self.assertIn("config error", code.stderr.decode("utf-8", "replace").lower())
 
 
 # ---------------------------------------------------------------------------
@@ -855,6 +919,45 @@ class TestHttpServer(unittest.TestCase):
             }, headers=headers)
         self.assertEqual(status, 400)
         self.assertEqual(body["code"], "request.invalid")
+
+    def test_idempotency_key_too_short_rejected(self):
+        """#92: Idempotency-Key < 8 字符不再静默忽略，而是 400 problem+json。"""
+        with _ServerFixture(self._cfg()) as server:
+            url = f"{server.base}/v1/conversations/c/messages"
+            for key in ("", "short", "1234567"):
+                status, body = _http("POST", url, {
+                    "sender_persona_id": "p", "content": {"type": "text", "text": "x"},
+                }, headers={"Idempotency-Key": key})
+                self.assertEqual(status, 400, f"key {key!r} should be 400")
+                self.assertEqual(body["code"], "request.invalid")
+                self.assertTrue(body["type"].startswith("urn:botville:error:"))
+                self.assertIn("request_id", body)
+                self.assertIn("8–128", body.get("detail", ""))
+            # 被拒绝的请求没有投递
+            self.assertEqual(len(server.server.transport.sent), 0)
+
+    def test_idempotency_key_boundary_lengths_accepted(self):
+        """#92: 恰好 8 和 128 字符合法，不应被 400 误伤。"""
+        with _ServerFixture(self._cfg()) as server:
+            url = f"{server.base}/v1/conversations/c/messages"
+            for key in ("k" * 8, "k" * 128):
+                status, body = _http("POST", url, {
+                    "sender_persona_id": "p", "content": {"type": "text", "text": "x"},
+                }, headers={"Idempotency-Key": key})
+                self.assertEqual(status, 200, f"key length {len(key)} should be accepted")
+                self.assertEqual(body["outcome"], "delivered")
+
+    def test_markdown_preserved_over_http(self):
+        """#92: HTTP 端到端 content.type=markdown 原样保留到回执与 transport。"""
+        with _ServerFixture(self._cfg()) as fixture:
+            status, body = _http(
+                "POST", f"{fixture.base}/v1/conversations/c/messages",
+                {"sender_persona_id": "p", "content": {"type": "markdown", "text": "**hi**"}},
+            )
+            sent = fixture.server.transport.sent
+        self.assertEqual(status, 200)
+        self.assertEqual(body["message"]["content"]["type"], "markdown")
+        self.assertEqual(sent[0].content_type, "markdown")
 
 
 # ---------------------------------------------------------------------------

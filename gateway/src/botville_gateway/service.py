@@ -272,6 +272,7 @@ class GatewayService:
                 conversation_id=conversation_id,
                 sender=sender,
                 text=text,
+                content_type=content_type,
                 reply_to=reply_to,
                 mentions=list(mentions) if mentions else None,
                 token_estimate=token_estimate,
@@ -289,6 +290,7 @@ class GatewayService:
         conversation_id: str,
         sender: str,
         text: str,
+        content_type: str,
         reply_to: Optional[str],
         mentions: Optional[List[str]] = None,
         token_estimate: Optional[int],
@@ -347,6 +349,7 @@ class GatewayService:
                 sender_id=sender,
                 text=text,
                 reply_to=reply_to,
+                content_type=content_type,
             )
         except DeliveryError as exc:
             # 传输失败是 5xx 传输层错误，不是策略结论；不记 usage，不占名额。
@@ -369,6 +372,7 @@ class GatewayService:
                 conversation_id=conversation_id,
                 sender=sender,
                 text=text,
+                content_type=content_type,
                 reply_to=reply_to,
                 mentions=mentions,
                 event_id=event.event_id,
@@ -417,12 +421,14 @@ class GatewayService:
         conversation_id: str,
         sender: str,
         text: str,
-        reply_to: Optional[str],
+        content_type: str = "text",
+        reply_to: Optional[str] = None,
         mentions: Optional[List[str]] = None,
         event_id: str,
         created_at: datetime,
     ) -> Dict[str, Any]:
-        content: Dict[str, Any] = {"type": "text", "text": text}
+        # 原样保留请求的 content.type：markdown 不得降级为 text（#92）。
+        content: Dict[str, Any] = {"type": content_type, "text": text}
         if mentions:
             content["mentions"] = list(mentions)
         msg: Dict[str, Any] = {

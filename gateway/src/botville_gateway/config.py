@@ -21,6 +21,9 @@ CONTRACT_VERSION = "0.1.0"
 # unless GATEWAY_DEV_MODE=true is explicitly set.
 _INSECURE_TOKENS: frozenset = frozenset({"", "<change-me>"})
 
+# dev 模式（免鉴权）只允许绑定这些本机地址，否则等于把无鉴权网关暴露到网络上。
+LOOPBACK_HOSTS: frozenset = frozenset({"127.0.0.1", "::1", "localhost"})
+
 DEFAULT_SILENT_START = "23:00"
 DEFAULT_SILENT_END = "07:30"
 DEFAULT_TIMEZONE = "Asia/Shanghai"
@@ -130,6 +133,13 @@ class Config:
                     "Set a strong random token, or set GATEWAY_DEV_MODE=true to run without auth "
                     "(dev mode only; prints a WARNING on startup)."
                 )
+        # #92: dev 模式只允许绑定 loopback；绑定非 loopback 时拒绝启动（ConfigError）。
+        if self.dev_mode and self.host not in LOOPBACK_HOSTS:
+            raise ConfigError(
+                f"GATEWAY_DEV_MODE=true requires GATEWAY_HOST to be a loopback address "
+                f"(127.0.0.1, ::1, or localhost), got {self.host!r}. "
+                "Set a real GATEWAY_AUTH_TOKEN and disable dev mode for non-loopback deployments."
+            )
 
     @property
     def silent_start_minute(self) -> int:

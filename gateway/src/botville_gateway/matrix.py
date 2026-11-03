@@ -32,6 +32,7 @@ class SentEvent:
     text: str
     sent_at: datetime
     reply_to: Optional[str] = None
+    content_type: str = "text"
 
 
 @dataclass
@@ -56,8 +57,13 @@ class MatrixTransport(Protocol):
         sender_id: str,
         text: str,
         reply_to: Optional[str] = None,
+        content_type: str = "text",
     ) -> SentEvent:
-        """以 `sender_id` 身份向 `room_id` 发送文本消息。失败抛 DeliveryError。"""
+        """以 `sender_id` 身份向 `room_id` 发送消息。失败抛 DeliveryError。
+
+        `content_type` 原样携带请求的 `content.type`（`text` / `markdown`），
+        实现方不得擅自降级为 `text`。
+        """
         ...
 
     def healthy(self) -> bool:
@@ -84,6 +90,7 @@ class InMemoryMatrixTransport:
         sender_id: str,
         text: str,
         reply_to: Optional[str] = None,
+        content_type: str = "text",
     ) -> SentEvent:
         if self.fail:
             raise DeliveryError("matrix.unavailable", "in-memory transport is set to fail")
@@ -95,6 +102,7 @@ class InMemoryMatrixTransport:
                 text=text,
                 sent_at=datetime.now(timezone.utc),
                 reply_to=reply_to,
+                content_type=content_type,
             )
             self.sent.append(event)
             return event
