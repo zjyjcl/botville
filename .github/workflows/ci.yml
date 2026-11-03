@@ -1,0 +1,126 @@
+# Botville CI (A0.2).
+#
+# smoke: boot the Compose stack per homeserver profile and run the
+#         standard-library smoke test against 127.0.0.1:8008.
+#         synapse + tuwunel are required-green; continuwuity is experimental
+#         (continue-on-error) because it tracks :latest images.
+# lint:   compose config for all three profiles, shellcheck, python syntax,
+#         and a guard that .env.example only ever contains placeholders.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    name: smoke (${{ matrix.homeserver }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        homeserver: [synapse, tuwunel, continuwuity]
+    continue-on-error: ${{ matrix.homeserver == 'continuwuity' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Init .env and select homeserver
+        run: |
+          bash server/scripts/init.sh
+          sed -i "s/^BOTVILLE_HOMESERVER=.*/BOTVILLE_HOMESERVER=${{ matrix.homeserver }}/" server/compose/.env
+          # CI-only: open Synapse registration so the UIA m.login.dummy flow
+          # works without email verification. This runs on an ephemeral,
+          # loopback-only runner; local defaults stay closed.
+          sed -i "s/^BOTVILLE_OPEN_REGISTRATION=.*/BOTVILLE_OPEN_REGISTRATION=true/" server/compose/.env
+
+      - name: Start homeserver
+        run: make up HS=${{ matrix.homeserver }}
+
+      - name: Smoke test
+        run: |
+          token="$(sed -n 's/^BOTVILLE_REGISTRATION_TOKEN=//p' server/compose/.env)"
+          python3 server/tests/smoke.py \
+            --base-url http://127.0.0.1:8008 \
+            --registration-token "$token"
+
+      - name: Dump logs
+        if: failure()
+        run: |
+          docker compose -f server/compose/docker-compose.yml \
+            --env-file server/compose/.env --profile ${{ matrix.homeserver }} \
+            logs --no-color
+
+      - name: Teardown
+        if: always()
+        run: |
+          docker compose -f server/compose/docker-compose.yml \
+            --env-file server/compose/.env --profile ${{ matrix.homeserver }} \
+            down -v --remove-orphans
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck init.sh
+        run: shellcheck server/scripts/init.sh
+
+      - name: Python syntax
+        run: python3 -m py_compile server/tests/smoke.py
+
+      - name: Compose config validates for every profile
+        run: |
+          bash server/scripts/init.sh
+          for hs in synapse tuwunel continuwuity; do
+            echo "== docker compose config --profile ${hs}"
+            docker compose -f server/compose/docker-compose.yml \
+              --env-file server/compose/.env --profile "${hs}" config --quiet
+          done
+
+      - name: .env.example contains placeholders only
+        run: |
+          python3 - <<'EOF'
+          import sys
+
+          path = "server/compose/.env.example"
+          # Strict allowlist: KEY plus the only acceptable (non-secret) value.
+          # When adding a key here, keep this check in sync.
+          allowed = {
+              "BOTVILLE_HOMESERVER": "synapse",
+              "BOTVILLE_SERVER_NAME": "localhost",
+              "BOTVILLE_HTTP_PORT": "8008",
+              "BOTVILLE_OPEN_REGISTRATION": "false",
+              "BOTVILLE_REGISTRATION_TOKEN": "<change-me>",
+              "POSTGRES_USER": "botville",
+              "POSTGRES_PASSWORD": "<change-me>",
+              "POSTGRES_DB": "synapse",
+              "SYNAPSE_MACAROON_SECRET": "<change-me>",
+              "SYNAPSE_FORM_SECRET": "<change-me>",
+              "SYNAPSE_REGISTRATION_SHARED_SECRET": "<change-me>",
+              "SYNAPSE_IMAGE": "docker.io/matrixdotorg/synapse:v1.141.0",
+              "TUWUNEL_IMAGE": "ghcr.io/matrix-construct/tuwunel:latest",
+              "CONTINUWUITY_IMAGE": "ghcr.io/continuwuity/continuwuity:latest",
+          }
+
+          problems = []
+          for n, raw in enumerate(open(path, encoding="utf-8"), 1):
+              line = raw.strip()
+              if not line or line.startswith("#"):
+                  continue
+              key, sep, value = line.partition("=")
+              if not sep or not key:
+                  problems.append(f"{path}:{n}: not a KEY=VALUE line: {raw!r}")
+              elif key not in allowed:
+                  problems.append(f"{path}:{n}: unexpected key {key!r}")
+              elif value != allowed[key]:
+                  problems.append(
+                      f"{path}:{n}: {key} must stay {allowed[key]!r}, found {value!r}"
+                  )
+          if problems:
+              print("\n".join(problems))
+              sys.exit(1)
+          print(f"{path}: OK (placeholders only, no real values)")
+          EOF

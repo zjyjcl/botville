@@ -1,0 +1,119 @@
+# Botville homeserver stack (A0.2).
+#
+# Exactly one homeserver profile is active at a time:
+#   docker compose --profile synapse | --profile tuwunel | --profile continuwuity
+# `make up` / `make up HS=tuwunel` in the repo root wraps this (see Makefile).
+#
+# Ports are bound to 127.0.0.1 only; expose via a reverse proxy when needed.
+# Images can be pinned/overridden via SYNAPSE_IMAGE / TUWUNEL_IMAGE /
+# CONTINUWUITY_IMAGE in server/compose/.env.
+#
+# Readiness:
+#   - postgres, synapse: container healthchecks.
+#   - tuwunel, continuwuity: their OCI images are OS-less (no shell, no curl),
+#     so no in-container healthcheck is possible; server/tests/smoke.py waits
+#     for GET /_matrix/client/versions instead.
+
+name: botville
+
+services:
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    profiles: [synapse]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-botville}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in server/compose/.env}
+      POSTGRES_DB: ${POSTGRES_DB:-synapse}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-botville} -d ${POSTGRES_DB:-synapse}"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+    restart: unless-stopped
+
+  synapse:
+    # Pinned tag; v1.142.0 had a regression at the time of writing, 1.141.0 is
+    # what matrix-docker-ansible-deploy stayed on.
+    image: ${SYNAPSE_IMAGE:-docker.io/matrixdotorg/synapse:v1.141.0}
+    profiles: [synapse]
+    # homeserver.yaml is rendered from synapse/homeserver.yaml.tmpl by
+    # server/scripts/init.sh into ./generated/synapse/ (gitignored).
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        python -m synapse.app.homeserver --config-path /config/homeserver.yaml
+        --generate-keys --keys-directory /data &&
+        exec python -m synapse.app.homeserver --config-path /config/homeserver.yaml
+        --keys-directory /data
+    ports:
+      - "127.0.0.1:${BOTVILLE_HTTP_PORT:-8008}:8008"
+    volumes:
+      - ./generated/synapse:/config:ro
+      - synapse-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # /health is always served on the client listener (synapse >= 1.63).
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8008/health', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  tuwunel:
+    # Registry also mirrored at docker.io/jevolk/tuwunel. `latest` is the most
+    # recent tagged release (~monthly); override TUWUNEL_IMAGE to pin.
+    image: ${TUWUNEL_IMAGE:-ghcr.io/matrix-construct/tuwunel:latest}
+    profiles: [tuwunel]
+    # First boot after an upgrade runs RocksDB migrations that must not be
+    # interrupted; upstream recommends a long stop grace period.
+    stop_grace_period: 10m
+    environment:
+      TUWUNEL_SERVER_NAME: ${BOTVILLE_SERVER_NAME:-localhost}
+      TUWUNEL_DATABASE_PATH: /var/lib/tuwunel
+      TUWUNEL_ADDRESS: 0.0.0.0
+      TUWUNEL_PORT: "8008"
+      # Registration stays token-gated even when open; token comes from .env.
+      TUWUNEL_ALLOW_REGISTRATION: "true"
+      TUWUNEL_REGISTRATION_TOKEN: ${BOTVILLE_REGISTRATION_TOKEN:?set in server/compose/.env}
+      TUWUNEL_ALLOW_FEDERATION: "false"
+      TUWUNEL_TRUSTED_SERVERS: "[]"
+    ports:
+      - "127.0.0.1:${BOTVILLE_HTTP_PORT:-8008}:8008"
+    volumes:
+      - tuwunel-data:/var/lib/tuwunel
+    restart: unless-stopped
+
+  continuwuity:
+    # Experimental in CI (continue-on-error); image is FROM scratch with CMD
+    # /sbin/conduwuit, so no command override is needed.
+    image: ${CONTINUWUITY_IMAGE:-ghcr.io/continuwuity/continuwuity:latest}
+    profiles: [continuwuity]
+    stop_grace_period: 10m
+    environment:
+      CONTINUWUITY_SERVER_NAME: ${BOTVILLE_SERVER_NAME:-localhost}
+      CONTINUWUITY_DATABASE_PATH: /var/lib/continuwuity
+      CONTINUWUITY_ADDRESS: 0.0.0.0
+      CONTINUWUITY_PORT: "8008"
+      CONTINUWUITY_ALLOW_REGISTRATION: "true"
+      CONTINUWUITY_REGISTRATION_TOKEN: ${BOTVILLE_REGISTRATION_TOKEN:?set in server/compose/.env}
+      CONTINUWUITY_ALLOW_FEDERATION: "false"
+      CONTINUWUITY_TRUSTED_SERVERS: "[]"
+    ports:
+      - "127.0.0.1:${BOTVILLE_HTTP_PORT:-8008}:8008"
+    volumes:
+      - continuwuity-data:/var/lib/continuwuity
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  synapse-data:
+  tuwunel-data:
+  continuwuity-data:

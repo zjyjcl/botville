@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+# rendered by server/scripts/init.sh from .env + templates
+server/compose/generated/
 *.pem
 *.key
 *.p8
