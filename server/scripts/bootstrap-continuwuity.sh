@@ -62,6 +62,7 @@ python3 - "${base_url}" "${timeout_secs}" <<'PY'
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 base_url, timeout_secs = sys.argv[1], float(sys.argv[2])
@@ -158,6 +159,23 @@ def fail(message):
 
 
 already = "{} already registered; bootstrap was already complete".format(username)
+
+# Idempotency: GET /register/available (standard CS API) answers 400
+# M_USER_IN_USE once the admin exists, even when stale token lines remain in
+# the container logs.
+try:
+    with urllib.request.urlopen(
+        base_url + "/_matrix/client/v3/register/available?username="
+        + urllib.parse.quote(username), timeout=30) as r:
+        pass
+except urllib.error.HTTPError as exc:
+    try:
+        body = json.loads(exc.read() or b"{}")
+    except json.JSONDecodeError:
+        body = {}
+    if body.get("errcode") == "M_USER_IN_USE":
+        print(PREFIX + already)
+        sys.exit(0)
 
 # UIA step 1: no auth -> 401 with a session (flows: m.login.registration_token).
 status, resp = post_register({"username": username, "password": password})
