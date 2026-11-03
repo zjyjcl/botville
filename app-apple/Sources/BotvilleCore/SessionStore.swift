@@ -64,12 +64,13 @@ struct RestoredHomeserverPolicy: Sendable {
     }
 
     func validatedURL(_ value: String) throws -> URL {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         if !allowLocalHTTP,
-           let components = URLComponents(string: value),
+           let components = URLComponents(string: trimmed),
            components.scheme?.lowercased() == "http" {
             throw SessionRestoreSecurityError.insecureHTTP
         }
-        return try HomeserverPolicy(allowLocalHTTP: allowLocalHTTP).validatedURL(value)
+        return try HomeserverPolicy(allowLocalHTTP: allowLocalHTTP).validatedURL(trimmed)
     }
 
     private static let isDebugBuild: Bool = {
@@ -85,7 +86,7 @@ enum SessionRestoreSecurityError: LocalizedError {
     case insecureHTTP
 
     var errorDescription: String? {
-        "已拒绝并清除旧的 HTTP 本地会话；Release 仅可恢复 HTTPS 会话，请重新登录。"
+        "已拒绝并清除旧的 HTTP 本地会话；仅可恢复 HTTPS 会话，请重新登录。"
     }
 }
 

@@ -15,18 +15,102 @@ public struct HomeserverPolicy: Sendable {
 
     public func validatedURL(_ value: String) throws -> URL {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let components = URLComponents(string: trimmed),
+        guard let url = URL(string: trimmed),
+              let components = try? EndpointURLPolicy.validatedComponents(url),
               let scheme = components.scheme?.lowercased(),
-              let host = components.host?.lowercased(), !host.isEmpty,
-              components.user == nil, components.password == nil,
+              let host = components.host?.lowercased(),
               components.query == nil, components.fragment == nil,
-              components.port.map({ (1...65_535).contains($0) }) ?? true,
-              components.url != nil,
               scheme == "https" || (allowLocalHTTP && scheme == "http" && (host == "localhost" || host == "127.0.0.1")) else {
             throw AuthenticationError.invalidHomeserver
         }
-        return components.url!
+        return url
     }
+}
+
+/// Validates the URL authority in its percent-encoded form. `URLComponents`
+/// exposes a decoded host, so checking only `host`, `user`, and `password`
+/// would allow encoded delimiters to create a differently interpreted origin.
+enum EndpointURLPolicy {
+    static func validatedComponents(_ url: URL, originalSource: String? = nil) throws -> URLComponents {
+        let source = originalSource ?? url.absoluteString
+        guard isSafeURLString(source),
+              source.removingPercentEncoding.map({ isSafeURLString($0) }) ?? false,
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let host = components.host, !host.isEmpty,
+              let encodedHost = components.percentEncodedHost, !encodedHost.isEmpty,
+              !encodedHost.contains("%"),
+              components.user == nil, components.password == nil,
+              components.fragment == nil else {
+            throw URLAuthorityError.invalid
+        }
+
+        guard !containsUnsafeHostCharacter(host),
+              !containsUnsafeHostCharacter(encodedHost) else {
+            throw URLAuthorityError.invalid
+        }
+
+        let explicitPort = try explicitPort(in: source)
+        guard components.port == explicitPort,
+              components.port.map({ (1...65_535).contains($0) }) ?? true else {
+            throw URLAuthorityError.invalid
+        }
+        return components
+    }
+
+    static func isSafeURLString(_ value: String) -> Bool {
+        value.rangeOfCharacter(from: CharacterSet.whitespacesAndNewlines.union(.controlCharacters)) == nil
+    }
+
+    private static func containsUnsafeHostCharacter(_ host: String) -> Bool {
+        host.unicodeScalars.contains { scalar in
+            CharacterSet.whitespacesAndNewlines.contains(scalar)
+                || scalar.value < 0x20 || scalar.value == 0x7F
+        } || host.contains("\\") || host.contains("/") || host.contains("@") || host.contains("%")
+    }
+
+    /// Returns nil when the authority has no explicit port.  Parsing the raw
+    /// authority prevents an overflowing or empty port from being hidden as a
+    /// nil `URLComponents.port` value.
+    private static func explicitPort(in source: String) throws -> Int? {
+        guard let schemeBoundary = source.range(of: "://") else { throw URLAuthorityError.invalid }
+        let afterScheme = source[schemeBoundary.upperBound...]
+        let authorityEnd = afterScheme.firstIndex(where: { $0 == "/" || $0 == "?" || $0 == "#" }) ?? afterScheme.endIndex
+        let authority = String(afterScheme[..<authorityEnd])
+        guard !authority.isEmpty, !authority.contains("@") else { throw URLAuthorityError.invalid }
+
+        let portText: Substring?
+        if authority.first == "[" {
+            guard let closingBracket = authority.firstIndex(of: "]") else { throw URLAuthorityError.invalid }
+            let suffix = authority[authority.index(after: closingBracket)...]
+            guard !suffix.contains("[") && !suffix.contains("]") else { throw URLAuthorityError.invalid }
+            if suffix.isEmpty {
+                portText = nil
+            } else {
+                guard suffix.first == ":" else { throw URLAuthorityError.invalid }
+                portText = suffix.dropFirst()
+            }
+        } else {
+            let colonCount = authority.reduce(into: 0) { if $1 == ":" { $0 += 1 } }
+            guard colonCount <= 1 else { throw URLAuthorityError.invalid }
+            if let colon = authority.lastIndex(of: ":") {
+                guard colon != authority.startIndex else { throw URLAuthorityError.invalid }
+                portText = authority[authority.index(after: colon)...]
+            } else {
+                portText = nil
+            }
+        }
+
+        guard let portText else { return nil }
+        guard !portText.isEmpty,
+              portText.allSatisfy({ $0.isASCII && $0.isNumber }),
+              let port = Int(portText),
+              (1...65_535).contains(port) else {
+            throw URLAuthorityError.invalid
+        }
+        return port
+    }
+
+    private enum URLAuthorityError: Error { case invalid }
 }
 
 public enum AuthenticationError: LocalizedError, Equatable, Sendable {

@@ -6,6 +6,12 @@ import MatrixRustSDK
 import XCTest
 
 final class AuthenticationSessionTests: XCTestCase {
+    override func tearDown() {
+        DiscoveryURLProtocol.handler = nil
+        DiscoveryURLProtocol.paths = []
+        super.tearDown()
+    }
+
     func testHomeserverPolicyRequiresHTTPSExceptExplicitLoopbackDevelopment() throws {
         XCTAssertEqual(try HomeserverPolicy().validatedURL(" https://matrix.example.org/base ").absoluteString, "https://matrix.example.org/base")
         XCTAssertThrowsError(try HomeserverPolicy().validatedURL("http://127.0.0.1:8008"))
@@ -124,7 +130,9 @@ final class AuthenticationSessionTests: XCTestCase {
     }
 
     func testSessionStoreDirectoryCreatesAndRemovesOnlyItsSessionDirectory() throws {
-        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temporary = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".build/authentication-tests/\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: temporary) }
         let directory = SessionStoreDirectory(baseURL: temporary)
         let id = UUID()

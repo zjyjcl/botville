@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # 会话安全边界
 
 ## Release 恢复
@@ -14,7 +16,9 @@
 
 **本次继续关闭自动 refresh，不使用 refresh token。** 后续需先实现 Keychain session delegate，覆盖保存失败、轮换后重启、多请求并发及旧 token 失效路径，再启用自动 refresh；因此本 PR 对 #90 使用 Refs。
 
-SDK 的 `M_UNKNOWN_TOKEN` 带 `softLogout: true` 时，服务端要求重新认证但明确保留该会话。客户端会停用当前 SDK client，保留 Keychain 记录和加密 SQLite store，并提示用户重输密码；请求会带原 device ID，成功后复用原 store ID 和 store key。密码错误、取消或新会话激活失败会恢复旧 Keychain 记录，不会删除本地数据，也不会对新 token 调用 logout，避免撤销同一设备。`softLogout: false` 仍按失效会话清理。
+SDK 的 `M_UNKNOWN_TOKEN` 带 `softLogout: true` 时，服务端要求重新认证但明确保留该会话。客户端会停用当前 SDK client，保留 Keychain 记录和加密 SQLite store，并提示用户重输密码；请求会带原 device ID，成功后复用原 store ID 和 store key。重新认证期间不再自动恢复旧 token。密码错误、取消或新会话激活失败不会删除本地数据；登录页始终提供经二次确认的退出登录和清除本地会话入口，清除后可修改账号与服务器。两者均复用 `clearLocalSession()`：删除本机 Keychain 会话及本地消息数据库（包括待发送消息），不撤销服务器设备会话、不删除服务器消息。`softLogout: false` 仍按失效会话清理。
+
+失败的 soft logout 重登不会对候选 token 调用 `/logout`。[Matrix 规范](https://spec.matrix.org/latest/client-server-api/#post_matrixclientv3logout)规定该接口还会删除关联 device 及其 device keys；同设备重登后调用它，会破坏原设备加密状态。代价是激活或持久化失败后的候选 token 可能仍在服务器有效，当前不能保证立即撤销它；后续需服务端支持安全的单 token 撤销或明确的设备管理流程。普通新登录失败仍执行凭据撤销。正常登录在激活前保存新 store key；soft logout 保留旧记录到替换会话激活成功，原子保存失败仍保留旧记录与本地清除出口。若用户清除本地会话时发生部分失败，必须先完成清除，不能继续用旧记录重建已删除的 store。
 
 
 本轮使用模拟 client/password transport 验证设备 ID、store ID/key、目录内容保留与失败路径；不代表真实服务端 token rotation 或旧加密历史端到端验收。

@@ -12,7 +12,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
     func testReleaseRestorePolicyRejectsStoredLoopbackHTTP() {
         XCTAssertThrowsError(
             try RestoredHomeserverPolicy(storedAllowLocalHTTP: true, isDebugBuild: false)
-                .validatedURL("http://127.0.0.1:8028")
+                .validatedURL("  http://127.0.0.1:8028  ")
         ) { error in
             XCTAssertTrue(error is SessionRestoreSecurityError)
         }
@@ -41,7 +41,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         let deniedService = makeService(sessionStore: deniedStore, directory: temporary, client: FakeClient())
         await deniedService.restoreSession()
         XCTAssertNil(try deniedStore.load())
-        XCTAssertEqual(deniedService.sessionError, "已拒绝并清除旧的 HTTP 本地会话；Release 仅可恢复 HTTPS 会话，请重新登录。")
+        XCTAssertEqual(deniedService.sessionError, "已拒绝并清除旧的 HTTP 本地会话；仅可恢复 HTTPS 会话，请重新登录。")
     }
     #else
     func testReleaseBuildClearsStoredLoopbackHTTPForLocalhostAndIPAddress() async throws {
@@ -60,7 +60,37 @@ final class MatrixServiceLifecycleTests: XCTestCase {
             XCTAssertFalse(service.isLoggedIn)
             XCTAssertNil(try store.load())
             XCTAssertFalse(FileManager.default.fileExists(atPath: directory.url(for: saved.storeID).path))
-            XCTAssertEqual(service.sessionError, "已拒绝并清除旧的 HTTP 本地会话；Release 仅可恢复 HTTPS 会话，请重新登录。")
+            XCTAssertEqual(service.sessionError, "已拒绝并清除旧的 HTTP 本地会话；仅可恢复 HTTPS 会话，请重新登录。")
+        }
+    }
+
+    func testReleaseLoginRejectsExplicitLoopbackHTTPBeforeDiscoveryClientOrPasswordTransport() async throws {
+        for homeserver in ["http://localhost:8028", "http://127.0.0.1:8028"] {
+            let temporary = try makeTemporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: temporary) }
+            let discovery = CountingPasswordDiscovery()
+            let authentication = FakePasswordAuthentication()
+            let service = MatrixService(
+                sessionStore: InMemorySessionStore(),
+                storeDirectory: SessionStoreDirectory(baseURL: temporary),
+                discovery: discovery,
+                monitorNetwork: false,
+                passwordAuthentication: authentication
+            )
+            var clientFactoryCalls = 0
+            service.clientFactory = { _, _, _ in
+                clientFactoryCalls += 1
+                throw SessionStoreError.unavailable
+            }
+
+            do {
+                try await service.login(homeserver: homeserver, username: "release-http", password: "test-password", allowLocalHTTP: true)
+                XCTFail("Release must reject explicit local HTTP")
+            } catch {}
+
+            XCTAssertEqual(discovery.calls, 0, "policy must reject before discovery")
+            XCTAssertEqual(clientFactoryCalls, 0, "policy must reject before creating a client")
+            XCTAssertTrue(authentication.loginCalls.isEmpty, "policy must reject before password transport")
         }
     }
 
@@ -90,6 +120,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         try await waitUntil { service.requiresPasswordReauthentication }
 
         XCTAssertFalse(service.isLoggedIn)
+        XCTAssertTrue(service.canClearLocalSession)
         XCTAssertEqual(try store.load(), saved)
         XCTAssertTrue(FileManager.default.fileExists(atPath: temporary.appendingPathComponent(saved.storeID.uuidString).path))
         XCTAssertEqual(service.reauthenticationHomeserver, saved.homeserverURL)
@@ -182,6 +213,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
 
         XCTAssertEqual(try store.load(), saved)
         XCTAssertTrue(service.requiresPasswordReauthentication)
+        XCTAssertTrue(service.canClearLocalSession)
         XCTAssertTrue(FileManager.default.fileExists(atPath: temporary.appendingPathComponent(saved.storeID.uuidString).path))
         client.syncError = nil
         authentication.error = nil
@@ -285,7 +317,8 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         let failing = FakeClient(restoreError: ClientError.Generic(msg: "transport", details: nil))
         let replacement = FakeClient()
         let clients = ClientSequence([first, failing, replacement])
-        let service = MatrixService(sessionStore: store, storeDirectory: SessionStoreDirectory(baseURL: temporary), discovery: PasswordDiscovery(), monitorNetwork: false, passwordAuthentication: FakePasswordAuthentication())
+        let authentication = FakePasswordAuthentication()
+        let service = MatrixService(sessionStore: store, storeDirectory: SessionStoreDirectory(baseURL: temporary), discovery: PasswordDiscovery(), monitorNetwork: false, passwordAuthentication: authentication)
         service.clientFactory = { _, _, _ in try clients.next() }
         _ = try SessionStoreDirectory(baseURL: temporary).create(for: saved.storeID)
 
@@ -299,6 +332,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         }
         XCTAssertEqual(try store.load(), saved)
         XCTAssertTrue(service.requiresPasswordReauthentication)
+        XCTAssertEqual(authentication.discardCalls, 0)
 
         try await service.login(homeserver: "https://wrong.invalid", username: "wrong", password: "new-password")
         XCTAssertTrue(service.isLoggedIn)
@@ -448,6 +482,46 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: temporary.path), [])
     }
 
+    func testNormalLoginPersistsSessionBeforeActivationAndCleansItWhenActivationFails() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let store = InMemorySessionStore()
+        let authentication = FakePasswordAuthentication()
+        var sawPersistedSessionAtActivation = false
+        let client = FakeClient(onSetDelegate: {
+            sawPersistedSessionAtActivation = (try store.load()) != nil
+            throw SessionStoreError.unavailable
+        })
+        let service = makeService(sessionStore: store, directory: temporary, client: client, authentication: authentication)
+
+        do {
+            try await service.login(homeserver: "https://matrix.test", username: "activation-order", password: "test-password")
+            XCTFail("Expected activation failure")
+        } catch MatrixServiceError.storageUnavailable {}
+
+        XCTAssertTrue(sawPersistedSessionAtActivation)
+        XCTAssertNil(try store.load())
+        XCTAssertEqual(authentication.discardCalls, 1)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: temporary.path), [])
+    }
+
+    func testNormalLoginRestoreFailureDiscardsNewRemoteSession() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let authentication = FakePasswordAuthentication()
+        let client = FakeClient(restoreError: ClientError.Generic(msg: "transport", details: nil))
+        let service = makeService(sessionStore: InMemorySessionStore(), directory: temporary, client: client, authentication: authentication)
+
+        do {
+            try await service.login(homeserver: "https://matrix.test", username: "restore-failure", password: "test-password")
+            XCTFail("Expected candidate restore failure")
+        } catch AuthenticationError.serverFailure {}
+
+        XCTAssertEqual(authentication.discardCalls, 1)
+        XCTAssertFalse(service.isLoggedIn)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: temporary.path), [])
+    }
+
     func testLogoutThenLoginCreatesFreshStoreAndDoesNotReusePreviousAccount() async throws {
         let temporary = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: temporary) }
@@ -520,6 +594,72 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         XCTAssertNil(try store.load())
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.url(for: saved.storeID).path))
         XCTAssertEqual(service.sessionError, "会话已失效，请重新登录。")
+    }
+
+    func testRestoreSoftLogoutKeepsClearExitAndForegroundDoesNotRestoreExpiredSession() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let saved = testCredentials(userID: "@restore-soft:matrix.test")
+        let store = InMemorySessionStore(saved)
+        let directory = SessionStoreDirectory(baseURL: temporary)
+        _ = try directory.create(for: saved.storeID)
+        let softLogout = ClientError.MatrixApi(kind: .unknownToken(softLogout: true), code: "M_UNKNOWN_TOKEN", msg: "redacted", details: nil)
+        let client = FakeClient(restoreError: softLogout)
+        let service = makeService(sessionStore: store, directory: temporary, client: client)
+
+        await service.restoreSession()
+
+        XCTAssertFalse(service.isLoggedIn)
+        XCTAssertTrue(service.requiresPasswordReauthentication)
+        XCTAssertTrue(service.canClearLocalSession)
+        XCTAssertEqual(try store.load(), saved)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.url(for: saved.storeID).path))
+        XCTAssertEqual(client.restoreCalls, 1)
+        await service.applicationDidBecomeActive()
+        XCTAssertFalse(service.isLoggedIn)
+        XCTAssertTrue(service.requiresPasswordReauthentication)
+        XCTAssertEqual(try store.load(), saved)
+        XCTAssertEqual(client.restoreCalls, 1)
+
+        try await service.clearLocalSession()
+        XCTAssertNil(try store.load())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.url(for: saved.storeID).path))
+        XCTAssertFalse(service.requiresPasswordReauthentication)
+        XCTAssertFalse(service.canClearLocalSession)
+    }
+
+    func testSoftLogoutWithFailedLocalClearDoesNotRewriteRecordForDeletedStore() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let saved = testCredentials(userID: "@soft-partial-clear:matrix.test")
+        let store = FailFirstDeleteSessionStore(saved)
+        let directory = SessionStoreDirectory(baseURL: temporary)
+        _ = try directory.create(for: saved.storeID)
+        let softLogout = ClientError.MatrixApi(kind: .unknownToken(softLogout: true), code: "M_UNKNOWN_TOKEN", msg: "redacted", details: nil)
+        let client = FakeClient(syncError: softLogout)
+        let authentication = FakePasswordAuthentication()
+        let service = MatrixService(sessionStore: store, storeDirectory: directory, discovery: PasswordDiscovery(), monitorNetwork: false, passwordAuthentication: authentication)
+        service.clientFactory = { _, _, _ in client }
+
+        await service.restoreSession()
+        try await waitUntil { service.requiresPasswordReauthentication }
+        do { try await service.clearLocalSession(); XCTFail("first local clear should fail") }
+        catch MatrixServiceError.storageUnavailable {}
+        XCTAssertEqual(try store.load(), saved)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.url(for: saved.storeID).path))
+        let saveCallsAfterFailedClear = store.saveCalls
+
+        do {
+            try await service.login(homeserver: "https://matrix.test", username: "soft-partial-clear", password: "test-password")
+            XCTFail("partial cleanup must block soft reauthentication")
+        } catch MatrixServiceError.storageUnavailable {}
+        XCTAssertTrue(authentication.loginCalls.isEmpty)
+        XCTAssertEqual(try store.load(), saved)
+        XCTAssertEqual(store.saveCalls, saveCallsAfterFailedClear)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.url(for: saved.storeID).path))
+
+        try await service.clearLocalSession()
+        XCTAssertNil(try store.load())
     }
 
     func testLogoutUnknownTokenStillClearsLocalSession() async throws {
@@ -743,6 +883,15 @@ private struct PasswordDiscovery: LoginCapabilityDiscovering {
     }
 }
 
+private final class CountingPasswordDiscovery: LoginCapabilityDiscovering, @unchecked Sendable {
+    private(set) var calls = 0
+
+    func discover(at homeserver: URL) async throws -> LoginCapabilities {
+        calls += 1
+        return LoginCapabilities(supportsPassword: true)
+    }
+}
+
 private final class FakeClient: Client, @unchecked Sendable {
     private let configuredLogoutError: Error?
     private let configuredRestoreError: Error?
@@ -751,15 +900,17 @@ private final class FakeClient: Client, @unchecked Sendable {
     private let probe: QueueProbe?
     private let configuredRooms: [Room]
     private let blockQueueEnable: Bool
+    private let onSetDelegate: (() throws -> Void)?
     private(set) var syncCalls = 0
     private(set) var queueEnableValues: [Bool] = []
     private(set) var didLogout = false
+    private(set) var restoreCalls = 0
     private(set) var restoredSession: Session?
     private(set) var lifecycleEvents: [String] = []
     private let configuredSession: Session
     private var delegate: ClientDelegate?
 
-    init(session: Session = fakeSession(userID: "@c21_alpha:matrix.test", deviceID: "C21TEST"), logoutError: Error? = nil, restoreError: Error? = nil, syncError: Error? = nil, successfulSync: Bool = false, probe: QueueProbe? = nil, rooms: [Room] = [], blockQueueEnable: Bool = false) {
+    init(session: Session = fakeSession(userID: "@c21_alpha:matrix.test", deviceID: "C21TEST"), logoutError: Error? = nil, restoreError: Error? = nil, syncError: Error? = nil, successfulSync: Bool = false, probe: QueueProbe? = nil, rooms: [Room] = [], blockQueueEnable: Bool = false, onSetDelegate: (() throws -> Void)? = nil) {
         configuredLogoutError = logoutError
         configuredRestoreError = restoreError
         self.syncError = syncError
@@ -767,6 +918,7 @@ private final class FakeClient: Client, @unchecked Sendable {
         self.probe = probe
         configuredRooms = rooms
         self.blockQueueEnable = blockQueueEnable
+        self.onSetDelegate = onSetDelegate
         configuredSession = session
         super.init(noHandle: .init())
     }
@@ -779,6 +931,7 @@ private final class FakeClient: Client, @unchecked Sendable {
         probe = nil
         configuredRooms = []
         blockQueueEnable = false
+        onSetDelegate = nil
         configuredSession = fakeSession(userID: "@c21_unexpected:matrix.test", deviceID: "UNEXPECTED")
         super.init(unsafeFromHandle: handle)
     }
@@ -790,6 +943,7 @@ private final class FakeClient: Client, @unchecked Sendable {
     }
 
     override func restoreSession(session: Session) async throws {
+        restoreCalls += 1
         if let configuredRestoreError { throw configuredRestoreError }
         restoredSession = session
     }
@@ -800,6 +954,7 @@ private final class FakeClient: Client, @unchecked Sendable {
     }
 
     override func setDelegate(delegate: ClientDelegate?) throws -> TaskHandle? {
+        try onSetDelegate?()
         self.delegate = delegate
         return nil
     }
@@ -939,6 +1094,27 @@ private final class FailFirstDeleteMalformedStore: SessionStore, @unchecked Send
             throw SessionStoreError.unavailable
         }
         isMalformed = false
+    }
+}
+
+private final class FailFirstDeleteSessionStore: SessionStore, @unchecked Sendable {
+    private var value: SessionCredentials?
+    private var shouldFailDelete = true
+    private(set) var saveCalls = 0
+
+    init(_ value: SessionCredentials) { self.value = value }
+
+    func load() throws -> SessionCredentials? { value }
+    func save(_ credentials: SessionCredentials) throws {
+        saveCalls += 1
+        value = credentials
+    }
+    func delete() throws {
+        if shouldFailDelete {
+            shouldFailDelete = false
+            throw SessionStoreError.unavailable
+        }
+        value = nil
     }
 }
 

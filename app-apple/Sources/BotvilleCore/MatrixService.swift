@@ -158,7 +158,12 @@ public final class MatrixService: ObservableObject {
             // A soft logout is the one intentional exception: re-authenticate
             // against the same origin/device while retaining its encrypted
             // store.  A normal login never overwrites another account.
-            if cleanupRequired { try cleanStoredSession() }
+            // A pending cleanup may have already removed part of the retained
+            // store. Do not write its old Keychain record back over that state.
+            if cleanupRequired {
+                guard previous == nil else { throw MatrixServiceError.storageUnavailable }
+                try cleanStoredSession()
+            }
             if let previous {
                 guard try sessionStore.load() == previous,
                       server.absoluteString == previous.homeserverURL else {
@@ -187,12 +192,18 @@ public final class MatrixService: ObservableObject {
             try await retryRateLimits { try await newClient.restoreSession(session: session) }
             try Task.checkCancellation()
             let stored = SessionCredentials(session: session, storeID: storeID, storeKey: key, allowLocalHTTP: allowLocalHTTP)
+            // A new encrypted store must have its recovery record before it is
+            // made active. Soft logout deliberately keeps the old record until
+            // its replacement has activated successfully.
+            if previous == nil { try sessionStore.save(stored) }
             credentials = stored
             try await activate(newClient, stored: stored)
             // Preserve the old Keychain record until the replacement session
             // has been restored and activated.  A failed soft re-login can
             // therefore still be retried with its original local store.
-            try sessionStore.save(stored)
+            if previous != nil {
+                try sessionStore.save(stored)
+            }
             softLogoutCredentials = nil
             requiresPasswordReauthentication = false
             reauthenticationHomeserver = nil
@@ -205,12 +216,12 @@ public final class MatrixService: ObservableObject {
             if let previous {
                 // A bad password, cancellation, or failed replacement token
                 // must not destroy a valid soft-logout store.
-                // If activation got as far as writing the replacement before
-                // failing, restore the previous Keychain value as well.
-                try? sessionStore.save(previous)
+                // The replacement is saved only after activation. SessionStore
+                // save is atomic, so a failed save leaves the previous record.
                 credentials = previous
                 softLogoutCredentials = previous
                 requiresPasswordReauthentication = true
+                canClearLocalSession = true
                 if client != nil { await detachClient() }
             } else if credentials?.storeID == storeID { await clearSession() }
             else {
@@ -237,7 +248,10 @@ public final class MatrixService: ObservableObject {
     }
 
     public func restoreSession() async {
-        guard !didAttemptRestore, !isAuthenticating, !isRestoring, !isLoggedIn, !isLoggingOut else { return }
+        // A soft logout must stay on the password screen. In particular, an
+        // app foreground event must not briefly restore the expired session.
+        guard softLogoutCredentials == nil, !requiresPasswordReauthentication,
+              !didAttemptRestore, !isAuthenticating, !isRestoring, !isLoggedIn, !isLoggingOut else { return }
         didAttemptRestore = true
         isRestoring = true
         sessionError = nil
@@ -290,6 +304,10 @@ public final class MatrixService: ObservableObject {
             try await retryRateLimits { try await restored.restoreSession(session: stored.sdkSession) }
             try Task.checkCancellation()
             try await activate(restored, stored: stored)
+            softLogoutCredentials = nil
+            requiresPasswordReauthentication = false
+            reauthenticationHomeserver = nil
+            reauthenticationUserID = nil
             canClearLocalSession = false
         } catch {
             await candidate?.enableAllSendQueues(enable: false)
@@ -385,7 +403,7 @@ public final class MatrixService: ObservableObject {
 
     public func applicationDidBecomeActive() async {
         if isLoggedIn { try? await sync() }
-        else { await restoreSession() }
+        else if !requiresPasswordReauthentication { await restoreSession() }
     }
 
     func networkChanged(available: Bool) async {
@@ -669,6 +687,9 @@ public final class MatrixService: ObservableObject {
         requiresPasswordReauthentication = true
         reauthenticationHomeserver = saved.homeserverURL
         reauthenticationUserID = saved.userID
+        canClearLocalSession = true
+        canRetryRestore = false
+        didAttemptRestore = true
         sessionError = "会话需要重新输入密码；将使用当前设备 ID 重新登录，已加密的本地数据会保留。"
         isLoggingOut = false
     }

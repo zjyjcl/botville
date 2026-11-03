@@ -14,29 +14,32 @@ public struct PushPusherData: Codable, Equatable, Sendable {
     /// The pusher endpoint receives device tokens. It must therefore use a
     /// credential-free HTTPS origin before this wire model can be created.
     public init(url: URL) throws {
-        try Self.validate(url)
-        self.url = url
+        self.url = try Self.validatedAndNormalizedURL(url)
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        let url = try container.decode(URL.self, forKey: .url)
-        try Self.validate(url)
-        self.url = url
+        let source = try container.decode(String.self, forKey: .url)
+        guard EndpointURLPolicy.isSafeURLString(source),
+              let url = URL(string: source) else {
+            throw PushPusherDataError.invalidURL
+        }
+        self.url = try Self.validatedAndNormalizedURL(url, originalSource: source)
     }
 
     private enum CodingKeys: String, CodingKey {
         case url
     }
 
-    private static func validate(_ url: URL) throws {
-        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+    private static func validatedAndNormalizedURL(_ url: URL, originalSource: String? = nil) throws -> URL {
+        guard var components = try? EndpointURLPolicy.validatedComponents(url, originalSource: originalSource),
               components.scheme?.lowercased() == "https",
-              let host = components.host, !host.isEmpty,
-              components.user == nil, components.password == nil,
-              components.port.map({ (1...65_535).contains($0) }) ?? true else {
+              components.fragment == nil else {
             throw PushPusherDataError.invalidURL
         }
+        components.scheme = "https"
+        guard let normalized = components.url else { throw PushPusherDataError.invalidURL }
+        return normalized
     }
 }
 
