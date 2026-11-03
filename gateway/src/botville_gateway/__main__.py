@@ -6,8 +6,26 @@ from __future__ import annotations
 
 import sys
 
-from .config import ConfigError, load_config
+from .config import Config, ConfigError, load_config
 from .http_server import build_server
+from .matrix import InMemoryMatrixTransport, MatrixTransport
+
+
+def _build_transport(config: Config) -> MatrixTransport:
+    """按 `GATEWAY_MATRIX_TRANSPORT` 选择传输（A1.3）。
+
+    appservice 所需的 URL / server_name / as_token 已在 `Config` 构造时校验，
+    这里只负责装配；token 不打印。
+    """
+    if config.matrix_transport == "appservice":
+        from .matrix_appservice import AppServiceMatrixTransport
+
+        return AppServiceMatrixTransport(
+            homeserver_url=config.homeserver_url,
+            as_token=config.as_token,
+            server_name=config.matrix_server_name,
+        )
+    return InMemoryMatrixTransport()
 
 
 def main(argv=None) -> int:
@@ -25,8 +43,9 @@ def main(argv=None) -> int:
             file=sys.stderr,
         )
 
+    transport = _build_transport(config)
     try:
-        server = build_server(config)
+        server = build_server(config, transport)
     except OSError as exc:
         print(f"config error: cannot bind {config.host}:{config.port}: {exc}", file=sys.stderr)
         return 2
@@ -38,7 +57,7 @@ def main(argv=None) -> int:
     print("  POST /v1/conversations/{conversation_id}/messages")
     if config.auth_token is None:
         print("  (dev mode: Authorization is not checked)")
-    print("transport: InMemoryMatrixTransport (A1.3 appservice not wired yet)")
+    print(f"transport: {type(transport).__name__} (GATEWAY_MATRIX_TRANSPORT={config.matrix_transport})")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

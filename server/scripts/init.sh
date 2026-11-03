@@ -12,7 +12,11 @@
 #      server/compose/generated/synapse/homeserver.yaml, appending
 #      synapse/ip-range-whitelist.part only while BOTVILLE_SYGNAL_IP is set
 #      (the push allow is exactly that /32; empty = no whitelist at all);
-#   3. render server/compose/sygnal/sygnal.yaml.tmpl into
+#   3. render server/compose/appservice/botville-gateway.yaml.tmpl (A1.3,
+#      the AI gateway's appservice registration) into
+#      server/compose/generated/appservice/botville-gateway.yaml (0600 — it
+#      carries the as_token, which is full control over the @ai_* namespace);
+#   4. render server/compose/sygnal/sygnal.yaml.tmpl into
 #      server/compose/generated/sygnal/sygnal.yaml, appending app parts:
 #      sygnal/mock-app.yaml.part (org.botville.mock) unless BOTVILLE_PUSH_MOCK
 #      is false/0/no (default true), and — only when BOTVILLE_APNS_ENABLED is
@@ -20,7 +24,7 @@
 #      server/compose/secrets/apns.p8 exists — sygnal/apns-app.yaml.part.
 #      With APNs prerequisites missing the APNs app is skipped with a WARNING;
 #      with no app at all init.sh warns (sygnal could deliver nothing);
-#   4. render generated/push-denylist.env via scripts/render_push_denylist.py:
+#   5. render generated/push-denylist.env via scripts/render_push_denylist.py:
 #      the tuwunel v1.9.4 upstream default IP denylist (incl. 0.0.0.0/8 and
 #      ::/128) minus the sygnal container's /32 (BOTVILLE_SYGNAL_IP; empty =
 #      no carve-out). The script also validates BOTVILLE_DOCKER_SUBNET /
@@ -31,6 +35,11 @@
 # so user secrets survive re-runs; *_IMAGE values that drifted from the repo
 # defaults only get a WARNING here (never rewritten).
 set -euo pipefail
+
+# Everything written below is secret (.env, the appservice registration with
+# the as_token): create it 0600 from the start instead of chmod-ing after a
+# brief world-readable window.
+umask 077
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 compose_dir="${script_dir}/../compose"
@@ -47,6 +56,9 @@ sygnal_generated_dir="${compose_dir}/generated/sygnal"
 sygnal_generated="${sygnal_generated_dir}/sygnal.yaml"
 sygnal_data_dir="${compose_dir}/generated/sygnal-data"
 secrets_dir="${compose_dir}/secrets"
+appservice_template="${compose_dir}/appservice/botville-gateway.yaml.tmpl"
+appservice_dir="${compose_dir}/generated/appservice"
+appservice_generated="${appservice_dir}/botville-gateway.yaml"
 
 
 # The last line for a key wins everywhere (docker compose --env-file, the
@@ -88,6 +100,51 @@ env_flag() {
 is_leftover_placeholder() {
     [[ "$(env_value "$1")" == "<change-me>" && "$(example_value "$1")" == *"<change-me>"* ]]
 }
+
+# Rewrite one KEY=VALUE line in .env: existing KEY= lines are dropped and the
+# new assignment is appended (the last assignment wins everywhere anyway —
+# docker compose --env-file, the renderer, env_value). Portable: no sed -i.
+set_env_value() {
+    local key="$1" value="$2" tmp_file
+    tmp_file="${env_file}.tmp.$$"
+    trap 'rm -f "${tmp_file}"' EXIT
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        if [[ "${line}" != "${key}="* ]]; then
+            printf '%s\n' "${line}"
+        fi
+    done < "${env_file}" > "${tmp_file}"
+    printf '%s=%s\n' "${key}" "${value}" >> "${tmp_file}"
+    mv "${tmp_file}" "${env_file}"
+    trap - EXIT
+}
+
+# APPSERVICE_*_TOKEN gate (PR #99 review, blocker 2): render only valid
+# registrations. An empty value or the '<change-me>' placeholder is
+# regenerated randomly and written back with a notice; any other invalid
+# value (not 64 lowercase hex characters) aborts. Hand-filled values are
+# never silently overwritten: only the two regenerable states are rewritten,
+# anything else is the operator's to fix. as_token == hs_token is rejected
+# by the caller (they must differ).
+ensure_appservice_token() {
+    local key="$1" value
+    value="$(env_value "$1")"
+    if [[ -z "${value}" || "${value}" == "<change-me>" ]]; then
+        if ! command -v openssl >/dev/null 2>&1; then
+            echo "init.sh: openssl is required to generate ${key}" >&2
+            exit 1
+        fi
+        set_env_value "${key}" "$(openssl rand -hex 32)"
+        echo "init.sh: ${key} in ${env_file} was empty/placeholder; generated a random 64-hex value" >&2
+        return 0
+    fi
+    if [[ "${value}" =~ ^[0-9a-f]{64}$ ]]; then
+        return 0
+    fi
+    echo "init.sh: ${key} in ${env_file} is not 64 lowercase hex characters;" >&2
+    echo "init.sh: refusing to render the appservice registration (fix the value, or empty the line to have it regenerated)" >&2
+    exit 1
+}
+
 
 # An existing .env keeps overriding the compose image defaults, so a stale
 # *_IMAGE value (older pin, bare tag without digest, or :latest) silently
@@ -212,7 +269,21 @@ else
     warn_image_overrides
 fi
 
-mkdir -p "${generated_dir}" "${sygnal_generated_dir}"
+# --- appservice tokens: validate BEFORE rendering anything ------------------
+# Empty as_token/hs_token would render `as_token: ""`, which Synapse happily
+# accepts — and then POST /register?access_token= creates @ai_* accounts with
+# no auth at all (reproduced in the PR #99 review). Fail closed here instead.
+ensure_appservice_token APPSERVICE_AS_TOKEN
+ensure_appservice_token APPSERVICE_HS_TOKEN
+if [[ "$(env_value APPSERVICE_AS_TOKEN)" == "$(env_value APPSERVICE_HS_TOKEN)" ]]; then
+    echo "init.sh: APPSERVICE_AS_TOKEN and APPSERVICE_HS_TOKEN in ${env_file} must be different values" >&2
+    exit 1
+fi
+# Unconditional: a hand-created .env may be 0644 even when nothing above
+# changed it.
+chmod 600 "${env_file}"
+
+mkdir -p "${generated_dir}" "${sygnal_generated_dir}" "${appservice_dir}"
 
 # Push denylist for tuwunel/continuwuity: their outbound HTTP (pushes to
 # sygnal) refuses private ranges by default. render_push_denylist.py writes
@@ -258,6 +329,59 @@ with open(env_path, encoding="utf-8") as f:
             sys.exit(f"init.sh: {env_path}:{n}: not a KEY=VALUE line: {raw!r}")
         values[key] = value
 
+# Derived value for the appservice namespace regex (A1.3): escape every regex
+# metacharacter in the server name so e.g. "example.com" cannot also match
+# "examplexcom". The server name is validated and lowercased first.
+_dns_label = re.compile(r"^[0-9a-z]([0-9a-z-]*[0-9a-z])?$")
+
+
+def validate_server_name(raw):
+    """Valid Matrix server name (hostname or IP, optional :port), lowercased."""
+    name = raw.strip().lower()
+
+    def bad():
+        sys.exit(
+            "init.sh: BOTVILLE_SERVER_NAME must be a Matrix server name "
+            f"(hostname or IP, optionally with :port), got {raw!r}"
+        )
+
+    port = None
+    host = name
+    if name.startswith("["):
+        end = name.find("]")
+        if end < 0:
+            bad()
+        host = name[: end + 1]
+        rest = name[end + 1:]
+        if rest:
+            if not rest.startswith(":") or not rest[1:].isdigit():
+                bad()
+            port = int(rest[1:])
+        if not re.fullmatch(r"\[[0-9a-f:.]+\]", host):
+            bad()
+    else:
+        left, sep, maybe_port = name.rpartition(":")
+        if sep:
+            host = left
+            if not maybe_port.isdigit():
+                bad()
+            port = int(maybe_port)
+        if not host or len(host) > 253:
+            bad()
+        for label in host.split("."):
+            if not label or len(label) > 63 or not _dns_label.fullmatch(label):
+                bad()
+    if port is not None and not 1 <= port <= 65535:
+        bad()
+    return name
+
+
+server_name = values.get("BOTVILLE_SERVER_NAME")
+if server_name:
+    server_name = validate_server_name(server_name)
+    values["BOTVILLE_SERVER_NAME"] = server_name
+    values["BOTVILLE_SERVER_NAME_REGEX"] = re.escape(server_name)
+
 with open(template_path, encoding="utf-8") as f:
     template = f.read()
 
@@ -275,7 +399,19 @@ rendered = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", substitute, template)
 
 leftover = re.findall(r"\$\{[^}]*\}", rendered)
 if leftover:
-    sys.exit(f"init.sh: unsubstituted placeholders remain: {leftover}")
+    sys.exit(f"init.sh: unsubstituted placeholders remain in {out_path}: {leftover}")
+
+# Belt and braces (PR #99 review, blocker 2): refuse to write any rendered
+# registration whose as_token/hs_token is empty or malformed.
+for line in rendered.splitlines():
+    key, sep, rest = line.partition(":")
+    if sep and key.strip() in ("as_token", "hs_token"):
+        token = rest.strip().strip('"').strip("'")
+        if not re.fullmatch(r"[0-9a-f]{64}", token):
+            sys.exit(
+                f"init.sh: {out_path}: {key.strip()} is empty/invalid; "
+                "refusing to write the registration"
+            )
 
 with open(out_path, "w", encoding="utf-8") as f:
     f.write(rendered)
@@ -294,6 +430,12 @@ if [[ -n "$(env_value BOTVILLE_SYGNAL_IP)" ]]; then
     cat "${whitelist_part}" >> "${generated}"
     rm -f "${whitelist_part}"
 fi
+
+render_template "${appservice_template}" "${appservice_generated}"
+# The registration file carries the as_token (full control over the @ai_*
+# namespace); keep it 0600 like .env. The homeserver containers read it as
+# root through the read-only bind mount.
+chmod 600 "${appservice_generated}"
 
 render_template "${sygnal_template}" "${sygnal_generated}"
 

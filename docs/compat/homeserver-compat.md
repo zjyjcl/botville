@@ -133,6 +133,8 @@ Conduit (timokoesters/conduit, Rust)
 
 **风险与对策**：安装向导（A3.1）为三家各写一段「注册 appservice」步骤；CI 里 Synapse 用 `app_service_config_files`（改配置 + 重启），Tuwunel 优先**内联 TOML / `appservice_dir`**（纯文件、无消息交互），continuwuity 只能走**管理室消息 / `--execute`**——三家均可脚本化，只是路径不同。`as_token`/`hs_token` 一律 CI 生成、示例文件只放占位符。
 
+**A1.3 落地（2026-11，issue #5）**：文件式注册已实装并纳入 CI——`server/compose/appservice/botville-gateway.yaml.tmpl` 由 init.sh 渲染（token 来自 `.env`，产物 0600）；Synapse 走 `app_service_config_files` + `/appservice` 只读挂载，Tuwunel 走 `TUWUNEL_APPSERVICE_DIR=/appservice`（同一份 YAML）。命名空间为 exclusive `^@ai_.*:<server_name>$`（server_name 正则转义）；注册文件 `url: null`（M1 不收事务）。验收由 CI `appservice-e2e` job（matrix `synapse, tuwunel`）对真实容器执行：网关以 `@ai_*` 身份注册（`m.login.application_service`）、加入被邀房间、以该身份发消息并被人类用户回读；普通 UIA 注册 `ai_*` 被拒（`M_EXCLUSIVE`/400/403）、命名空间外 masquerade 被 HS 拒（`M_EXCLUSIVE`/`M_FORBIDDEN`）。**Tuwunel 接受 `url: null` 的解析行为以该 job 绿灯为准**（桌面核实未逐条确认）；continuwuity 仍为后续（只能管理室注册，CI 不跑其 appservice job）。详见 [`docs/deploy/appservice.md`](../deploy/appservice.md)。
+
 ### 3.2 管理 API 边界（硬性规则）
 
 - `/_synapse/admin/*` 是 **Synapse 私有 API**：注册令牌管理、用户管理、统计等都走它，无规范保证。Tuwunel 自 v1.7.0 起自行实现了一个 **Synapse 兼容 admin API 子集**（`/_synapse/admin/v1/register` 共享密钥注册、用户/房间/媒体/设备/访问令牌等端点，覆盖仍在扩大），continuwuity 没有兼容层——覆盖度各家不同且随时可变，**botville 运行时代码仍然禁止调用任何 `/_synapse/admin` 端点或 admin room 命令**；该兼容子集只作为安装向导/运维脚本在 Tuwunel 上复用 Synapse 工具链的便利项；

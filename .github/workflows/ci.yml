@@ -15,6 +15,13 @@
 #         make up runs the first-boot bootstrap automatically. Real APNs
 #         delivery is out of scope (no Apple account); see
 #         docs/deploy/push-sygnal.md.
+# appservice-e2e (A1.3, synapse + tuwunel): init (renders the appservice
+#         registration from .env) -> open registration -> up -> run
+#         server/tests/appservice_e2e.py: the real gateway transport
+#         registers an @ai_* user, joins an invited room and sends as that
+#         identity; exclusive-namespace rejections asserted both ways.
+#         continuwuity has no file-based appservice registration yet and is
+#         not covered (see docs/deploy/appservice.md).
 # lint:   compose config for all three profiles, shellcheck, python syntax,
 #         stdlib unit tests for the bootstrap/init scripts (no Docker),
 #         notify/gateway contract validation, a guard that .env.example
@@ -167,6 +174,48 @@ jobs:
             --env-file server/compose/.env --profile ${{ matrix.homeserver }} \
             --profile push down -v --remove-orphans
 
+  appservice-e2e:
+    name: appservice-e2e (${{ matrix.homeserver }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # continuwuity has no file-based appservice registration yet
+        # (admin room only) — not in this matrix; see docs/deploy/appservice.md.
+        homeserver: [synapse, tuwunel]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Init .env and select homeserver
+        run: |
+          bash server/scripts/init.sh
+          sed -i "s/^BOTVILLE_HOMESERVER=.*/BOTVILLE_HOMESERVER=${{ matrix.homeserver }}/" server/compose/.env
+          # CI-only: open Synapse registration so the UIA m.login.dummy flow
+          # works for the human account (tuwunel stays token-gated and reads
+          # BOTVILLE_REGISTRATION_TOKEN from .env).
+          sed -i "s/^BOTVILLE_OPEN_REGISTRATION=.*/BOTVILLE_OPEN_REGISTRATION=true/" server/compose/.env
+
+      - name: Start homeserver
+        run: make up HS=${{ matrix.homeserver }}
+
+      - name: Appservice e2e (gateway sends as an @ai_* user)
+        run: make appservice-e2e
+
+      - name: Dump logs
+        if: failure()
+        run: |
+          docker compose -f server/compose/docker-compose.yml \
+            --env-file server/compose/.env --profile ${{ matrix.homeserver }} \
+            logs --no-color
+
+      - name: Teardown
+        if: always()
+        run: |
+          docker compose -f server/compose/docker-compose.yml \
+            --env-file server/compose/.env --profile ${{ matrix.homeserver }} \
+            down -v --remove-orphans
+
   lint:
     name: lint
     runs-on: ubuntu-latest
@@ -180,7 +229,7 @@ jobs:
             server/scripts/lib.sh server/scripts/backup-synapse.sh server/scripts/restore-synapse.sh
 
       - name: Python syntax
-        run: python3 -m py_compile server/tests/smoke.py server/tests/e2e_synapse.py server/tests/push_e2e.py server/scripts/render_push_denylist.py
+        run: python3 -m py_compile server/tests/smoke.py server/tests/e2e_synapse.py server/tests/push_e2e.py server/tests/appservice_e2e.py server/scripts/render_push_denylist.py
 
       - name: Bootstrap/init script unit tests (stdlib mock, no Docker)
         run: python3 -m unittest discover -s server/tests -p "test_*.py" -v

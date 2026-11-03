@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from .config import Config, load_config
-from .matrix import InMemoryMatrixTransport
+from .matrix import InMemoryMatrixTransport, MatrixTransport
 from .service import (
     GatewayDeliveryError,
     GatewayService,
@@ -423,16 +423,21 @@ class GatewayServer(http.server.ThreadingHTTPServer):
 
     daemon_threads = True
 
-    def __init__(self, config: Config, service: GatewayService, transport: InMemoryMatrixTransport) -> None:
+    def __init__(self, config: Config, service: GatewayService, transport: MatrixTransport) -> None:
         self.config = config
         self.service = service
         self.transport = transport
         super().__init__((config.host, config.port), GatewayHandler)
 
 
-def build_server(config: Optional[Config] = None) -> GatewayServer:
+def build_server(
+    config: Optional[Config] = None,
+    transport: Optional[MatrixTransport] = None,
+) -> GatewayServer:
+    """默认仍是内存假后端（B1.1 行为）；A1.3 起可显式传入 appservice 传输。"""
     cfg = config or load_config()
-    transport = InMemoryMatrixTransport()
+    if transport is None:
+        transport = InMemoryMatrixTransport()
     store = UsageStore()
     svc = GatewayService(cfg, transport, store)
     return GatewayServer(cfg, svc, transport)

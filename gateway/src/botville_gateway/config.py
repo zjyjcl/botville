@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -23,6 +23,10 @@ _INSECURE_TOKENS: frozenset = frozenset({"", "<change-me>"})
 
 # dev 模式（免鉴权）只允许绑定这些本机地址，否则等于把无鉴权网关暴露到网络上。
 LOOPBACK_HOSTS: frozenset = frozenset({"127.0.0.1", "::1", "localhost"})
+
+# Matrix 传输选择（A1.3）：memory = 内存假后端（B1.1 现状），appservice = 以
+# 部署层注册的 application service 身份代发（真实 homeserver）。
+MATRIX_TRANSPORTS = frozenset({"memory", "appservice"})
 
 DEFAULT_SILENT_START = "23:00"
 DEFAULT_SILENT_END = "07:30"
@@ -104,6 +108,12 @@ class Config:
     access_log: bool = False
     version: str = GATEWAY_VERSION
     contract_version: str = CONTRACT_VERSION
+    # Matrix 传输（A1.3）。memory 保持 B1.1 现状；appservice 需要下面三个值。
+    matrix_transport: str = "memory"
+    homeserver_url: Optional[str] = None
+    matrix_server_name: Optional[str] = None
+    # as_token 等同 @ai_* 命名空间管理员凭据：不进 repr（日志/断言消息不泄露）。
+    as_token: Optional[str] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         # 构造时校验，避免明显错误的配置拖到第一次请求才炸。
@@ -140,6 +150,33 @@ class Config:
                 f"(127.0.0.1, ::1, or localhost), got {self.host!r}. "
                 "Set a real GATEWAY_AUTH_TOKEN and disable dev mode for non-loopback deployments."
             )
+        # A1.3：transport=appservice 时必须带齐全的三件套（fail closed），
+        # 否则启动即失败，而不是回落到内存假后端悄悄"成功"。
+        if self.matrix_transport not in MATRIX_TRANSPORTS:
+            raise ConfigError(
+                f"GATEWAY_MATRIX_TRANSPORT must be one of {sorted(MATRIX_TRANSPORTS)}, "
+                f"got {self.matrix_transport!r}"
+            )
+        if self.matrix_transport == "appservice":
+            if not self.homeserver_url or not self.homeserver_url.startswith(
+                ("http://", "https://")
+            ):
+                raise ConfigError(
+                    "GATEWAY_MATRIX_TRANSPORT=appservice requires GATEWAY_HOMESERVER_URL "
+                    "to be an http:// or https:// URL of the homeserver Client-Server API"
+                )
+            if self.as_token is None:
+                raise ConfigError(
+                    "GATEWAY_MATRIX_TRANSPORT=appservice requires a real GATEWAY_AS_TOKEN "
+                    "(unset or '<change-me>' is rejected; it must match APPSERVICE_AS_TOKEN "
+                    "in the homeserver's rendered registration file)"
+                )
+            if not self.matrix_server_name:
+                raise ConfigError(
+                    "GATEWAY_MATRIX_TRANSPORT=appservice requires GATEWAY_MATRIX_SERVER_NAME "
+                    "(the homeserver's server_name, e.g. 'localhost') to validate the @ai_* "
+                    "namespace"
+                )
 
     @property
     def silent_start_minute(self) -> int:
@@ -155,6 +192,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
     source: Mapping[str, str] = os.environ if env is None else env
     token = _env_str(source, "GATEWAY_AUTH_TOKEN", "")
     dev_mode = _env_bool(source, "GATEWAY_DEV_MODE", False)
+    as_token = _env_str(source, "GATEWAY_AS_TOKEN", "")
     return Config(
         host=_env_str(source, "GATEWAY_HOST", "127.0.0.1"),
         # 环境变量里的 0 会随机选端口，对部署是事故；仅测试直接构造 Config(port=0)。
@@ -178,4 +216,10 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         ),
         max_message_chars=_env_int(source, "MAX_MESSAGE_CHARS", 8000, minimum=1),
         access_log=_env_bool(source, "GATEWAY_ACCESS_LOG", False),
+        matrix_transport=_env_str(source, "GATEWAY_MATRIX_TRANSPORT", "memory") or "memory",
+        # 空串统一归一为 None；占位符 token 与 GATEWAY_AUTH_TOKEN 同规则降级，
+        # 由 Config 校验在 appservice 模式下拒绝启动（fail closed）。
+        homeserver_url=_env_str(source, "GATEWAY_HOMESERVER_URL", "") or None,
+        matrix_server_name=_env_str(source, "GATEWAY_MATRIX_SERVER_NAME", "") or None,
+        as_token=None if as_token in _INSECURE_TOKENS else as_token,
     )

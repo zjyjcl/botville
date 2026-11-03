@@ -2,14 +2,13 @@
 # Copyright 2026 botville contributors
 """Matrix 传输抽象。
 
-生产环境（A1.3 落地后）会用 appservice 注册的 AS token 调用
-`PUT /_matrix/client/v3/rooms/{roomId}/send/m.room.message/{txnId}`，
-以角色身份把消息写进房间。A1.3 未就绪，所以这里只定义：
-
   - `MatrixTransport`：Protocol，网关只依赖这几个方法；
   - `InMemoryMatrixTransport`：内存假后端，消息进列表，供测试与本地跑通用。
 
-接 appservice 时新增 `AppServiceMatrixTransport`，service 层不用改。
+A1.3 起真实后端是 `matrix_appservice.AppServiceMatrixTransport`（appservice
+注册的 AS token + `?user_id=` masquerade，调用
+`PUT /_matrix/client/v3/rooms/{roomId}/send/m.room.message/{txnId}`），同样
+满足本 Protocol，service 层不用改。
 """
 
 from __future__ import annotations
