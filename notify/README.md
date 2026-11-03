@@ -7,3 +7,4 @@
 - 中枢并行、迁移、下线流程（个人部署事项与中枢维护方协作，不进本仓库）
 
 盘点文档：[docs/migration/D0.1-hub-inventory.md](../docs/migration/D0.1-hub-inventory.md)
+搁置归档：[docs/migration/deferred.md](../docs/migration/deferred.md)（中枢迁移与个人通道相关工作按所有者决定全部搁置，暂不执行）
