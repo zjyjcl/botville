@@ -60,17 +60,29 @@ public final class MatrixService: ObservableObject {
     private var timelineTask: Task<Void, Never>?
     private var timelineGeneration = UUID()
     private var timelineState = TimelineState()
-    private var isAuthenticating = false
+    @Published public private(set) var isAuthenticating = false
+    @Published public private(set) var authenticationStatus: String?
+    @Published public private(set) var canClearLocalSession = false
+    @Published public private(set) var canRetryRestore = false
+    private let passwordAuthentication: any PasswordAuthenticating
+    private let authenticationTimeout: TimeInterval
+    private var authenticationAttempt: AuthenticationAttempt?
+    private var queueRecoveryPending = false
+    var storeKeyFactory: () throws -> Data = SessionCredentials.makeStoreKey
     private var isLoggingOut = false
     private var paginationGeneration: UUID?
 
     public init(sessionStore: any SessionStore = KeychainSessionStore(),
                 storeDirectory: SessionStoreDirectory? = nil,
                 discovery: any LoginCapabilityDiscovering = MatrixLoginCapabilityDiscovery(),
-                monitorNetwork: Bool = true) {
+                monitorNetwork: Bool = true,
+                passwordAuthentication: any PasswordAuthenticating = MatrixPasswordAuthentication(),
+                authenticationTimeout: TimeInterval = 60) {
         self.sessionStore = sessionStore
         self.storeDirectory = storeDirectory
         self.discovery = discovery
+        self.passwordAuthentication = passwordAuthentication
+        self.authenticationTimeout = authenticationTimeout.isFinite && authenticationTimeout > 0 ? authenticationTimeout : 60
         if monitorNetwork {
             let monitor = NWPathMonitor()
             networkMonitor = monitor
@@ -107,69 +119,177 @@ public final class MatrixService: ObservableObject {
         let username = username.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !username.isEmpty, !password.isEmpty else { throw MatrixServiceError.missingCredentials }
         isAuthenticating = true
-        defer { isAuthenticating = false }
-        // Never overwrite an unreadable or uncleaned previous account.
-        if cleanupRequired { try cleanStoredSession() }
-        guard try sessionStore.load() == nil else { throw MatrixServiceError.storageUnavailable }
         sessionError = nil
-        let capabilities = try await discovery.discover(at: server)
-        guard capabilities.supportsPassword else { throw AuthenticationError.unsupportedLoginMethod }
-        let storeID = UUID()
-        let key = try SessionCredentials.makeStoreKey()
-        let path = try directory().create(for: storeID)
-        var candidate: Client?
-        var loggedIn = false
+        let attempt = AuthenticationAttempt()
+        authenticationAttempt = attempt
         do {
-            let newClient = try await clientFactory(server.absoluteString, path, key)
+            try await attempt.run(timeout: authenticationTimeout) { [self] in
+                defer { isAuthenticating = false; authenticationAttempt = nil; authenticationStatus = nil }
+                try await performLogin(server: server, username: username, password: password, allowLocalHTTP: allowLocalHTTP)
+            }
+        } catch {
+            sessionError = error is CancellationError ? "已取消登录。" : error.localizedDescription
+            throw error
+        }
+    }
+
+    private func performLogin(server: URL, username: String, password: String, allowLocalHTTP: Bool) async throws {
+        let storeID = UUID()
+        var candidate: Client?
+        var remoteSession: Session?
+        do {
+            try Task.checkCancellation()
+            // Never overwrite an unreadable or uncleaned previous account.
+            if cleanupRequired { try cleanStoredSession() }
+            guard try sessionStore.load() == nil else { throw MatrixServiceError.storageUnavailable }
+            let capabilities = try await retryRateLimits { try await self.discovery.discover(at: server) }
+            guard capabilities.supportsPassword else { throw AuthenticationError.unsupportedLoginMethod }
+            let key = try storeKeyFactory()
+            let path = try directory().create(for: storeID)
+            let newClient = try await retryRateLimits { try await self.clientFactory(server.absoluteString, path, key) }
             candidate = newClient
-            try await newClient.login(username: username, password: password,
-                                      initialDeviceName: "botville C2.1", deviceId: nil)
-            loggedIn = true
-            let stored = SessionCredentials(session: try newClient.session(), storeID: storeID,
-                                            storeKey: key, allowLocalHTTP: allowLocalHTTP)
-            _ = try HomeserverPolicy(allowLocalHTTP: allowLocalHTTP).validatedURL(stored.homeserverURL)
+            try Task.checkCancellation()
+            let session = try await retryRateLimits {
+                try await self.passwordAuthentication.login(at: server, username: username, password: password)
+            }
+            remoteSession = session
+            try Task.checkCancellation()
+            try await retryRateLimits { try await newClient.restoreSession(session: session) }
+            try Task.checkCancellation()
+            let stored = SessionCredentials(session: session, storeID: storeID, storeKey: key, allowLocalHTTP: allowLocalHTTP)
             try sessionStore.save(stored)
             credentials = stored
             try await activate(newClient, stored: stored)
+            canClearLocalSession = false
+            canRetryRestore = false
         } catch {
-            if loggedIn { try? await candidate?.logout() }
             await candidate?.enableAllSendQueues(enable: false)
             candidate = nil
-            // A failed Keychain write/activation must never become an active UI session.
             if credentials?.storeID == storeID { await clearSession() }
-            else { try? directory().remove(for: storeID) }
-            if error is SessionStoreError { throw MatrixServiceError.storageUnavailable }
-            if let error = error as? MatrixServiceError { throw error }
+            else {
+                do { try directory().remove(for: storeID) }
+                catch { cleanupRequired = true; canClearLocalSession = true }
+            }
+            // A separate bounded request can revoke credentials even when the
+            // authentication task was cancelled. It never logs response bodies.
+            if let remoteSession {
+                let transport = passwordAuthentication
+                await Task { await transport.discard(remoteSession) }.value
+            }
+            if error is CancellationError { throw error }
+            if error is SessionStoreError || error is CocoaError {
+                canClearLocalSession = true
+                throw MatrixServiceError.storageUnavailable
+            }
+            if let error = error as? MatrixServiceError {
+                if case .storageUnavailable = error { canClearLocalSession = true }
+                throw error
+            }
             throw PasswordLoginResultClassifier.error(for: error)
         }
     }
 
     public func restoreSession() async {
-        guard !didAttemptRestore, !isAuthenticating, !isLoggedIn, !isLoggingOut else { return }
+        guard !didAttemptRestore, !isAuthenticating, !isRestoring, !isLoggedIn, !isLoggingOut else { return }
         didAttemptRestore = true
         isRestoring = true
-        defer { isRestoring = false }
+        sessionError = nil
+        canRetryRestore = false
+        let attempt = AuthenticationAttempt()
+        authenticationAttempt = attempt
         do {
+            try await attempt.run(timeout: authenticationTimeout) { [self] in
+                defer { isRestoring = false; authenticationAttempt = nil; authenticationStatus = nil }
+                try await performRestore()
+            }
+        } catch {
+            if PasswordLoginResultClassifier.isExpiredSession(error) {
+                await invalidateSession()
+                canRetryRestore = false
+            } else {
+                didAttemptRestore = false
+                canRetryRestore = true
+                canClearLocalSession = true
+                if error is CancellationError { sessionError = "已取消恢复会话，本地会话仍保留。" }
+                else if error is SessionStoreError || error is CocoaError { sessionError = MatrixServiceError.storageUnavailable.localizedDescription }
+                else if let error = error as? AuthenticationError { sessionError = error.localizedDescription }
+                else { sessionError = "会话恢复暂时失败，请检查网络后重试。" }
+            }
+        }
+    }
+
+    private func performRestore() async throws {
+        var candidate: Client?
+        do {
+            try Task.checkCancellation()
             if cleanupRequired { try cleanStoredSession() }
             guard let stored = try sessionStore.load() else { return }
             credentials = stored
             _ = try HomeserverPolicy(allowLocalHTTP: stored.allowLocalHTTP).validatedURL(stored.homeserverURL)
             let path = try directory().create(for: stored.storeID)
-            let restored = try await clientFactory(stored.homeserverURL, path, stored.storeKey)
-            try await restored.restoreSession(session: stored.sdkSession)
+            let restored = try await retryRateLimits { try await self.clientFactory(stored.homeserverURL, path, stored.storeKey) }
+            candidate = restored
+            try Task.checkCancellation()
+            try await retryRateLimits { try await restored.restoreSession(session: stored.sdkSession) }
+            try Task.checkCancellation()
             try await activate(restored, stored: stored)
+            canClearLocalSession = false
         } catch {
-            if PasswordLoginResultClassifier.isExpiredSession(error) {
-                await invalidateSession()
-            } else {
-                // Offline startup is retryable; never discard a valid token for transport errors.
-                sessionError = "会话恢复暂时失败，请检查网络后重试。"
-                didAttemptRestore = false
+            await candidate?.enableAllSendQueues(enable: false)
+            candidate = nil
+            // Keep the original credentials and encrypted store for offline retry.
+            if client != nil { await detachClient() }
+            throw error
+        }
+    }
+
+    private func retryRateLimits<T>(_ operation: () async throws -> T) async throws -> T {
+        while true {
+            try Task.checkCancellation()
+            do {
+                let result = try await operation()
+                authenticationStatus = nil
+                return result
+            } catch {
+                guard case .rateLimited(let delay) = PasswordLoginResultClassifier.error(for: error) else { throw error }
+                authenticationStatus = AuthenticationError.rateLimited(retryAfter: delay).localizedDescription
+                // Unknown Retry-After uses a conservative pause; the overall
+                // deadline still bounds all attempts and this sleep is cancellable.
+                try await Task.sleep(for: .seconds(min(31_536_000, max(1, delay ?? 5))))
             }
         }
     }
 
+    public func cancelAuthentication() {
+        authenticationAttempt?.cancel()
+    }
+
+    /// Invoked only after the UI's destructive confirmation. No successful
+    /// load() is required, so malformed Keychain items can be deleted too.
+    public func clearLocalSession() async throws {
+        guard !isAuthenticating, !isRestoring, !isLoggingOut else { throw MatrixServiceError.busy }
+        isLoggingOut = true
+        defer { isLoggingOut = false }
+        await detachClient()
+        cleanupRequired = true
+        var failed = false
+        do { try sessionStore.delete() } catch { failed = true }
+        do { try directory().removeAll() } catch { failed = true }
+        guard !failed else {
+            canClearLocalSession = true
+            sessionError = MatrixServiceError.storageUnavailable.localizedDescription
+            throw MatrixServiceError.storageUnavailable
+        }
+        credentials = nil
+        cleanupRequired = false
+        didAttemptRestore = false
+        canRetryRestore = false
+        canClearLocalSession = false
+        sessionError = nil
+    }
+
     private func activate(_ client: Client, stored: SessionCredentials) async throws {
+        try Task.checkCancellation()
         self.client = client
         credentials = stored
         sessionGeneration = UUID()
@@ -185,14 +305,17 @@ public final class MatrixService: ObservableObject {
                 return
             }
         }
+        await refreshRooms(from: client, session: generation)
+        try Task.checkCancellation()
+        guard generation == sessionGeneration else { throw CancellationError() }
+        await client.enableAllSendQueues(enable: true)
+        try Task.checkCancellation()
+        guard generation == sessionGeneration else { throw CancellationError() }
         userID = stored.userID
         isLoggedIn = true
         sessionError = nil
-        await refreshRooms(from: client, session: generation)
-        guard generation == sessionGeneration, isLoggedIn else { throw CancellationError() }
-        await client.enableAllSendQueues(enable: true)
-        guard generation == sessionGeneration, isLoggedIn else { throw CancellationError() }
         try await sync()
+        try Task.checkCancellation()
     }
 
     public func applicationDidBecomeActive() async {
@@ -200,12 +323,12 @@ public final class MatrixService: ObservableObject {
         else { await restoreSession() }
     }
 
-    private func networkChanged(available: Bool) async {
+    func networkChanged(available: Bool) async {
         let wasAvailable = networkAvailable
         networkAvailable = available
         guard isLoggedIn else { return }
         if !available { connectionStatus = .offline }
-        else if !wasAvailable { try? await sync() }
+        else if !wasAvailable { queueRecoveryPending = true; try? await sync() }
     }
 
     /// A single standard /sync loop; foreground and path recovery interrupt backoff.
@@ -233,8 +356,12 @@ public final class MatrixService: ObservableObject {
                     self.isSyncing = false
                     self.syncError = nil
                     self.connectionStatus = .connected
-                    // Recoverable send errors disable queues; successful sync proves reachability.
-                    await client.enableAllSendQueues(enable: true)
+                    // Re-enable only after an actual outage/reconnection, never
+                    // on steady-state sync. Parked sends still need user retry.
+                    if self.queueRecoveryPending {
+                        self.queueRecoveryPending = false
+                        await client.enableAllSendQueues(enable: true)
+                    }
                     initial = false
                     backoff.reset()
                     try await Task.sleep(for: .milliseconds(100))
@@ -246,6 +373,7 @@ public final class MatrixService: ObservableObject {
                         await self.invalidateSession()
                         return
                     }
+                    self.queueRecoveryPending = true
                     self.isSyncing = false
                     let delay = backoff.nextDelay()
                     self.connectionStatus = self.networkAvailable ? .reconnecting(after: delay) : .offline
@@ -450,6 +578,13 @@ public final class MatrixService: ObservableObject {
     }
 
     private func clearSession() async {
+        await detachClient()
+        cleanupRequired = true
+        do { try cleanStoredSession() }
+        catch { canClearLocalSession = true; sessionError = MatrixServiceError.storageUnavailable.localizedDescription }
+    }
+
+    private func detachClient() async {
         sessionGeneration = UUID()
         syncGeneration = UUID()
         let previous = syncTask
@@ -472,9 +607,7 @@ public final class MatrixService: ObservableObject {
         await client?.enableAllSendQueues(enable: false)
         await previous?.value
         client = nil
-        cleanupRequired = true
-        do { try cleanStoredSession() }
-        catch { sessionError = MatrixServiceError.storageUnavailable.localizedDescription }
+        queueRecoveryPending = false
     }
 
     private func cleanStoredSession() throws {

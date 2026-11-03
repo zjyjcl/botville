@@ -77,7 +77,7 @@ final class SynapseIntegrationTests: XCTestCase {
             try await waitFor("disconnect evidence") { if case .reconnecting = restored.connectionStatus { return true }; return restored.connectionStatus == .offline }
             let queuedText = "c21-recovery-\(UUID().uuidString)"
             _ = try? await restored.send(text: queuedText, to: roomID)
-            try await waitFor("local queued or failed echo") { restored.messages.contains { $0.body == queuedText && ($0.deliveryState == .queued || $0.deliveryState == .failed) } }
+            try await waitFor("local queued or retrying echo") { restored.messages.contains { $0.body == queuedText && ($0.deliveryState == .queued || $0.deliveryState == .retrying) } }
             // Leave a genuine sync gap so the peer's new events must be caught
             // up by the automatic retry, rather than an already-connected loop.
             try await waitFor("retry backoff evidence") {

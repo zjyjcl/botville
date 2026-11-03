@@ -5,6 +5,7 @@
 import Foundation
 import MatrixRustSDK
 import XCTest
+import Combine
 
 @MainActor
 final class MatrixServiceLifecycleTests: XCTestCase {
@@ -94,7 +95,8 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: temporary) }
         let sessionStore = FailingSaveSessionStore()
         let client = FakeClient()
-        let service = makeService(sessionStore: sessionStore, directory: temporary, client: client)
+        let authentication = FakePasswordAuthentication()
+        let service = makeService(sessionStore: sessionStore, directory: temporary, client: client, authentication: authentication)
 
         do {
             try await service.login(homeserver: "https://matrix.test", username: "c21_storage", password: "test-password")
@@ -102,7 +104,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         } catch MatrixServiceError.storageUnavailable {
             // Expected: candidate has already received logout.
         }
-        XCTAssertTrue(client.didLogout)
+        XCTAssertEqual(authentication.discardCalls, 1)
         XCTAssertFalse(service.isLoggedIn)
         XCTAssertNil(try sessionStore.load())
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: temporary.path), [])
@@ -115,7 +117,13 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         let firstClient = FakeClient(session: fakeSession(userID: "@c21_first:matrix.test", deviceID: "FIRST"))
         let secondClient = FakeClient(session: fakeSession(userID: "@c21_second:matrix.test", deviceID: "SECOND"))
         let sequence = ClientSequence([firstClient, secondClient])
-        let service = MatrixService(sessionStore: sessionStore, storeDirectory: SessionStoreDirectory(baseURL: temporary), discovery: PasswordDiscovery(), monitorNetwork: false)
+        let authentication = FakePasswordAuthentication()
+        let sessions = SessionSequence([
+            fakeSession(userID: "@c21_first:matrix.test", deviceID: "FIRST"),
+            fakeSession(userID: "@c21_second:matrix.test", deviceID: "SECOND")
+        ])
+        authentication.sessionForLogin = { _ in sessions.next() }
+        let service = MatrixService(sessionStore: sessionStore, storeDirectory: SessionStoreDirectory(baseURL: temporary), discovery: PasswordDiscovery(), monitorNetwork: false, passwordAuthentication: authentication)
         service.clientFactory = { _, _, _ in try sequence.next() }
 
         try await service.login(homeserver: "https://matrix.test", username: "c21_first", password: "test-password")
@@ -144,15 +152,203 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         let saved = try XCTUnwrap(sessionStore.load())
         client.syncError = expired
         try await service.sync()
-        for _ in 0..<1_000 {
-            if try sessionStore.load() == nil && service.sessionError == "会话已失效，请重新登录。" { break }
-            await Task.yield()
+        let cleared = expectation(description: "unknown token clears the local session")
+        Task { @MainActor in
+            while service.isLoggedIn { try? await Task.sleep(for: .milliseconds(5)) }
+            cleared.fulfill()
         }
+        await fulfillment(of: [cleared], timeout: 1)
 
         XCTAssertFalse(service.isLoggedIn)
         XCTAssertNil(try sessionStore.load())
         XCTAssertFalse(FileManager.default.fileExists(atPath: temporary.appendingPathComponent(saved.storeID.uuidString).path))
         XCTAssertEqual(service.sessionError, "会话已失效，请重新登录。")
+    }
+
+    func testRestoreUnknownTokenClearsStoredSession() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let saved = testCredentials(userID: "@restore-expired:matrix.test")
+        let store = InMemorySessionStore(saved)
+        let directory = SessionStoreDirectory(baseURL: temporary)
+        _ = try directory.create(for: saved.storeID)
+        let expired = ClientError.MatrixApi(kind: .unknownToken(softLogout: false), code: "M_UNKNOWN_TOKEN", msg: "expired", details: nil)
+        let client = FakeClient(restoreError: expired)
+        let service = makeService(sessionStore: store, directory: temporary, client: client)
+
+        await service.restoreSession()
+
+        XCTAssertFalse(service.isLoggedIn)
+        XCTAssertNil(try store.load())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.url(for: saved.storeID).path))
+        XCTAssertEqual(service.sessionError, "会话已失效，请重新登录。")
+    }
+
+    func testLogoutUnknownTokenStillClearsLocalSession() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let expired = ClientError.MatrixApi(kind: .unknownToken(softLogout: false), code: "M_UNKNOWN_TOKEN", msg: "expired", details: nil)
+        let client = FakeClient(logoutError: expired)
+        let store = InMemorySessionStore()
+        let service = makeService(sessionStore: store, directory: temporary, client: client)
+        try await service.login(homeserver: "https://matrix.test", username: "logout-expired", password: "test-password")
+
+        await service.logout()
+
+        XCTAssertFalse(service.isLoggedIn)
+        XCTAssertNil(try store.load())
+    }
+
+    func testCorruptKeychainCanBeClearedWithAllStoresAndLoginCanResume() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let store = MalformedSessionStore()
+        let directory = SessionStoreDirectory(baseURL: temporary)
+        _ = try directory.create(for: UUID())
+        let client = FakeClient()
+        let service = makeService(sessionStore: store, directory: temporary, client: client)
+
+        await service.restoreSession()
+        XCTAssertTrue(service.canClearLocalSession)
+        try await service.clearLocalSession()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: temporary.path))
+        store.isMalformed = false
+        try await service.login(homeserver: "https://matrix.test", username: "after-clear", password: "test-password")
+        XCTAssertTrue(service.isLoggedIn)
+        await service.logout()
+    }
+
+    func testFailedLocalClearKeepsRecoveryExitForRetry() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let store = FailFirstDeleteMalformedStore()
+        let service = makeService(sessionStore: store, directory: temporary, client: FakeClient())
+        await service.restoreSession()
+
+        do { try await service.clearLocalSession(); XCTFail("first delete should fail") }
+        catch MatrixServiceError.storageUnavailable {}
+        XCTAssertTrue(service.canClearLocalSession)
+        XCTAssertThrowsError(try store.load())
+
+        try await service.clearLocalSession()
+        XCTAssertFalse(service.canClearLocalSession)
+        XCTAssertNil(try store.load())
+    }
+
+    func testStoreKeyAndDirectoryFailuresAreStorageErrorsWithoutOrphan() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let keyClient = FakeClient()
+        let keyService = makeService(sessionStore: InMemorySessionStore(), directory: temporary, client: keyClient)
+        keyService.storeKeyFactory = { throw SessionStoreError.unavailable }
+        await assertStorageFailure(keyService)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: temporary.path), [])
+
+        let file = temporary.appendingPathComponent("not-a-directory")
+        try Data("x".utf8).write(to: file)
+        let directoryClient = FakeClient()
+        let directoryService = makeService(sessionStore: InMemorySessionStore(), directory: file, client: directoryClient)
+        await assertStorageFailure(directoryService)
+        XCTAssertFalse(directoryClient.didLogout)
+    }
+
+    func testRateLimitIsVisibleAndAuthenticationCanBeCancelled() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let authentication = FakePasswordAuthentication()
+        authentication.error = AuthenticationError.rateLimited(retryAfter: 30)
+        let service = MatrixService(sessionStore: InMemorySessionStore(), storeDirectory: SessionStoreDirectory(baseURL: temporary), discovery: PasswordDiscovery(), monitorNetwork: false, passwordAuthentication: authentication, authenticationTimeout: 1)
+        service.clientFactory = { _, _, _ in FakeClient() }
+        let task = Task { @MainActor in
+            try await service.login(homeserver: "https://matrix.test", username: "limited", password: "test-password")
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertTrue(service.authenticationStatus?.contains("30 秒") == true)
+        service.cancelAuthentication()
+        do { try await task.value; XCTFail("expected cancellation") }
+        catch is CancellationError {}
+    }
+
+    func testRestoreRateLimitIsVisibleAndCancellationKeepsStoredSession() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let saved = testCredentials(userID: "@restore-limited:matrix.test")
+        let store = InMemorySessionStore(saved)
+        _ = try SessionStoreDirectory(baseURL: temporary).create(for: saved.storeID)
+        let client = FakeClient(restoreError: AuthenticationError.rateLimited(retryAfter: 20))
+        let service = makeService(sessionStore: store, directory: temporary, client: client)
+        let task = Task { @MainActor in await service.restoreSession() }
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertTrue(service.authenticationStatus?.contains("20 秒") == true)
+        service.cancelAuthentication()
+        await task.value
+        XCTAssertEqual(try store.load(), saved)
+        XCTAssertTrue(service.canRetryRestore)
+        XCTAssertTrue(service.canClearLocalSession)
+    }
+
+    func testAuthenticationTimeoutCleansLateCandidateWithoutActivation() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let authentication = LatePasswordAuthentication()
+        let probe = QueueProbe()
+        var client: FakeClient? = FakeClient(probe: probe)
+        weak var releasedClient = client
+        let store = InMemorySessionStore()
+        let service = MatrixService(sessionStore: store, storeDirectory: SessionStoreDirectory(baseURL: temporary), discovery: PasswordDiscovery(), monitorNetwork: false, passwordAuthentication: authentication, authenticationTimeout: 0.05)
+        service.clientFactory = { [weak client] _, _, _ in
+            guard let client else { throw SessionStoreError.unavailable }
+            return client
+        }
+
+        do { try await service.login(homeserver: "https://matrix.test", username: "late", password: "test-password"); XCTFail("expected timeout") }
+        catch let error as AuthenticationError { XCTAssertEqual(error, .timedOut) }
+        XCTAssertTrue(service.isAuthenticating)
+        client = nil
+        let cleaned = expectation(description: "late authentication worker cleans up")
+        let observation = service.$isAuthenticating.dropFirst().filter { !$0 }.sink { _ in cleaned.fulfill() }
+        XCTAssertTrue(authentication.complete(), "the cancelled worker still owns the pending result")
+        await fulfillment(of: [cleaned], timeout: 1)
+        withExtendedLifetime(observation) {}
+        XCTAssertFalse(service.isAuthenticating)
+        XCTAssertFalse(service.isLoggedIn)
+        XCTAssertTrue(probe.values.contains(false))
+        XCTAssertEqual(authentication.discardCalls, 1)
+        XCTAssertNil(releasedClient)
+        XCTAssertNil(try store.load())
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: temporary.path), [])
+    }
+
+    func testForegroundAndNetworkRecoveryStartSyncWithoutSteadyQueueEnable() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let client = FakeClient(successfulSync: true)
+        let service = makeService(sessionStore: InMemorySessionStore(), directory: temporary, client: client)
+        try await service.login(homeserver: "https://matrix.test", username: "foreground", password: "test-password")
+        try await Task.sleep(for: .milliseconds(15))
+        let beforeForeground = client.syncCalls
+        let initialEnableCount = client.queueEnableValues.filter { $0 }.count
+
+        await service.applicationDidBecomeActive()
+        try await Task.sleep(for: .milliseconds(15))
+        XCTAssertGreaterThan(client.syncCalls, beforeForeground)
+        XCTAssertEqual(client.queueEnableValues.filter { $0 }.count, initialEnableCount)
+
+        let beforeNetwork = client.syncCalls
+        await service.networkChanged(available: false)
+        await service.networkChanged(available: true)
+        try await Task.sleep(for: .milliseconds(15))
+        XCTAssertGreaterThan(client.syncCalls, beforeNetwork)
+        XCTAssertEqual(client.queueEnableValues.filter { $0 }.count, initialEnableCount + 1)
+        await service.logout()
+    }
+
+    private func assertStorageFailure(_ service: MatrixService) async {
+        do {
+            try await service.login(homeserver: "https://matrix.test", username: "storage", password: "test-password")
+            XCTFail("expected storage failure")
+        } catch MatrixServiceError.storageUnavailable {}
+        catch { XCTFail("unexpected error \(error)") }
     }
 
     func testRoomSortingUsesActivityAndDirectFlagDoesNotDependOnDisplayName() {
@@ -169,19 +365,23 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         XCTAssertTrue(rooms[1].isDirect)
     }
 
-    private func makeService(sessionStore: any SessionStore, directory: URL, client: FakeClient) -> MatrixService {
+    private func makeService(sessionStore: any SessionStore, directory: URL, client: FakeClient,
+                             authentication: FakePasswordAuthentication = FakePasswordAuthentication()) -> MatrixService {
         let service = MatrixService(
             sessionStore: sessionStore,
             storeDirectory: SessionStoreDirectory(baseURL: directory),
             discovery: PasswordDiscovery(),
-            monitorNetwork: false
+            monitorNetwork: false,
+            passwordAuthentication: authentication,
+            authenticationTimeout: 5
         )
         service.clientFactory = { _, _, _ in client }
         return service
     }
 
     private func makeTemporaryDirectory() throws -> URL {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".build/lifecycle-tests/\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
     }
@@ -199,21 +399,32 @@ private struct PasswordDiscovery: LoginCapabilityDiscovering {
 
 private final class FakeClient: Client, @unchecked Sendable {
     private let configuredLogoutError: Error?
+    private let configuredRestoreError: Error?
     var syncError: Error?
+    private let successfulSync: Bool
+    private let probe: QueueProbe?
+    private(set) var syncCalls = 0
+    private(set) var queueEnableValues: [Bool] = []
     private(set) var didLogout = false
     private(set) var restoredSession: Session?
     private let configuredSession: Session
 
-    init(session: Session = fakeSession(userID: "@c21_alpha:matrix.test", deviceID: "C21TEST"), logoutError: Error? = nil, syncError: Error? = nil) {
+    init(session: Session = fakeSession(userID: "@c21_alpha:matrix.test", deviceID: "C21TEST"), logoutError: Error? = nil, restoreError: Error? = nil, syncError: Error? = nil, successfulSync: Bool = false, probe: QueueProbe? = nil) {
         configuredLogoutError = logoutError
+        configuredRestoreError = restoreError
         self.syncError = syncError
+        self.successfulSync = successfulSync
+        self.probe = probe
         configuredSession = session
         super.init(noHandle: .init())
     }
 
     required init(unsafeFromHandle handle: UInt64) {
         configuredLogoutError = nil
+        configuredRestoreError = nil
         syncError = nil
+        successfulSync = false
+        probe = nil
         configuredSession = fakeSession(userID: "@c21_unexpected:matrix.test", deviceID: "UNEXPECTED")
         super.init(unsafeFromHandle: handle)
     }
@@ -225,6 +436,7 @@ private final class FakeClient: Client, @unchecked Sendable {
     }
 
     override func restoreSession(session: Session) async throws {
+        if let configuredRestoreError { throw configuredRestoreError }
         restoredSession = session
     }
 
@@ -235,18 +447,84 @@ private final class FakeClient: Client, @unchecked Sendable {
 
     override func setDelegate(delegate: ClientDelegate?) throws -> TaskHandle? { nil }
     override func rooms() -> [Room] { [] }
-    override func enableAllSendQueues(enable: Bool) async {}
+    override func enableAllSendQueues(enable: Bool) async {
+        queueEnableValues.append(enable)
+        probe?.values.append(enable)
+    }
 
     override func syncOnceV2(settings: SyncSettingsV2) async throws -> SyncResponseV2 {
+        syncCalls += 1
         if let syncError { throw syncError }
+        if successfulSync {
+            return SyncResponseV2(nextBatch: "test", rooms: SyncResponseRoomsV2(invited: [], joined: [], left: [], knocked: []))
+        }
         throw ClientError.Generic(msg: "offline", details: nil)
     }
+}
+
+private final class QueueProbe: @unchecked Sendable { var values: [Bool] = [] }
+
+private final class FakePasswordAuthentication: PasswordAuthenticating, @unchecked Sendable {
+    var error: Error?
+    var discardCalls = 0
+    var sessionForLogin: ((String) -> Session) = { username in
+        fakeSession(userID: "@\(username):matrix.test", deviceID: "C21TEST")
+    }
+
+    func login(at server: URL, username: String, password: String) async throws -> Session {
+        if let error { throw error }
+        return sessionForLogin(username)
+    }
+    func discard(_ session: Session) async { discardCalls += 1 }
+}
+
+private final class LatePasswordAuthentication: PasswordAuthenticating, @unchecked Sendable {
+    private(set) var discardCalls = 0
+    private let lock = NSLock()
+    private var pending: CheckedContinuation<Session, Never>?
+    func login(at server: URL, username: String, password: String) async throws -> Session {
+        // A manually completed future deliberately ignores Task cancellation.
+        await withCheckedContinuation { continuation in lock.withLock { pending = continuation } }
+    }
+    func complete() -> Bool {
+        let continuation = lock.withLock { let value = pending; pending = nil; return value }
+        continuation?.resume(returning: fakeSession(userID: "@late:matrix.test", deviceID: "LATE"))
+        return continuation != nil
+    }
+    func discard(_ session: Session) async { discardCalls += 1 }
 }
 
 private final class FailingSaveSessionStore: SessionStore, @unchecked Sendable {
     func load() throws -> SessionCredentials? { nil }
     func save(_ credentials: SessionCredentials) throws { throw SessionStoreError.unavailable }
     func delete() throws {}
+}
+
+private final class MalformedSessionStore: SessionStore, @unchecked Sendable {
+    var isMalformed = true
+    func load() throws -> SessionCredentials? {
+        if isMalformed { throw SessionStoreError.malformedItem }
+        return nil
+    }
+    func save(_ credentials: SessionCredentials) throws {}
+    func delete() throws { isMalformed = false }
+}
+
+private final class FailFirstDeleteMalformedStore: SessionStore, @unchecked Sendable {
+    private var shouldFailDelete = true
+    private var isMalformed = true
+    func load() throws -> SessionCredentials? {
+        if isMalformed { throw SessionStoreError.malformedItem }
+        return nil
+    }
+    func save(_ credentials: SessionCredentials) throws {}
+    func delete() throws {
+        if shouldFailDelete {
+            shouldFailDelete = false
+            throw SessionStoreError.unavailable
+        }
+        isMalformed = false
+    }
 }
 
 private final class ClientSequence: @unchecked Sendable {
@@ -259,6 +537,18 @@ private final class ClientSequence: @unchecked Sendable {
         try lock.withLock {
             guard !clients.isEmpty else { throw SessionStoreError.unavailable }
             return clients.removeFirst()
+        }
+    }
+}
+
+private final class SessionSequence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sessions: [Session]
+    init(_ sessions: [Session]) { self.sessions = sessions }
+    func next() -> Session {
+        lock.withLock {
+            precondition(!sessions.isEmpty, "test session sequence exhausted")
+            return sessions.removeFirst()
         }
     }
 }

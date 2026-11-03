@@ -36,6 +36,8 @@ public enum AuthenticationError: LocalizedError, Equatable, Sendable {
     case invalidCredentials
     case unsupportedLoginMethod
     case serverFailure
+    case rateLimited(retryAfter: TimeInterval?)
+    case timedOut
 
     public var errorDescription: String? {
         switch self {
@@ -44,6 +46,10 @@ public enum AuthenticationError: LocalizedError, Equatable, Sendable {
         case .networkFailure: return "无法连接服务器，请检查网络后重试。"
         case .invalidCredentials: return "用户名或密码错误。"
         case .unsupportedLoginMethod: return "该服务器不支持密码登录，请使用支持的登录方式。"
+        case .timedOut: return "登录或恢复会话超时，请检查网络后重试。"
+        case .rateLimited(let delay):
+            if let delay { return "服务器请求过于频繁，请等待至少 \(Int(min(delay.rounded(.up), 86_400))) 秒后重试；可取消本次操作。" }
+            return "服务器请求过于频繁，未提供等待时长，请稍后重试；可取消本次操作。"
         case .serverFailure: return "服务器暂时无法处理登录请求，请稍后重试。"
         }
     }
@@ -84,11 +90,11 @@ public struct MatrixLoginCapabilityDiscovery: LoginCapabilityDiscovering {
         do {
             let (versionData, versionResponse) = try await session.data(from: versions)
             guard let response = versionResponse as? HTTPURLResponse else { throw AuthenticationError.networkFailure }
-            guard (200..<300).contains(response.statusCode) else { throw discoveryError(for: response.statusCode) }
+            guard (200..<300).contains(response.statusCode) else { throw discoveryError(response: response, data: versionData) }
             guard validVersions(versionData) else { throw AuthenticationError.discoveryFailed }
             let (loginData, loginResponse) = try await session.data(from: login)
             guard let response = loginResponse as? HTTPURLResponse else { throw AuthenticationError.networkFailure }
-            guard (200..<300).contains(response.statusCode) else { throw discoveryError(for: response.statusCode) }
+            guard (200..<300).contains(response.statusCode) else { throw discoveryError(response: response, data: loginData) }
             let document = try JSONDecoder().decode(LoginDocument.self, from: loginData)
             return LoginCapabilities(supportsPassword: document.flows.contains { $0.type == "m.login.password" })
         } catch let error as AuthenticationError {
@@ -110,8 +116,9 @@ public struct MatrixLoginCapabilityDiscovery: LoginCapabilityDiscovering {
         (try? JSONDecoder().decode(VersionsDocument.self, from: data).versions.isEmpty) == false
     }
 
-    private func discoveryError(for status: Int) -> AuthenticationError {
-        (500..<600).contains(status) ? .serverFailure : .discoveryFailed
+    private func discoveryError(response: HTTPURLResponse, data: Data) -> AuthenticationError {
+        MatrixRateLimit.error(response: response, data: data)
+            ?? ((500..<600).contains(response.statusCode) ? .serverFailure : .discoveryFailed)
     }
 
     private struct VersionsDocument: Decodable { let versions: [String] }
@@ -123,6 +130,7 @@ public enum PasswordLoginResultClassifier {
     public static func error(forHTTPStatus status: Int) -> AuthenticationError? {
         switch status {
         case 200..<300: return nil
+        case 429: return .rateLimited(retryAfter: nil)
         case 401, 403: return .invalidCredentials
         case 404, 405: return .unsupportedLoginMethod
         case 500..<600: return .serverFailure
@@ -143,8 +151,12 @@ public enum PasswordLoginResultClassifier {
             return .discoveryFailed
         case let ClientBuildError.Sdk(message), let ClientBuildError.Generic(message):
             return looksLikeNetworkFailure(message: message, details: nil) ? .networkFailure : .serverFailure
-        case let ClientError.MatrixApi(_, code, _, _):
+        case let ClientError.MatrixApi(kind, code, _, _):
+            if case .limitExceeded(let milliseconds) = kind {
+                return .rateLimited(retryAfter: milliseconds.map { Double($0) / 1_000 })
+            }
             switch code {
+            case "M_LIMIT_EXCEEDED": return .rateLimited(retryAfter: nil)
             case "M_UNKNOWN_TOKEN", "M_FORBIDDEN": return .invalidCredentials
             default: return .serverFailure
             }
@@ -183,7 +195,7 @@ public enum HTTPSRedirectPolicy {
     }
 }
 
-private final class HTTPSRedirectGuard: NSObject, URLSessionTaskDelegate {
+final class HTTPSRedirectGuard: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
         guard let original = task.originalRequest?.url, let target = request.url,
               HTTPSRedirectPolicy.allowsRedirect(from: original, to: target) else {

@@ -13,6 +13,8 @@ struct LoginView: View {
     @State private var password = ""
     @State private var isLoggingIn = false
     @State private var errorMessage: String?
+    @State private var confirmLocalClear = false
+    @State private var isClearing = false
 #if DEBUG
     @State private var allowLocalHTTP = false
 #endif
@@ -21,7 +23,7 @@ struct LoginView: View {
         !homeserver.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !password.isEmpty
-            && !isLoggingIn
+            && !isLoggingIn && !service.isAuthenticating && !service.isRestoring && !isClearing
     }
 
     var body: some View {
@@ -64,9 +66,24 @@ struct LoginView: View {
                     .frame(maxWidth: 480)
             }
 
-            if service.sessionError != nil {
+            if let status = service.authenticationStatus {
+                Text(status).font(.footnote).multilineTextAlignment(.center)
+            }
+
+            if service.isAuthenticating || service.isRestoring {
+                Button("取消登录或恢复") { service.cancelAuthentication() }
+                Text("操作可取消；取消后如仍有请求结束中，会先清理再允许重试。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            if service.canRetryRestore {
                 Button("重试恢复会话") { Task { await service.restoreSession() } }
-                    .disabled(isLoggingIn)
+                    .disabled(isLoggingIn || service.isAuthenticating || service.isRestoring || isClearing)
+            }
+
+            if service.canClearLocalSession {
+                Button("清除本地会话并重新登录", role: .destructive) { confirmLocalClear = true }
+                    .disabled(isLoggingIn || service.isAuthenticating || service.isRestoring || isClearing)
             }
 
             Button(action: logIn) {
@@ -79,6 +96,19 @@ struct LoginView: View {
             }
             .buttonStyle(.borderedProminent)
             .disabled(!canLogIn)
+        }
+        .confirmationDialog("清除本地会话并重新登录？", isPresented: $confirmLocalClear, titleVisibility: .visible) {
+            Button("清除本地会话", role: .destructive) {
+                isClearing = true
+                Task {
+                    defer { isClearing = false }
+                    do { try await service.clearLocalSession(); errorMessage = nil; password = "" }
+                    catch { errorMessage = error.localizedDescription }
+                }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("将删除此 App 的 Keychain 会话和本地消息数据库，包括尚未发送的消息。服务器上的消息不会删除；此操作不会撤销服务器上的设备会话。")
         }
         .padding(32)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -105,6 +135,8 @@ struct LoginView: View {
                     }()
                 )
                 password = ""
+            } catch is CancellationError {
+                errorMessage = "已取消登录。"
             } catch {
                 errorMessage = error.localizedDescription
             }

@@ -221,7 +221,7 @@ private struct MessageBubble: View {
             .background(message.isOwn ? Color.accentColor.opacity(0.15) : Color.secondary.opacity(0.12))
             .clipShape(RoundedRectangle(cornerRadius: 12))
 
-            if message.isOwn, let deliveryState = message.deliveryState, deliveryState.isFailed {
+            if message.isOwn, let deliveryState = message.deliveryState, deliveryState.canRetry {
                 VStack(spacing: 6) {
                     Button("重试", action: retry).font(.caption)
                     if deliveryState.canCancel {

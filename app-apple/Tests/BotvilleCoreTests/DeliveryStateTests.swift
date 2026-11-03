@@ -26,11 +26,16 @@ final class DeliveryStateTests: XCTestCase {
         XCTAssertEqual(timeline.cancelArguments?.target, .event)
     }
 
-    func testFailedStateIsTheOnlyStateWithRetryCancelUI() {
+    func testOnlyParkedFailureHasRetryCancelUI() {
         XCTAssertEqual(MessageDeliveryState.queued.displayName, "等待发送")
         XCTAssertFalse(MessageDeliveryState.queued.isFailed)
         XCTAssertFalse(MessageDeliveryState.queued.canCancel)
+        XCTAssertEqual(MessageDeliveryState.retrying.displayName, "自动重试中，请等待网络恢复后自动发送")
+        XCTAssertFalse(MessageDeliveryState.retrying.isFailed)
+        XCTAssertFalse(MessageDeliveryState.retrying.canRetry)
+        XCTAssertFalse(MessageDeliveryState.retrying.canCancel)
         XCTAssertTrue(MessageDeliveryState.failed.isFailed)
+        XCTAssertTrue(MessageDeliveryState.failed.canRetry)
         XCTAssertTrue(MessageDeliveryState.failed.canCancel)
         XCTAssertFalse(MessageDeliveryState.sent.canCancel)
     }
@@ -38,11 +43,12 @@ final class DeliveryStateTests: XCTestCase {
     func testSDKLocalSendStateProjectsQueuedFailedAndSent() {
         let projection = [
             EventSendState.notSentYet(progress: nil),
+            .sendingFailed(error: .genericApiError(msg: "recoverable"), isRecoverable: true),
             .sendingFailed(error: .genericApiError(msg: "test"), isRecoverable: false),
             .notSentYet(progress: nil),
             .sent(eventId: "$event")
         ].compactMap(MessageDeliveryState.init)
-        XCTAssertEqual(projection, [.queued, .failed, .queued, .sent])
+        XCTAssertEqual(projection, [.queued, .retrying, .failed, .queued, .sent])
     }
 
     func testReconnectBackoffCapsAndResets() {
