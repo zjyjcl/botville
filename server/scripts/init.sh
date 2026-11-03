@@ -35,7 +35,6 @@
 # so user secrets survive re-runs; *_IMAGE values that drifted from the repo
 # defaults only get a WARNING here (never rewritten).
 set -euo pipefail
-
 # Everything written below is secret (.env, the appservice registration with
 # the as_token): create it 0600 from the start instead of chmod-ing after a
 # brief world-readable window.
@@ -331,12 +330,18 @@ with open(env_path, encoding="utf-8") as f:
 
 # Derived value for the appservice namespace regex (A1.3): escape every regex
 # metacharacter in the server name so e.g. "example.com" cannot also match
-# "examplexcom". The server name is validated and lowercased first.
+# "examplexcom". [A-Za-z0-9_] stay as-is (re.escape semantics). The server
+# name is validated and lowercased first: Matrix server names are case-
+# insensitive (Synapse lowercases its own config), so a mixed-case value in
+# .env must not fork the @ai_* namespace between homeserver and gateway.
 _dns_label = re.compile(r"^[0-9a-z]([0-9a-z-]*[0-9a-z])?$")
 
 
 def validate_server_name(raw):
-    """Valid Matrix server name (hostname or IP, optional :port), lowercased."""
+    """Valid Matrix server name (hostname or IP, optional :port), lowercased.
+
+    Exits with a message when invalid so a broken namespace regex can never
+    be rendered."""
     name = raw.strip().lower()
 
     def bad():
@@ -369,6 +374,7 @@ def validate_server_name(raw):
         if not host or len(host) > 253:
             bad()
         for label in host.split("."):
+            # DNS labels and IPv4 segments alike.
             if not label or len(label) > 63 or not _dns_label.fullmatch(label):
                 bad()
     if port is not None and not 1 <= port <= 65535:

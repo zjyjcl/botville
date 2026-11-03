@@ -6,26 +6,8 @@ from __future__ import annotations
 
 import sys
 
-from .config import Config, ConfigError, load_config
-from .http_server import build_server
-from .matrix import InMemoryMatrixTransport, MatrixTransport
-
-
-def _build_transport(config: Config) -> MatrixTransport:
-    """按 `GATEWAY_MATRIX_TRANSPORT` 选择传输（A1.3）。
-
-    appservice 所需的 URL / server_name / as_token 已在 `Config` 构造时校验，
-    这里只负责装配；token 不打印。
-    """
-    if config.matrix_transport == "appservice":
-        from .matrix_appservice import AppServiceMatrixTransport
-
-        return AppServiceMatrixTransport(
-            homeserver_url=config.homeserver_url,
-            as_token=config.as_token,
-            server_name=config.matrix_server_name,
-        )
-    return InMemoryMatrixTransport()
+from .config import ConfigError, load_config
+from .http_server import build_server, build_transport
 
 
 def main(argv=None) -> int:
@@ -43,7 +25,20 @@ def main(argv=None) -> int:
             file=sys.stderr,
         )
 
-    transport = _build_transport(config)
+    # 传输选择收敛在 http_server.build_transport（与 build_server 同一逻辑）。
+    transport = build_transport(config)
+
+    # appservice 模式启动即校验可达性与 AS token（whoami）：配错就 fail fast，
+    # 不带病运行到第一条消息才失败，也不让 /health 一开始就误报 degraded。
+    if config.matrix_transport == "appservice" and not transport.healthy():
+        print(
+            "config error: homeserver health check failed (whoami with the appservice "
+            "token); check GATEWAY_HOMESERVER_URL / GATEWAY_AS_TOKEN and that the "
+            "homeserver loaded the appservice registration",
+            file=sys.stderr,
+        )
+        return 2
+
     try:
         server = build_server(config, transport)
     except OSError as exc:

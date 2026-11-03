@@ -406,10 +406,39 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             )
             return
         except GatewayDeliveryError as exc:
-            # 传输层失败是网关内部错误。契约状态码集合只有 500，
-            # 502/`matrix.unavailable` 未入契约，因此映射为 500 internal.error。
             if self.server.config.access_log:  # type: ignore[attr-defined]
                 self.log_error("delivery failed: %s: %s", exc.code, exc.detail)
+            # appservice 传输在客户端侧就能判定的请求错误映射为 4xx（契约
+            # sendMessage 已声明 400/404；其余传输失败仍是网关内部错误 → 500，
+            # 502/`matrix.unavailable` 未入契约）。
+            if exc.code == "appservice.namespace":
+                self._send_problem(
+                    400, "request.invalid", "Request validation failed",
+                    detail=exc.detail,
+                    errors=[{
+                        "field": "sender_persona_id",
+                        "code": exc.code,
+                        "message": exc.detail,
+                    }],
+                )
+                return
+            if exc.code == "conversation.invalid":
+                self._send_problem(
+                    400, "request.invalid", "Request validation failed",
+                    detail=exc.detail,
+                    errors=[{
+                        "field": "conversation_id",
+                        "code": exc.code,
+                        "message": exc.detail,
+                    }],
+                )
+                return
+            if exc.code == "conversation.not_found":
+                self._send_problem(
+                    404, "conversation.not_found", "Conversation not found",
+                    detail=exc.detail,
+                )
+                return
             self._send_problem(
                 500, "internal.error", "Internal Server Error",
                 detail="message delivery failed; the message was not recorded",
@@ -430,14 +459,36 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         super().__init__((config.host, config.port), GatewayHandler)
 
 
+def build_transport(config: Config) -> MatrixTransport:
+    """按 `GATEWAY_MATRIX_TRANSPORT` 选择传输的唯一工厂（PR #99 审查阻塞项 3）。
+
+    `__main__` 与 `build_server` 共用本函数：任何入口在 appservice 配置下
+    都拿到真实传输，而不是静默回落内存假后端。appservice 所需的 URL /
+    server_name / as_token 已在 `Config` 构造时校验，这里只负责装配；
+    token 不打印。
+    """
+    if config.matrix_transport == "appservice":
+        from .matrix_appservice import AppServiceMatrixTransport
+
+        return AppServiceMatrixTransport(
+            homeserver_url=config.homeserver_url,
+            as_token=config.as_token,
+            server_name=config.matrix_server_name,
+            room_alias_prefix=config.room_alias_prefix,
+        )
+    return InMemoryMatrixTransport()
+
+
 def build_server(
     config: Optional[Config] = None,
     transport: Optional[MatrixTransport] = None,
 ) -> GatewayServer:
-    """默认仍是内存假后端（B1.1 行为）；A1.3 起可显式传入 appservice 传输。"""
+    """transport 缺省时按 config 构建（memory→内存假后端，B1.1 行为；
+    appservice→AppServiceMatrixTransport，不静默降级）；显式传入的
+    transport 优先（测试注入用）。"""
     cfg = config or load_config()
     if transport is None:
-        transport = InMemoryMatrixTransport()
+        transport = build_transport(cfg)
     store = UsageStore()
     svc = GatewayService(cfg, transport, store)
     return GatewayServer(cfg, svc, transport)

@@ -30,7 +30,8 @@ if _SRC not in sys.path:
 
 from botville_gateway.config import Config, ConfigError, load_config  # noqa: E402
 from botville_gateway.http_server import MAX_BODY_BYTES, build_server  # noqa: E402
-from botville_gateway.matrix import InMemoryMatrixTransport  # noqa: E402
+from botville_gateway.matrix import DeliveryError, InMemoryMatrixTransport  # noqa: E402
+from botville_gateway.matrix_appservice import AppServiceMatrixTransport  # noqa: E402
 from botville_gateway.service import (  # noqa: E402
     GatewayService,
     IdempotencyConflict,
@@ -648,8 +649,8 @@ class TestIsoFormat(unittest.TestCase):
 class _ServerFixture:
     """在后台线程里起 GatewayServer（端口 0 = 随机空闲端口）。"""
 
-    def __init__(self, config: Config):
-        self.server = build_server(config)
+    def __init__(self, config: Config, transport=None):
+        self.server = build_server(config, transport)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     def __enter__(self):
@@ -665,6 +666,18 @@ class _ServerFixture:
     def base(self) -> str:
         host, port = self.server.server_address[:2]
         return f"http://{host}:{port}"
+
+
+class _FailingTransport(InMemoryMatrixTransport):
+    """按给定 code/detail 抛 DeliveryError 的内存传输（4xx/5xx 映射测试用）。"""
+
+    def __init__(self, code: str, detail: str):
+        super().__init__()
+        self._code = code
+        self._detail = detail
+
+    def send_text(self, **kwargs):
+        raise DeliveryError(self._code, self._detail)
 
 
 def _http(method, url, body=None, headers=None, timeout=5):
@@ -958,6 +971,105 @@ class TestHttpServer(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["message"]["content"]["type"], "markdown")
         self.assertEqual(sent[0].content_type, "markdown")
+
+    # ---------------------- appservice 投递错误的 4xx 映射（PR #99 建议）
+    def test_namespace_delivery_error_is_400(self):
+        """appservice.namespace（非法 persona / 越权 sender）→ 400 request.invalid，
+        不是 500：请求在客户端侧就能判定非法，且消息未投递、未记账。"""
+        with _ServerFixture(
+            self._cfg(), _FailingTransport("appservice.namespace", "sender outside namespace")
+        ) as server:
+            status, body = _http(
+                "POST", f"{server.base}/v1/conversations/c/messages",
+                {"sender_persona_id": "Bad Persona", "content": {"type": "text", "text": "x"}},
+            )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["code"], "request.invalid")
+        errors = body.get("errors") or []
+        self.assertTrue(any(e.get("field") == "sender_persona_id" for e in errors))
+
+    def test_invalid_conversation_error_is_400(self):
+        # 路径里不放非法字符（HTTP 请求行安全）：传输层无条件抛
+        # conversation.invalid，映射只看错误码。
+        with _ServerFixture(
+            self._cfg(), _FailingTransport("conversation.invalid", "bad conversation id")
+        ) as server:
+            status, body = _http(
+                "POST", f"{server.base}/v1/conversations/conv_bad/messages",
+                {"sender_persona_id": "p", "content": {"type": "text", "text": "x"}},
+            )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["code"], "request.invalid")
+        errors = body.get("errors") or []
+        self.assertTrue(any(e.get("field") == "conversation_id" for e in errors))
+
+    def test_conversation_not_found_is_404(self):
+        """conversation.not_found（房间别名不存在）→ 404（契约错误码表已有）。"""
+        with _ServerFixture(
+            self._cfg(), _FailingTransport("conversation.not_found", "no such room alias")
+        ) as server:
+            status, body = _http(
+                "POST", f"{server.base}/v1/conversations/conv_missing/messages",
+                {"sender_persona_id": "p", "content": {"type": "text", "text": "x"}},
+            )
+        self.assertEqual(status, 404)
+        self.assertEqual(body["code"], "conversation.not_found")
+        self.assertIn("request_id", body)
+
+    def test_other_delivery_errors_still_500(self):
+        """其余传输失败仍统一 500 internal.error（契约无 502）。"""
+        with _ServerFixture(
+            self._cfg(), _FailingTransport("M_LIMIT_EXCEEDED", "slow down")
+        ) as server:
+            status, body = _http(
+                "POST", f"{server.base}/v1/conversations/c/messages",
+                {"sender_persona_id": "p", "content": {"type": "text", "text": "x"}},
+            )
+        self.assertEqual(status, 500)
+        self.assertEqual(body["code"], "internal.error")
+
+
+# ---------------------------------------------------------------------------
+# 9b. build_server 传输工厂：transport 缺省时按 config 构建（PR #99 阻塞项 3）
+# ---------------------------------------------------------------------------
+class TestBuildServerTransportFactory(unittest.TestCase):
+    @staticmethod
+    def _appservice_cfg(**overrides):
+        base = dict(
+            host="127.0.0.1",
+            port=0,
+            dev_mode=True,
+            silent_hours_enabled=False,
+            matrix_transport="appservice",
+            homeserver_url="http://127.0.0.1:8008",
+            matrix_server_name="localhost",
+            as_token="a" * 64,
+        )
+        base.update(overrides)
+        return Config(**base)
+
+    def test_appservice_config_does_not_fall_back_to_memory(self):
+        """appservice 配置下 build_server 必须拿到真实传输（构造时不发请求）。"""
+        server = build_server(self._appservice_cfg())
+        try:
+            self.assertIsInstance(server.transport, AppServiceMatrixTransport)
+        finally:
+            server.server_close()
+
+    def test_memory_config_keeps_in_memory_transport(self):
+        server = build_server(_cfg())
+        try:
+            self.assertIsInstance(server.transport, InMemoryMatrixTransport)
+        finally:
+            server.server_close()
+
+    def test_explicit_transport_wins(self):
+        custom = InMemoryMatrixTransport()
+        server = build_server(self._appservice_cfg(), custom)
+        try:
+            self.assertIs(server.transport, custom)
+        finally:
+            server.server_close()
 
 
 # ---------------------------------------------------------------------------

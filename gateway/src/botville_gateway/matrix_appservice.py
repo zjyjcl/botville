@@ -8,19 +8,32 @@
   - `POST /_matrix/client/v3/register` + `m.login.application_service`：
     在注册文件声明的 exclusive user namespace 内免密建号；
   - `?user_id=` masquerade：以 `@ai_*` 身份 join / send；
-  - `GET /_matrix/client/versions`：健康检查。
+  - `GET /_matrix/client/v3/directory/room/{alias}`：把 conversation 别名解析
+    成 room id（进程内缓存）；
+  - `GET /_matrix/client/v3/account/whoami`：带 AS token 的健康检查。
 
 注册文件由部署层渲染（`server/compose/appservice/botville-gateway.yaml.tmpl`
 → `init.sh` → `generated/appservice/`，见 docs/deploy/appservice.md）。
 
+身份与房间映射（PR #99 审查阻塞项 1，语义见 docs/deploy/appservice.md）：
+  - `sender_id` 以 `@` 开头 → 必须落在本 server 的 `@ai_*` 命名空间；
+  - 否则视为 persona id，字符集 `^[a-z0-9._=-]{1,64}$`（大写即非法，不做
+    静默小写化——先按字符集拒绝，再谈归一化），映射为
+    `@ai_<persona_id>:<server_name>`；
+  - `room_id` 以 `!` 开头 → 直接使用；否则视为 conversation id（字符集同上），
+    解析房间别名 `#<room_alias_prefix><conversation_id>:<server_name>`；别名
+    不存在 → `DeliveryError(code="conversation.not_found")`。
+
 安全：`as_token` 等同整个 `@ai_*` 命名空间的管理员凭据，本模块不把它写进
 任何日志或异常消息（`DeliveryError.detail` 只含 HS 返回的错误摘要与路径）。
-命名空间外的 sender 在客户端侧直接拒绝，不发起请求。
+命名空间外的 sender 在客户端侧直接拒绝，不发起请求；HTTP 重定向一律不跟随
+（防止 Authorization 头被转发到跨源地址），也不吃环境变量里的代理配置。
 """
 
 from __future__ import annotations
 
 import json
+import re
 import threading
 import urllib.error
 import urllib.parse
@@ -35,11 +48,30 @@ from .matrix import DeliveryError, SentEvent
 # server/compose/appservice/botville-gateway.yaml.tmpl 保持一致）。
 AI_NAMESPACE_PREFIX = "@ai_"
 
+# conversation 别名 localpart 的默认前缀（GATEWAY_ROOM_ALIAS_PREFIX 可覆盖）。
+DEFAULT_ROOM_ALIAS_PREFIX = "botville_conv_"
+
+# persona / conversation id 的字符集（小写即合法；大写在映射前就被拒绝，
+# 不做静默小写化，避免调用方把 "Persona" 与 "persona" 当两个身份）。
+LOCAL_ID_RE = re.compile(r"^[a-z0-9._=-]{1,64}$")
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """禁止跟随重定向：AS token 在 Authorization 头里，跟随 3xx 可能把凭据
+    转发到跨源地址。重定向在这里永远是配置错误（比如把 URL 指到了反代跳转），
+    报错比悄悄跟随更安全。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        raise urllib.error.HTTPError(
+            req.full_url, code, "redirects are not followed", headers, fp
+        )
+
 
 class AppServiceMatrixTransport:
     """满足 `MatrixTransport` Protocol 的 appservice 传输（标准库实现）。
 
-    线程安全：HTTP 雏形是多线程服务器，`ensure_user` 缓存的读写持锁。
+    线程安全：HTTP 雏形是多线程服务器，`ensure_user` 缓存与别名缓存的
+    读写持锁。
     """
 
     def __init__(
@@ -49,15 +81,23 @@ class AppServiceMatrixTransport:
         as_token: str,
         server_name: str,
         namespace_prefix: str = AI_NAMESPACE_PREFIX,
+        room_alias_prefix: str = DEFAULT_ROOM_ALIAS_PREFIX,
         timeout: float = 30.0,
     ) -> None:
         self._base = homeserver_url.rstrip("/")
         self._as_token = as_token
         self._server_name = server_name
         self._prefix = namespace_prefix
+        self._room_alias_prefix = room_alias_prefix
         self._timeout = timeout
         self._ensured: Set[str] = set()
+        self._rooms: Dict[str, str] = {}
         self._lock = threading.Lock()
+        # 不跟随重定向；忽略 http_proxy 等环境变量（部署网关的机器上代理
+        # 配置与 homeserver 内网地址无关，走代理反而会泄漏 AS token）。
+        self._opener = urllib.request.build_opener(
+            _NoRedirectHandler, urllib.request.ProxyHandler({})
+        )
 
     # ----------------------------------------------------------- low level
     def _request(
@@ -80,9 +120,8 @@ class AppServiceMatrixTransport:
         headers["Authorization"] = "Bearer " + self._as_token
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            with self._opener.open(req, timeout=self._timeout) as resp:
                 raw = resp.read()
-                return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as exc:
             raw = exc.read()
             try:
@@ -104,6 +143,20 @@ class AppServiceMatrixTransport:
             raise DeliveryError(
                 "matrix.unreachable", f"{method} {path}: {exc}"
             ) from exc
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except ValueError as exc:
+            # 2xx 但不是 JSON：按投递失败处理，不把半懂不懂的响应当成功。
+            raise DeliveryError(
+                "appservice.response", f"{method} {path}: non-JSON 2xx response"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise DeliveryError(
+                "appservice.response", f"{method} {path}: 2xx response is not a JSON object"
+            )
+        return parsed
 
     # ---------------------------------------------------------- namespace
     def _check_sender(self, sender_id: str) -> None:
@@ -125,13 +178,82 @@ class AppServiceMatrixTransport:
                 f"({self._server_name!r})",
             )
 
+    # ------------------------------------------------------ id mapping
+    def resolve_sender(self, sender_id: str) -> str:
+        """网关 API 的 sender 标识 → Matrix 用户 ID。
+
+        `@` 开头：按 Matrix 用户 ID 校验（必须已在 @ai_* 命名空间内）；
+        否则视为 persona id：字符集 `^[a-z0-9._=-]{1,64}$`（大写即非法，
+        先拒绝非法字符、不做任何小写化），映射 `@ai_<persona>:<server>`。
+        """
+        if sender_id.startswith("@"):
+            self._check_sender(sender_id)
+            return sender_id
+        if not LOCAL_ID_RE.fullmatch(sender_id):
+            raise DeliveryError(
+                "appservice.namespace",
+                f"sender_persona_id {sender_id!r} is neither an @ai_* Matrix user id "
+                f"nor a persona id matching ^[a-z0-9._=-]{{1,64}}$",
+            )
+        return f"{self._prefix}{sender_id}:{self._server_name}"
+
+    def resolve_room(self, room_id: str) -> str:
+        """网关 API 的 conversation 标识 → Matrix room ID。
+
+        `!` 开头：直接当 room id 用；否则视为 conversation id（字符集同
+        persona），解析房间别名 `#<room_alias_prefix><id>:<server_name>`
+        （`GET /_matrix/client/v3/directory/room/{alias}`，带 AS token），
+        成功后进程内缓存。别名不存在 → `conversation.not_found`。
+        """
+        if room_id.startswith("!"):
+            return room_id
+        if not LOCAL_ID_RE.fullmatch(room_id):
+            raise DeliveryError(
+                "conversation.invalid",
+                f"conversation_id {room_id!r} is neither a Matrix room id (!...) "
+                f"nor a conversation id matching ^[a-z0-9._=-]{{1,64}}$",
+            )
+        with self._lock:
+            cached = self._rooms.get(room_id)
+        if cached is not None:
+            return cached
+        alias = f"#{self._room_alias_prefix}{room_id}:{self._server_name}"
+        try:
+            resp = self._request(
+                "GET",
+                "/_matrix/client/v3/directory/room/{}".format(
+                    urllib.parse.quote(alias, safe="")
+                ),
+            )
+        except DeliveryError as exc:
+            if exc.code == "M_NOT_FOUND":
+                raise DeliveryError(
+                    "conversation.not_found",
+                    f"room alias {alias} does not exist on this homeserver",
+                ) from exc
+            raise
+        resolved = resp.get("room_id")
+        if not isinstance(resolved, str) or not resolved.startswith("!"):
+            raise DeliveryError(
+                "appservice.response",
+                f"directory response for {alias} has no room_id",
+            )
+        with self._lock:
+            self._rooms[room_id] = resolved
+        return resolved
+
     @staticmethod
     def _localpart(user_id: str) -> str:
         return user_id[1:].split(":", 1)[0]
 
     # ------------------------------------------------------------- actions
     def ensure_user(self, user_id: str) -> None:
-        """命名空间内免密注册（幂等；M_USER_IN_USE 视为已存在）。进程内缓存。"""
+        """命名空间内免密注册（幂等；M_USER_IN_USE 视为已存在）。进程内缓存。
+
+        200 响应必须带与请求一致的 `user_id`，否则按命名空间错误处理
+        （不缓存失败结果）。
+        """
+        self._check_sender(user_id)
         if user_id in self._ensured:
             return
         try:
@@ -147,19 +269,19 @@ class AppServiceMatrixTransport:
         except DeliveryError as exc:
             if exc.code != "M_USER_IN_USE":
                 raise
-            resp = {}
-        got = resp.get("user_id")
-        if got and got != user_id:
+            resp = None  # 已存在：HS 侧就是请求的 localpart，无响应可核对
+        if resp is not None and resp.get("user_id") != user_id:
             # 防御性检查：HS 建出的账号必须就是请求的那个。
             raise DeliveryError(
                 "appservice.namespace",
-                f"homeserver registered {got!r} for requested {user_id!r}",
+                f"homeserver registered {resp.get('user_id')!r} for requested {user_id!r}",
             )
         with self._lock:
             self._ensured.add(user_id)
 
     def join(self, room_id: str, user_id: str) -> str:
         """以 `user_id` 身份加入房间（AS masquerade）。返回 room_id。"""
+        self._check_sender(user_id)
         resp = self._request(
             "POST",
             "/_matrix/client/v3/join/{}".format(urllib.parse.quote(room_id, safe="")),
@@ -177,8 +299,9 @@ class AppServiceMatrixTransport:
         reply_to: Optional[str] = None,
         content_type: str = "text",
     ) -> SentEvent:
-        self._check_sender(sender_id)
-        self.ensure_user(sender_id)
+        sender = self.resolve_sender(sender_id)
+        room = self.resolve_room(room_id)
+        self.ensure_user(sender)
 
         content: Dict[str, Any] = {"msgtype": "m.text", "body": text}
         if content_type == "markdown":
@@ -189,16 +312,16 @@ class AppServiceMatrixTransport:
             content["m.relates_to"] = {"m.in_reply_to": {"event_id": reply_to}}
 
         path = "/_matrix/client/v3/rooms/{}/send/m.room.message/{}".format(
-            urllib.parse.quote(room_id, safe=""), uuid.uuid4().hex
+            urllib.parse.quote(room, safe=""), uuid.uuid4().hex
         )
         try:
-            resp = self._request("PUT", path, body=content, query={"user_id": sender_id})
+            resp = self._request("PUT", path, body=content, query={"user_id": sender})
         except DeliveryError as exc:
             # 未加入房间（M_FORBIDDEN）时自动 join 后重试一次；其余错误直接上抛。
             if exc.code != "M_FORBIDDEN":
                 raise
-            self.join(room_id, sender_id)
-            resp = self._request("PUT", path, body=content, query={"user_id": sender_id})
+            self.join(room, sender)
+            resp = self._request("PUT", path, body=content, query={"user_id": sender})
 
         event_id = resp.get("event_id")
         if not event_id:
@@ -207,8 +330,8 @@ class AppServiceMatrixTransport:
             )
         return SentEvent(
             event_id=event_id,
-            room_id=room_id,
-            sender_id=sender_id,
+            room_id=room,
+            sender_id=sender,
             text=text,
             sent_at=datetime.now(timezone.utc),
             reply_to=reply_to,
@@ -216,8 +339,12 @@ class AppServiceMatrixTransport:
         )
 
     def healthy(self) -> bool:
+        """带 AS 身份的健康检查：whoami 校验可达性 **和** token 有效性。
+
+        （只打 /versions 的话，token 配错也返回 ok，/health 会误报。）
+        """
         try:
-            self._request("GET", "/_matrix/client/versions")
+            self._request("GET", "/_matrix/client/v3/account/whoami")
         except DeliveryError:
             return False
         except OSError:

@@ -14,11 +14,20 @@ gateway transport from gateway/src — no install needed:
   4. the transport delivers a message under the AI identity, auto-joining the
      invited room on M_FORBIDDEN;
   5. alice reads /messages and asserts sender == the AI user and body matches;
-  6. a normal UIA registration inside the @ai_* namespace must be rejected
-     (exclusive: M_EXCLUSIVE / 400 / 403);
-  7. the transport refuses out-of-namespace senders client-side (no request);
-  8. raw masquerade (?user_id=@bob:...) with the as_token must be rejected by
-     the homeserver (M_EXCLUSIVE / M_FORBIDDEN).
+  6. the rendered registration carries a valid hs_token (64 hex, differs from
+     the as_token; PR #99 review);
+  7. gateway HTTP e2e (PR #99 review blocker 1): alice creates a room with
+     room_alias_name=botville_conv_<conversation_id> and invites
+     @ai_<persona>:<server>; the real gateway HTTP server (build_server,
+     appservice transport, port 0) receives POST
+     /v1/conversations/<conversation_id>/messages with
+     sender_persona_id=<persona>; alice reads the room and asserts the event
+     sender/body (persona -> @ai_* mapping + alias -> room resolution);
+  8. a normal UIA registration inside the @ai_* namespace must be rejected
+     with errcode M_EXCLUSIVE (exclusive namespace);
+  9. the transport refuses out-of-namespace senders client-side (no request);
+  10. raw masquerade (?user_id=@bob:...) with the as_token must be rejected by
+      the homeserver (M_EXCLUSIVE / M_FORBIDDEN).
 
 Only standard endpoints; no /_synapse/admin, no admin-room commands. The
 as_token is read from --env-file and never printed. First failure exits
@@ -27,8 +36,10 @@ non-zero (each step prints PASS/FAIL).
 
 import argparse
 import os
+import re
 import secrets
 import sys
+import threading
 import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -42,11 +53,17 @@ _GATEWAY_SRC = os.path.join(_REPO_ROOT, "gateway", "src")
 if _GATEWAY_SRC not in sys.path:
     sys.path.insert(0, _GATEWAY_SRC)
 
+from botville_gateway.config import Config  # noqa: E402
+from botville_gateway.http_server import build_server  # noqa: E402
 from botville_gateway.matrix import DeliveryError  # noqa: E402
 from botville_gateway.matrix_appservice import AppServiceMatrixTransport  # noqa: E402
 
 # Reuse the A1.1 e2e helpers (step runner, UIA registration, room creation).
 from e2e_synapse import create_room, quote_room, register_user, run_step  # noqa: E402
+
+# Conversation -> room alias convention (gateway GATEWAY_ROOM_ALIAS_PREFIX
+# default; see docs/deploy/appservice.md).
+ROOM_ALIAS_PREFIX = "botville_conv_"
 
 
 def read_env(path):
@@ -88,8 +105,9 @@ def read_ai_message(alice, room_id, event_id, want_sender, want_body):
 
 
 def expect_normal_ai_registration_rejected(base_url, registration_token):
-    """A normal UIA registration of ai_<name> must be refused — the namespace
-    is exclusive to the appservice (M_EXCLUSIVE / 400 / 403)."""
+    """A normal UIA registration of ai_<name> must be refused with M_EXCLUSIVE —
+    anything else (e.g. registration closed for other reasons) would paint a
+    green light over a broken exclusive namespace (PR #99 review)."""
     body = {
         "username": "ai_" + secrets.token_hex(4),
         "password": secrets.token_hex(16),
@@ -107,10 +125,12 @@ def expect_normal_ai_registration_rejected(base_url, registration_token):
         if status != 401:
             errcode = (resp or {}).get("errcode")
             expect(
-                status in (400, 403),
-                "register ai_* returned HTTP {}: {!r}".format(status, resp),
+                errcode == "M_EXCLUSIVE",
+                "register ai_* returned HTTP {} errcode {!r}, expected M_EXCLUSIVE: {!r}".format(
+                    status, errcode, resp
+                ),
             )
-            return "HTTP {} {}".format(status, errcode)
+            return "HTTP {} M_EXCLUSIVE".format(status)
         # Spend the UIA flow (dummy / registration token); the rejection may
         # only come after the stages complete.
         session = (resp or {}).get("session")
@@ -136,6 +156,64 @@ def expect_normal_ai_registration_rejected(base_url, registration_token):
     raise smoke.Failure(
         "registration of {} neither succeeded nor was rejected".format(body["username"])
     )
+
+
+def expect_registration_tokens(registration_path, env_as_token):
+    """The rendered registration must carry both tokens: 64 hex, non-empty,
+    and different from each other (PR #99 review: an empty as_token turns the
+    @ai_* namespace into an unauthenticated takeover)."""
+    with open(registration_path, encoding="utf-8") as f:
+        text = f.read()
+
+    def find(key):
+        m = re.search(r'^{}: "?([0-9a-f]{{64}})"?$'.format(key), text, re.MULTILINE)
+        expect(m, "{} missing/invalid in {}".format(key, registration_path))
+        return m.group(1)
+
+    file_as = find("as_token")
+    file_hs = find("hs_token")
+    expect(
+        file_as != file_hs,
+        "as_token and hs_token must differ in {}".format(registration_path),
+    )
+    expect(
+        file_as == env_as_token,
+        "rendered as_token differs from APPSERVICE_AS_TOKEN in the env file",
+    )
+    return "hs_token ok (64 hex, differs from as_token)"
+
+
+class GatewayHttpFixture:
+    """The real gateway HTTP server (build_server + appservice transport,
+    port 0) started in-process for the HTTP-level e2e leg."""
+
+    def __init__(self, base_url, server_name, as_token):
+        self.config = Config(
+            host="127.0.0.1",
+            port=0,
+            dev_mode=True,  # e2e exercises delivery, not gateway auth
+            silent_hours_enabled=False,  # CI runs at any local time
+            matrix_transport="appservice",
+            homeserver_url=base_url,
+            matrix_server_name=server_name,
+            as_token=as_token,
+        )
+        self.server = build_server(self.config)
+
+    def __enter__(self):
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    @property
+    def base(self):
+        host, port = self.server.server_address[:2]
+        return "http://{}:{}".format(host, port)
 
 
 def expect_transport_rejects_out_of_namespace(transport, room_id, server_name):
@@ -189,6 +267,15 @@ def main():
         "default: server/compose/.env)",
     )
     parser.add_argument(
+        "--registration-file",
+        default=os.path.join(
+            _REPO_ROOT, "server", "compose", "generated", "appservice",
+            "botville-gateway.yaml",
+        ),
+        help="rendered appservice registration to verify hs_token "
+        "(default: server/compose/generated/appservice/botville-gateway.yaml)",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=180,
@@ -229,6 +316,52 @@ def main():
 
     room = {}
     sent = {}
+    conv = {}
+
+    def _create_aliased_room():
+        # PR #99 review blocker 1: the gateway-level flow. Alice creates a room
+        # whose alias follows the botville_conv_<conversation_id> convention
+        # and invites @ai_<persona>:<server>; the gateway then only sees the
+        # persona/conversation ids.
+        conv["conversation_id"] = secrets.token_hex(6)
+        conv["persona"] = "e2e" + secrets.token_hex(3)
+        conv["sender"] = "@ai_{}:{}".format(conv["persona"], server_name)
+        conv["text"] = "gateway http e2e {}".format(secrets.token_hex(4))
+        transport.ensure_user(conv["sender"])
+        room["alias_id"] = create_room(
+            alice["client"],
+            room_alias_name=ROOM_ALIAS_PREFIX + conv["conversation_id"],
+            invite=[conv["sender"]],
+            preset="private_chat",
+        )
+        return "{} invites {}".format(room["alias_id"], conv["sender"])
+
+    def _gateway_http_deliver():
+        with GatewayHttpFixture(base_url, server_name, as_token) as gateway:
+            status, resp = request_json(
+                "POST",
+                gateway.base + "/v1/conversations/{}/messages".format(
+                    conv["conversation_id"]
+                ),
+                body={
+                    "sender_persona_id": conv["persona"],
+                    "content": {"type": "text", "text": conv["text"]},
+                },
+            )
+        expect(
+            200 <= status < 300,
+            "gateway sendMessage returned HTTP {}: {!r}".format(status, resp),
+        )
+        expect(
+            (resp or {}).get("outcome") == "delivered",
+            "gateway receipt outcome={!r}: {!r}".format(
+                (resp or {}).get("outcome"), resp
+            ),
+        )
+        event_id = ((resp or {}).get("delivery") or {}).get("matrix_event_id")
+        expect(event_id, "receipt without matrix_event_id: {!r}".format(resp))
+        conv["event_id"] = event_id
+        return event_id
 
     run_step("versions", lambda: smoke.Smoke(base_url, None).wait_for_versions(args.timeout))
     run_step("register alice (UIA)", _register_alice)
@@ -260,7 +393,28 @@ def main():
         ),
     )
     run_step(
-        "normal ai_* UIA registration rejected (exclusive)",
+        "rendered registration carries a valid hs_token",
+        lambda: expect_registration_tokens(args.registration_file, as_token),
+    )
+    run_step(
+        "alice creates aliased room #{}<conv> and invites @ai_<persona>".format(
+            ROOM_ALIAS_PREFIX
+        ),
+        _create_aliased_room,
+    )
+    run_step(
+        "gateway HTTP POST /v1/conversations/<id>/messages delivers via appservice",
+        _gateway_http_deliver,
+    )
+    run_step(
+        "alice reads the persona message (sender + body)",
+        lambda: read_ai_message(
+            alice["client"], room["alias_id"], conv["event_id"], conv["sender"],
+            conv["text"],
+        ),
+    )
+    run_step(
+        "normal ai_* UIA registration rejected (M_EXCLUSIVE)",
         lambda: expect_normal_ai_registration_rejected(base_url, registration_token),
     )
     run_step(
@@ -275,8 +429,8 @@ def main():
             base_url, as_token, room["id"], server_name
         ),
     )
-    print("APPSERVICE E2E OK: {} sent as {} via {}".format(
-        sent["event"].event_id, ai_user, base_url))
+    print("APPSERVICE E2E OK: {} + gateway HTTP {} sent via {}".format(
+        sent["event"].event_id, conv["event_id"], base_url))
     return 0
 
 
