@@ -22,9 +22,14 @@ compose() {
     ${COMPOSE} "$@"
 }
 
+# First value of KEY from an arbitrary env file (empty if unset/no file).
+env_value_from() { # env_value_from <file> <KEY>
+    sed -n "s/^$2=//p" "$1" | head -n 1
+}
+
 # First value of KEY from server/compose/.env (empty if unset/no file).
 env_value() {
-    sed -n "s/^$1=//p" "${BOTVILLE_ENV_FILE}" | head -n 1
+    env_value_from "${BOTVILLE_ENV_FILE}" "$1"
 }
 
 # .env value usable as a quoted SQL identifier (defaults mirror compose).

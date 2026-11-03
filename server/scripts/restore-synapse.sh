@@ -8,19 +8,25 @@
 # with the copies from <backup_dir>. --yes is required to run; without it the
 # script only prints what it would do.
 #
-# Steps: verify the sha256 of every artifact against the manifest (when it
-# has them) -> stop synapse -> install the backed-up .env/homeserver.yaml ->
-# ensure postgres is healthy -> DROP/CREATE DATABASE (UTF8, C locale,
-# template0) -> pg_restore -> untar the volume -> start synapse -> wait for
-# GET /health. A backup missing any of the four artifacts (env included) is
-# rejected: the backed-up homeserver.yaml carries the DB password, so a
-# partial restore would leave synapse unable to log in.
+# Steps: check the backup belongs to this instance (COMPOSE_PROJECT_NAME and
+# BOTVILLE_HTTP_PORT of the current .env must match the backup's) -> verify
+# the sha256 of every artifact against the manifest (when a manifest exists,
+# every artifact must be listed; a missing entry aborts) -> stop synapse ->
+# install the backed-up .env/homeserver.yaml -> ensure postgres is healthy
+# -> DROP/CREATE DATABASE (UTF8, C locale, template0) -> pg_restore -> untar
+# the volume -> start synapse -> wait for GET /health. A backup missing any
+# of the four artifacts (env included) is rejected: the backed-up
+# homeserver.yaml carries the DB password, so a partial restore would leave
+# synapse unable to log in.
 #
 # On a fresh machine run `make init` first (the generated random .env is
 # replaced by the backup copy before postgres is first started).
 #
 # Override (environment): COMPOSE, same default as backup-synapse.sh
-# (docker compose with -p <COMPOSE_PROJECT_NAME from .env, else botville>).
+# (docker compose with -p <COMPOSE_PROJECT_NAME from .env, else botville>);
+# it is recomputed from the restored .env once installed, unless the caller
+# exported COMPOSE. BOTVILLE_RESTORE_ALLOW_CROSS_INSTANCE=yes skips the
+# instance consistency check (disaster recovery onto a renamed instance).
 set -euo pipefail
 
 usage() {
@@ -60,7 +66,13 @@ source "${script_dir}/lib.sh"
 repo_root="${BOTVILLE_REPO_ROOT}"
 cd "${repo_root}"
 
-COMPOSE="${COMPOSE:-$(default_compose)}"
+# COMPOSE first addresses the CURRENT stack (`compose stop` below); after the
+# backup's .env is installed it is recomputed from the new file so later
+# commands target the restored project. A COMPOSE exported by the caller wins
+# throughout (COMPOSE_OVERRIDE tells set from unset; empty counts as unset,
+# matching the :- default below).
+COMPOSE_OVERRIDE="${COMPOSE-}"
+COMPOSE="${COMPOSE_OVERRIDE:-$(default_compose)}"
 
 env_file="server/compose/.env"
 generated_config="server/compose/generated/synapse/homeserver.yaml"
@@ -130,19 +142,68 @@ EOF
     exit 2
 fi
 
+# --- instance consistency ----------------------------------------------
+
+# The backup must belong to THIS instance: the compose project name prefixes
+# every container/volume/network, and the HTTP port feeds the health check
+# below. Restoring another instance's backup would write the wrong project's
+# volumes while replacing .env/homeserver.yaml with the foreign copies, so
+# compare the current .env with the backup's copy before anything is touched.
+# BOTVILLE_RESTORE_ALLOW_CROSS_INSTANCE=yes skips the check for disaster
+# recovery onto a renamed/re-hosted instance (the operator owns the outcome).
+current_project="$(env_value_from "${env_file}" COMPOSE_PROJECT_NAME)"
+current_project="${current_project:-botville}"
+backup_project="$(env_value_from "${backup_dir}/env" COMPOSE_PROJECT_NAME)"
+backup_project="${backup_project:-botville}"
+current_port="$(env_value_from "${env_file}" BOTVILLE_HTTP_PORT)"
+current_port="${current_port:-8008}"
+backup_port="$(env_value_from "${backup_dir}/env" BOTVILLE_HTTP_PORT)"
+backup_port="${backup_port:-8008}"
+
+mismatch=0
+if [[ "${current_project}" != "${backup_project}" ]]; then
+    echo "restore-synapse.sh: COMPOSE_PROJECT_NAME mismatch: current '${current_project}', backup '${backup_project}'" >&2
+    mismatch=1
+fi
+if [[ "${current_port}" != "${backup_port}" ]]; then
+    echo "restore-synapse.sh: BOTVILLE_HTTP_PORT mismatch: current '${current_port}', backup '${backup_port}'" >&2
+    mismatch=1
+fi
+if [[ "${mismatch}" -ne 0 ]]; then
+    if [[ "${BOTVILLE_RESTORE_ALLOW_CROSS_INSTANCE:-}" == "yes" ]]; then
+        echo "restore-synapse.sh: WARNING: BOTVILLE_RESTORE_ALLOW_CROSS_INSTANCE=yes, restoring a cross-instance backup at the operator's request" >&2
+    else
+        cat >&2 <<EOF
+restore-synapse.sh: refusing to restore a backup from a different instance.
+Confirm this is the same instance first: align the values above in ${env_file}
+with the backup (or restore on a matching checkout), or acknowledge the
+rename/re-host explicitly with BOTVILLE_RESTORE_ALLOW_CROSS_INSTANCE=yes.
+EOF
+        exit 1
+    fi
+fi
+
 # --- restore -----------------------------------------------------------
 
 # Verify every artifact against the manifest before destroying anything
-# (manifests from older backups list the same four files).
+# (manifests from older backups list the same four files). With a manifest
+# present, every artifact MUST have an entry: a missing line means a truncated
+# or hand-edited manifest, and silently skipping that file's check is how a
+# swapped artifact goes unnoticed. Only a backup without any manifest falls
+# back to skipping verification (warned about above).
 for f in synapse-db.dump synapse-data.tar.gz homeserver.yaml env; do
-    if expected="$(expected_sha "${f}")" && [[ -n "${expected}" ]]; then
-        got="$(sha256_of "${backup_dir}/${f}")"
-        if [[ "${expected}" != "${got}" ]]; then
-            echo "restore-synapse.sh: sha256 mismatch for ${f}: manifest ${expected}, file ${got}" >&2
-            exit 1
-        fi
-        echo "==> checksum OK: ${f}"
+    expected="$(expected_sha "${f}")" || expected=""
+    if [[ -f "${backup_dir}/manifest.txt" && -z "${expected}" ]]; then
+        echo "restore-synapse.sh: manifest.txt has no sha256 entry for ${f}" >&2
+        exit 1
     fi
+    [[ -n "${expected}" ]] || continue
+    got="$(sha256_of "${backup_dir}/${f}")"
+    if [[ "${expected}" != "${got}" ]]; then
+        echo "restore-synapse.sh: sha256 mismatch for ${f}: manifest ${expected}, file ${got}" >&2
+        exit 1
+    fi
+    echo "==> checksum OK: ${f}"
 done
 
 echo "==> stopping synapse"
@@ -153,6 +214,14 @@ compose stop synapse
 echo "==> restoring ${env_file} from backup (contains secrets, mode 600)"
 cp "${backup_dir}/env" "${env_file}"
 chmod 600 "${env_file}"
+# The restored .env may carry a different COMPOSE_PROJECT_NAME than this
+# checkout had: recompute COMPOSE so the postgres/synapse commands below
+# target the backup's project (an explicit caller COMPOSE still wins).
+if [[ -n "${COMPOSE_OVERRIDE}" ]]; then
+    COMPOSE="${COMPOSE_OVERRIDE}"
+else
+    COMPOSE="$(default_compose)"
+fi
 echo "==> restoring ${generated_config} from backup"
 mkdir -p "$(dirname "${generated_config}")"
 cp "${backup_dir}/homeserver.yaml" "${generated_config}"
