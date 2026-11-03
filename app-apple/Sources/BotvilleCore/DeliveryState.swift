@@ -8,9 +8,9 @@ import Foundation
 public enum MessageDeliveryState: String, Equatable, Sendable {
     case queued
     case sent
-    /// The SDK has temporarily disabled this room's send queue and will retry
-    /// once a deliberate recovery path re-enables it.
-    case retrying
+    /// SDK retries are exhausted and the room queue is disabled. Explicit user
+    /// retry resumes that queue; sync/connection recovery must not resume it.
+    case paused
     /// The SDK parked this item. It will not send again until the user retries
     /// or cancels this exact transaction.
     case failed
@@ -22,20 +22,19 @@ public extension MessageDeliveryState {
         switch self {
         case .queued: return "等待发送"
         case .sent: return "已发送"
-        case .retrying: return "自动重试中，请等待网络恢复后自动发送"
-        case .failed: return "发送失败，已暂停"
+        case .paused, .failed: return "发送失败，已暂停"
         case .cancelled: return "已取消"
         }
     }
 
-    var isFailed: Bool { self == .failed }
+    var isFailed: Bool { self == .paused || self == .failed }
 
-    /// A recoverable SDK wedge is intentionally not actionable: retrying or
-    /// aborting it can race the queue's automatic recovery.
-    var canRetry: Bool { self == .failed }
+    /// Recoverable failures resume the room queue. Unrecoverable failures
+    /// unpark the original transaction with retrySend.
+    var canRetry: Bool { self == .paused || self == .failed }
 
-    /// Cancellation is intentionally offered only after a failed send.  This
-    /// avoids treating an in-flight send as a local cancellation/redaction.
+    /// Only an SDK-parked unrecoverable item can be cancelled. Disabling a
+    /// room queue does not interrupt requests, so paused is not cancellable.
     var canCancel: Bool { self == .failed }
 }
 

@@ -19,7 +19,7 @@ final class SynapseIntegrationTests: XCTestCase {
     func testLocalSynapseC21MessagingAndRecovery() async throws {
         let homeserver = try requiredHomeserver()
         let root = try requiredArtifactRoot()
-        try requiredContainer()
+        _ = try requiredContainer()
         api = SynapseAPI(homeserver: homeserver)
         let runDirectory = root.appendingPathComponent("c21-e2e-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: runDirectory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
@@ -77,19 +77,39 @@ final class SynapseIntegrationTests: XCTestCase {
             try await waitFor("disconnect evidence") { if case .reconnecting = restored.connectionStatus { return true }; return restored.connectionStatus == .offline }
             let queuedText = "c21-recovery-\(UUID().uuidString)"
             _ = try? await restored.send(text: queuedText, to: roomID)
-            try await waitFor("local queued or retrying echo") { restored.messages.contains { $0.body == queuedText && ($0.deliveryState == .queued || $0.deliveryState == .retrying) } }
+            try await waitFor("local queued, paused, or failed echo") {
+                restored.messages.contains {
+                    $0.body == queuedText && ($0.deliveryState == .queued || $0.deliveryState == .paused || $0.deliveryState == .failed)
+                }
+            }
             // Leave a genuine sync gap so the peer's new events must be caught
-            // up by the automatic retry, rather than an already-connected loop.
+            // up after reconnect, rather than an already-connected loop.
             try await waitFor("retry backoff evidence") {
                 if case .reconnecting(let delay) = restored.connectionStatus { return delay >= 8 }
                 return false
             }
-            phase("disconnected with one queued or failed message")
+            // Exhaust the SDK send attempts before bringing the server back,
+            // so this exercises an actual disabled queue rather than a send
+            // that was still in flight when connectivity returned.
+            try await waitFor("SDK send attempts exhausted") {
+                restored.messages.contains { $0.body == queuedText && $0.deliveryState == .paused }
+            }
+            phase("disconnected with one queued, paused, or failed message")
             try await startAndWaitForSynapse()
             let afterRecovery = ["c21-after-\(UUID().uuidString)", "c21-after-\(UUID().uuidString)"]
             for text in afterRecovery { try await api.sendText(accessToken: peer.accessToken, roomID: roomID, body: text) }
             try await waitFor("automatic reconnect") { restored.connectionStatus == .connected }
             try await waitFor("sync catch-up") { afterRecovery.allSatisfy { expected in restored.messages.contains { $0.body == expected && $0.sender == peer.userID } } }
+            try await waitFor("recoverable send parked") {
+                restored.messages.contains { $0.body == queuedText && $0.isOwn && $0.deliveryState == .paused }
+            }
+            guard let paused = restored.messages.first(where: { $0.body == queuedText && $0.isOwn && $0.deliveryState == .paused }) else {
+                throw SynapseTestError(step: "recoverable send parked", status: nil, errcode: nil)
+            }
+            let deliveriesBeforeRetry = try await api.messageCount(accessToken: peer.accessToken, roomID: roomID, body: queuedText)
+            XCTAssertEqual(deliveriesBeforeRetry, 0, "Successful sync must not resume a paused send queue")
+            phase("sync recovered while send remains paused")
+            try await restored.retryMessage(paused.id)
             try await waitFor("queued message remote echo") { restored.messages.contains { $0.body == queuedText && $0.isOwn && ($0.deliveryState == nil || $0.deliveryState == .sent) } }
             try await exactlyOnce(accessToken: peer.accessToken, roomID: roomID, body: queuedText)
             phase("outage recovery and exactly once")
@@ -99,10 +119,10 @@ final class SynapseIntegrationTests: XCTestCase {
 
     private func requiredHomeserver() throws -> URL {
         guard let value = ProcessInfo.processInfo.environment["BOTVILLE_E2E_HOMESERVER"] else {
-            throw XCTSkip("Set BOTVILLE_E2E_HOMESERVER=http://127.0.0.1:8028 to run local Synapse acceptance tests.")
+            throw XCTSkip("Set BOTVILLE_E2E_HOMESERVER to the local Synapse URL to run acceptance tests.")
         }
         guard let url = try? HomeserverPolicy(allowLocalHTTP: true).validatedURL(value),
-              url.scheme == "http", url.port == 8028 else {
+              url.scheme == "http" else {
             throw SynapseTestError(step: "invalid local homeserver", status: nil, errcode: nil)
         }
         return url
@@ -153,13 +173,11 @@ final class SynapseIntegrationTests: XCTestCase {
         try docker("start")
     }
 
-    private func requiredContainer() throws {
-        guard let value = ProcessInfo.processInfo.environment["BOTVILLE_E2E_CONTAINER"] else {
-            throw XCTSkip("Set BOTVILLE_E2E_CONTAINER=botville-codex-synapse-1 to run the outage check.")
+    private func requiredContainer() throws -> String {
+        guard let value = ProcessInfo.processInfo.environment["BOTVILLE_E2E_CONTAINER"], !value.isEmpty else {
+            throw XCTSkip("Set BOTVILLE_E2E_CONTAINER to the disposable local Synapse container for the outage check.")
         }
-        guard value == "botville-codex-synapse-1" else {
-            throw SynapseTestError(step: "invalid E2E container", status: nil, errcode: nil)
-        }
+        return value
     }
 
     private func startAndWaitForSynapse() async throws {
@@ -179,9 +197,10 @@ final class SynapseIntegrationTests: XCTestCase {
 
     private func docker(_ verb: String) throws {
         #if os(macOS)
+        let container = try requiredContainer()
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["docker", verb, "botville-codex-synapse-1"]
+        process.arguments = ["docker", verb, container]
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe

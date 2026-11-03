@@ -67,7 +67,6 @@ public final class MatrixService: ObservableObject {
     private let passwordAuthentication: any PasswordAuthenticating
     private let authenticationTimeout: TimeInterval
     private var authenticationAttempt: AuthenticationAttempt?
-    private var queueRecoveryPending = false
     var storeKeyFactory: () throws -> Data = SessionCredentials.makeStoreKey
     private var isLoggingOut = false
     private var paginationGeneration: UUID?
@@ -305,14 +304,17 @@ public final class MatrixService: ObservableObject {
                 return
             }
         }
+        // `restoreSession` only restores local SDK state. Make the active
+        // session visible before reading that local room store so an offline
+        // restore can render rooms without waiting for its first `/sync`.
+        userID = stored.userID
+        isLoggedIn = true
         await refreshRooms(from: client, session: generation)
         try Task.checkCancellation()
         guard generation == sessionGeneration else { throw CancellationError() }
         await client.enableAllSendQueues(enable: true)
         try Task.checkCancellation()
         guard generation == sessionGeneration else { throw CancellationError() }
-        userID = stored.userID
-        isLoggedIn = true
         sessionError = nil
         try await sync()
         try Task.checkCancellation()
@@ -328,7 +330,7 @@ public final class MatrixService: ObservableObject {
         networkAvailable = available
         guard isLoggedIn else { return }
         if !available { connectionStatus = .offline }
-        else if !wasAvailable { queueRecoveryPending = true; try? await sync() }
+        else if !wasAvailable { try? await sync() }
     }
 
     /// A single standard /sync loop; foreground and path recovery interrupt backoff.
@@ -356,12 +358,9 @@ public final class MatrixService: ObservableObject {
                     self.isSyncing = false
                     self.syncError = nil
                     self.connectionStatus = .connected
-                    // Re-enable only after an actual outage/reconnection, never
-                    // on steady-state sync. Parked sends still need user retry.
-                    if self.queueRecoveryPending {
-                        self.queueRecoveryPending = false
-                        await client.enableAllSendQueues(enable: true)
-                    }
+                    // SDK sendingFailed means retries are exhausted. Keep its
+                    // disabled room queue paused even if /sync recovers; only
+                    // an explicit user retry may resume it in this session.
                     initial = false
                     backoff.reset()
                     try await Task.sleep(for: .milliseconds(100))
@@ -373,7 +372,6 @@ public final class MatrixService: ObservableObject {
                         await self.invalidateSession()
                         return
                     }
-                    self.queueRecoveryPending = true
                     self.isSyncing = false
                     let delay = backoff.nextDelay()
                     self.connectionStatus = self.networkAvailable ? .reconnecting(after: delay) : .offline
@@ -529,8 +527,21 @@ public final class MatrixService: ObservableObject {
 
     private func actOnFailedMessage(_ messageID: String, retry: Bool) async throws {
         guard isLoggedIn, !isLoggingOut else { throw MatrixServiceError.notLoggedIn }
-        guard let timeline, let transactionID = timelineState.failedSendTransactionID(for: messageID) else { throw MatrixServiceError.sendNoLongerFailed }
+        guard let timeline else { throw MatrixServiceError.sendNoLongerFailed }
         guard !messageActions.contains(messageID) else { throw MatrixServiceError.busy }
+        if timelineState.pausedSendTransactionID(for: messageID) != nil {
+            // 26.10.27 disables the room after recoverable retries exhaust.
+            // retrySend only unwedges unrecoverable items; resume this room's
+            // existing transactions instead. Never abort a recoverable item:
+            // the SDK may turn an in-flight abort into a server redaction.
+            guard retry, let roomID = activeRoomID, let client,
+                  let room = try client.getRoom(roomId: roomID) else {
+                throw MatrixServiceError.sendNoLongerFailed
+            }
+            room.enableSendQueue(enable: true)
+            return
+        }
+        guard let transactionID = timelineState.failedSendTransactionID(for: messageID) else { throw MatrixServiceError.sendNoLongerFailed }
         let generation = timelineGeneration
         messageActions.insert(messageID)
         let session = sessionGeneration
@@ -607,7 +618,6 @@ public final class MatrixService: ObservableObject {
         await client?.enableAllSendQueues(enable: false)
         await previous?.value
         client = nil
-        queueRecoveryPending = false
     }
 
     private func cleanStoredSession() throws {

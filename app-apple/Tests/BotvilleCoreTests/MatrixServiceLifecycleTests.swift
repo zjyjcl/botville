@@ -35,6 +35,49 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         await restored.logout()
     }
 
+    func testOfflineRestorePublishesLocalRoomsBeforeFirstSync() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let saved = testCredentials(userID: "@offline-rooms:matrix.test")
+        let sessionStore = InMemorySessionStore(saved)
+        _ = try SessionStoreDirectory(baseURL: temporary).create(for: saved.storeID)
+        let client = FakeClient(rooms: [FakeRoom(id: "!cached:matrix.test", name: "Cached room")])
+        let service = makeService(sessionStore: sessionStore, directory: temporary, client: client)
+
+        await service.restoreSession()
+        try await waitUntil { client.syncCalls > 0 }
+
+        XCTAssertTrue(service.isLoggedIn)
+        XCTAssertEqual(service.rooms.map(\.id), ["!cached:matrix.test"])
+        XCTAssertEqual(client.lifecycleEvents.first, "rooms")
+        XCTAssertEqual(client.lifecycleEvents.prefix(3), ["rooms", "enable-true", "sync"])
+    }
+
+    func testCancelledRestoreAfterLocalRoomsArePublishedDetachesClientAndKeepsCredentials() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let saved = testCredentials(userID: "@cancel-after-rooms:matrix.test")
+        let store = InMemorySessionStore(saved)
+        _ = try SessionStoreDirectory(baseURL: temporary).create(for: saved.storeID)
+        let client = FakeClient(
+            rooms: [FakeRoom(id: "!cached:matrix.test", name: "Cached room")],
+            blockQueueEnable: true
+        )
+        let service = makeService(sessionStore: store, directory: temporary, client: client)
+
+        let restore = Task { @MainActor in await service.restoreSession() }
+        try await waitUntil { client.lifecycleEvents.contains("enable-true") }
+        XCTAssertEqual(service.rooms.map(\.id), ["!cached:matrix.test"])
+
+        service.cancelAuthentication()
+        await restore.value
+        try await waitUntil { !service.isRestoring && !service.isLoggedIn }
+
+        XCTAssertEqual(service.rooms, [])
+        XCTAssertEqual(try store.load(), saved)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: temporary.appendingPathComponent(saved.storeID.uuidString).path))
+    }
+
     func testSuccessfulLogoutClearsKeychainValueAndOnlyItsStoreDirectory() async throws {
         let temporary = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: temporary) }
@@ -319,7 +362,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: temporary.path), [])
     }
 
-    func testForegroundAndNetworkRecoveryStartSyncWithoutSteadyQueueEnable() async throws {
+    func testForegroundAndNetworkRecoverySyncWithoutResumingPausedQueues() async throws {
         let temporary = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: temporary) }
         let client = FakeClient(successfulSync: true)
@@ -339,7 +382,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         await service.networkChanged(available: true)
         try await Task.sleep(for: .milliseconds(15))
         XCTAssertGreaterThan(client.syncCalls, beforeNetwork)
-        XCTAssertEqual(client.queueEnableValues.filter { $0 }.count, initialEnableCount + 1)
+        XCTAssertEqual(client.queueEnableValues.filter { $0 }.count, initialEnableCount)
         await service.logout()
     }
 
@@ -389,6 +432,14 @@ final class MatrixServiceLifecycleTests: XCTestCase {
     private func testCredentials(userID: String) -> SessionCredentials {
         SessionCredentials(accessToken: "fake-access", refreshToken: nil, userID: userID, deviceID: "C21TEST", homeserverURL: "https://matrix.test", oauthData: nil, storeID: UUID(), storeKey: Data(repeating: 7, count: 32))
     }
+
+    private func waitUntil(_ condition: @escaping () -> Bool) async throws {
+        for _ in 0 ..< 100 {
+            if condition() { return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("Timed out waiting for expected lifecycle state")
+    }
 }
 
 private struct PasswordDiscovery: LoginCapabilityDiscovering {
@@ -403,18 +454,23 @@ private final class FakeClient: Client, @unchecked Sendable {
     var syncError: Error?
     private let successfulSync: Bool
     private let probe: QueueProbe?
+    private let configuredRooms: [Room]
+    private let blockQueueEnable: Bool
     private(set) var syncCalls = 0
     private(set) var queueEnableValues: [Bool] = []
     private(set) var didLogout = false
     private(set) var restoredSession: Session?
+    private(set) var lifecycleEvents: [String] = []
     private let configuredSession: Session
 
-    init(session: Session = fakeSession(userID: "@c21_alpha:matrix.test", deviceID: "C21TEST"), logoutError: Error? = nil, restoreError: Error? = nil, syncError: Error? = nil, successfulSync: Bool = false, probe: QueueProbe? = nil) {
+    init(session: Session = fakeSession(userID: "@c21_alpha:matrix.test", deviceID: "C21TEST"), logoutError: Error? = nil, restoreError: Error? = nil, syncError: Error? = nil, successfulSync: Bool = false, probe: QueueProbe? = nil, rooms: [Room] = [], blockQueueEnable: Bool = false) {
         configuredLogoutError = logoutError
         configuredRestoreError = restoreError
         self.syncError = syncError
         self.successfulSync = successfulSync
         self.probe = probe
+        configuredRooms = rooms
+        self.blockQueueEnable = blockQueueEnable
         configuredSession = session
         super.init(noHandle: .init())
     }
@@ -425,6 +481,8 @@ private final class FakeClient: Client, @unchecked Sendable {
         syncError = nil
         successfulSync = false
         probe = nil
+        configuredRooms = []
+        blockQueueEnable = false
         configuredSession = fakeSession(userID: "@c21_unexpected:matrix.test", deviceID: "UNEXPECTED")
         super.init(unsafeFromHandle: handle)
     }
@@ -446,13 +504,19 @@ private final class FakeClient: Client, @unchecked Sendable {
     }
 
     override func setDelegate(delegate: ClientDelegate?) throws -> TaskHandle? { nil }
-    override func rooms() -> [Room] { [] }
+    override func rooms() -> [Room] {
+        lifecycleEvents.append("rooms")
+        return configuredRooms
+    }
     override func enableAllSendQueues(enable: Bool) async {
+        lifecycleEvents.append(enable ? "enable-true" : "enable-false")
         queueEnableValues.append(enable)
         probe?.values.append(enable)
+        if enable && blockQueueEnable { try? await Task.sleep(for: .seconds(60)) }
     }
 
     override func syncOnceV2(settings: SyncSettingsV2) async throws -> SyncResponseV2 {
+        lifecycleEvents.append("sync")
         syncCalls += 1
         if let syncError { throw syncError }
         if successfulSync {
@@ -460,6 +524,30 @@ private final class FakeClient: Client, @unchecked Sendable {
         }
         throw ClientError.Generic(msg: "offline", details: nil)
     }
+}
+
+private final class FakeRoom: Room, @unchecked Sendable {
+    private let roomID: String
+    private let roomName: String
+
+    init(id: String, name: String) {
+        roomID = id
+        roomName = name
+        super.init(noHandle: .init())
+    }
+
+    required init(unsafeFromHandle handle: UInt64) {
+        roomID = "!unexpected:matrix.test"
+        roomName = "Unexpected"
+        super.init(unsafeFromHandle: handle)
+    }
+
+    override func id() -> String { roomID }
+    override func displayName() -> String? { roomName }
+    override func membership() -> Membership { .joined }
+    override func roomInfo() async throws -> RoomInfo { throw ClientError.Generic(msg: "unused", details: nil) }
+    override func latestEvent() async -> LatestEventValue { .none }
+    override func isDirect() async -> Bool { false }
 }
 
 private final class QueueProbe: @unchecked Sendable { var values: [Bool] = [] }

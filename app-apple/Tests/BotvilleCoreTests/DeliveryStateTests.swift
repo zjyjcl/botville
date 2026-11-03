@@ -26,14 +26,14 @@ final class DeliveryStateTests: XCTestCase {
         XCTAssertEqual(timeline.cancelArguments?.target, .event)
     }
 
-    func testOnlyParkedFailureHasRetryCancelUI() {
+    func testPausedFailureOffersRoomRetryAndOnlyParkedFailureOffersCancel() {
         XCTAssertEqual(MessageDeliveryState.queued.displayName, "等待发送")
         XCTAssertFalse(MessageDeliveryState.queued.isFailed)
         XCTAssertFalse(MessageDeliveryState.queued.canCancel)
-        XCTAssertEqual(MessageDeliveryState.retrying.displayName, "自动重试中，请等待网络恢复后自动发送")
-        XCTAssertFalse(MessageDeliveryState.retrying.isFailed)
-        XCTAssertFalse(MessageDeliveryState.retrying.canRetry)
-        XCTAssertFalse(MessageDeliveryState.retrying.canCancel)
+        XCTAssertEqual(MessageDeliveryState.paused.displayName, "发送失败，已暂停")
+        XCTAssertTrue(MessageDeliveryState.paused.isFailed)
+        XCTAssertTrue(MessageDeliveryState.paused.canRetry)
+        XCTAssertFalse(MessageDeliveryState.paused.canCancel)
         XCTAssertTrue(MessageDeliveryState.failed.isFailed)
         XCTAssertTrue(MessageDeliveryState.failed.canRetry)
         XCTAssertTrue(MessageDeliveryState.failed.canCancel)
@@ -48,7 +48,7 @@ final class DeliveryStateTests: XCTestCase {
             .notSentYet(progress: nil),
             .sent(eventId: "$event")
         ].compactMap(MessageDeliveryState.init)
-        XCTAssertEqual(projection, [.queued, .retrying, .failed, .queued, .sent])
+        XCTAssertEqual(projection, [.queued, .paused, .failed, .queued, .sent])
     }
 
     func testReconnectBackoffCapsAndResets() {
