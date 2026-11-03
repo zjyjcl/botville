@@ -1,0 +1,45 @@
+{
+  "type": "notification",
+  "title": "构建结果：示例服务 #42 成功",
+  "subtitle": "来自 CI Bridge",
+  "fallback_text": "CI Bridge：示例服务构建 #42 成功，产物已发布到制品库。",
+  "priority": "normal",
+  "risk": "low",
+  "blocks": [
+    { "type": "text", "text": "分支 main 的构建 #42 已完成，全部 18 个任务通过。", "level": "success" },
+    {
+      "type": "key_value",
+      "items": [
+        { "label": "构建号", "value": "42" },
+        { "label": "分支", "value": "main" },
+        { "label": "耗时", "value": "3 分 12 秒" }
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "id": "open",
+      "label": "查看构建",
+      "kind": "open_url",
+      "style": "secondary",
+      "target": "external",
+      "url": "https://ci.example.invalid/pipelines/42"
+    }
+  ],
+  "source": {
+    "module": "bridge",
+    "capability_id": "notify.inbox",
+    "dedupe_key": "bridge-ci-example-svc-build-42",
+    "actor": { "id": "persona_ci_bridge", "kind": "ai", "display_name": "CI Bridge" }
+  },
+  "context": {
+    "conversation_id": "conv_demo",
+    "metadata": { "build_id": "42" }
+  },
+  "deliver_after": null,
+  "scheduled_at": null,
+  "interrupt": false,
+  "collapse_key": "ci.example-svc.build",
+  "group_id": null,
+  "expires_at": "2026-11-11T00:00:00Z"
+}

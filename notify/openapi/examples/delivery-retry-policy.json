@@ -1,0 +1,5 @@
+{
+  "max_attempts": 3,
+  "min_interval_seconds": 300,
+  "applies_to": "failed_only"
+}

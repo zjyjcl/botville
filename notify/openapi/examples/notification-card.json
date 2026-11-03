@@ -1,0 +1,62 @@
+{
+  "id": "card_notify_demo",
+  "card_schema_version": "1.0.0",
+  "type": "notification",
+  "title": "构建完成",
+  "subtitle": "来自 Demo AI · 刚刚",
+  "fallback_text": "Demo AI：构建 #128 成功，产物已上传。",
+  "priority": "normal",
+  "risk": "low",
+  "status": "read",
+  "blocks": [
+    { "type": "text", "text": "主分支构建成功，产物已上传到制品库。", "level": "success" },
+    {
+      "type": "key_value",
+      "items": [
+        { "label": "构建号", "value": "#128" },
+        { "label": "提交", "value": "9f8e7d6" },
+        { "label": "耗时", "value": "4 分 12 秒" }
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "id": "open",
+      "label": "查看构建",
+      "kind": "open_url",
+      "style": "secondary",
+      "target": "in_app",
+      "capability_id": "notify.inbox",
+      "url": "https://gateway.example.invalid/modules/ci/builds/128"
+    }
+  ],
+  "source": {
+    "module": "notify",
+    "capability_id": "notify.inbox",
+    "event_id": "evt_inbox_build_128",
+    "actor": { "id": "persona_demo_ai", "kind": "ai", "display_name": "Demo AI" }
+  },
+  "context": {
+    "conversation_id": "conv_demo",
+    "deep_link": "botville://cards/card_notify_demo"
+  },
+  "delivery": [
+    {
+      "channel": "in_app",
+      "state": "confirmed",
+      "attempts": 1,
+      "last_attempt_at": "2026-11-04T02:10:05Z",
+      "failure_code": null,
+      "provider_message_id": null
+    }
+  ],
+  "group_id": null,
+  "collapse_key": null,
+  "deliver_after": null,
+  "interrupt": false,
+  "created_at": "2026-11-04T02:10:00Z",
+  "updated_at": "2026-11-04T02:12:00Z",
+  "expires_at": null,
+  "acted_at": null,
+  "revision": 1
+}
