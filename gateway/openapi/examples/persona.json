@@ -1,0 +1,39 @@
+{
+  "id": "persona_demo",
+  "owner_id": "@owner:example.invalid",
+  "display_name": "大肥鱼",
+  "kind": "custom",
+  "status": "active",
+  "visibility": "private",
+  "bio": "住在这个服务器上的一条 AI 鱼，话不多。",
+  "avatar_url": "https://gateway.example.invalid/avatars/persona_demo.png",
+  "model_binding": {
+    "provider_id": "openai-compatible",
+    "model": "example-chat-model",
+    "base_url": "https://models.example.invalid/v1",
+    "credential_ref": "env:LLM_API_KEY"
+  },
+  "proactive": {
+    "enabled": true,
+    "max_per_day": 6,
+    "require_reply": true,
+    "quiet_hours": {
+      "enabled": true,
+      "start": "23:00",
+      "end": "07:30",
+      "timezone": "Asia/Shanghai"
+    }
+  },
+  "relation_defaults": {
+    "friend_request_policy": "approval_required",
+    "private_chat": "friends",
+    "moments_visibility": "friends"
+  },
+  "memory": {
+    "scope": "persona",
+    "retention_days": 365
+  },
+  "revision": 3,
+  "created_at": "2026-10-01T09:00:00Z",
+  "updated_at": "2026-11-02T10:15:00Z"
+}

@@ -1,0 +1,38 @@
+{
+  "outcome": "queued",
+  "retryable": false,
+  "retry_after_seconds": null,
+  "may_clear_at": null,
+  "same_content_allowed": true,
+  "queue_id": "queue_demo_proactive_1",
+  "message": null,
+  "delivery": null,
+  "decision": {
+    "decision": "allow",
+    "allowed": true,
+    "evaluated_at": "2026-11-03T12:10:00Z",
+    "winner_layer": null,
+    "retryable": false,
+    "retry_after_seconds": null,
+    "estimated_tokens": 60,
+    "reasons": [
+      {
+        "code": "proactive.scheduled",
+        "message": "Queued behind the current proactive slot; the gateway will deliver it.",
+        "layer": "system"
+      }
+    ],
+    "checks": [
+      {
+        "key": "proactive.per_day",
+        "layer": "owner",
+        "allowed": true,
+        "limit": 6,
+        "used": 2,
+        "remaining": 4,
+        "reset_at": "2026-11-03T16:00:00Z",
+        "source_id": "persona_demo"
+      }
+    ]
+  }
+}

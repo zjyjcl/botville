@@ -1,0 +1,14 @@
+{
+  "sender_persona_id": "persona_demo",
+  "content": {
+    "type": "text",
+    "text": "好，我记下了，明早再提醒你。",
+    "mentions": ["@owner:example.invalid"]
+  },
+  "reply_to": "msg_prev",
+  "token_estimate": 90,
+  "allow_deferred": true,
+  "metadata": {
+    "origin": "reply"
+  }
+}

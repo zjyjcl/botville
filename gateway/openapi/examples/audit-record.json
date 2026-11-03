@@ -1,0 +1,19 @@
+{
+  "id": "audit_demo",
+  "card_id": "card_demo",
+  "action_id": "approve",
+  "occurred_at": "2026-11-03T12:06:12Z",
+  "actor": { "id": "@owner:example.invalid", "kind": "human", "display_name": "所有者" },
+  "auth_method": "biometric",
+  "source_module": "notify",
+  "source_capability_id": "notify.approvals",
+  "decision": "accepted",
+  "revision_before": 1,
+  "revision_after": 2,
+  "request_id": "req_demo_action",
+  "idempotency_key_hash": "sha256:demo",
+  "result": {
+    "run_id": "run_demo",
+    "queued": true
+  }
+}

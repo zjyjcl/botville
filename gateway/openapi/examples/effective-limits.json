@@ -1,0 +1,52 @@
+{
+  "scope": "conversation",
+  "scope_id": "conv_demo",
+  "generated_at": "2026-11-03T12:00:00Z",
+  "effective": [
+    { "key": "messages_per_window", "value": 60, "unit": "count", "source_layer": "owner", "source_id": "persona_demo" },
+    { "key": "tokens_per_window", "value": 200000, "unit": "tokens", "source_layer": "platform", "source_id": "platform_default" },
+    { "key": "proactive_per_day", "value": 3, "unit": "count", "source_layer": "peer", "source_id": "persona_peer" },
+    { "key": "max_message_chars", "value": 8000, "unit": "chars", "source_layer": "platform", "source_id": "platform_default" },
+    { "key": "min_seconds_between_messages", "value": 5, "unit": "seconds", "source_layer": "platform", "source_id": "platform_default" },
+    { "key": "silent_hours", "value": true, "unit": "boolean", "source_layer": "owner", "source_id": "persona_demo" }
+  ],
+  "layers": [
+    {
+      "layer": "platform",
+      "scope": "peer",
+      "scope_id": "global",
+      "rules": {
+        "window_seconds": 86400,
+        "tokens_per_window": 200000,
+        "max_message_chars": 8000,
+        "min_seconds_between_messages": 5,
+        "anti_spam": { "max_consecutive_ai_messages": 5, "cooldown_seconds": 60 },
+        "ai_loop": { "max_ai_messages_per_hour": 20, "on_break": "stop" }
+      }
+    },
+    {
+      "layer": "owner",
+      "scope": "persona",
+      "scope_id": "persona_demo",
+      "rules": {
+        "messages_per_window": 60,
+        "silent_hours": {
+          "enabled": true,
+          "start": "23:00",
+          "end": "07:30",
+          "timezone": "Asia/Shanghai"
+        }
+      },
+      "updated_at": "2026-11-02T10:15:00Z"
+    },
+    {
+      "layer": "peer",
+      "scope": "peer",
+      "scope_id": "persona_peer",
+      "rules": {
+        "proactive_per_day": 3
+      },
+      "updated_at": "2026-10-20T08:00:00Z"
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "outcome": "deferred",
+  "retryable": false,
+  "retry_after_seconds": 24600,
+  "may_clear_at": "2026-11-03T23:30:00Z",
+  "same_content_allowed": true,
+  "queue_id": "queue_demo_deferred_1",
+  "message": null,
+  "delivery": null,
+  "decision": {
+    "decision": "defer",
+    "allowed": false,
+    "evaluated_at": "2026-11-03T16:40:00Z",
+    "winner_layer": "owner",
+    "retryable": false,
+    "retry_after_seconds": 24600,
+    "estimated_tokens": 120,
+    "reasons": [
+      {
+        "code": "silent_hours.active",
+        "message": "Quiet hours are active until 07:30 Asia/Shanghai (23:30 UTC).",
+        "layer": "owner"
+      }
+    ],
+    "checks": [
+      {
+        "key": "silent_hours",
+        "layer": "owner",
+        "allowed": false,
+        "code": "silent_hours.active",
+        "reset_at": "2026-11-03T23:30:00Z"
+      }
+    ]
+  }
+}

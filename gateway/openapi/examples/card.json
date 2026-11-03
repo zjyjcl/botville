@@ -1,0 +1,123 @@
+{
+  "id": "card_demo",
+  "card_schema_version": "1.0.0",
+  "type": "approval",
+  "title": "授权：部署到生产",
+  "subtitle": "来自 代码助手 · 5 分钟前",
+  "fallback_text": "代码助手请求授权：把 staging 分支部署到生产。回复「批准」或「拒绝」。",
+  "priority": "urgent",
+  "risk": "high",
+  "status": "active",
+  "blocks": [
+    {
+      "type": "text",
+      "text": "代码助手想执行一次生产部署，请确认变更内容。",
+      "level": "info"
+    },
+    {
+      "type": "key_value",
+      "items": [
+        { "label": "分支", "value": "release/2026.11" },
+        { "label": "提交", "value": "a1b2c3d" },
+        { "label": "影响", "value": "3 个服务", "emphasis": true }
+      ]
+    },
+    { "type": "divider" },
+    {
+      "type": "list",
+      "items": [
+        { "label": "部署网关", "value": "1 个实例" },
+        { "label": "回滚窗口", "value": "10 分钟" }
+      ]
+    },
+    {
+      "type": "progress",
+      "label": "今日部署次数",
+      "value": 2,
+      "max": 5
+    },
+    {
+      "type": "code",
+      "text": "botville deploy --env prod --ref release/2026.11",
+      "level": "warning"
+    }
+  ],
+  "actions": [
+    {
+      "id": "approve",
+      "label": "批准",
+      "kind": "approve",
+      "style": "primary",
+      "risk": "high",
+      "payload": { "run_id": "run_demo" },
+      "confirmation": {
+        "required": true,
+        "title": "确认批准生产部署",
+        "body": "将把 release/2026.11 部署到生产，10 分钟内可回滚。",
+        "biometric": true
+      }
+    },
+    {
+      "id": "deny",
+      "label": "拒绝",
+      "kind": "deny",
+      "style": "danger",
+      "risk": "low",
+      "confirmation": { "required": false }
+    },
+    {
+      "id": "open",
+      "label": "查看日志",
+      "kind": "open_url",
+      "style": "secondary",
+      "target": "in_app",
+      "capability_id": "notify.approvals",
+      "url": "https://gateway.example.invalid/modules/ci/runs/run_demo"
+    }
+  ],
+  "source": {
+    "module": "notify",
+    "capability_id": "notify.approvals",
+    "event_id": "evt_ci_run_demo_approval",
+    "actor": { "id": "persona_ci", "kind": "ai", "display_name": "代码助手" }
+  },
+  "context": {
+    "conversation_id": "conv_ci",
+    "deep_link": "botville://cards/card_demo",
+    "metadata": { "run_id": "run_demo" }
+  },
+  "i18n": {
+    "en": {
+      "title": "Approval: deploy to production",
+      "subtitle": "From Code Assistant · 5 minutes ago",
+      "fallback_text": "Code Assistant requests approval to deploy staging to production."
+    }
+  },
+  "delivery": [
+    {
+      "channel": "push",
+      "state": "confirmed",
+      "attempts": 1,
+      "last_attempt_at": "2026-11-03T12:05:02Z",
+      "failure_code": null,
+      "provider_message_id": "apns_demo_1"
+    },
+    {
+      "channel": "in_app",
+      "state": "pending",
+      "attempts": 0,
+      "last_attempt_at": null,
+      "failure_code": null,
+      "provider_message_id": null
+    }
+  ],
+  "group_id": null,
+  "collapse_key": null,
+  "deliver_after": null,
+  "interrupt": true,
+  "created_at": "2026-11-03T12:05:00Z",
+  "updated_at": "2026-11-03T12:05:02Z",
+  "expires_at": "2026-11-03T13:05:00Z",
+  "acted_at": null,
+  "revision": 1
+}

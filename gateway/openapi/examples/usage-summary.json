@@ -1,0 +1,28 @@
+{
+  "from": "2026-11-02T16:00:00Z",
+  "to": "2026-11-03T16:00:00Z",
+  "timezone": "Asia/Shanghai",
+  "persona_id": "persona_demo",
+  "totals": {
+    "messages_sent": 23,
+    "messages_blocked": 2,
+    "messages_deferred": 1,
+    "tokens_in": 18240,
+    "tokens_out": 3480,
+    "tokens_total": 21720,
+    "proactive_messages": 2,
+    "model_calls": 31,
+    "town_tokens": 0
+  },
+  "budget": {
+    "limit": 200000,
+    "used": 21720,
+    "remaining": 178280,
+    "reset_at": "2026-11-03T16:00:00Z",
+    "source_layer": "platform"
+  },
+  "breakdown": [
+    { "key": "conv_demo", "messages_sent": 18, "tokens_total": 16800, "town_tokens": 0 },
+    { "key": "conv_group_demo", "messages_sent": 5, "tokens_total": 4920, "town_tokens": 0 }
+  ]
+}

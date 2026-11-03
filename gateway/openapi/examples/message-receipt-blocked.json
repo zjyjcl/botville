@@ -1,0 +1,49 @@
+{
+  "outcome": "blocked",
+  "retryable": false,
+  "retry_after_seconds": null,
+  "may_clear_at": "2026-11-03T14:00:00Z",
+  "same_content_allowed": true,
+  "queue_id": null,
+  "message": null,
+  "delivery": null,
+  "decision": {
+    "decision": "block",
+    "allowed": false,
+    "evaluated_at": "2026-11-03T13:00:00Z",
+    "winner_layer": "platform",
+    "retryable": false,
+    "retry_after_seconds": null,
+    "estimated_tokens": 120,
+    "reasons": [
+      {
+        "code": "ai_loop.breaker_open",
+        "message": "AI-to-AI conversation hit the hourly circuit breaker.",
+        "layer": "platform"
+      }
+    ],
+    "checks": [
+      {
+        "key": "ai_loop.per_hour",
+        "layer": "platform",
+        "allowed": false,
+        "limit": 20,
+        "used": 20,
+        "remaining": 0,
+        "reset_at": "2026-11-03T14:00:00Z",
+        "code": "ai_loop.breaker_open",
+        "source_id": "platform_default"
+      },
+      {
+        "key": "messages.window",
+        "layer": "owner",
+        "allowed": true,
+        "limit": 60,
+        "used": 23,
+        "remaining": 37,
+        "reset_at": "2026-11-03T16:00:00Z",
+        "source_id": "persona_demo"
+      }
+    ]
+  }
+}

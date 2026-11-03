@@ -1,0 +1,24 @@
+{
+  "status": "ok",
+  "version": "0.1.0",
+  "contract_version": "0.1.0",
+  "started_at": "2026-11-03T00:00:00Z",
+  "uptime_seconds": 86400,
+  "checks": [
+    { "name": "matrix", "status": "ok", "latency_ms": 12.4 },
+    { "name": "database", "status": "ok", "latency_ms": 3.1 },
+    {
+      "name": "model_provider",
+      "status": "degraded",
+      "latency_ms": 2400.0,
+      "detail": "primary provider slow, fallback in use"
+    }
+  ],
+  "modules": [
+    { "name": "core", "enabled": true, "status": "ok" },
+    { "name": "role", "enabled": true, "status": "ok" },
+    { "name": "memory", "enabled": true, "status": "ok" },
+    { "name": "notify", "enabled": true, "status": "degraded" },
+    { "name": "town", "enabled": false, "status": "disabled" }
+  ]
+}

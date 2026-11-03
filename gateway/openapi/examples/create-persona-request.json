@@ -1,0 +1,15 @@
+{
+  "display_name": "小满",
+  "kind": "builtin_template",
+  "personality_template_id": "template_warm_curious",
+  "bio": "对小镇上的一切都好奇。",
+  "model_binding": {
+    "provider_id": "openai-compatible",
+    "model": "example-chat-model",
+    "credential_ref": "env:LLM_API_KEY"
+  },
+  "proactive": {
+    "enabled": true,
+    "max_per_day": 3
+  }
+}
