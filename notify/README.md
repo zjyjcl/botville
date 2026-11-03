@@ -11,9 +11,11 @@ License: Apache-2.0（与仓库一致）。
 
 - `docs/data-model.md` — 开源通知数据模型规范（D1.1 交付，Schema 评审入口）
 - `openapi/notify.v1.yaml` — 通知域 schema：`$ref` 聚合 `gateway.v1.yaml` 的
-  `Card*` 等，`allOf` 只增通知域语义（类型、来源键、失败码、重试建议值）
+  `Card*` 等，`allOf` 只增通知域语义（类型、来源键 MUST 约定、失败码、
+  重试规范建议值）
 - `openapi/examples/` — 通知域示例（wire 时间一律 UTC `Z`，无真实密钥，显示名中性）
-- `scripts/validate_examples.py` — 通知域文档 + 示例校验
+- `scripts/validate_examples.py` — 通知域 OpenAPI 结构 + 示例校验（不解析
+  data-model.md；交叉校验独立重读 gateway.v1.yaml，防 shadow）
 
 ## 与 B0.1 的关系
 
@@ -24,7 +26,7 @@ D1.1 不改网关契约：`notify.v1.yaml` 只引用、只增，网关校验保�
 ## 如何校验
 
 ```bash
-python3 notify/scripts/validate_examples.py   # notify 文档 + 5 个示例（含对网关 schema 的交叉校验）
+python3 notify/scripts/validate_examples.py   # notify OpenAPI + 7 个示例（交叉校验独立重读 gateway.v1.yaml）
 python3 gateway/scripts/validate_openapi.py   # 网关契约（D1.1 未改动，应保持绿）
 ```
 

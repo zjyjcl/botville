@@ -14,8 +14,8 @@ info:
     （`Card` / `CreateCardRequest` / `CardAction*` / `AuditRecord`）由
     `gateway.v1.yaml` 定义（行为见 `gateway/docs/contract.md` §4.8）；
     本文件用 `$ref` 汇聚通知域评审所需 schema，并用 `allOf` **只增**补充
-    通知域语义（卡片类型、来源键建议格式、投递失败码建议值、重试建议值）。
-    本文件不改动网关契约；`python3 gateway/scripts/validate_openapi.py`
+    通知域语义（卡片类型、来源键 MUST 约定、投递失败码建议值、重试规范
+    建议值）。本文件不改动网关契约；`python3 gateway/scripts/validate_openapi.py`
     保持绿。
 servers:
   - url: https://gateway.example.invalid/v1
@@ -59,8 +59,10 @@ components:
     # ---- 通知域扩展（allOf 只增，不改网关语义） ----
     NotifyCapabilityId:
       description: |
-        通知域能力 ID 约定：点分小写 `notify.<功能>`。开放枚举——可新增其他
-        `notify.*` 能力；已发布值不复用、不重命名（contract §4 能力规则）。
+        通知域能力 ID 约定（MUST）：点分小写 `notify.<功能>`。开放枚举——
+        可新增其他 `notify.*` 能力；已发布值不复用、不重命名
+        （contract §4 能力规则）。相对 gateway 的开放 string，通知域将
+        键格式收敛为 MUST（来源去重元组的第一分量）。
       anyOf:
         - enum: [notify.approvals, notify.inbox, notify.reminders, notify.digest]
         - type: string
@@ -70,28 +72,33 @@ components:
       type: string
       pattern: '^[a-z0-9][a-z0-9._-]{2,127}$'
       description: |
-        来源事件稳定 ID 的建议格式：`evt_<功能>_<语义slug>`。同一事件被
-        重新发起时必须复用同一 `event_id`，供业务级去重
-        `(capability_id, event_id ?? dedupe_key)` 使用。
+        来源事件稳定 ID 的通知域约定（MUST）：`evt_<功能>_<语义slug>`，
+        小写字母/数字/`._-`，≤ 128 字符。同一事件被重新发起时必须复用
+        同一 `event_id`，供业务级去重 `(capability_id, event_id ?? dedupe_key)`
+        使用。相对 gateway 的开放 string 收敛（MUST）。
       example: evt_reminders_standup_20261104
 
     NotifyDedupeKey:
       type: string
       pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{2,191}$'
       description: |
-        无稳定事件 ID 时的去重键（桥接、外部 webhook、轮询结果）。
-        同一业务事实的重发必须复用同一 `dedupe_key`。
+        无稳定事件 ID 时的去重键（桥接、外部 webhook、轮询结果），
+        通知域约定（MUST）：≤ 192 字符，可含 `:`。同一业务事实的重发
+        必须复用同一 `dedupe_key`。相对 gateway 的开放 string 收敛（MUST）。
       example: bridge-webhook-msg-demo-42
 
     NotificationSource:
       description: |
         通知域对 `CardSource` 的补充约束：去重规则不变
         （`event_id` / `dedupe_key` 二选一必填，按
-        `(capability_id, event_id ?? dedupe_key)` 去重），取值遵守
-        `NotifyCapabilityId` / `NotifyEventId` / `NotifyDedupeKey` 建议格式。
+        `(capability_id, event_id ?? dedupe_key)` 去重），且
+        `capability_id` 必填（去重元组第一分量，contract §4.6 规则 8）；
+        三个键的取值遵守 `NotifyCapabilityId` / `NotifyEventId` /
+        `NotifyDedupeKey` 的通知域约定（MUST，相对 gateway 收敛）。
       allOf:
         - $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/CardSource'
         - type: object
+          required: [capability_id]
           properties:
             capability_id:
               $ref: '#/components/schemas/NotifyCapabilityId'
@@ -125,7 +132,8 @@ components:
       description: |
         投递重试的**规范建议值**：只对 `failed`（确认失败）生效，可同渠道
         重试；`unconfirmed`（模糊结果）绝不重放，只能换渠道或由所有者主动
-        触发。超过上限保持 `failed` 并保留 `failure_code`。
+        触发。计数口径：同渠道总尝试 ≤ 3（含首次），即可重试 ≤ 2 次。
+        超过上限保持 `failed` 并保留 `failure_code`。
       required: [max_attempts, min_interval_seconds, applies_to]
       properties:
         max_attempts:
@@ -133,7 +141,9 @@ components:
           minimum: 1
           maximum: 3
           example: 3
-          description: 同渠道重试上限（含首次尝试）。
+          description: |
+            同渠道总尝试上限（含首次尝试），规范值 3；
+            即可重试次数 = max_attempts − 1（≤ 2 次）。
         min_interval_seconds:
           type: integer
           minimum: 300
@@ -179,7 +189,10 @@ components:
               const: approval
 
     NotificationCreateRequest:
-      description: 通知域创建请求：`source` 遵守通知域键格式建议，其余同网关。
+      description: |
+        通知域创建请求：`source` 遵守通知域键格式 MUST 约定
+        （`capability_id` 必填，`event_id` / `dedupe_key` 二选一，
+        取值见 `NotificationSource`），其余同网关。
       allOf:
         - $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/CreateCardRequest'
         - type: object
@@ -200,12 +213,15 @@ components:
 
     ApprovalCreateRequest:
       description: |
-        授权卡创建请求：`type: approval`，`expires_at` 必填
-        （contract §4.6 规则 9）；有效 risk=high 的操作在回调时走
-        challenge / assertion / revision 链。
+        授权卡创建请求：`type: approval`；`expires_at` 在本层 schema
+        必填（contract §4.6 规则 9）。`actions[]` 至少包含一个决策操作
+        （`kind: approve` / `deny`，或模块自定义 `callback`）——决策操作
+        是开放枚举、无法在 JSON Schema 穷举，属**运行时校验**。
+        有效 risk=high 的操作在回调时走 challenge / assertion / revision 链。
       allOf:
         - $ref: '#/components/schemas/NotificationCreateRequest'
         - type: object
+          required: [expires_at]
           properties:
             type:
               const: approval

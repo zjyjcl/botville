@@ -15,6 +15,8 @@ and extends them with ``allOf``. This script therefore:
 3. Validates every file in ``notify/openapi/examples/`` against its declared
    notify schema target, then cross-checks each example against the gateway
    schema it ultimately derives from — proof that the notify layer is additive.
+   The cross-check **re-reads the original ``gateway.v1.yaml``** (instead of
+   reusing the bundled copy), so a bundling bug cannot shadow a divergence.
 
 The JSON-Schema validator is imported from ``gateway/scripts/validate_openapi.py``
 (no third-party schema library needed beyond PyYAML).
@@ -35,6 +37,7 @@ import sys
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 NOTIFY_OPENAPI = os.path.join(REPO_ROOT, "notify", "openapi", "notify.v1.yaml")
 EXAMPLES_DIR = os.path.join(REPO_ROOT, "notify", "openapi", "examples")
+GATEWAY_OPENAPI = os.path.join(REPO_ROOT, "gateway", "openapi", "gateway.v1.yaml")
 GATEWAY_VALIDATOR = os.path.join(REPO_ROOT, "gateway", "scripts", "validate_openapi.py")
 
 _spec = importlib.util.spec_from_file_location("gateway_validate_openapi", GATEWAY_VALIDATOR)
@@ -48,15 +51,19 @@ EXAMPLE_TARGETS = {
     "notification-card.json": "#/components/schemas/NotificationCard",
     "reminder-create-request.json": "#/components/schemas/ReminderCreateRequest",
     "approval-create-request.json": "#/components/schemas/ApprovalCreateRequest",
+    "bridge-create-request.json": "#/components/schemas/NotificationCreateRequest",
     "card-delivery-states.json": "#/components/schemas/Card",
     "digest-collapsed.json": "#/components/schemas/NotificationCard",
+    "delivery-retry-policy.json": "#/components/schemas/DeliveryRetryPolicy",
 }
 
-# Same example -> gateway schema it must ALSO satisfy directly (additivity check).
+# Same example -> gateway schema it must ALSO satisfy directly (additivity
+# check, resolved against a fresh read of gateway.v1.yaml).
 GATEWAY_CROSS_CHECK = {
     "notification-card.json": "#/components/schemas/Card",
     "reminder-create-request.json": "#/components/schemas/CreateCardRequest",
     "approval-create-request.json": "#/components/schemas/CreateCardRequest",
+    "bridge-create-request.json": "#/components/schemas/CreateCardRequest",
     "card-delivery-states.json": "#/components/schemas/Card",
     "digest-collapsed.json": "#/components/schemas/Card",
 }
@@ -181,25 +188,43 @@ def check_examples(document, report):
     if missing:
         report.fail("every mapped example file exists", "missing: %s" % ", ".join(missing))
 
-    example_hits = []
+    # Read every example first; unreadable files are reported FAIL here and
+    # skipped below (never KeyError).
     texts = {}
+    read_errors = []
     for name in present:
         path = os.path.join(EXAMPLES_DIR, name)
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 texts[name] = handle.read()
         except OSError as exc:
-            example_hits.append("%s: %s" % (name, exc))
-            continue
-        for hit in gv.scan_secrets(texts[name]):
+            read_errors.append("%s: %s" % (name, exc))
+    if read_errors:
+        report.fail("all example files readable", "\n".join(read_errors[:10]))
+    else:
+        report.ok("all example files readable (%d files)" % len(present))
+
+    example_hits = []
+    for name, text in texts.items():
+        for hit in gv.scan_secrets(text):
             example_hits.append("%s: %s" % (name, hit))
     if example_hits:
         report.fail("no committed secrets in examples", "\n".join(example_hits[:10]))
     else:
-        report.ok("no committed secrets in examples (%d files)" % len(present))
+        report.ok("no committed secrets in examples (%d files)" % len(texts))
+
+    # Fresh read of the gateway contract for the cross-check: proves the
+    # notify layer is additive even if bundling silently changed something.
+    gateway_doc = None
+    try:
+        gateway_doc = load_yaml(GATEWAY_OPENAPI)
+    except (OSError, yaml.YAMLError) as exc:
+        report.fail("gateway.v1.yaml re-read for cross-check", exc)
 
     failures = 0
     for name in present:
+        if name not in texts:
+            continue  # unreadable; already reported FAIL above
         pointer = EXAMPLE_TARGETS.get(name)
         if not pointer:
             continue
@@ -221,10 +246,14 @@ def check_examples(document, report):
             failures += 1
             continue
         cross = GATEWAY_CROSS_CHECK.get(name)
-        if cross:
-            cross_errors = gv.validate(
-                payload, gv.resolve_pointer(document, cross), document
-            )
+        if cross and gateway_doc is not None:
+            try:
+                cross_schema = gv.resolve_pointer(gateway_doc, cross)
+            except (KeyError, ValueError, IndexError) as exc:
+                report.fail("%s: gateway schema pointer resolves" % name, "%s -> %s" % (cross, exc))
+                failures += 1
+                continue
+            cross_errors = gv.validate(payload, cross_schema, gateway_doc)
             if cross_errors:
                 report.fail(
                     "%s still matches gateway %s" % (name, cross),

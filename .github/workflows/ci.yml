@@ -5,7 +5,8 @@
 #         synapse + tuwunel are required-green; continuwuity is experimental
 #         (continue-on-error) because it tracks :latest images.
 # lint:   compose config for all three profiles, shellcheck, python syntax,
-#         and a guard that .env.example only ever contains placeholders.
+#         notify/gateway contract validation, and a guard that .env.example
+#         only ever contains placeholders.
 name: CI
 
 on:
@@ -70,6 +71,11 @@ jobs:
 
       - name: Python syntax
         run: python3 -m py_compile server/tests/smoke.py
+
+      - name: Notify examples + gateway contract validation
+        run: |
+          python3 notify/scripts/validate_examples.py
+          python3 gateway/scripts/validate_openapi.py
 
       - name: Compose config validates for every profile
         run: |
