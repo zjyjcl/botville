@@ -22,6 +22,13 @@ info:
 
     所有示例、令牌与密钥均为占位符（`<change-me>`），本契约不含任何真实凭据。
 
+    **开放枚举**：所有响应侧的枚举字段（卡片类型、块类型、操作类型、能力状态等）
+    都按开放枚举声明——客户端遇到未知值必须按契约给出的降级规则处理，
+    不得因未知值导致整条响应解码失败。请求侧枚举仍为封闭集合。
+
+    **卡片结构版本**：`card_schema_version` 与契约 `info.version` 解耦，
+    通过 `X-Card-Schema-Version` / `card_schema_max` 协商，见 contract.md 4.7。
+
     许可：Apache-2.0。
   license:
     name: Apache-2.0
@@ -59,6 +66,8 @@ tags:
     description: token 预算、用量汇总与账单明细。
   - name: Cards
     description: 通用卡片与授权操作。
+  - name: Audit
+    description: 卡片操作与授权审计记录查询。
 
 x-botville-contract:
   stability: draft
@@ -181,11 +190,25 @@ paths:
     post:
       tags: [Capabilities]
       operationId: createCapabilitySessionToken
-      summary: 签发模块网页短时身份令牌
+      summary: 签发模块网页一次性 code
       description: |
-        为 App 内置浏览器打开模块网页签发短时令牌。令牌只承载当前用户在该 capability 上的
-        scopes，默认 300 秒过期，最长 86400 秒；不得写入 URL 查询串或日志，应由 webview 以
-        `Authorization: Bearer` 头发送。令牌内容对客户端不透明。
+        为 App 内置浏览器打开模块网页签发**一次性 code**，而不是可直接放进请求头的长期令牌。
+        WKWebView 只能给首个 `URLRequest` 加头，后续导航、子资源与 XHR 都带不上
+        `Authorization`，因此令牌方案改为「一次性 code → HttpOnly cookie」：
+
+        1. App 调用本接口，拿到 `code`（TTL ≤ 60 秒、单次使用）与 `url`（`code` 已作为查询串
+           带给模块页面）。`url` 是唯一允许出现 `code` 的位置，不得写入日志或长期缓存。
+        2. 模块页面用该 `code` 调用
+           `POST /capabilities/{capability_id}/session-cookies` 换取 `Set-Cookie`，
+           浏览器自动保存 **HttpOnly + Secure + SameSite** cookie，页面脚本读不到值。
+        3. 之后页面所有同源请求自动携带 cookie，不再需要请求头。
+        4. 会话上限 3600 秒（`ttl_seconds` ≤ 3600）。过期由页面通过 JS bridge 消息
+           `botville.session.renew` 通知 App，App 重新走第 1 步。
+
+        `allowed_origins` 是 App 放行导航的白名单：只在该列表内的 origin 加载页面，
+        跳到其他 origin 改用外部浏览器打开。
+
+        网关响应中的 `code` 只是占位示例（`<change-me>`），真实值不会出现在仓库里。
       parameters:
         - $ref: '#/components/parameters/CapabilityId'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -197,7 +220,7 @@ paths:
               $ref: '#/components/schemas/SessionTokenRequest'
       responses:
         '201':
-          description: 已签发短时令牌。
+          description: 已签发一次性 code 与模块网页地址。
           content:
             application/json:
               schema:
@@ -210,6 +233,58 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /capabilities/{capability_id}/session-cookies:
+    post:
+      tags: [Capabilities]
+      operationId: exchangeCapabilitySessionCookie
+      summary: 一次性 code 换取 HttpOnly 会话 cookie
+      description: |
+        模块网页（不是 App）调用：用 `session-tokens` 签发的一次性 `code` 换取
+        `Set-Cookie` 会话。`code` 单次使用、≤ 60 秒有效；成功返回 `204` 并设置
+        **HttpOnly + Secure + SameSite** cookie，JSON 响应体**不含** cookie 值。
+        会话有效期 ≤ 3600 秒，与 `session-tokens` 的 `ttl_seconds` 一致。
+
+        `code` 只能出现在请求体或页面首次加载 URL 中，不得写入日志、localStorage
+        或任何可被脚本读取的位置。重复使用同一 `code` 返回 401 `auth.invalid_token`。
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/CapabilityId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionCookieRequest'
+      responses:
+        '204':
+          description: 已设置会话 cookie（`Set-Cookie`），无响应体。
+          headers:
+            Set-Cookie:
+              description: |
+                HttpOnly、Secure、SameSite=Lax 的会话 cookie；会话 ≤ 3600 秒。
+                示例占位，不含真实值。
+              schema:
+                type: string
+                example: botville_session=<change-me>; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=3000
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          description: code 已使用或已过期。
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
         '422':
           $ref: '#/components/responses/UnprocessableEntity'
         '500':
@@ -630,8 +705,6 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/XRequestId'
-            Retry-After:
-              $ref: '#/components/headers/RetryAfter'
           content:
             application/json:
               schema:
@@ -845,7 +918,10 @@ paths:
           in: query
           schema:
             type: string
-            enum: [model_call, message_sent, message_blocked, proactive_message, town_action, image_generation]
+            enum: [model_call, message_sent, blocked, message_blocked, proactive_message, town_action, image_generation, card_action]
+          description: |
+            `blocked` 是策略拦截的规范值（对应 `outcome: blocked`）；
+            `message_blocked` 为 0.1.0 旧别名，保留兼容。`card_action` 记录卡片操作审计。
         - name: from
           in: query
           schema:
@@ -879,7 +955,7 @@ paths:
       tags: [Cards]
       operationId: listCards
       summary: 列出卡片
-      description: 返回当前用户的卡片，可按状态、类型、优先级与来源能力过滤。App 按 `blocks` 通用渲染。
+      description: 返回当前用户的卡片，可按状态、类型、优先级与来源能力过滤。App 按 `blocks` 通用渲染。`updated_since` 用于增量同步。
       parameters:
         - name: status
           in: query
@@ -900,6 +976,21 @@ paths:
           in: query
           schema:
             type: string
+        - name: updated_since
+          in: query
+          description: 只返回此时间之后更新的卡片，用于增量同步（RFC 3339，带时区）。
+          schema:
+            type: string
+            format: date-time
+        - name: card_schema_max
+          in: query
+          description: |
+            客户端支持的最高卡片 schema 版本（格式 `<major>.<minor>`）。
+            服务端按此降级；高于客户端 major 的卡片只返回 `fallback_text`。
+          schema:
+            type: string
+            pattern: '^[0-9]+\.[0-9]+$'
+            example: '1.0'
         - name: locale
           in: query
           schema:
@@ -907,6 +998,15 @@ paths:
             example: zh-CN
         - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/PageLimit'
+        - name: X-Card-Schema-Version
+          in: header
+          description: |
+            客户端支持的最高卡片 schema 版本（格式 `<major>.<minor>`）。
+            与 `card_schema_max` 等效，优先级低于 query param。
+          schema:
+            type: string
+            pattern: '^[0-9]+\.[0-9]+$'
+            example: '1.0'
       responses:
         '200':
           description: 卡片分页。
@@ -976,6 +1076,20 @@ paths:
           schema:
             type: string
             example: zh-CN
+        - name: card_schema_max
+          in: query
+          description: 客户端支持的最高卡片 schema 版本（`<major>.<minor>`）。
+          schema:
+            type: string
+            pattern: '^[0-9]+\.[0-9]+$'
+            example: '1.0'
+        - name: X-Card-Schema-Version
+          in: header
+          description: 客户端支持的最高卡片 schema 版本，与 `card_schema_max` 等效。
+          schema:
+            type: string
+            pattern: '^[0-9]+\.[0-9]+$'
+            example: '1.0'
       responses:
         '200':
           description: 卡片详情。
@@ -1033,14 +1147,34 @@ paths:
       operationId: actOnCard
       summary: 执行卡片操作
       description: |
-        执行卡片上的操作（批准、拒绝、打开链接、回调、忽略）。高风险操作（`risk: high`）需要
-        App 完成 Face ID 后提交短时 `assertion`，缺失或过期返回 403 `card.step_up_required`。
-        同一 `Idempotency-Key` 重复提交返回同一回执；已处理过的卡片再次操作返回 409
-        `card.already_decided`（同一操作幂等重放除外）。操作全程写入审计。
+        执行卡片上的操作（批准、拒绝、打开链接、回调、忽略）。
+
+        **幂等（强制）**：本接口 `Idempotency-Key` 必填。同一次用户意图复用同一个 key，
+        超时重试也复用同一个 key；同 key 重放返回原回执（状态码、回执内容一致），
+        不会返回 409。新的用户意图必须用新的 key。
+
+        **有效风险等级**：`effective_risk = action.risk ?? card.risk`。只要有效 risk 为
+        `high`，App **必须**二次确认 + Face ID，不论服务端是否下发 `confirmation`；
+        服务端漏配不得导致绕过。
+
+        **高风险流程（C3.1 / C4）**：
+        1. App 完成 Face ID 后调用
+           `POST /cards/{card_id}/actions/{action_id}/challenge` 取一次性 challenge。
+        2. App 用 Secure Enclave 设备密钥对
+           `card_id + action_id + revision + challenge` 签名，得到 `assertion`。
+        3. 提交本接口，带 `assertion`、`challenge`、`revision`。
+        4. 缺失或无效返回 403 `card.step_up_required` / `card.assertion_invalid`；
+           challenge 过期 `card.challenge_expired`；challenge 不匹配 `card.challenge_invalid`。
+
+        **并发**：`revision` 用于防 TOCTOU。approval 类型或有效 risk=high 时必填；
+        与当前卡片 revision 不一致返回 409 `card.revision_conflict`（响应附带最新卡片）。
+
+        已处理过的卡片再次操作返回 409 `card.already_decided`（同 key 幂等重放除外）。
+        操作全程写入审计，回执带 `audit_id`，可用 `GET /audit/{audit_id}` 查询。
       parameters:
         - $ref: '#/components/parameters/CardId'
         - $ref: '#/components/parameters/ActionId'
-        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CardActionIdempotencyKey'
       requestBody:
         required: true
         content:
@@ -1049,7 +1183,7 @@ paths:
               $ref: '#/components/schemas/CardActionRequest'
       responses:
         '200':
-          description: 操作回执。
+          description: 操作回执（同 key 重放返回同一回执）。
           headers:
             X-Request-Id:
               $ref: '#/components/headers/XRequestId'
@@ -1069,6 +1203,85 @@ paths:
           $ref: '#/components/responses/Conflict'
         '422':
           $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /cards/{card_id}/actions/{action_id}/challenge:
+    post:
+      tags: [Cards]
+      operationId: createCardActionChallenge
+      summary: 申请高风险操作 challenge
+      description: |
+        为高风险卡片操作签发一次性 challenge。App 完成 Face ID 后用 Secure Enclave
+        设备密钥（或 App Attest 密钥）对 `card_id + action_id + revision + challenge`
+        签名，得到 `assertion`，再提交到 `POST /cards/{card_id}/actions/{action_id}`。
+
+        只在有效 risk 为 `high` 时需要；低风险操作直接提交操作接口即可。
+        challenge 短时有效（默认 120 秒），单次使用，绑定卡片、操作与 revision，
+        因此不能跨卡、跨操作或跨版本重放。
+
+        返回的 `algorithm` 声明签名算法（如 `p256`），`assertion` 的字节编码由 D2.1 定义；
+        当前只要求签名输入包含上述四个字段。
+      parameters:
+        - $ref: '#/components/parameters/CardId'
+        - $ref: '#/components/parameters/ActionId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CardActionChallengeRequest'
+      responses:
+        '201':
+          description: 已签发 challenge。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CardActionChallenge'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /audit/{audit_id}:
+    get:
+      tags: [Audit]
+      operationId: getAuditRecord
+      summary: 查询卡片操作审计记录
+      description: |
+        按 `audit_id` 查询卡片操作（授权、拒绝、回调、忽略）的审计记录。
+        `CardActionReceipt.audit_id` 即此处的 ID。审计记录 append-only，
+        `decision` 字段说明操作结果，`before_revision` / `after_revision` 说明决策前后版本。
+      parameters:
+        - name: audit_id
+          in: path
+          required: true
+          description: 审计记录 ID（来自 `CardActionReceipt.audit_id`）。
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 审计记录。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditRecord'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -1142,6 +1355,19 @@ components:
       description: |
         幂等键，建议使用随机值并在重试时复用。同一 key 相同请求体返回同一结果；
         同一 key 不同请求体返回 409 `idempotency.conflict`。
+        卡片操作接口另有必填版本 `CardActionIdempotencyKey`。
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+    CardActionIdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        **必填**。同一次用户意图（一次「批准」/「拒绝」点击及其超时重试）复用同一个 key；
+        同 key 重放返回原回执，不会返回 409。新的用户意图必须用新的 key。
+        8–128 字符，建议随机 UUID。
       schema:
         type: string
         minLength: 8
@@ -1953,7 +2179,10 @@ components:
           enum: [allow, defer, block]
         allowed:
           type: boolean
-          description: 是否允许立即发言（`defer` 时为 true，表示稍后可发）。
+          description: |
+            `allow` → `true`；`block` → `false`；
+            `defer` → `false`（服务端排程延后，当前时刻不允许立即发言；
+            最终会投递但不是「立即允许」）。
         evaluated_at:
           type: string
           format: date-time
@@ -1963,6 +2192,10 @@ components:
           description: 最严格限制所属的层。
         retryable:
           type: boolean
+          description: |
+            `block` 时为 `false`（同一内容不重试）；`defer` 时为 `false`
+            （客户端不自行重试，服务端排程后推送）；`allow` 时为 `false`（已允许无需重试）。
+            此字段是 `PolicyDecision` 自身的语义，以 `MessageReceipt.retryable` 为权威来源。
         retry_after_seconds:
           type: [integer, 'null']
           minimum: 0
@@ -2002,8 +2235,20 @@ components:
     MessageReceipt:
       type: object
       description: |
-        `outcome` 是网关的发言裁决：`delivered` 已投递、`queued` 已入队、
-        `deferred` 延后到允许时段、`blocked` 本次不允许。具体原因在 `decision`。
+        `outcome` 是网关的发言裁决：`delivered` 已投递、`queued` 已入队（带 `queue_id`）、
+        `deferred` 延后到允许时段（服务端排程，带 `queue_id`，客户端**不要**自行重试）、
+        `blocked` 本次不允许（**不重试**，`retryable: false`；原因见 `decision.reasons`；
+        记 `usage_events kind=blocked`）。
+
+        `retryable` / `retry_after_seconds` 只在本结构内有效，`PolicyDecision` 内的同名字段
+        仅在 `POST /policy/evaluate` 单独使用时有意义，两处语义相同但不互相引用。
+
+        **200 响应不附带 `Retry-After` HTTP 头**；重试时机放 body 里。
+
+        三分表（供通知 / 重试 / 审计统一口径）：
+        - **成功**：`delivered` / `queued` / `deferred`，2xx，不是错误
+        - **策略拦截**：`blocked`，2xx，不重试，记 `usage_events kind=blocked`
+        - **失败**：4xx / 5xx，body 为 problem+json，按 `code` 决定重试策略
       required: [outcome, retryable, decision]
       properties:
         outcome:
@@ -2011,9 +2256,31 @@ components:
           enum: [delivered, queued, deferred, blocked]
         retryable:
           type: boolean
+          description: |
+            `delivered` → `false`；`queued` / `deferred` → `false`（服务端排程，客户端不重试）；
+            `blocked` → **始终 `false`**（同一内容不再重试；若额度会恢复见 `may_clear_at`）。
         retry_after_seconds:
           type: [integer, 'null']
           minimum: 0
+          description: |
+            `blocked` 时始终 `null`（不重试）；`deferred` 时为服务端排程到允许时段的等待秒数（仅供参考显示，不要用它自动重试）。
+        may_clear_at:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            `blocked` 时可选：额度预计恢复时间（如周期窗口重置时间）。与 `retryable: false`
+            不矛盾——当前内容被拦截不重试，但用户换内容后可以在该时间后重试。
+        same_content_allowed:
+          type: boolean
+          description: |
+            `blocked` 时为 `false`：当前内容即使额度恢复也不允许（例如关系策略）；
+            `true` 或省略表示额度恢复后同一内容可重发。
+        queue_id:
+          type: [string, 'null']
+          description: |
+            `queued` / `deferred` 时为服务端排程 ID（必填，用于追踪投递状态）。
+            幂等缓存只对终态（`delivered` / `blocked`）生效；
+            `deferred` 重用同一 `Idempotency-Key` 返回同一 `queue_id`，服务端会在允许时段投递。
         message:
           anyOf:
             - $ref: '#/components/schemas/Message'
@@ -2287,7 +2554,10 @@ components:
           format: date-time
         kind:
           type: string
-          enum: [model_call, message_sent, message_blocked, proactive_message, town_action, image_generation]
+          enum: [model_call, message_sent, blocked, message_blocked, proactive_message, town_action, image_generation, card_action]
+          description: |
+            `blocked` 是策略拦截的规范值；`message_blocked` 为旧别名。
+            `card_action` 记录一次卡片操作（与 `audit_id` 关联）。
         persona_id:
           type: string
         conversation_id:
@@ -2305,6 +2575,9 @@ components:
           minimum: 0
         decision_code:
           type: string
+        audit_id:
+          type: [string, 'null']
+          description: 仅 `card_action` kind 时有值；与 `AuditRecord.id` 对应。
         request_id:
           type: string
 
@@ -2325,23 +2598,35 @@ components:
       required: [type, value]
       properties:
         type:
-          type: string
-          enum: [sf_symbol, url]
+          description: |
+            开放枚举：`sf_symbol` / `url`。客户端遇到未知类型时忽略图标并按无图标渲染。
+          anyOf:
+            - enum: [sf_symbol, url]
+            - type: string
         value:
           type: string
           description: SF Symbol 名称或图标 URL。
+        fallback:
+          type: string
+          description: |
+            `type: sf_symbol` 时的回退 symbol 名（设备系统没有主 symbol 时使用）；
+            仍不可用时按无图标渲染。
 
     CapabilityEntry:
       type: object
       description: |
         模块入口。`native` 使用 App 内置页面与 `deep_link`；`web` 用内置浏览器打开 `web_url`，
-        需先取 session token；`card_list` 直接在动态页渲染指定类型的卡片。未知 entry 类型视为
+        需先取一次性 code；`card_list` 直接在动态页渲染指定类型的卡片。未知 entry 类型视为
         `none`，App 忽略该入口但保留能力。
       required: [type]
       properties:
         type:
-          type: string
-          enum: [native, web, card_list, none]
+          description: |
+            开放枚举：`native` / `web` / `card_list` / `none`。
+            **未知类型一律按 `none` 处理**——保留能力、忽略入口，不得导致清单解码失败。
+          anyOf:
+            - enum: [native, web, card_list, none]
+            - type: string
         deep_link:
           type: string
           example: botville://chat
@@ -2380,8 +2665,11 @@ components:
         ttl_seconds:
           type: integer
           minimum: 60
-          maximum: 86400
+          maximum: 3600
           default: 300
+          description: |
+            模块网页会话的建议有效期（秒），上限 3600。WKWebView 会话是短时的，
+            不再支持 24 小时这种长值。
 
     Capability:
       type: object
@@ -2392,9 +2680,13 @@ components:
           pattern: '^[a-z][a-z0-9]*(\.[a-z][a-z0-9_]*)*$'
           example: memory.search
         module:
-          type: string
-          description: 所属模块，与仓库模块名一致。
-          enum: [core, role, memory, social, notify, bridge, town]
+          description: |
+            开放枚举：所属模块，与仓库模块名一致（`core`/`role`/`memory`/`social`/`notify`/
+            `bridge`/`town`）。未知 module 照常显示能力，按「其他」分组。
+          anyOf:
+            - enum: [core, role, memory, social, notify, bridge, town]
+            - type: string
+          example: memory
         version:
           type: string
           pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
@@ -2408,8 +2700,12 @@ components:
         icon:
           $ref: '#/components/schemas/CapabilityIcon'
         status:
-          type: string
-          enum: [enabled, disabled, degraded]
+          description: |
+            开放枚举：`enabled` / `disabled` / `degraded`。
+            **未知 status 按 `disabled` 处理**（入口隐藏），不得导致整份清单解码失败。
+          anyOf:
+            - enum: [enabled, disabled, degraded]
+            - type: string
         unavailable_reason:
           type: string
           description: 不可用或降级时的机器可读原因，例如 `module_disabled`。
@@ -2473,7 +2769,24 @@ components:
 
     SessionTokenRequest:
       type: object
+      required: [url]
       properties:
+        url:
+          type: string
+          format: uri
+          description: |
+            要打开的模块网页地址。必须与能力的 `entry.web_url` 同源；网关把一次性 `code`
+            作为查询串附加后返回。App 不得自行拼接 `code`。
+          example: https://gateway.example.invalid/modules/memory/
+        allowed_origins:
+          type: array
+          items:
+            type: string
+            format: uri
+          description: |
+            App 允许在**内置浏览器**内加载的 origin 白名单。只在该列表内放行导航；
+            跳到其他 origin 时改用外部浏览器打开。省略时默认为 `url` 的 origin。
+          example: ['https://gateway.example.invalid']
         scopes:
           type: array
           items:
@@ -2482,31 +2795,63 @@ components:
         ttl_seconds:
           type: integer
           minimum: 60
-          maximum: 86400
+          maximum: 3600
           default: 300
+          description: 会话有效期（秒），**上限 3600**。一次性 `code` 本身的 TTL ≤ 60 秒，与此无关。
       additionalProperties: false
 
     SessionToken:
       type: object
-      required: [token, token_type, expires_at, audience]
+      description: |
+        一次性 code 交换信息。`code` 单次使用、≤ 60 秒有效，只能由模块页面拿去换
+        HttpOnly cookie；App 不得把它当长期凭据保存或以 `Authorization` 头发送。
+      required: [code, code_ttl_seconds, expires_at, audience, url, allowed_origins]
       properties:
-        token:
+        code:
           type: string
-          description: 不透明短时令牌，占位示例。
+          description: 一次性 code，占位示例。TTL ≤ 60 秒，单次使用。
           example: <change-me>
-        token_type:
-          type: string
-          enum: [Bearer]
+        code_ttl_seconds:
+          type: integer
+          minimum: 1
+          maximum: 60
+          description: code 的有效期（秒），上限 60。
         expires_at:
           type: string
           format: date-time
+          description: 兑换出的 cookie 会话到期时间（`now + ttl_seconds`，≤ 3600 秒）。
         audience:
           type: string
-          description: 该令牌仅适用于对应 capability ID。
+          description: 该会话仅适用于对应 capability ID。
         url:
           type: string
           format: uri
-          description: 建议打开的模块网页地址（不含令牌）。
+          description: |
+            建议打开的模块网页地址，**已附带一次性 `code`**。这是唯一允许出现 `code`
+            的位置；不得写入日志、localStorage 或长期缓存。
+        allowed_origins:
+          type: array
+          items:
+            type: string
+            format: uri
+          description: 内置浏览器放行的 origin 白名单；超出即改用外部浏览器。
+        renew_via:
+          type: string
+          enum: [js_bridge]
+          default: js_bridge
+          description: |
+            会话续期方式：页面通过 JS bridge 消息 `botville.session.renew` 通知 App，
+            App 重新调用 `session-tokens`。页面脚本不得自行续期。
+
+    SessionCookieRequest:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+          description: 从 `session-tokens` 一次性 code 获取的原始值。
+          example: <change-me>
+      additionalProperties: false
 
     # ----- 卡片 -----
     CardBlockItem:
@@ -2527,22 +2872,37 @@ components:
         通用渲染块。字段按 `type` 取用，见 contract.md 卡片一节：
         text→text；key_value/list→items；divider→无；image→url、alt；
         progress→value、max、label；code→text。
+
+        `type` 是开放枚举：客户端遇到未知块类型时**跳过该块**继续渲染其余内容，
+        不得因未知块导致整卡解码失败。
       required: [type]
       properties:
         type:
-          type: string
-          enum: [text, key_value, divider, image, progress, list, code]
+          description: |
+            开放枚举：`text` / `key_value` / `divider` / `image` / `progress` / `list` / `code`。
+            未知类型 → 跳过此块。
+          anyOf:
+            - enum: [text, key_value, divider, image, progress, list, code]
+            - type: string
         text:
           type: string
+          maxLength: 4000
         items:
           type: array
+          maxItems: 50
           items:
             $ref: '#/components/schemas/CardBlockItem'
         url:
           type: string
           format: uri
+          description: '`image` 块只接受 `https` URL；加载失败时显示 `alt`。'
         alt:
           type: string
+          description: 图片替代文本；也用于图片加载失败时的占位。
+        aspect_ratio:
+          type: number
+          description: 可选宽高比（如 `1.777`），供客户端预留布局高度、避免列表跳动。
+          exclusiveMinimum: 0
         label:
           type: string
         value:
@@ -2550,8 +2910,11 @@ components:
         max:
           type: number
         level:
-          type: string
-          enum: [info, success, warning, danger]
+          description: |
+            开放枚举：`info` / `success` / `warning` / `danger`。未知 level 按无颜色渲染。
+          anyOf:
+            - enum: [info, success, warning, danger]
+            - type: string
 
     CardActionConfirmation:
       type: object
@@ -2565,7 +2928,9 @@ components:
           type: string
         biometric:
           type: boolean
-          description: 高风险操作必须为 true，App 完成 Face ID 后提交 assertion。
+          description: |
+            高风险操作必须为 true，App 完成 Face ID 后提交 assertion。
+            若服务端漏配而有效 risk 为 `high`，App 仍**强制**二次确认 + Face ID。
 
     CardAction:
       type: object
@@ -2576,15 +2941,39 @@ components:
         label:
           type: string
         kind:
-          type: string
-          enum: [approve, deny, open_url, callback, dismiss]
+          description: |
+            开放枚举：`approve` / `deny` / `open_url` / `callback` / `dismiss`。
+            **未知 kind → 隐藏该按钮**（保留其余操作），不得整卡解码失败。
+          anyOf:
+            - enum: [approve, deny, open_url, callback, dismiss]
+            - type: string
         style:
+          description: |
+            开放枚举：`primary` / `secondary` / `danger`。未知 style 按 `secondary`。
+          anyOf:
+            - enum: [primary, secondary, danger]
+            - type: string
+        risk:
+          description: |
+            可选，缺省继承卡片 `risk`。有效风险为 `action.risk ?? card.risk`。
+            **未知 risk 按 `high` 处理**（二次确认 + Face ID）。
+          anyOf:
+            - enum: [low, medium, high]
+            - type: string
+        target:
+          description: |
+            `kind: open_url` 时打开链接的位置：`in_app` 用内置浏览器（可携带该能力的
+            session cookie），`external` 用系统浏览器。缺省 `external`。
+          anyOf:
+            - enum: [in_app, external]
+            - type: string
+        capability_id:
           type: string
-          enum: [primary, secondary, danger]
+          description: '`target: in_app` 时可选，指明用哪个能力的会话打开链接。'
         url:
           type: string
           format: uri
-          description: '当 `kind` 为 open_url 时必填。'
+          description: '当 `kind` 为 open_url 时必填，且为 `https`。'
         payload:
           type: object
           description: 回传给来源模块的不透明数据；不得包含密钥或无关个人信息。
@@ -2595,12 +2984,28 @@ components:
 
     CardSource:
       type: object
-      required: [module]
+      required: [module, event_id]
       properties:
         module:
-          type: string
+          description: |
+            开放枚举：产生卡片的模块，对齐 Capability 的 module（`core`/`role`/`memory`/
+            `social`/`notify`/`bridge`/`town`）。未知 module 照常显示。
+          anyOf:
+            - enum: [core, role, memory, social, notify, bridge, town]
+            - type: string
         capability_id:
           type: string
+          description: |
+            来源能力 ID。创建时校验它属于调用方的 scope；`notification` / `approval`
+            卡片必填，用于去重与来源识别。
+        event_id:
+          type: string
+          description: |
+            来源事件的稳定 ID（必填）。服务端按 `(capability_id, event_id)` 幂等：
+            同一来源事件重复创建返回已有卡片，不会重复打扰。
+        dedupe_key:
+          type: string
+          description: 可选去重键，缺省等于 `event_id`；用于来源没有稳定事件 ID 的桥接场景。
         actor:
           $ref: '#/components/schemas/Actor'
 
@@ -2626,6 +3031,40 @@ components:
         fallback_text:
           type: string
 
+    CardDelivery:
+      type: object
+      description: |
+        单个投递渠道的投递状态。与 `Card.status`（用户生命周期）分开：
+        `status` 表示用户是否已读/已处理，`delivery` 表示渠道是否真的送达。
+        模糊结果（超时、回执缺失）记 `unconfirmed`，**不得在同渠道重放**，避免重复打扰。
+      required: [channel, state, attempts]
+      properties:
+        channel:
+          description: |
+            开放枚举：`push` / `in_app` / `email` / `webhook` 等。未知渠道照常显示状态。
+          anyOf:
+            - enum: [push, in_app, email, webhook]
+            - type: string
+        state:
+          description: |
+            开放枚举：`pending` / `confirmed` / `unconfirmed` / `failed`。
+            未知 state 按 `unconfirmed` 处理（不重放该渠道）。
+          anyOf:
+            - enum: [pending, confirmed, unconfirmed, failed]
+            - type: string
+        attempts:
+          type: integer
+          minimum: 0
+        last_attempt_at:
+          type: [string, 'null']
+          format: date-time
+        failure_code:
+          type: [string, 'null']
+          description: 失败或未确认的机器可读原因，例如 `push.timeout`、`push.receipt_missing`。
+        provider_message_id:
+          type: [string, 'null']
+          description: 渠道侧的消息 ID，用于对账。
+
     Card:
       type: object
       required:
@@ -2639,6 +3078,7 @@ components:
         - risk
         - status
         - fallback_text
+        - source
         - created_at
       properties:
         id:
@@ -2647,31 +3087,53 @@ components:
           type: string
           pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
           example: 1.0.0
+          description: |
+            卡片结构版本。**与契约 `info.version` 解耦**：卡片 minor 升级不要求契约升版本，
+            卡片 major 可在 `/v1` 内共存（通过协商下发 `fallback_text`）。见 contract.md 4.7。
         type:
-          type: string
-          enum: [notification, approval, moment, system, reminder, result]
+          description: |
+            开放枚举：`notification` / `approval` / `moment` / `system` / `reminder` / `result`。
+            **未知 type → 只用 `fallback_text` 降级渲染**，不崩溃。
+          anyOf:
+            - enum: [notification, approval, moment, system, reminder, result]
+            - type: string
         title:
           type: string
+          maxLength: 200
         subtitle:
           type: string
+          maxLength: 200
         fallback_text:
           type: string
           description: 纯文本降级内容；旧客户端、未知类型或渲染失败时展示。
         priority:
-          type: string
-          enum: [urgent, high, normal, low]
+          description: |
+            开放枚举：`urgent` / `high` / `normal` / `low`。未知 priority 按 `normal` 处理。
+          anyOf:
+            - enum: [urgent, high, normal, low]
+            - type: string
         risk:
-          type: string
-          enum: [low, medium, high]
+          description: |
+            开放枚举：`low` / `medium` / `high`。
+            **未知 risk 按 `high` 处理**（二次确认 + Face ID），这是安全侧的失败保护。
+          anyOf:
+            - enum: [low, medium, high]
+            - type: string
         status:
-          type: string
-          enum: [active, read, dismissed, expired, acted]
+          description: |
+            开放枚举：`active` / `read` / `dismissed` / `expired` / `acted`。
+            未知 status 按 `disabled` 处理（不可操作，但仍可展示）。
+          anyOf:
+            - enum: [active, read, dismissed, expired, acted]
+            - type: string
         blocks:
           type: array
+          maxItems: 50
           items:
             $ref: '#/components/schemas/CardBlock'
         actions:
           type: array
+          maxItems: 10
           items:
             $ref: '#/components/schemas/CardAction'
         source:
@@ -2682,6 +3144,25 @@ components:
           type: object
           additionalProperties:
             $ref: '#/components/schemas/CardI18nText'
+        delivery:
+          type: array
+          items:
+            $ref: '#/components/schemas/CardDelivery'
+          description: 各渠道投递状态；D1.1 用它表达「已确认 / 未确认 / 失败 / 待投递」。
+        group_id:
+          type: [string, 'null']
+          description: 合并展示的组 ID（同组卡片折叠为摘要）。
+        collapse_key:
+          type: [string, 'null']
+          description: 合并键；同键的未读卡片由客户端折叠。
+        deliver_after:
+          type: [string, 'null']
+          format: date-time
+          description: 最早投递时间（服务端排程）；`null` 表示立即。
+        interrupt:
+          type: boolean
+          default: false
+          description: 是否穿透静默时段立即打断。
         created_at:
           type: string
           format: date-time
@@ -2711,31 +3192,44 @@ components:
 
     CreateCardRequest:
       type: object
-      required: [type, title, blocks, fallback_text]
+      description: |
+        创建卡片。`source` 必填，`source.event_id` 必填——服务端按
+        `(capability_id, event_id)` 幂等，重复创建返回已有卡片（200），不重复投递。
+
+        参与静默检查：`interrupt: false`（默认）时，`priority` 为 `urgent` 可穿透静默，
+        其余优先级在静默时段内排到 `deliver_after`。
+      required: [type, title, blocks, fallback_text, source]
       properties:
         type:
           type: string
           enum: [notification, approval, moment, system, reminder, result]
         title:
           type: string
+          maxLength: 200
         subtitle:
           type: string
+          maxLength: 200
         fallback_text:
           type: string
         priority:
           type: string
           enum: [urgent, high, normal, low]
           default: normal
+          description: |
+            打断级别：`urgent` 默认穿透静默（除非 `interrupt: false`）；
+            `high` 静默时段内延后但置顶；`normal` / `low` 静默时段内延后。
         risk:
           type: string
           enum: [low, medium, high]
           default: low
         blocks:
           type: array
+          maxItems: 50
           items:
             $ref: '#/components/schemas/CardBlock'
         actions:
           type: array
+          maxItems: 10
           items:
             $ref: '#/components/schemas/CardAction'
         source:
@@ -2749,6 +3243,26 @@ components:
         expires_at:
           type: string
           format: date-time
+          description: |
+            `notification` / `approval` 卡片建议设置。approval 或有效 risk=high 时**必填**。
+        deliver_after:
+          type: [string, 'null']
+          format: date-time
+          description: 服务端最早投递时间；`null` 表示立即（但仍受静默检查）。
+        scheduled_at:
+          type: [string, 'null']
+          format: date-time
+          description: 期望展示时间（例如提醒卡片的触发时刻）；与 `deliver_after` 二选一。
+        interrupt:
+          type: boolean
+          default: false
+          description: 是否穿透静默时段立即打断；`false` 时静默期间顺延。
+        collapse_key:
+          type: [string, 'null']
+          description: 合并键；同键未读卡片由客户端折叠展示。
+        group_id:
+          type: [string, 'null']
+          description: 合并展示组 ID。
       additionalProperties: false
 
     UpdateCardStateRequest:
@@ -2763,21 +3277,91 @@ components:
           minimum: 1
       additionalProperties: false
 
+    CardActionChallengeRequest:
+      type: object
+      description: 可选请求体，用于声明客户端支持的签名算法。
+      properties:
+        algorithm:
+          type: string
+          enum: [p256]
+          default: p256
+          description: 期望的签名算法；当前仅 `p256`（Secure Enclave / App Attest 密钥）。
+        revision:
+          type: integer
+          minimum: 1
+          description: 可选。声明客户端看到的卡片 revision，challenge 将绑定该值。
+      additionalProperties: false
+
+    CardActionChallenge:
+      type: object
+      description: |
+        一次性高风险操作 challenge。`assertion` 必须绑定
+        `card_id + action_id + revision + challenge`，防止跨卡、跨操作重放。
+      required: [challenge, expires_at, card_id, action_id, revision, algorithm]
+      properties:
+        challenge:
+          type: string
+          description: 一次性随机值，单次使用，短时有效。占位示例。
+          example: <change-me>
+        expires_at:
+          type: string
+          format: date-time
+          description: challenge 过期时间（默认 120 秒）。
+        card_id:
+          type: string
+        action_id:
+          type: string
+        revision:
+          type: integer
+          minimum: 1
+          description: challenge 绑定的卡片 revision；提交操作时必须回传同一值。
+        algorithm:
+          type: string
+          enum: [p256]
+          description: 签名算法，当前仅 `p256`。
+
     CardActionRequest:
       type: object
       properties:
         payload:
           type: object
           description: 操作附带的表单或选择值，由操作声明决定；不得包含密钥。
+        revision:
+          type: integer
+          minimum: 1
+          description: |
+            客户端看到的卡片 revision。approval 类型或有效 risk=high 时**必填**；
+            与当前不一致返回 409 `card.revision_conflict`（响应附带最新卡片），防止 TOCTOU。
+        challenge:
+          type: string
+          description: |
+            有效 risk=high 时必填。来自
+            `POST /cards/{card_id}/actions/{action_id}/challenge`。
         assertion:
           type: string
-          description: 高风险操作的短时步骤验证断言（App 完成 Face ID 后获得），占位示例。
+          description: |
+            有效 risk=high 时必填。App 用 Secure Enclave 设备密钥对
+            `card_id + action_id + revision + challenge` 的签名（占位示例）。
           example: <change-me>
       additionalProperties: false
 
     CardActionReceipt:
       type: object
-      required: [card_id, action_id, status, decided_at, audit_id]
+      description: |
+        卡片操作回执。同一次用户意图的幂等重放返回完全相同的回执与 `audit_id`。
+        `card` 必填，且其 `status` 与本次操作结果一致（例如批准后为 `acted`）。
+      required:
+        - card_id
+        - action_id
+        - status
+        - decided_at
+        - audit_id
+        - actor
+        - auth_method
+        - source_module
+        - revision_before
+        - revision_after
+        - card
       properties:
         card_id:
           type: string
@@ -2786,16 +3370,78 @@ components:
         status:
           type: string
           enum: [accepted, rejected, failed]
+          description: |
+            `accepted` 操作成功；`rejected` 网关或来源模块拒绝；`failed` 执行失败。
         decided_at:
           type: string
           format: date-time
         audit_id:
           type: string
+          description: 审计记录 ID；可用 `GET /audit/{audit_id}` 查询。
+        actor:
+          $ref: '#/components/schemas/Actor'
+        auth_method:
+          type: string
+          enum: [none, biometric]
+          description: 本次操作的认证方式；高风险操作应为 `biometric`。
+        source_module:
+          type: string
+          description: 卡片来源模块（对齐 `source.module`）。
+        revision_before:
+          type: integer
+          minimum: 1
+          description: 决策前的卡片 revision。
+        revision_after:
+          type: integer
+          minimum: 1
+          description: 决策后的卡片 revision。
         result:
           type: object
           description: 来源模块返回的操作结果，结构由模块定义。
         card:
           $ref: '#/components/schemas/Card'
+
+    AuditRecord:
+      type: object
+      description: 卡片操作的审计记录（append-only）。`GET /audit/{audit_id}` 返回。
+      required: [id, card_id, action_id, occurred_at, actor, auth_method, source_module, decision, revision_before, revision_after]
+      properties:
+        id:
+          type: string
+          example: audit_demo
+        card_id:
+          type: string
+        action_id:
+          type: string
+        occurred_at:
+          type: string
+          format: date-time
+        actor:
+          $ref: '#/components/schemas/Actor'
+        auth_method:
+          type: string
+          enum: [none, biometric]
+        source_module:
+          type: string
+        source_capability_id:
+          type: string
+        decision:
+          type: string
+          enum: [accepted, rejected, failed]
+        revision_before:
+          type: integer
+          minimum: 1
+        revision_after:
+          type: integer
+          minimum: 1
+        request_id:
+          type: string
+        idempotency_key_hash:
+          type: string
+          description: 幂等键的哈希（不回显原值），用于排查重放。
+        result:
+          type: object
+          description: 来源模块返回的结果快照。
 
     # ----- 健康 -----
     HealthCheck:

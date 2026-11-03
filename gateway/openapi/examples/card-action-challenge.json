@@ -1,0 +1,8 @@
+{
+  "challenge": "<change-me>",
+  "expires_at": "2026-11-03T12:07:00Z",
+  "card_id": "card_demo",
+  "action_id": "approve",
+  "revision": 1,
+  "algorithm": "p256"
+}

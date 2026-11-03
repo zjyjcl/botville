@@ -3,8 +3,8 @@
   "allowed": false,
   "evaluated_at": "2026-11-03T12:30:00Z",
   "winner_layer": "platform",
-  "retryable": true,
-  "retry_after_seconds": 3600,
+  "retryable": false,
+  "retry_after_seconds": null,
   "estimated_tokens": 120,
   "reasons": [
     {
@@ -21,7 +21,7 @@
       "limit": 20,
       "used": 20,
       "remaining": 0,
-      "reset_at": "2026-11-03T12:20:00Z",
+      "reset_at": "2026-11-03T13:00:00Z",
       "code": "ai_loop.breaker_open",
       "source_id": "platform_default"
     },
@@ -32,7 +32,7 @@
       "limit": 60,
       "used": 23,
       "remaining": 37,
-      "reset_at": "2026-11-04T00:00:00+08:00",
+      "reset_at": "2026-11-04T00:00:00Z",
       "source_id": "persona_demo"
     }
   ]

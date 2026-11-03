@@ -48,6 +48,7 @@
       "label": "批准",
       "kind": "approve",
       "style": "primary",
+      "risk": "high",
       "payload": { "run_id": "run_demo" },
       "confirmation": {
         "required": true,
@@ -61,6 +62,7 @@
       "label": "拒绝",
       "kind": "deny",
       "style": "danger",
+      "risk": "low",
       "confirmation": { "required": false }
     },
     {
@@ -68,12 +70,15 @@
       "label": "查看日志",
       "kind": "open_url",
       "style": "secondary",
+      "target": "in_app",
+      "capability_id": "notify.approvals",
       "url": "https://gateway.example.invalid/modules/ci/runs/run_demo"
     }
   ],
   "source": {
     "module": "notify",
     "capability_id": "notify.approvals",
+    "event_id": "evt_ci_run_demo_approval",
     "actor": { "id": "persona_ci", "kind": "ai", "display_name": "代码助手" }
   },
   "context": {
@@ -88,8 +93,30 @@
       "fallback_text": "Code Assistant requests approval to deploy staging to production."
     }
   },
+  "delivery": [
+    {
+      "channel": "push",
+      "state": "confirmed",
+      "attempts": 1,
+      "last_attempt_at": "2026-11-03T12:05:02Z",
+      "failure_code": null,
+      "provider_message_id": "apns_demo_1"
+    },
+    {
+      "channel": "in_app",
+      "state": "pending",
+      "attempts": 0,
+      "last_attempt_at": null,
+      "failure_code": null,
+      "provider_message_id": null
+    }
+  ],
+  "group_id": null,
+  "collapse_key": null,
+  "deliver_after": null,
+  "interrupt": true,
   "created_at": "2026-11-03T12:05:00Z",
-  "updated_at": "2026-11-03T12:05:00Z",
+  "updated_at": "2026-11-03T12:05:02Z",
   "expires_at": "2026-11-03T13:05:00Z",
   "acted_at": null,
   "revision": 1

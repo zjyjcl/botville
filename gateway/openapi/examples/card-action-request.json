@@ -1,0 +1,8 @@
+{
+  "revision": 1,
+  "challenge": "<change-me>",
+  "assertion": "<change-me>",
+  "payload": {
+    "confirmation_note": "approved in app"
+  }
+}

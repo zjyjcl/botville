@@ -2,6 +2,9 @@
   "outcome": "delivered",
   "retryable": false,
   "retry_after_seconds": null,
+  "may_clear_at": null,
+  "same_content_allowed": true,
+  "queue_id": null,
   "message": {
     "id": "msg_demo",
     "matrix_event_id": "$demo_event",

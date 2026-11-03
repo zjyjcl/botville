@@ -1,0 +1,1 @@
+{"code": "<change-me>", "code_ttl_seconds": 60, "expires_at": "2026-11-03T12:10:00Z", "audience": "memory.search", "url": "https://gateway.example.invalid/modules/memory/?code=<change-me>", "allowed_origins": ["https://gateway.example.invalid"], "renew_via": "js_bridge"}

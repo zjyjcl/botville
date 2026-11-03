@@ -66,6 +66,8 @@ EXAMPLE_TARGETS = {
     "send-message-request.json": "#/paths/~1conversations~1{conversation_id}~1messages/post/requestBody/content/application~1json/schema",
     "message-receipt.json": "#/paths/~1conversations~1{conversation_id}~1messages/post/responses/200/content/application~1json/schema",
     "message-receipt-deferred.json": "#/paths/~1conversations~1{conversation_id}~1messages/post/responses/200/content/application~1json/schema",
+    "message-receipt-blocked.json": "#/paths/~1conversations~1{conversation_id}~1messages/post/responses/200/content/application~1json/schema",
+    "message-receipt-queued.json": "#/paths/~1conversations~1{conversation_id}~1messages/post/responses/200/content/application~1json/schema",
     "policy-evaluate-request.json": "#/paths/~1policy~1evaluate/post/requestBody/content/application~1json/schema",
     "policy-decision.json": "#/paths/~1policy~1evaluate/post/responses/200/content/application~1json/schema",
     "effective-limits.json": "#/paths/~1limits/get/responses/200/content/application~1json/schema",
@@ -73,6 +75,10 @@ EXAMPLE_TARGETS = {
     "card.json": "#/paths/~1cards~1{card_id}/get/responses/200/content/application~1json/schema",
     "create-card-request.json": "#/paths/~1cards/post/requestBody/content/application~1json/schema",
     "card-action-receipt.json": "#/paths/~1cards~1{card_id}~1actions~1{action_id}/post/responses/200/content/application~1json/schema",
+    "card-action-request.json": "#/paths/~1cards~1{card_id}~1actions~1{action_id}/post/requestBody/content/application~1json/schema",
+    "card-action-challenge.json": "#/paths/~1cards~1{card_id}~1actions~1{action_id}~1challenge/post/responses/201/content/application~1json/schema",
+    "audit-record.json": "#/paths/~1audit~1{audit_id}/get/responses/200/content/application~1json/schema",
+    "session-token.json": "#/paths/~1capabilities~1{capability_id}~1session-tokens/post/responses/201/content/application~1json/schema",
     "problem.json": "#/components/responses/Forbidden/content/application~1problem+json/schema",
 }
 
@@ -202,9 +208,11 @@ def _type_matches(value, name):
 def _check_format(value, fmt):
     if fmt == "date-time":
         try:
-            _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            parsed = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             return "not a valid RFC 3339 date-time"
+        if parsed.tzinfo is None:
+            return "date-time must carry a timezone (Z or +HH:MM)"
         return None
     if fmt in ("uri", "uri-reference"):
         if " " in value:
@@ -374,6 +382,29 @@ def iter_operations(document):
                 yield path, method, operation, item
 
 
+def scan_secrets(raw_text):
+    """Return a list of suspected committed secrets in ``raw_text``.
+
+    Placeholders (``<change-me>``, ``env:``/``ref:`` references, example.invalid
+    hosts) are allowed; anything else that looks like a literal credential fails.
+    """
+    hits = []
+    for pattern, label in SECRET_PATTERNS:
+        for match in pattern.finditer(raw_text):
+            hits.append("%s near %r" % (label, match.group(0)[:24]))
+    for line_no, line in enumerate(raw_text.splitlines(), 1):
+        match = SECRET_ASSIGNMENT.search(line)
+        if not match:
+            continue
+        value = match.group("value")
+        if value.startswith("<") or "change-me" in value or value.startswith(("env:", "ref:")):
+            continue
+        if ".example.invalid" in value or value.startswith("https://"):
+            continue
+        hits.append("possible literal secret at line %d (%s)" % (line_no, match.group("key")))
+    return hits
+
+
 def check_document(document, raw_text, report):
     print("\n[1/3] OpenAPI document structure")
 
@@ -414,14 +445,18 @@ def check_document(document, raw_text, report):
         report.ok("securitySchemes.bearerAuth is http/bearer placeholder")
     else:
         report.fail("securitySchemes.bearerAuth is http/bearer placeholder", "got %r" % (scheme,))
-    if str(document.get("security", [{}])[0].get("bearerAuth", None)) != "{}":
-        # document-level security should reference the scheme by name
-        if not any("bearerAuth" in entry for entry in document.get("security", [])):
-            report.fail("default security uses bearerAuth", "security = %r" % (document.get("security"),))
-        else:
-            report.ok("default security uses bearerAuth")
-    else:
+    # document-level security should reference the scheme by name; an explicit
+    # empty list ("security: []") disables the default and is also acceptable.
+    # Never index [0] blindly: an empty list would raise IndexError.
+    default_security = document.get("security", [])
+    if not isinstance(default_security, list):
+        report.fail("default security uses bearerAuth", "security = %r" % (default_security,))
+    elif not default_security:
+        report.ok("default security is explicitly empty (security: [])")
+    elif any(isinstance(entry, dict) and "bearerAuth" in entry for entry in default_security):
         report.ok("default security uses bearerAuth")
+    else:
+        report.fail("default security uses bearerAuth", "security = %r" % (default_security,))
 
     # --- refs resolve ---
     refs = []
@@ -517,24 +552,11 @@ def check_document(document, raw_text, report):
         report.ok("path operations are well formed (%d ops, unique operationIds)" % len(operations))
 
     # --- secrets ---
-    hits = []
-    for pattern, label in SECRET_PATTERNS:
-        for match in pattern.finditer(raw_text):
-            hits.append("%s near %r" % (label, match.group(0)[:24]))
-    for line_no, line in enumerate(raw_text.splitlines(), 1):
-        match = SECRET_ASSIGNMENT.search(line)
-        if not match:
-            continue
-        value = match.group("value")
-        if value.startswith("<") or "change-me" in value or value.startswith(("env:", "ref:")):
-            continue
-        if ".example.invalid" in value or value.startswith("https://"):
-            continue
-        hits.append("possible literal secret at line %d (%s)" % (line_no, match.group("key")))
+    hits = scan_secrets(raw_text)
     if hits:
-        report.fail("no committed secrets (placeholder only)", "\n".join(hits[:10]))
+        report.fail("no committed secrets in contract (placeholder only)", "\n".join(hits[:10]))
     else:
-        report.ok("no committed secrets (placeholder only)")
+        report.ok("no committed secrets in contract (placeholder only)")
 
 
 # --------------------------------------------------------------------------- #
@@ -553,6 +575,23 @@ def check_examples(document, report):
         report.fail("every example has a schema target", "unmapped: %s" % ", ".join(untracked))
     if missing:
         report.fail("every mapped example file exists", "missing: %s" % ", ".join(missing))
+
+    # Secret placeholders must hold in examples too, not just in the contract.
+    example_hits = []
+    for name in present:
+        path = os.path.join(EXAMPLES_DIR, name)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                text = handle.read()
+        except OSError as exc:
+            example_hits.append("%s: %s" % (name, exc))
+            continue
+        for hit in scan_secrets(text):
+            example_hits.append("%s: %s" % (name, hit))
+    if example_hits:
+        report.fail("no committed secrets in examples", "\n".join(example_hits[:10]))
+    else:
+        report.ok("no committed secrets in examples (%d files)" % len(present))
 
     failures = 0
     for name in present:

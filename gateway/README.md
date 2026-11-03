@@ -12,7 +12,7 @@
 | 路径 | 内容 |
 |---|---|
 | `openapi/gateway.v1.yaml` | 网关契约（OpenAPI 3.1，唯一事实源） |
-| `openapi/examples/` | 18 个请求/响应示例，全部对 schema 校验 |
+| `openapi/examples/` | 23 个请求/响应示例，全部对 schema 校验 |
 | `docs/contract.md` | 人类可读契约说明：功能清单规范、卡片描述规范、版本规则、评审清单 |
 | `scripts/validate_openapi.py` | 离线校验脚本（文档结构 + 示例 schema） |
 
@@ -38,8 +38,9 @@ python3 gateway/scripts/validate_openapi.py
 2. **示例** — `openapi/examples/*.json` 逐个对契约里声明的 schema 校验
    （映射表在脚本的 `EXAMPLE_TARGETS`，指向契约本身，所以 schema 一改示例就会暴露问题）；
    每个示例文件必须有映射，每个映射必须有文件。
-3. **占位扫描** — 疑似真实密钥（`sk-…`、`AKIA…`、私钥块、长字面量密码等）即失败。
-   所有示例只允许 `<change-me>` 与 `example.invalid`。
+3. **占位扫描** — 疑似真实密钥（`sk-…`、`AKIA…`、私钥块、长字面量密码等）即失败，
+   契约与 `examples/*.json` 都会扫描。所有示例只允许 `<change-me>` 与 `example.invalid`。
+   `date-time` 必须带时区（`Z` 或 `+HH:MM`）。
 
 常用变体：
 
