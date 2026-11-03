@@ -38,13 +38,7 @@ struct TimelineState {
             case .text, .notice, .emote: break
             default: return nil
             }
-            let delivery: String?
-            switch event.localSendState {
-            case .notSentYet: delivery = "等待发送"
-            case .sendingFailed: delivery = "发送失败（消息保留在本次会话中）"
-            case .sent: delivery = "已发送"
-            case nil: delivery = nil
-            }
+            let delivery = MessageDeliveryState(event.localSendState)
             return MatrixMessage(
                 id: item.uniqueId().id,
                 sender: event.sender,
@@ -53,6 +47,45 @@ struct TimelineState {
                 isOwn: event.isOwn,
                 deliveryState: delivery
             )
+        }
+    }
+
+    /// Produces the exact identifier the SDK expects for retry/cancel.  It is
+    /// derived from the current local echo rather than guessed from message
+    /// order or display text. Only non-recoverable (parked) own messages use
+    /// retrySend/abortSend. Recoverable failures require a room-queue resume.
+    func failedSendTransactionID(for messageID: String) -> String? {
+        failedSendTransactionID(for: messageID, recoverable: false)
+    }
+
+    func pausedSendTransactionID(for messageID: String) -> String? {
+        failedSendTransactionID(for: messageID, recoverable: true)
+    }
+
+    private func failedSendTransactionID(for messageID: String, recoverable: Bool) -> String? {
+        guard let item = items.first(where: { $0.uniqueId().id == messageID }),
+              let event = item.asEvent(), event.isOwn else {
+            return nil
+        }
+        guard case .sendingFailed(error: _, let isRecoverable) = event.localSendState,
+              isRecoverable == recoverable else { return nil }
+        guard case .transactionId(let transactionID) = event.eventOrTransactionId else {
+            return nil
+        }
+        return transactionID
+    }
+}
+
+extension MessageDeliveryState {
+    init?(_ sdkState: EventSendState?) {
+        switch sdkState {
+        case .notSentYet(progress: _): self = .queued
+        // SDK 26.10.27 has exhausted retries and disabled this room before
+        // reporting the failure. There is no background retry to wait for.
+        case .sendingFailed(error: _, isRecoverable: true): self = .paused
+        case .sendingFailed(error: _, isRecoverable: false): self = .failed
+        case .sent(eventId: _): self = .sent
+        case nil: return nil
         }
     }
 }

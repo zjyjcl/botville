@@ -47,7 +47,11 @@ struct RoomView: View {
                             }
 
                             ForEach(service.messages) { message in
-                                MessageBubble(message: message)
+                                MessageBubble(message: message, retry: {
+                                    Task { await actOnMessage(message.id, retry: true) }
+                                }, cancel: {
+                                    Task { await actOnMessage(message.id, retry: false) }
+                                })
                                     .id(message.id)
                             }
                         }
@@ -105,6 +109,14 @@ struct RoomView: View {
         .onDisappear {
             service.closeRoom(room.id)
         }
+    }
+
+    private func actOnMessage(_ messageID: String, retry: Bool) async {
+        errorMessage = nil
+        do {
+            if retry { try await service.retryMessage(messageID) }
+            else { try await service.cancelMessage(messageID) }
+        } catch { errorMessage = error.localizedDescription }
     }
 
     private func send() {
@@ -183,6 +195,8 @@ struct RoomView: View {
 @MainActor
 private struct MessageBubble: View {
     let message: MatrixMessage
+    let retry: () -> Void
+    let cancel: () -> Void
 
     var body: some View {
         HStack {
@@ -197,7 +211,7 @@ private struct MessageBubble: View {
                 HStack(spacing: 6) {
                     Text(message.timestamp, format: .dateTime.month().day().hour().minute())
                     if let deliveryState = message.deliveryState {
-                        Text(deliveryState)
+                        Text(deliveryState.displayName)
                     }
                 }
                 .font(.caption2)
@@ -206,6 +220,15 @@ private struct MessageBubble: View {
             .padding(10)
             .background(message.isOwn ? Color.accentColor.opacity(0.15) : Color.secondary.opacity(0.12))
             .clipShape(RoundedRectangle(cornerRadius: 12))
+
+            if message.isOwn, let deliveryState = message.deliveryState, deliveryState.canRetry {
+                VStack(spacing: 6) {
+                    Button("重试", action: retry).font(.caption)
+                    if deliveryState.canCancel {
+                        Button("取消", role: .destructive, action: cancel).font(.caption)
+                    }
+                }
+            }
 
             if !message.isOwn { Spacer(minLength: 40) }
         }
