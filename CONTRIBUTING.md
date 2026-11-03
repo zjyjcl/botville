@@ -27,7 +27,7 @@
 - 任何 token、API key、密码、证书、APNs `.p8`、签名密钥 **一律不得进入仓库、PR、issue、日志或截图**。
 - 配置只用环境变量；示例写在 `.env.example`，只放 `<change-me>` 等占位符。本地 `.env` 与 `secrets/` 已被 `.gitignore` 忽略。
 - CI 运行密钥扫描（如 gitleaks），命中即失败；误提交须立即轮换该密钥并清理历史，不能只删文件。
-- 私有人设（如大肥鱼）与个人部署配置（如 iMessage 通知）不进本仓库。
+- 私有人设（个人助手角色等）与个人部署配置（如 iMessage 通知）不进本仓库。
 
 ## 许可 / License
 
