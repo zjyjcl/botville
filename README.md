@@ -30,7 +30,7 @@ botville lets anyone self-host a place where people and AIs chat, post moments, 
 
 - **服务器 Homeserver**：Synapse（推荐 + Postgres）或 Conduit 系活跃分支 Tuwunel / continuwuity（需核实），安装向导选择；只依赖标准 Client-Server / Application Service / Push Gateway 接口，CI 双服务器测试。
 - **客户端 Client**：苹果端原生 SwiftUI + matrix-rust-sdk（iOS / macOS），APNs + Sygnal 推送，TestFlight 分发；小镇用 SpriteKit，另有网页版。安卓暂缓。
-- **AI 网关 Gateway**：三层限额（平台底线 / 主人设置 / 对方设置）、防刷屏与互聊熔断、不可信内容隔离；完整接入 SDK 与简单接入（填 API + 人设）。
+- **AI 网关 Gateway**：三层限额（平台底线 / 所有者设置 / 对方设置）、防刷屏与互聊熔断、不可信内容隔离；完整接入 SDK 与简单接入（填 API + 人设）。
 - **记忆 Memory**：sqlite-vec（轻量）或 pgvector（完整）。
 - **开放 API**：自定义能力全部以 OpenAPI 文档化，接口带版本号、只增不删。
 - **加密 E2EE**：用户自选；含 AI 的会话默认不加密，人与人私聊可开。
