@@ -33,10 +33,20 @@ xcodebuild -project Botville.xcodeproj \
   -scheme BotvilleApp-iOS -configuration Debug \
   -destination 'generic/platform=iOS Simulator' \
   -derivedDataPath .build/xcode \
-  CODE_SIGNING_ALLOWED=NO build
+  -sdk iphonesimulator CODE_SIGN_IDENTITY="-" CODE_SIGNING_ALLOWED=YES build
 ```
 
-也可用 Xcode 打开 `Botville.xcodeproj`，选择 `BotvilleApp-iOS` 和一个已安装的 iPhone 模拟器，点击 Run。目标默认关闭签名，模拟器路径不需要 Apple 账号。真机安装、分发和 TestFlight 不在本次范围内。
+也可用 Xcode 打开 `Botville.xcodeproj`，选择 `BotvilleApp-iOS` 和一个已安装的 iPhone 模拟器，点击 Run。Debug 目标仅对 Simulator SDK 默认启用 ad-hoc 签名（`CODE_SIGN_IDENTITY="-"`），不需要 Apple 账号或开发证书。不要传 `CODE_SIGNING_ALLOWED=NO`：这会丢失 Keychain 所需的应用标识 entitlement，导致新安装后 `SecItemCopyMatching` 返回 `errSecMissingEntitlement (-34018)`。真机及 Release 的签名设置不受本修复影响。真机安装、分发和 TestFlight 不在本次范围内。
+
+Keychain 诊断只记录 Security 操作名和数值 OSStatus，不记录查询、账号、令牌、密码或会话数据。用目标模拟器的 UDID 替换下方 `<UDID>`：
+
+```sh
+xcrun simctl spawn <UDID> log stream --level info --style compact \
+  --predicate 'subsystem == "org.botville.app.session"'
+# 启动后也可用 log show --last 5m --info 和相同 predicate 回查。
+```
+
+正常首次启动的 `SecItemCopyMatching OSStatus=-25300`（`errSecItemNotFound`）表示没有会话；删除无条目同样视为成功。签名构建会由 Xcode 生成模拟器的 `application-identifier`，无需另加共享 Keychain 分组或回退存储。卸载不保证删除 Keychain；清理测试账号前应先在 App 内退出，并确认 `SecItemDelete OSStatus=0`、重启后读取为 `-25300`，再卸载 App。
 
 ### 受限开发环境中的构建
 
@@ -59,7 +69,8 @@ CFFIXED_USER_HOME="$PWD/.build/xcode-home" \
   -derivedDataPath .build/xcode -clonedSourcePackagesDirPath .build \
   -packageCachePath .build/cache -disablePackageRepositoryCache \
   -IDEPackageSupportDisableManifestSandbox=YES \
-  CODE_SIGNING_ALLOWED=NO 'OTHER_SWIFT_FLAGS=$(inherited) -disable-sandbox' build
+  -sdk iphonesimulator CODE_SIGN_IDENTITY="-" CODE_SIGNING_ALLOWED=YES \
+  'OTHER_SWIFT_FLAGS=$(inherited) -disable-sandbox' build
 ```
 
 `--disable-sandbox`、Xcode 的清单选项和 `OTHER_SWIFT_FLAGS` 只关闭构建工具自身的嵌套沙箱（含 SwiftUI 宏插件），不改变宿主权限或签名要求。`CFFIXED_USER_HOME` 仅对本条 Xcode 命令生效，将其缓存与配置定位到 `.build/`，无需改系统偏好。
