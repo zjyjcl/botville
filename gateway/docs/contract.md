@@ -537,7 +537,7 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
                         "body": "将把 release/2026.11 部署到生产，10 分钟内可回滚。",
                         "biometric": true } },
     { "id": "deny", "label": "拒绝", "kind": "deny", "style": "danger", "risk": "low" },
-    { "id": "open", "label": "查看日志", "kind": "open_url", "style": "secondary",
+    { "id": "open", "label": "查看日志", "kind": "open_url", "style": "secondary", "risk": "low",
       "target": "in_app", "capability_id": "notify.approvals",
       "url": "https://gateway.example.invalid/modules/ci/runs/run_demo" }
   ],

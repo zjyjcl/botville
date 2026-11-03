@@ -13,15 +13,35 @@ import AppKit
 @MainActor
 struct BotvilleApp: App {
     @StateObject private var matrixService = MatrixService()
+    @State private var selectedTab = Self.initialTab
+
+    private static var initialTab: Int {
+#if DEBUG
+        ProcessInfo.processInfo.arguments.contains("-dynamic-ui-mock") ? 1 : 0
+#else
+        0
+#endif
+    }
+
+    private var root: some View {
+        TabView(selection: $selectedTab) {
+            AppRootView(service: matrixService)
+                .tabItem { Label("会话", systemImage: "bubble.left.and.bubble.right") }
+                .tag(0)
+            DynamicUIView(onOpenChat: { selectedTab = 0 })
+                .tabItem { Label("动态", systemImage: "square.grid.2x2") }
+                .tag(1)
+        }
+    }
 
     var body: some Scene {
 #if os(macOS)
         Window("botville", id: "main") {
-            AppRootView(service: matrixService)
+            root
         }
 #else
         WindowGroup {
-            AppRootView(service: matrixService)
+            root
         }
 #endif
     }

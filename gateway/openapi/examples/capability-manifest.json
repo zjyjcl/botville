@@ -54,8 +54,13 @@
       "summary": "工作通知与高风险操作授权。",
       "status": "degraded",
       "unavailable_reason": "push_channel_degraded",
-      "entry": { "type": "card_list", "card_types": ["notification", "approval"] },
+      "entry": {
+        "type": "card_list",
+        "card_types": ["notification", "approval"],
+        "web_url": "https://gateway.example.invalid/modules/ci/"
+      },
       "scopes": ["notify.read", "card.act"],
+      "session_token": { "supported": true, "ttl_seconds": 300 },
       "updated_at": "2026-11-02T09:30:00Z"
     },
     {
