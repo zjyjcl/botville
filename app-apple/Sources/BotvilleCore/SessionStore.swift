@@ -5,6 +5,7 @@ import Foundation
 import MatrixRustSDK
 #if canImport(Security)
 import Security
+import OSLog
 #endif
 
 /// Sensitive session material. Instances are encoded only for a Keychain item,
@@ -149,7 +150,7 @@ private struct SecurityKeychainBackend: KeychainBackend {
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
-        return (map(status), item as? Data)
+        return (map(status, operation: "SecItemCopyMatching"), item as? Data)
     }
 
     func update(data: Data, service: String, account: String, accessibility: KeychainAccessibility) -> KeychainBackendStatus {
@@ -157,18 +158,18 @@ private struct SecurityKeychainBackend: KeychainBackend {
             kSecValueData as String: data,
             kSecAttrAccessible as String: securityAccessibility(accessibility)
         ]
-        return map(SecItemUpdate(baseQuery(service: service, account: account) as CFDictionary, attributes as CFDictionary))
+        return map(SecItemUpdate(baseQuery(service: service, account: account) as CFDictionary, attributes as CFDictionary), operation: "SecItemUpdate")
     }
 
     func add(data: Data, service: String, account: String, accessibility: KeychainAccessibility) -> KeychainBackendStatus {
         var item = baseQuery(service: service, account: account)
         item[kSecValueData as String] = data
         item[kSecAttrAccessible as String] = securityAccessibility(accessibility)
-        return map(SecItemAdd(item as CFDictionary, nil))
+        return map(SecItemAdd(item as CFDictionary, nil), operation: "SecItemAdd")
     }
 
     func delete(service: String, account: String) -> KeychainBackendStatus {
-        map(SecItemDelete(baseQuery(service: service, account: account) as CFDictionary))
+        map(SecItemDelete(baseQuery(service: service, account: account) as CFDictionary), operation: "SecItemDelete")
     }
 
     private func baseQuery(service: String, account: String) -> [String: Any] {
@@ -179,7 +180,16 @@ private struct SecurityKeychainBackend: KeychainBackend {
         switch accessibility { case .afterFirstUnlockThisDeviceOnly: return kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly }
     }
 
-    private func map(_ status: OSStatus) -> KeychainBackendStatus {
+    // Log only the Security operation and numeric status. Never include the
+    // query, item data, service/account names, credentials, or error payloads.
+    private static let logger = Logger(subsystem: "org.botville.app.session", category: "Keychain")
+
+    private func map(_ status: OSStatus, operation: String) -> KeychainBackendStatus {
+        if status == errSecSuccess || status == errSecItemNotFound {
+            Self.logger.info("\(operation, privacy: .public) OSStatus=\(status, privacy: .public)")
+        } else {
+            Self.logger.error("\(operation, privacy: .public) OSStatus=\(status, privacy: .public)")
+        }
         switch status {
         case errSecSuccess: return .success
         case errSecItemNotFound: return .itemNotFound
