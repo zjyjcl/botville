@@ -1,0 +1,44 @@
+# Synapse homeserver configuration template (A0.2).
+#
+# server/scripts/init.sh renders this file into
+# server/compose/generated/synapse/homeserver.yaml (gitignored) by
+# substituting ${VAR} placeholders from server/compose/.env.
+# Edit this template, never the generated file.
+#
+# Only Matrix-standard surface is used: no /_synapse/admin, no admin rooms.
+# log_config is intentionally unset so logs go to stdout.
+server_name: "${BOTVILLE_SERVER_NAME}"
+pid_file: /data/homeserver.pid
+listeners:
+  - port: 8008
+    tls: false
+    type: http
+    x_forwarded: true
+    bind_addresses: ["0.0.0.0", "::"]
+    resources:
+      - names: [client, federation]
+        compress: false
+database:
+  name: psycopg2
+  args:
+    user: "${POSTGRES_USER}"
+    password: "${POSTGRES_PASSWORD}"
+    database: "${POSTGRES_DB}"
+    host: postgres
+    port: 5432
+    cp_min: 5
+    cp_max: 10
+media_store_path: /data/media_store
+signing_key_path: /data/signing.key
+report_stats: false
+# Both flags follow BOTVILLE_OPEN_REGISTRATION: false by default (registration
+# closed), CI flips it to true so the UIA m.login.dummy flow works.
+enable_registration: ${BOTVILLE_OPEN_REGISTRATION}
+enable_registration_without_verification: ${BOTVILLE_OPEN_REGISTRATION}
+# Secrets are random-generated into .env by init.sh on first run.
+macaroon_secret_key: "${SYNAPSE_MACAROON_SECRET}"
+form_secret: "${SYNAPSE_FORM_SECRET}"
+registration_shared_secret: "${SYNAPSE_REGISTRATION_SHARED_SECRET}"
+# No federation to public key servers; this stack is local/pairing-only.
+trusted_key_servers: []
+suppress_key_server_warning: true
