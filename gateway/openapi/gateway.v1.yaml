@@ -560,8 +560,13 @@ paths:
       summary: 登记会话
       description: |
         把 Matrix room 登记为网关会话（幂等：同一 `matrix_room_id` 已存在时返回 200 与已有会话）。
-        含 AI 的会话默认 `encryption: none`；E2EE 房间中 `ai_participation` 为 `disabled`，
-        网关不会代表 AI 发言。
+        botville 的 AI 接入不支持加密会话：含 AI 的会话使用 `encryption: none`，App 不提供开启加密；
+        E2EE 房间中 `ai_participation` 必须为 `disabled`，网关不得代表 AI 发言。
+        这是网关参与策略，不代表撤销 Matrix 成员资格或密钥，也不是 AI 无法解密的保证。
+
+        `encryption=e2ee` 且显式 `ai_participation=enabled` → `422` `request.invalid`
+        （语义组合不合法）。省略 `ai_participation` 时按 `encryption` 推导：
+        `e2ee` → `disabled`，`none` → `enabled`。
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -595,7 +600,31 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
         '422':
-          $ref: '#/components/responses/UnprocessableEntity'
+          description: |
+            语义不合法。典型：`encryption=e2ee` 且 `ai_participation=enabled`
+            （`code=request.invalid`）。
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                e2ee_with_ai_enabled:
+                  summary: e2ee 会话不允许 ai_participation=enabled
+                  value:
+                    type: urn:botville:error:request.invalid
+                    title: Request validation failed
+                    status: 422
+                    detail: encryption=e2ee cannot be combined with ai_participation=enabled
+                    instance: /v1/conversations
+                    code: request.invalid
+                    request_id: req_demo_e2ee_create
+                    errors:
+                      - field: ai_participation
+                        code: incompatible_with_encryption
+                        message: e2ee conversations require ai_participation=disabled
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -683,11 +712,14 @@ paths:
       summary: 请求以 AI 身份发言
       description: |
         AI 运行时提交一条待发送消息，由网关做完整裁决（三层限额、静默时段、防刷屏、互聊熔断、
-        关系与 E2EE 策略），通过后经 appservice 以角色身份投递到 Matrix。
+        关系策略），通过后经 appservice 以角色身份投递到 Matrix。
 
-        **策略结论不是 HTTP 错误**：请求合法时始终返回 200 与 `MessageReceipt`，
+        **策略结论不是 HTTP 错误**：请求合法且会话允许 AI 参与时始终返回 200 与 `MessageReceipt`，
         `outcome` 为 `delivered` / `queued` / `deferred` / `blocked`，原因见 `decision.reasons`。
-        401/403 只表示调用方身份、所有权或 scope 问题。
+        401/403 只表示调用方身份、所有权、scope 或会话硬约束问题。
+
+        **加密会话硬约束**：目标会话 `encryption=e2ee` 或 `ai_participation=disabled` 时返回
+        `403` `conversation.e2ee`（不可重试）。这不是 §1.4 的 `200 blocked`，不消耗限额、不入队。
 
         重试必须复用同一 `Idempotency-Key`；同一 key 不同请求体返回 409。
       parameters:
@@ -714,7 +746,27 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
-          $ref: '#/components/responses/Forbidden'
+          description: |
+            身份有效但无权限。含 `persona.not_owned`、`relation.chat_denied`，以及加密/
+            AI 禁用会话硬约束 `conversation.e2ee`（不可重试，非策略 blocked）。
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                conversation_e2ee:
+                  summary: 加密或 AI 禁用会话拒绝代发言
+                  value:
+                    type: urn:botville:error:conversation.e2ee
+                    title: AI participation disabled for this conversation
+                    status: 403
+                    detail: encryption=e2ee or ai_participation=disabled; gateway must not speak as AI here
+                    instance: /v1/conversations/conv_demo/messages
+                    code: conversation.e2ee
+                    request_id: req_demo_e2ee_send
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -735,6 +787,9 @@ paths:
         在不投递的情况下评估一次发言是否会被允许，供 AI 在花 token 之前决定「要不要说」。
         返回完整的 `PolicyDecision`（命中层级、剩余额度、重置时间、原因）。
         预检结果不占用额度，也不保证稍后发送一定成功（额度可能被并发消耗）。
+
+        目标会话 `encryption=e2ee` 或 `ai_participation=disabled` 时返回 `403` `conversation.e2ee`
+        （与 sendMessage 同一硬约束；不返回 200 blocked）。
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -755,7 +810,26 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
-          $ref: '#/components/responses/Forbidden'
+          description: |
+            含加密/AI 禁用会话硬约束 `conversation.e2ee`（与 sendMessage 相同，不可重试）。
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                conversation_e2ee:
+                  summary: 加密或 AI 禁用会话拒绝预检代发言
+                  value:
+                    type: urn:botville:error:conversation.e2ee
+                    title: AI participation disabled for this conversation
+                    status: 403
+                    detail: encryption=e2ee or ai_participation=disabled; gateway must not speak as AI here
+                    instance: /v1/policy/evaluate
+                    code: conversation.e2ee
+                    request_id: req_demo_e2ee_policy
         '404':
           $ref: '#/components/responses/NotFound'
         '422':
@@ -1432,7 +1506,9 @@ components:
           schema:
             $ref: '#/components/schemas/Problem'
     Forbidden:
-      description: 身份有效但无权限（scope 不足、非资源所有者、关系或 E2EE 策略拒绝）。
+      description: |
+        身份有效但无权限（scope 不足、非资源所有者、关系拒绝，或会话硬约束
+        `conversation.e2ee`：加密/`ai_participation=disabled` 会话禁止代 AI 发言）。
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
@@ -1952,11 +2028,15 @@ components:
         encryption:
           type: string
           enum: [none, e2ee]
-          description: 含 AI 的会话默认 `none`；人与人私聊可由用户开启。
+          description: |
+            Matrix 房间的加密状态。含 AI 的会话使用 `none`，App 不提供开启；
+            成员通过 App 策略检查的会话可由用户确认开启。
         ai_participation:
           type: string
           enum: [enabled, disabled]
-          description: E2EE 房间中为 `disabled`，网关不代 AI 发言。
+          description: |
+            E2EE 房间中必须为 `disabled`，网关不得代 AI 发言；不表示已撤销 Matrix
+            成员资格或密钥。对该会话的 AI 发言/预检返回 `403 conversation.e2ee`。
         relation:
           $ref: '#/components/schemas/Relation'
         limits:
@@ -2005,9 +2085,15 @@ components:
           type: string
           enum: [none, e2ee]
           default: none
+          description: |
+            Matrix 房间加密状态。与 `ai_participation=enabled` 同时为 `e2ee` 时返回
+            `422 request.invalid`。
         ai_participation:
           type: string
           enum: [enabled, disabled]
+          description: |
+            省略时按 `encryption` 推导（`e2ee`→`disabled`，`none`→`enabled`）。
+            显式 `enabled` 不得与 `encryption=e2ee` 组合。
       additionalProperties: false
 
     # ----- 消息与策略 -----

@@ -28,6 +28,25 @@
 传输层仍是标准 Matrix：网关以 appservice 身份代 AI 发消息。本契约里的 `/conversations`
 只是把 Matrix room 在网关侧登记（限额、记忆范围、关系都挂在会话上），不替代 Matrix 房间。
 
+### 会话加密与 AI 参与
+
+`Conversation.encryption` 表示 Matrix 房间的加密状态：`none` 为未加密，`e2ee` 为端到端加密。
+botville 的 AI 接入目前不支持加密会话。含 AI 的会话使用 `none`，App 不提供开启加密；
+`encryption=e2ee` 时，契约要求 `ai_participation=disabled`，网关不得代表 AI 发言。
+`disabled` 表示禁止网关 AI 参与，**不表示已撤销 Matrix 成员资格或密钥**。
+
+**硬约束，不是策略拦截。** 向 `encryption=e2ee` 或 `ai_participation=disabled` 的会话请求
+AI 发言（`POST /conversations/{id}/messages`）或预检（`POST /policy/evaluate`）时，网关返回
+`403` `conversation.e2ee`（调用方无权在此会话代 AI 发言）。该码**不可重试**，也**不是**
+§1.4 的 `200` + `outcome: "blocked"`：这是所有权/会话约束，不是限额或静默等产品策略结论。
+
+**登记会话。** `POST /conversations`：`encryption=e2ee` 且 `ai_participation=enabled` 返回
+`422` `request.invalid`（语义组合不合法）；省略 `ai_participation` 时按 `encryption` 推导
+（`e2ee` → `disabled`，`none` → `enabled`）。
+
+客户端侧限制与已知局限见[苹果端加密策略](../../app-apple/docs/encryption-policy.md)。
+当前网关参考实现尚未校验房间加密状态；后续接入须按真实房间状态执行上述限制。
+
 > **D 线注意**：通知数据模型（D1.1）与授权回调签名（D2.1）会扩展 `/cards` 与
 > `/cards/{card_id}/actions/{action_id}`。v1 已预留 `source.module`、`source.capability_id`、
 > `context.metadata` 和 `audit_id`，扩展时按「只增不删」加字段即可，不需要升主版本。
@@ -518,7 +537,7 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
                         "body": "将把 release/2026.11 部署到生产，10 分钟内可回滚。",
                         "biometric": true } },
     { "id": "deny", "label": "拒绝", "kind": "deny", "style": "danger", "risk": "low" },
-    { "id": "open", "label": "查看日志", "kind": "open_url", "style": "secondary",
+    { "id": "open", "label": "查看日志", "kind": "open_url", "style": "secondary", "risk": "low",
       "target": "in_app", "capability_id": "notify.approvals",
       "url": "https://gateway.example.invalid/modules/ci/runs/run_demo" }
   ],
@@ -761,6 +780,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.1.0 | 2026-11-04 | 澄清会话加密与 AI 参与：E2EE/`ai_participation=disabled` 下 AI 发言与预检返回 `403 conversation.e2ee`（硬约束，非 §1.4 blocked）；`createConversation` 禁止 `e2ee`+`enabled`（`422 request.invalid`），省略 `ai_participation` 时按 `encryption` 推导；苹果端细节改为外链。属文档澄清，不改字段集合。 |
 | 0.1.0 | 2026-11-04 | `Card.interrupt` 与 `CreateCardRequest.interrupt` 移除 `default: false`，改为三态（省略 / `true` / `false`）：省略时由 `priority` 决定（`urgent`→穿透，其余→顺延），显式 `false` 即使 `urgent` 也不打断。属「改默认值」=准破坏，按 §5.3 minor + 公告处理；同主版本内字段语义未变，仅澄清三态。 |
 | 0.1.0 | 2026-11-03 | 初稿：健康、功能清单、角色与状态、会话、消息与发言裁决、策略预检、三层限额、用量与账单、卡片与授权操作。评审：C/D 线（B0.1） |
 

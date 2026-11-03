@@ -9,7 +9,7 @@ botville 与外部组件（Matrix 服务器、推送网关等）的兼容性核�
 ## 规划中的后续文档
 
 - `ci-smoke-results.md`（A0.2）：双服务器 CI smoke 的实测结果，逐条回填 homeserver-compat.md §2/§4.2 的状态列。
-- 组件兼容性文档按需增加（Sygnal/APNs 实测归 A1.2，配对联邦实测归 A2.1）。
+- 组件兼容性文档按需增加（Sygnal/APNs 的部署与验收状态见 [deploy/push-sygnal.md](../deploy/push-sygnal.md)：mock 链路 CI 已实测，真实 APNs 送达因缺 Apple 账号未验证；配对联邦实测归 A2.1）。
 
 ## 维护约定
 

@@ -42,3 +42,15 @@ registration_shared_secret: "${SYNAPSE_REGISTRATION_SHARED_SECRET}"
 # No federation to public key servers; this stack is local/pairing-only.
 trusted_key_servers: []
 suppress_key_server_warning: true
+
+# Application service (A1.3): the botville AI gateway owns the exclusive
+# @ai_* user namespace; the registration file is rendered by init.sh into
+# ./generated/appservice (mounted at /appservice). Adding or changing an
+# app service requires a container restart.
+app_service_config_files: ["/appservice/botville-gateway.yaml"]
+
+# ip_range_whitelist is NOT set inline: init.sh appends it from
+# synapse/ip-range-whitelist.part only while BOTVILLE_SYGNAL_IP is set, so
+# the outbound allow (pushes to sygnal, but also URL previews / remote
+# media / federation) stays a single /32 — or is absent entirely when the
+# push gateway is public. See docs/deploy/push-sygnal.md (内网推送放行).

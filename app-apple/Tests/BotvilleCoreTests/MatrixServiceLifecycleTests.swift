@@ -1003,6 +1003,7 @@ private final class FakeRoom: Room, @unchecked Sendable {
     override func roomInfo() async throws -> RoomInfo { throw ClientError.Generic(msg: "unused", details: nil) }
     override func latestEvent() async -> LatestEventValue { .none }
     override func isDirect() async -> Bool { false }
+    override func latestEncryptionState() async throws -> EncryptionState { .unknown }
 }
 
 private final class QueueProbe: @unchecked Sendable { var values: [Bool] = [] }

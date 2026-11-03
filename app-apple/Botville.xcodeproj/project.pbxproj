@@ -11,6 +11,8 @@
 		A10000000000000000000003 /* RoomListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000013 /* RoomListView.swift */; };
 		A10000000000000000000004 /* RoomView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000014 /* RoomView.swift */; };
 		A10000000000000000000005 /* BotvilleCore in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000031 /* BotvilleCore */; };
+		A10000000000000000000006 /* DynamicUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000016 /* DynamicUI.swift */; };
+		A10000000000000000000007 /* ModuleWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000017 /* ModuleWebView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -20,6 +22,8 @@
 		A10000000000000000000013 /* RoomListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RoomListView.swift; path = Sources/BotvilleApp/RoomListView.swift; sourceTree = SOURCE_ROOT; };
 		A10000000000000000000014 /* RoomView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RoomView.swift; path = Sources/BotvilleApp/RoomView.swift; sourceTree = SOURCE_ROOT; };
 		A10000000000000000000015 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = BotvilleApp/Info.plist; sourceTree = SOURCE_ROOT; };
+		A10000000000000000000016 /* DynamicUI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = DynamicUI.swift; path = Sources/BotvilleApp/DynamicUI.swift; sourceTree = SOURCE_ROOT; };
+		A10000000000000000000017 /* ModuleWebView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ModuleWebView.swift; path = Sources/BotvilleApp/ModuleWebView.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -48,6 +52,8 @@
 				A10000000000000000000013 /* RoomListView.swift */,
 				A10000000000000000000014 /* RoomView.swift */,
 				A10000000000000000000015 /* Info.plist */,
+				A10000000000000000000017 /* ModuleWebView.swift */,
+				A10000000000000000000016 /* DynamicUI.swift */,
 			);
 			name = BotvilleApp;
 			sourceTree = "<group>";
@@ -110,6 +116,8 @@
 				A10000000000000000000002 /* LoginView.swift in Sources */,
 				A10000000000000000000003 /* RoomListView.swift in Sources */,
 				A10000000000000000000004 /* RoomView.swift in Sources */,
+				A10000000000000000000007 /* ModuleWebView.swift in Sources */,
+				A10000000000000000000006 /* DynamicUI.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

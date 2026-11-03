@@ -1,0 +1,11 @@
+# The org.botville.mock test pushkin, appended by server/scripts/init.sh to
+# generated/sygnal/sygnal.yaml unless BOTVILLE_PUSH_MOCK is false/0/no
+# (default true: CI/local latency tests in server/tests/push_e2e.py need it;
+# turn it off for a production sygnal serving only the real APNs app — with
+# both apps off sygnal has no apps and init.sh prints a WARNING). Loaded
+# from the file bind-mounted at /custom via PYTHONPATH (see
+# docker-compose.yml, sygnal service); records every dispatch as one JSONL
+# line at pushes_path instead of contacting a push backend.
+  "org.botville.mock":
+    type: botville_mock_pushkin.MockPushkin
+    pushes_path: /data/mock-pushes.jsonl
