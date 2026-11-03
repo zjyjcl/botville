@@ -2,6 +2,8 @@
 
 SwiftUI + matrix-rust-sdk，最低 iOS 17 / macOS 14。支持密码登录、已加入房间列表、文本时间线、加载更早消息和发送纯文本。默认 homeserver `https://matrix.example.org` 仅为占位，运行时请填写自己有权使用的 HTTPS Matrix homeserver 和账号。
 
+客户端验证与后续待办见 [苹果端验证文档](docs/README.md)。
+
 ## 怎么跑
 
 需要完整 Xcode、对应平台 SDK 和首次下载依赖的网络。Swift Package 使用 Swift tools 5.9，精确固定 [MatrixRustSDK 26.10.27](https://github.com/matrix-org/matrix-rust-components-swift/tree/26.10.27)，同时保留 `Package.resolved`。这是无 alpha 后缀的正式发布标签；[上游仍声明 Swift API 可能变更](https://github.com/matrix-org/matrix-rust-components-swift#usage)，升级应重新编译和联调。
