@@ -21,6 +21,7 @@ make backup          # 备份到 ./backups/<UTC时间戳>/（目录 700、文件
 make restore RESTORE_DIR=backups/<时间戳>   # 破坏性恢复（自动 --yes）
 make e2e             # 验收：注册→私聊→建群；E2E_PHASE=verify 复核备份恢复
 make push-e2e        # 推送验收：HS→sygnal 时延 <5s（mock pushkin，需 PUSH=1 起栈）
+make appservice-e2e  # 验收：网关以 @ai_* 身份代发（A1.3；synapse/tuwunel）
 make logs            # 跟踪日志
 make ps              # 容器状态
 make down            # 停止（保留数据卷；手动 down -v 可清空）
@@ -30,7 +31,11 @@ make down            # 停止（保留数据卷；手动 down -v 可清空）
 
 - 首次 `make up` 会执行 `server/scripts/init.sh`：从 `.env.example` 生成本地
   `server/compose/.env`（所有 `<change-me>` 用 `openssl rand -hex 32` 就地随机生成，
-  不会提交），并把 `synapse/homeserver.yaml.tmpl` 渲染到 `generated/synapse/`（gitignore）。
+  不会提交），并把 `synapse/homeserver.yaml.tmpl` 渲染到 `generated/synapse/`（gitignore）、
+  把 `appservice/botville-gateway.yaml.tmpl` 渲染到 `generated/appservice/`
+  （gitignore，**0600**——携带 as_token；A1.3，Synapse 经
+  `app_service_config_files`、Tuwunel 经 `TUWUNEL_APPSERVICE_DIR` 读取，详见
+  [docs/deploy/appservice.md](../docs/deploy/appservice.md)）。
   `.env` 已存在时保留原值；其中的 `*_IMAGE` 与当前默认不同（如 `:latest`、无 digest）
   只会打 WARNING，不会自动改写——迁移见
   [docs/ops/upgrade-images.md](../docs/ops/upgrade-images.md) §5。
@@ -104,13 +109,14 @@ server/
 │   ├── synapse/
 │   │   ├── homeserver.yaml.tmpl  # homeserver 配置模板（whitelist 由 part 追加）
 │   │   └── ip-range-whitelist.part  # sygnal /32 放行（BOTVILLE_SYGNAL_IP 非空时追加）
+│   ├── appservice/botville-gateway.yaml.tmpl  # AI 网关 appservice 注册模板（A1.3）
 │   ├── sygnal/
 │   │   ├── sygnal.yaml.tmpl      # sygnal 配置模板（apps 由 part 追加，A1.2）
 │   │   ├── mock-app.yaml.part    # org.botville.mock（BOTVILLE_PUSH_MOCK，默认开）
 │   │   ├── apns-app.yaml.part    # APNs app 片段（APNs 启用且密钥就绪时追加）
 │   │   └── botville_mock_pushkin.py  # 自定义 pushkin：收通知写 JSONL
 │   ├── secrets/                  # 真实 apns.p8 放这里（init.sh 建 700，gitignore，绝不入库）
-│   └── generated/                # 渲染产物 + mock 推送数据，gitignore
+│   └── generated/                # 渲染产物 + mock 推送数据，gitignore（appservice/ 下 0600）
 ├── scripts/
 │   ├── init.sh                   # .env 引导/补齐缺失键 + 模板渲染（含 sygnal）
 │   ├── render_push_denylist.py   # push denylist 渲染 + subnet/sygnal IP 校验（A1.2）
@@ -122,6 +128,7 @@ server/
     ├── smoke.py                  # 仅标准库的 CS API 冒烟测试
     ├── e2e_synapse.py            # seed/verify 两阶段验收测试（A1.1）
     ├── push_e2e.py               # 推送时延验收（HS→sygnal <5s，A1.2）
+    ├── appservice_e2e.py         # appservice 代发验收（A1.3，复用 gateway/src）
     ├── test_bootstrap_continuwuity.py  # bootstrap/init 脚本 mock 单测（CI lint 跑）
     ├── test_push_sygnal.py       # mock pushkin + init.sh sygnal 渲染单测（A1.2）
     └── test_push_denylist.py     # push denylist 渲染/校验单测（A1.2 review B1）

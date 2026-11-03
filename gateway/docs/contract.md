@@ -35,15 +35,17 @@ botville 的 AI 接入目前不支持加密会话。含 AI 的会话使用 `none
 `encryption=e2ee` 时，契约要求 `ai_participation=disabled`，网关不得代表 AI 发言。
 `disabled` 表示禁止网关 AI 参与，**不表示已撤销 Matrix 成员资格或密钥**。
 
-苹果端在 `MatrixService` 内强制检查建房邀请列表（私聊、群聊共用）、已有房间开启与邀请入口；
-已加密或加密状态未知的房间拒绝 AI／身份未确认的邀请，不能通过二次确认绕过。
-含 AI 的房间及成员无法确认的房间不允许开启加密。客户端没有关闭加密入口。
+**硬约束，不是策略拦截。** 向 `encryption=e2ee` 或 `ai_participation=disabled` 的会话请求
+AI 发言（`POST /conversations/{id}/messages`）或预检（`POST /policy/evaluate`）时，网关返回
+`403` `conversation.e2ee`（调用方无权在此会话代 AI 发言）。该码**不可重试**，也**不是**
+§1.4 的 `200` + `outcome: "blocked"`：这是所有权/会话约束，不是限额或静默等产品策略结论。
 
-这些检查不能阻止其他 Matrix 客户端或直接 REST 调用，也不能与跨客户端邀请形成 homeserver
-原子事务。当前网关参考实现尚未接入 Conversation 登记与房间加密状态校验；这里定义的是
-契约要求，不宣称已提供全局服务端拦截。后续网关接入必须核对真实房间状态并执行上述限制。
-App 未实现仅向可信设备分享密钥的策略，不保证 AI 或其他未验证成员设备无法解密；
-详细实现与验收边界见[苹果端加密策略](../../app-apple/docs/encryption-policy.md)。
+**登记会话。** `POST /conversations`：`encryption=e2ee` 且 `ai_participation=enabled` 返回
+`422` `request.invalid`（语义组合不合法）；省略 `ai_participation` 时按 `encryption` 推导
+（`e2ee` → `disabled`，`none` → `enabled`）。
+
+客户端侧限制与已知局限见[苹果端加密策略](../../app-apple/docs/encryption-policy.md)。
+当前网关参考实现尚未校验房间加密状态；后续接入须按真实房间状态执行上述限制。
 
 > **D 线注意**：通知数据模型（D1.1）与授权回调签名（D2.1）会扩展 `/cards` 与
 > `/cards/{card_id}/actions/{action_id}`。v1 已预留 `source.module`、`source.capability_id`、
@@ -778,6 +780,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.1.0 | 2026-11-04 | 澄清会话加密与 AI 参与：E2EE/`ai_participation=disabled` 下 AI 发言与预检返回 `403 conversation.e2ee`（硬约束，非 §1.4 blocked）；`createConversation` 禁止 `e2ee`+`enabled`（`422 request.invalid`），省略 `ai_participation` 时按 `encryption` 推导；苹果端细节改为外链。属文档澄清，不改字段集合。 |
 | 0.1.0 | 2026-11-04 | `Card.interrupt` 与 `CreateCardRequest.interrupt` 移除 `default: false`，改为三态（省略 / `true` / `false`）：省略时由 `priority` 决定（`urgent`→穿透，其余→顺延），显式 `false` 即使 `urgent` 也不打断。属「改默认值」=准破坏，按 §5.3 minor + 公告处理；同主版本内字段语义未变，仅澄清三态。 |
 | 0.1.0 | 2026-11-03 | 初稿：健康、功能清单、角色与状态、会话、消息与发言裁决、策略预检、三层限额、用量与账单、卡片与授权操作。评审：C/D 线（B0.1） |
 

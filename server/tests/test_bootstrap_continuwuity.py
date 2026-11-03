@@ -334,6 +334,13 @@ BOTVILLE_ADMIN_PASSWORD=<change-me>
 POSTGRES_USER=botville
 POSTGRES_PASSWORD=<change-me>
 SYNAPSE_MACAROON_SECRET=<change-me>
+BOTVILLE_DOCKER_SUBNET=172.31.250.0/24
+BOTVILLE_DOCKER_IP_RANGE=172.31.250.64/26
+BOTVILLE_SYGNAL_IP=
+BOTVILLE_PUSH_MOCK=true
+BOTVILLE_APNS_ENABLED=false
+APPSERVICE_AS_TOKEN=<change-me>
+APPSERVICE_HS_TOKEN=<change-me>
 """
 
 TEMPLATE = (
@@ -342,7 +349,23 @@ TEMPLATE = (
     "port: ${BOTVILLE_HTTP_PORT}\n"
 )
 
+# Mirrors compose/appservice/botville-gateway.yaml.tmpl closely enough to
+# exercise init.sh's appservice rendering (A1.3), including the derived
+# regex-escaped server name.
+APPSERVICE_TEMPLATE = (
+    "id: botville-gateway\n"
+    'as_token: "${APPSERVICE_AS_TOKEN}"\n'
+    'hs_token: "${APPSERVICE_HS_TOKEN}"\n'
+    "namespaces:\n"
+    "  users:\n"
+    "    - exclusive: true\n"
+    "      regex: '^@ai_.*:${BOTVILLE_SERVER_NAME_REGEX}$'\n"
+)
+
 HEX64 = r"[0-9a-f]{64}"
+# Valid fixed appservice tokens (64 lowercase hex, different from each other).
+AS_TOKEN_FIXED = "a1" * 32
+HS_TOKEN_FIXED = "b2" * 32
 
 
 class InitScriptTest(unittest.TestCase):
@@ -353,6 +376,7 @@ class InitScriptTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         (self.tmp / "scripts").mkdir()
         (self.tmp / "compose" / "synapse").mkdir(parents=True)
+        (self.tmp / "compose" / "appservice").mkdir(parents=True)
         shutil.copy(INIT, self.tmp / "scripts" / "init.sh")
         # init.sh calls the renderer for generated/push-denylist.env (A1.2).
         shutil.copy(RENDERER, self.tmp / "scripts" / "render_push_denylist.py")
@@ -360,11 +384,12 @@ class InitScriptTest(unittest.TestCase):
         (self.tmp / "compose" / "synapse" / "homeserver.yaml.tmpl").write_text(
             TEMPLATE, encoding="utf-8"
         )
+        (self.tmp / "compose" / "appservice" / "botville-gateway.yaml.tmpl").write_text(
+            APPSERVICE_TEMPLATE, encoding="utf-8"
+        )
         # init.sh also renders the sygnal templates (A1.2); placeholder-free
         # one-liners keep these tests focused on the .env logic. The sygnal
-        # rendering itself has its own tests in test_push_sygnal.py. mock-app
-        # and ip-range-whitelist parts are the real ones (the fixtures never
-        # set BOTVILLE_SYGNAL_IP, so the whitelist part stays unused here).
+        # rendering itself has its own tests in test_push_sygnal.py.
         sygnal_dir = self.tmp / "compose" / "sygnal"
         sygnal_dir.mkdir()
         (sygnal_dir / "sygnal.yaml.tmpl").write_text(
@@ -383,6 +408,9 @@ class InitScriptTest(unittest.TestCase):
         )
         self.env_file = self.tmp / "compose" / ".env"
         self.generated = self.tmp / "compose" / "generated" / "synapse" / "homeserver.yaml"
+        self.appservice = (
+            self.tmp / "compose" / "generated" / "appservice" / "botville-gateway.yaml"
+        )
 
     def run_init(self):
         return subprocess.run(
@@ -411,6 +439,12 @@ class InitScriptTest(unittest.TestCase):
         self.assertRegex(self.env_value("POSTGRES_PASSWORD"), HEX64)
         self.assertNotEqual(
             self.env_value("BOTVILLE_ADMIN_PASSWORD"), self.env_value("POSTGRES_PASSWORD")
+        )
+        # Appservice tokens: 64 hex, and as_token != hs_token (PR #99 review).
+        self.assertRegex(self.env_value("APPSERVICE_AS_TOKEN"), HEX64)
+        self.assertRegex(self.env_value("APPSERVICE_HS_TOKEN"), HEX64)
+        self.assertNotEqual(
+            self.env_value("APPSERVICE_AS_TOKEN"), self.env_value("APPSERVICE_HS_TOKEN")
         )
         # 0600, and the template rendered without leftovers.
         self.assertEqual(stat.S_IMODE(self.env_file.stat().st_mode), 0o600)
@@ -461,6 +495,108 @@ class InitScriptTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("keeping current values", proc.stdout)
         self.assertEqual(self.env_file.read_text(encoding="utf-8"), first)
+
+    def test_renders_appservice_registration(self):
+        # A1.3: the appservice registration is rendered from .env, carries the
+        # configured (valid 64-hex) tokens, is 0600, and regex-escapes the
+        # server name.
+        self.env_file.write_text(
+            "BOTVILLE_HOMESERVER=synapse\n"
+            "BOTVILLE_SERVER_NAME=old.example\n"
+            "BOTVILLE_HTTP_PORT=8008\n"
+            "APPSERVICE_AS_TOKEN=" + AS_TOKEN_FIXED + "\n"
+            "APPSERVICE_HS_TOKEN=" + HS_TOKEN_FIXED + "\n",
+            encoding="utf-8",
+        )
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rendered = self.appservice.read_text(encoding="utf-8")
+        self.assertIn('as_token: "{}"'.format(AS_TOKEN_FIXED), rendered)
+        self.assertIn('hs_token: "{}"'.format(HS_TOKEN_FIXED), rendered)
+        # Dots in the server name are escaped so the anchored regex cannot
+        # match lookalike domains.
+        self.assertIn(r"regex: '^@ai_.*:old\.example$'", rendered)
+        self.assertNotIn("${", rendered)
+        # as_token = full control over the @ai_* namespace -> 0600 like .env.
+        self.assertEqual(stat.S_IMODE(self.appservice.stat().st_mode), 0o600)
+
+    # ------------------ appservice token gate (PR #99 review, blocker 2) ----
+    def _write_env_replacing(self, replacements):
+        content = ENV_EXAMPLE
+        for old, new in replacements.items():
+            content = content.replace(old, new)
+        self.env_file.write_text(content, encoding="utf-8")
+
+    def test_appservice_token_empty_is_regenerated(self):
+        # Empty token: regenerated randomly (with a notice), never rendered empty.
+        self._write_env_replacing({"APPSERVICE_AS_TOKEN=<change-me>": "APPSERVICE_AS_TOKEN="})
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(self.env_value("APPSERVICE_AS_TOKEN"), HEX64)
+        self.assertIn("APPSERVICE_AS_TOKEN", proc.stderr)
+        self.assertIn("generated", proc.stderr)
+        # The rendered registration carries the regenerated value.
+        rendered = self.appservice.read_text(encoding="utf-8")
+        self.assertIn('as_token: "{}"'.format(self.env_value("APPSERVICE_AS_TOKEN")), rendered)
+
+    def test_appservice_token_placeholder_is_regenerated(self):
+        self._write_env_replacing(
+            {"APPSERVICE_AS_TOKEN=<change-me>": "APPSERVICE_AS_TOKEN=<change-me>",
+             "APPSERVICE_HS_TOKEN=<change-me>": "APPSERVICE_HS_TOKEN=<change-me>"}
+        )
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(self.env_value("APPSERVICE_AS_TOKEN"), HEX64)
+        self.assertRegex(self.env_value("APPSERVICE_HS_TOKEN"), HEX64)
+        self.assertNotIn("<change-me>", self.appservice.read_text(encoding="utf-8"))
+
+    def test_appservice_token_invalid_aborts_without_rendering(self):
+        # A hand-filled but invalid value is an error: never overwritten, never
+        # rendered (an empty/short as_token would let Synapse accept
+        # unauthenticated @ai_* registrations).
+        self._write_env_replacing({"APPSERVICE_AS_TOKEN=<change-me>": "APPSERVICE_AS_TOKEN=short"})
+        self.env_file.chmod(0o600)
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("APPSERVICE_AS_TOKEN", proc.stderr)
+        self.assertIn("refusing to render", proc.stderr)
+        # The hand-filled value is untouched and nothing was rendered.
+        self.assertEqual(self.env_value("APPSERVICE_AS_TOKEN"), "short")
+        self.assertFalse(self.appservice.exists())
+
+    def test_appservice_tokens_must_differ(self):
+        same = "c3" * 32
+        self._write_env_replacing(
+            {
+                "APPSERVICE_AS_TOKEN=<change-me>": "APPSERVICE_AS_TOKEN=" + same,
+                "APPSERVICE_HS_TOKEN=<change-me>": "APPSERVICE_HS_TOKEN=" + same,
+            }
+        )
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("must be different", proc.stderr)
+        self.assertFalse(self.appservice.exists())
+
+    def test_env_file_chmod_600_even_when_unchanged(self):
+        # Unconditional chmod: a hand-created 0644 .env with nothing to fix up
+        # still ends up 0600.
+        valid = []
+        for line in ENV_EXAMPLE.splitlines():
+            key, sep, value = line.partition("=")
+            if sep and value == "<change-me>":
+                if key == "APPSERVICE_AS_TOKEN":
+                    value = AS_TOKEN_FIXED
+                elif key == "APPSERVICE_HS_TOKEN":
+                    value = HS_TOKEN_FIXED
+                else:
+                    value = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+            valid.append(key + sep + value if sep else line)
+        self.env_file.write_text("\n".join(valid) + "\n", encoding="utf-8")
+        self.env_file.chmod(0o644)
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("keeping current values", proc.stdout)
+        self.assertEqual(stat.S_IMODE(self.env_file.stat().st_mode), 0o600)
 
 
 if __name__ == "__main__":

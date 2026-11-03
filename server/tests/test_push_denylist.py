@@ -284,6 +284,8 @@ BASE_ENV = (
     "SYNAPSE_MACAROON_SECRET=fixture\n"
     "SYNAPSE_FORM_SECRET=fixture\n"
     "SYNAPSE_REGISTRATION_SHARED_SECRET=fixture\n"
+    "APPSERVICE_AS_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+    "APPSERVICE_HS_TOKEN=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
 )
 
 
@@ -310,6 +312,10 @@ class InitScriptDenylistTest(unittest.TestCase):
             compose / "synapse" / "ip-range-whitelist.part",
         )
         shutil.copytree(COMPOSE_DIR / "sygnal", compose / "sygnal", dirs_exist_ok=True)
+        # A1.3 appservice registration (init.sh always renders it).
+        shutil.copytree(
+            COMPOSE_DIR / "appservice", compose / "appservice", dirs_exist_ok=True
+        )
         self.env_file = compose / ".env"
 
     def write_env(self, extra):
