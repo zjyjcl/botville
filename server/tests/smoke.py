@@ -30,6 +30,9 @@ import urllib.request
 POLL_INTERVAL = 2.0
 REQUEST_TIMEOUT = 30.0
 SUPPORTED_STAGES = ("m.login.registration_token", "m.login.dummy")
+# Login retries on HTTP 429 (M_LIMIT_EXCEEDED): sleep retry_after_ms from the
+# response body (default 1000) and try again, at most this many times.
+LOGIN_MAX_RETRIES = 5
 
 
 def request_json(method, url, body=None, token=None, timeout=REQUEST_TIMEOUT):
@@ -152,15 +155,21 @@ class Smoke:
         raise Failure("registration did not complete for flow {}".format(flow))
 
     def login(self):
-        status, resp = request_json(
-            "POST",
-            self.url("/_matrix/client/v3/login"),
-            body={
-                "type": "m.login.password",
-                "identifier": {"type": "m.id.user", "user": self.username},
-                "password": self.password,
-            },
-        )
+        body = {
+            "type": "m.login.password",
+            "identifier": {"type": "m.id.user", "user": self.username},
+            "password": self.password,
+        }
+        retries_left = LOGIN_MAX_RETRIES
+        while True:
+            status, resp = request_json("POST", self.url("/_matrix/client/v3/login"), body=body)
+            if status != 429 or retries_left <= 0:
+                break
+            retries_left -= 1
+            delay_ms = (resp or {}).get("retry_after_ms")
+            if not isinstance(delay_ms, (int, float)):
+                delay_ms = 1000
+            time.sleep(delay_ms / 1000.0)
         expect(status == 200, "login returned HTTP {}: {!r}".format(status, resp))
         token = (resp or {}).get("access_token")
         expect(token, "login 200 without access_token: {!r}".format(resp))

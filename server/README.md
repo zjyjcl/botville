@@ -45,6 +45,9 @@ make down            # 停止（保留数据卷；手动 down -v 可清空）
   提供，默认 `botville`，卷名 `<project>_*`）。同机多实例必须每套用独立项目名 +
   独立 `BOTVILLE_HTTP_PORT`，否则 `down -v` 会误删彼此的卷；详见
   [docs/deploy/z423-synapse.md](../docs/deploy/z423-synapse.md) 的多实例一节。
+- **备份介质须支持 Unix 权限**：备份目录按密钥库对待（目录 700/文件 600），目标
+  盘须为 ext4/btrfs/ZFS/APFS 等保留权限位的文件系统，不要用 exFAT/FAT32 盘；详见
+  [docs/deploy/z423-synapse.md](../docs/deploy/z423-synapse.md) 的备份与恢复一节。
 - 注册策略：tuwunel / continuwuity 始终令牌门控（`BOTVILLE_REGISTRATION_TOKEN`）；
   Synapse 默认关闭注册，CI 中通过 `BOTVILLE_OPEN_REGISTRATION=true` 走 dummy 流程。
   本地想对 Synapse 跑 `make smoke` 时，把 `.env` 里该值改为 `true` 再 `make up`。

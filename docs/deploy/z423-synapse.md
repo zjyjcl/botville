@@ -295,6 +295,13 @@ make backup
 所有文件权限 600**（含容器内生成的 tar，结束前自检，不达标即报错）；不要明文放
 公网网盘、建议至少一份离线/异地。
 
+**备份介质必须支持 Unix 权限位**：备份目录 700、文件 600 这套权限要原样落在
+备份介质上。目标盘/挂载点须是 ext4、btrfs、ZFS、APFS 等保留权限的文件系统
+（极空间 NAS 自身的数据卷一般没问题）；**不要把 exFAT / FAT32 格式的 U 盘或移动
+硬盘直接当作 `BACKUP_DIR`**——这类文件系统没有 Unix 权限位，权限无法保持，备份
+脚本的权限自检会失败，或密钥文件在世界可读状态下留在盘上。需要用这类介质搬运时，
+先把备份目录 `tar` 打包再拷贝，在目标端解开并 `chmod` 恢复权限。
+
 脚本最后会把原本运行中的 synapse 重新拉起（备份中途失败也会自动拉回；备份期间
 服务中断约几秒到几十秒，取决于媒体量）。成功后会把本次备份目录路径记录到
 `backups/.last-backup`，供脚本/CI 读取。
@@ -329,11 +336,20 @@ make init                       # 生成临时随机 .env（稍后被备份覆�
 make restore RESTORE_DIR=backups/<时间戳>
 ```
 
-脚本流程：校验 manifest 里**全部 4 个文件**（dump、tar、`homeserver.yaml`、`env`）
-的 sha256 → 停 synapse → 装回 `.env`/`homeserver.yaml` → 等 postgres 健康 →
+`make init` 生成的 `.env` 默认项目名/端口（`botville` / `8008`）与默认配置的备份
+一致，可直接恢复；若备份来自改过名/换过端口的实例，先把这两项改成与备份一致再
+恢复（或临时 `BOTVILLE_RESTORE_ALLOW_CROSS_INSTANCE=yes make restore ...`）。
+
+脚本流程：先核对备份与当前实例的 `COMPOSE_PROJECT_NAME`、`BOTVILLE_HTTP_PORT`
+一致（缺省分别 `botville` / `8008`；不一致会报错拒绝，防止把别的实例的备份写进
+当前卷，确属跨实例/改名恢复时用 `BOTVILLE_RESTORE_ALLOW_CROSS_INSTANCE=yes`
+显式跳过）→ 校验 manifest 里**全部 4 个文件**（dump、tar、`homeserver.yaml`、
+`env`）的 sha256 → 停 synapse → 装回 `.env`/`homeserver.yaml`（之后的 compose
+命令按装回的 `.env` 重新计算项目名）→ 等 postgres 健康 →
 drop/recreate 数据库（UTF8、C locale）→ `pg_restore` → 恢复数据卷 → 启动 synapse
-并等待 `GET /health` 返回 200。备份缺任一文件（含 `env`）或校验不过会直接中止；
-没有 `manifest.txt` 时打告警并跳过校验。
+并等待 `GET /health` 返回 200。备份缺任一文件（含 `env`）、manifest 存在但缺任一
+文件的 sha256 行、或校验不过，都会直接中止；没有 `manifest.txt` 时打告警并跳过
+校验。
 
 ### 备份可恢复验收（对应 issue #3）
 
@@ -387,8 +403,9 @@ checkout 里跑就操作哪个实例。
 - **直接敲 `docker compose`（不经 make）时**，务必带
   `--env-file server/compose/.env`（它提供 `COMPOSE_PROJECT_NAME`），或显式
   `-p <项目名>`——否则可能落到 compose 文件内置的默认项目名上，正好撞上生产
-  实例。恢复备份时也建议备份与目标实例用同一项目名/端口（备份里的 `.env` 会
-  覆盖当前值，恢复后记得检查这两项）。
+  实例。恢复备份时，脚本会**强制核对**备份与当前 checkout 的项目名/端口一致，
+  不一致直接拒绝（防止跨实例误恢复；确需跨实例见上文
+  `BOTVILLE_RESTORE_ALLOW_CROSS_INSTANCE`）。
 
 ## 资源与端口
 
