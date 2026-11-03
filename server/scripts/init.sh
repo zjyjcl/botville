@@ -228,7 +228,8 @@ python3 "${script_dir}/render_push_denylist.py" \
 # with 700 up front so a first `up` on Linux does not leave Docker creating
 # a root-owned, more permissive directory; docs/deploy/push-sygnal.md §3
 # then only has to copy the key in.
-mkdir -p -m 700 "${secrets_dir}"
+mkdir -p "${secrets_dir}"
+chmod 700 "${secrets_dir}"
 
 # Scratch dir for the mock pushkin's JSONL, bind-mounted at /data. The sygnal
 # image runs as root (verified against the pinned v0.17.0), so 755 is enough
