@@ -103,14 +103,16 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         return self._rid
 
     def _idempotency_key(self) -> Optional[str]:
-        """读取 Idempotency-Key，按 OpenAPI 声明的 8–128 长度校验。"""
-        raw = self.headers.get("Idempotency-Key") or None
+        """读取 Idempotency-Key，按 OpenAPI 声明的 8–128 长度校验。
+
+        头部缺失 → 幂等关闭；头部存在但不在 8–128 字符内 → 400 problem+json
+        （契约 `IdempotencyKey` 参数是 minLength 8 / maxLength 128，不能静默忽略）。
+        """
+        raw = self.headers.get("Idempotency-Key")
         if raw is None:
             return None
         raw = raw.strip()
-        if not raw or len(raw) < 8:
-            return None  # 过短视为未提供（不拒绝合法请求）
-        if len(raw) > 128:
+        if not 8 <= len(raw) <= 128:
             raise ValidationError(
                 "request.invalid", "Idempotency-Key must be 8–128 characters"
             )
