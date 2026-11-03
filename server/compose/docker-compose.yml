@@ -188,6 +188,12 @@ services:
       CONTINUWUITY_REGISTRATION_TOKEN: ${BOTVILLE_REGISTRATION_TOKEN:?set in server/compose/.env}
       CONTINUWUITY_ALLOW_FEDERATION: "false"
       CONTINUWUITY_TRUSTED_SERVERS: "[]"
+      # Issue #91: the announcements worker polls https://continuwuity.org
+      # and is not interruptible; if SIGTERM arrives while that request is in
+      # flight (~first 40s after start), shutdown hangs until stop_grace_period
+      # (10m) and the container is SIGKILLed (exit 137). Botville runs without
+      # federation and makes no unsolicited outbound calls, so disable it.
+      CONTINUWUITY_ALLOW_ANNOUNCEMENTS_CHECK: "false"
     # CONTINUWUITY_IP_RANGE_DENYLIST: full upstream default private-range
     # denylist minus the sygnal container's /32 (BOTVILLE_SYGNAL_IP),
     # rendered by init.sh so pushes reach sygnal and nothing else.
