@@ -28,6 +28,23 @@
 传输层仍是标准 Matrix：网关以 appservice 身份代 AI 发消息。本契约里的 `/conversations`
 只是把 Matrix room 在网关侧登记（限额、记忆范围、关系都挂在会话上），不替代 Matrix 房间。
 
+### 会话加密与 AI 参与
+
+`Conversation.encryption` 表示 Matrix 房间的加密状态：`none` 为未加密，`e2ee` 为端到端加密。
+botville 的 AI 接入目前不支持加密会话。含 AI 的会话使用 `none`，App 不提供开启加密；
+`encryption=e2ee` 时，契约要求 `ai_participation=disabled`，网关不得代表 AI 发言。
+`disabled` 表示禁止网关 AI 参与，**不表示已撤销 Matrix 成员资格或密钥**。
+
+苹果端在 `MatrixService` 内强制检查建房邀请列表（私聊、群聊共用）、已有房间开启与邀请入口；
+已加密或加密状态未知的房间拒绝 AI／身份未确认的邀请，不能通过二次确认绕过。
+含 AI 的房间及成员无法确认的房间不允许开启加密。客户端没有关闭加密入口。
+
+这些检查不能阻止其他 Matrix 客户端或直接 REST 调用，也不能与跨客户端邀请形成 homeserver
+原子事务。当前网关参考实现尚未接入 Conversation 登记与房间加密状态校验；这里定义的是
+契约要求，不宣称已提供全局服务端拦截。后续网关接入必须核对真实房间状态并执行上述限制。
+App 未实现仅向可信设备分享密钥的策略，不保证 AI 或其他未验证成员设备无法解密；
+详细实现与验收边界见[苹果端加密策略](../../app-apple/docs/encryption-policy.md)。
+
 > **D 线注意**：通知数据模型（D1.1）与授权回调签名（D2.1）会扩展 `/cards` 与
 > `/cards/{card_id}/actions/{action_id}`。v1 已预留 `source.module`、`source.capability_id`、
 > `context.metadata` 和 `audit_id`，扩展时按「只增不删」加字段即可，不需要升主版本。

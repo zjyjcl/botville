@@ -560,8 +560,9 @@ paths:
       summary: 登记会话
       description: |
         把 Matrix room 登记为网关会话（幂等：同一 `matrix_room_id` 已存在时返回 200 与已有会话）。
-        含 AI 的会话默认 `encryption: none`；E2EE 房间中 `ai_participation` 为 `disabled`，
-        网关不会代表 AI 发言。
+        botville 的 AI 接入不支持加密会话：含 AI 的会话使用 `encryption: none`，App 不提供开启加密；
+        E2EE 房间中 `ai_participation` 必须为 `disabled`，网关不得代表 AI 发言。
+        这是网关参与策略，不代表撤销 Matrix 成员资格或密钥，也不是 AI 无法解密的保证。
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -1952,11 +1953,11 @@ components:
         encryption:
           type: string
           enum: [none, e2ee]
-          description: 含 AI 的会话默认 `none`；人与人私聊可由用户开启。
+          description: Matrix 房间的加密状态。含 AI 的会话使用 `none`，App 不提供开启；成员通过 App 策略检查的会话可由用户确认开启。
         ai_participation:
           type: string
           enum: [enabled, disabled]
-          description: E2EE 房间中为 `disabled`，网关不代 AI 发言。
+          description: E2EE 房间中必须为 `disabled`，网关不得代 AI 发言；不表示已撤销 Matrix 成员资格或密钥。
         relation:
           $ref: '#/components/schemas/Relation'
         limits:
