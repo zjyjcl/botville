@@ -1,0 +1,40 @@
+{
+  "type": "reminder",
+  "title": "20:00 例会前准备周报材料",
+  "subtitle": "来自 助手",
+  "fallback_text": "提醒：20:00（Asia/Shanghai）例会前准备好周报材料。",
+  "priority": "high",
+  "risk": "low",
+  "blocks": [
+    { "type": "text", "text": "你让助手记着：例会前 10 分钟提醒准备周报材料。", "level": "info" },
+    {
+      "type": "key_value",
+      "items": [
+        { "label": "触发时间", "value": "2026-11-04T12:00:00Z" },
+        { "label": "展示时区", "value": "Asia/Shanghai" }
+      ]
+    }
+  ],
+  "actions": [
+    { "id": "done", "label": "完成", "kind": "callback", "style": "primary",
+      "payload": { "reminder_id": "rem_demo" } },
+    { "id": "snooze", "label": "稍后提醒", "kind": "callback", "style": "secondary",
+      "payload": { "snooze_minutes": 10 } }
+  ],
+  "source": {
+    "module": "notify",
+    "capability_id": "notify.reminders",
+    "event_id": "evt_reminders_weekly_report_20261104",
+    "actor": { "id": "persona_assistant", "kind": "ai", "display_name": "助手" }
+  },
+  "context": {
+    "conversation_id": "conv_demo",
+    "metadata": { "display_timezone": "Asia/Shanghai" }
+  },
+  "scheduled_at": "2026-11-04T12:00:00Z",
+  "deliver_after": null,
+  "interrupt": false,
+  "collapse_key": "reminder.weekly_report",
+  "group_id": "grp_reminders_demo",
+  "expires_at": "2026-11-04T13:00:00Z"
+}

@@ -1,0 +1,63 @@
+{
+  "id": "card_digest_demo",
+  "card_schema_version": "1.0.0",
+  "type": "notification",
+  "title": "今日摘要：3 件新事项",
+  "subtitle": "来自 助手 · 08:00",
+  "fallback_text": "助手：今日摘要有 3 件新事项（2 条通知、1 条提醒），点开查看。",
+  "priority": "low",
+  "risk": "low",
+  "status": "active",
+  "blocks": [
+    { "type": "text", "text": "静默时段内产生的未读事项已折叠为一条摘要。", "level": "info" },
+    {
+      "type": "list",
+      "items": [
+        { "label": "构建失败 #129", "value": "1 条通知" },
+        { "label": "14:00 评审提醒", "value": "1 条提醒" },
+        { "label": "依赖升级建议", "value": "1 条通知" }
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "id": "open",
+      "label": "查看全部",
+      "kind": "open_url",
+      "style": "primary",
+      "target": "in_app",
+      "capability_id": "notify.digest",
+      "url": "https://gateway.example.invalid/modules/notify/digest/2026-11-04"
+    },
+    { "id": "dismiss", "label": "关闭", "kind": "dismiss", "style": "secondary", "risk": "low" }
+  ],
+  "source": {
+    "module": "notify",
+    "capability_id": "notify.digest",
+    "dedupe_key": "digest-2026-11-04-assistant",
+    "actor": { "id": "persona_assistant", "kind": "ai", "display_name": "助手" }
+  },
+  "context": {
+    "conversation_id": "conv_demo",
+    "metadata": { "digest_date": "2026-11-04", "display_timezone": "Asia/Shanghai" }
+  },
+  "delivery": [
+    {
+      "channel": "in_app",
+      "state": "confirmed",
+      "attempts": 1,
+      "last_attempt_at": "2026-11-04T00:00:05Z",
+      "failure_code": null,
+      "provider_message_id": null
+    }
+  ],
+  "group_id": "grp_digest_20261104",
+  "collapse_key": "digest.daily",
+  "deliver_after": "2026-11-04T00:00:00Z",
+  "interrupt": false,
+  "created_at": "2026-11-04T00:00:00Z",
+  "updated_at": "2026-11-04T00:00:05Z",
+  "expires_at": "2026-11-05T00:00:00Z",
+  "acted_at": null,
+  "revision": 1
+}

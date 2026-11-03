@@ -1,0 +1,52 @@
+{
+  "type": "approval",
+  "title": "授权：发布 v0.2.0",
+  "subtitle": "来自 Demo AI",
+  "fallback_text": "Demo AI 请求所有者授权：发布 v0.2.0 并推送更新说明。",
+  "priority": "urgent",
+  "risk": "high",
+  "blocks": [
+    { "type": "text", "text": "Demo AI 准备发布 v0.2.0，包含 12 个已合并变更。", "level": "info" },
+    {
+      "type": "key_value",
+      "items": [
+        { "label": "版本", "value": "v0.2.0" },
+        { "label": "变更数", "value": "12" },
+        { "label": "回滚", "value": "tag v0.1.9", "emphasis": true }
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "id": "approve",
+      "label": "批准",
+      "kind": "approve",
+      "style": "primary",
+      "risk": "high",
+      "payload": { "release_id": "rel_demo" },
+      "confirmation": {
+        "required": true,
+        "title": "确认发布 v0.2.0",
+        "body": "将创建 tag 并推送更新说明；如需回滚，使用 tag v0.1.9。",
+        "biometric": true
+      }
+    },
+    { "id": "deny", "label": "拒绝", "kind": "deny", "style": "danger", "risk": "low" }
+  ],
+  "source": {
+    "module": "notify",
+    "capability_id": "notify.approvals",
+    "event_id": "evt_approvals_release_v020",
+    "actor": { "id": "persona_demo_ai", "kind": "ai", "display_name": "Demo AI" }
+  },
+  "context": {
+    "conversation_id": "conv_demo",
+    "metadata": { "release_id": "rel_demo" }
+  },
+  "deliver_after": null,
+  "scheduled_at": null,
+  "interrupt": true,
+  "collapse_key": null,
+  "group_id": null,
+  "expires_at": "2026-11-04T10:00:00Z"
+}

@@ -1,0 +1,211 @@
+# SPDX-License-Identifier: Apache-2.0
+# botville 通知域数据模型（D1.1）。
+# 本文件不定义新接口：通知的 wire 形态由 gateway.v1.yaml 定义，
+# 此处以 $ref 聚合网关 schema 作为评审入口，并以 allOf 只增补充通知域语义。
+# 人类可读规范见 notify/docs/data-model.md。
+openapi: 3.1.0
+info:
+  title: botville notify data model
+  version: 0.1.0
+  license:
+    identifier: Apache-2.0
+  description: |
+    D1.1 开源通知数据模型的 OpenAPI 纳入层。通知的 wire 形态
+    （`Card` / `CreateCardRequest` / `CardAction*` / `AuditRecord`）由
+    `gateway.v1.yaml` 定义（行为见 `gateway/docs/contract.md` §4.8）；
+    本文件用 `$ref` 汇聚通知域评审所需 schema，并用 `allOf` **只增**补充
+    通知域语义（卡片类型、来源键建议格式、投递失败码建议值、重试建议值）。
+    本文件不改动网关契约；`python3 gateway/scripts/validate_openapi.py`
+    保持绿。
+servers:
+  - url: https://gateway.example.invalid/v1
+paths: {}
+components:
+  schemas:
+    # ---- 网关复用（只读 $ref，通知域评审的单一入口） ----
+    Actor:
+      $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/Actor'
+    SilentHours:
+      $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/SilentHours'
+    CardBlockItem:
+      $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/CardBlockItem'
+    CardBlock:
+      $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/CardBlock'
+    CardActionConfirmation:
+      $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/CardActionConfirmation'
+    CardAction:
+      $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/CardAction'
+    CardSource:
+      $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/CardSource'
+    CardContext:
+      $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/CardContext'
+    CardI18nText:
+      $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/CardI18nText'
+    CardDelivery:
+      $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/CardDelivery'
+    Card:
+      $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/Card'
+    CreateCardRequest:
+      $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/CreateCardRequest'
+    CardActionChallenge:
+      $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/CardActionChallenge'
+    CardActionRequest:
+      $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/CardActionRequest'
+    CardActionReceipt:
+      $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/CardActionReceipt'
+    AuditRecord:
+      $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/AuditRecord'
+
+    # ---- 通知域扩展（allOf 只增，不改网关语义） ----
+    NotifyCapabilityId:
+      description: |
+        通知域能力 ID 约定：点分小写 `notify.<功能>`。开放枚举——可新增其他
+        `notify.*` 能力；已发布值不复用、不重命名（contract §4 能力规则）。
+      anyOf:
+        - enum: [notify.approvals, notify.inbox, notify.reminders, notify.digest]
+        - type: string
+          pattern: '^notify\.[a-z0-9_]+(\.[a-z0-9_]+)*$'
+
+    NotifyEventId:
+      type: string
+      pattern: '^[a-z0-9][a-z0-9._-]{2,127}$'
+      description: |
+        来源事件稳定 ID 的建议格式：`evt_<功能>_<语义slug>`。同一事件被
+        重新发起时必须复用同一 `event_id`，供业务级去重
+        `(capability_id, event_id ?? dedupe_key)` 使用。
+      example: evt_reminders_standup_20261104
+
+    NotifyDedupeKey:
+      type: string
+      pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{2,191}$'
+      description: |
+        无稳定事件 ID 时的去重键（桥接、外部 webhook、轮询结果）。
+        同一业务事实的重发必须复用同一 `dedupe_key`。
+      example: bridge-webhook-msg-demo-42
+
+    NotificationSource:
+      description: |
+        通知域对 `CardSource` 的补充约束：去重规则不变
+        （`event_id` / `dedupe_key` 二选一必填，按
+        `(capability_id, event_id ?? dedupe_key)` 去重），取值遵守
+        `NotifyCapabilityId` / `NotifyEventId` / `NotifyDedupeKey` 建议格式。
+      allOf:
+        - $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/CardSource'
+        - type: object
+          properties:
+            capability_id:
+              $ref: '#/components/schemas/NotifyCapabilityId'
+            event_id:
+              $ref: '#/components/schemas/NotifyEventId'
+            dedupe_key:
+              $ref: '#/components/schemas/NotifyDedupeKey'
+
+    DeliveryFailureCode:
+      description: |
+        `CardDelivery.failure_code` 的建议值（开放枚举，实现可扩展）。
+        点分格式 `<channel>.<reason>`；`unconfirmed` 与 `failed` 态应带
+        code 说明原因；未知 code 原样展示。
+      anyOf:
+        - enum:
+            - push.timeout
+            - push.receipt_missing
+            - push.provider_rejected
+            - push.token_invalid
+            - email.bounced
+            - email.suppressed
+            - webhook.timeout
+            - webhook.non_2xx
+            - in_app.dropped
+            - unknown
+        - type: string
+          pattern: '^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$'
+
+    DeliveryRetryPolicy:
+      type: object
+      description: |
+        投递重试的**规范建议值**：只对 `failed`（确认失败）生效，可同渠道
+        重试；`unconfirmed`（模糊结果）绝不重放，只能换渠道或由所有者主动
+        触发。超过上限保持 `failed` 并保留 `failure_code`。
+      required: [max_attempts, min_interval_seconds, applies_to]
+      properties:
+        max_attempts:
+          type: integer
+          minimum: 1
+          maximum: 3
+          example: 3
+          description: 同渠道重试上限（含首次尝试）。
+        min_interval_seconds:
+          type: integer
+          minimum: 300
+          example: 300
+          description: 相邻两次尝试的最小间隔（300 秒 = 5 分钟）。
+        applies_to:
+          type: string
+          enum: [failed_only]
+          description: 重试仅适用于确认失败；模糊结果不重放。
+
+    NotificationCard:
+      description: |
+        普通通知卡：状态变更、构建结果、新消息摘要等非授权类通知。
+        完整 `delivery[]` 多状态示例见 examples/card-delivery-states.json。
+      allOf:
+        - $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/Card'
+        - type: object
+          properties:
+            type:
+              const: notification
+
+    ReminderCard:
+      description: |
+        提醒卡：一次性定时提醒。创建时 `scheduled_at`（触发时刻）与
+        `deliver_after` 二选一；响应侧 `Card` 只带 `deliver_after`。
+      allOf:
+        - $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/Card'
+        - type: object
+          properties:
+            type:
+              const: reminder
+
+    ApprovalCard:
+      description: |
+        授权卡：所有者拍板。创建时 `expires_at` 必填（contract §4.6 规则 9）；
+        高风险操作经 challenge / assertion / revision 链回调
+        （contract §4.4），签名算法细节属 D2.1。
+      allOf:
+        - $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/Card'
+        - type: object
+          properties:
+            type:
+              const: approval
+
+    NotificationCreateRequest:
+      description: 通知域创建请求：`source` 遵守通知域键格式建议，其余同网关。
+      allOf:
+        - $ref: '../../gateway/openapi/gateway.v1.yaml#/components/schemas/CreateCardRequest'
+        - type: object
+          properties:
+            source:
+              $ref: '#/components/schemas/NotificationSource'
+
+    ReminderCreateRequest:
+      description: |
+        提醒卡创建请求：`type: reminder`，`scheduled_at` 与 `deliver_after`
+        二选一（本例用 `scheduled_at`）。
+      allOf:
+        - $ref: '#/components/schemas/NotificationCreateRequest'
+        - type: object
+          properties:
+            type:
+              const: reminder
+
+    ApprovalCreateRequest:
+      description: |
+        授权卡创建请求：`type: approval`，`expires_at` 必填
+        （contract §4.6 规则 9）；有效 risk=high 的操作在回调时走
+        challenge / assertion / revision 链。
+      allOf:
+        - $ref: '#/components/schemas/NotificationCreateRequest'
+        - type: object
+          properties:
+            type:
+              const: approval

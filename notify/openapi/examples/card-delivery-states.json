@@ -1,0 +1,86 @@
+{
+  "id": "card_delivery_demo",
+  "card_schema_version": "1.0.0",
+  "type": "result",
+  "title": "任务结果：数据导出完成",
+  "subtitle": "来自 Demo AI · 10 分钟前",
+  "fallback_text": "Demo AI：数据导出任务已完成，文件在制品库可下载。",
+  "priority": "normal",
+  "risk": "low",
+  "status": "active",
+  "blocks": [
+    { "type": "text", "text": "导出任务完成，共 4 个文件，无失败分片。", "level": "success" },
+    {
+      "type": "key_value",
+      "items": [
+        { "label": "任务", "value": "export_demo" },
+        { "label": "文件数", "value": "4" },
+        { "label": "大小", "value": "182 MB" }
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "id": "open",
+      "label": "查看产物",
+      "kind": "open_url",
+      "style": "secondary",
+      "target": "external",
+      "url": "https://gateway.example.invalid/modules/jobs/export_demo/artifacts"
+    },
+    { "id": "dismiss", "label": "知道了", "kind": "dismiss", "style": "secondary", "risk": "low" }
+  ],
+  "source": {
+    "module": "notify",
+    "capability_id": "notify.inbox",
+    "event_id": "evt_inbox_export_demo_done",
+    "actor": { "id": "persona_demo_ai", "kind": "ai", "display_name": "Demo AI" }
+  },
+  "context": {
+    "conversation_id": "conv_demo",
+    "metadata": { "job_id": "export_demo" }
+  },
+  "delivery": [
+    {
+      "channel": "push",
+      "state": "confirmed",
+      "attempts": 1,
+      "last_attempt_at": "2026-11-04T01:00:03Z",
+      "failure_code": null,
+      "provider_message_id": "apns_demo_1"
+    },
+    {
+      "channel": "in_app",
+      "state": "pending",
+      "attempts": 0,
+      "last_attempt_at": null,
+      "failure_code": null,
+      "provider_message_id": null
+    },
+    {
+      "channel": "email",
+      "state": "failed",
+      "attempts": 3,
+      "last_attempt_at": "2026-11-04T01:15:00Z",
+      "failure_code": "email.bounced",
+      "provider_message_id": "smtp_demo_9"
+    },
+    {
+      "channel": "webhook",
+      "state": "unconfirmed",
+      "attempts": 1,
+      "last_attempt_at": "2026-11-04T01:00:30Z",
+      "failure_code": "webhook.timeout",
+      "provider_message_id": "wh_demo_3"
+    }
+  ],
+  "group_id": null,
+  "collapse_key": null,
+  "deliver_after": null,
+  "interrupt": false,
+  "created_at": "2026-11-04T01:00:00Z",
+  "updated_at": "2026-11-04T01:15:00Z",
+  "expires_at": "2026-11-05T01:00:00Z",
+  "acted_at": null,
+  "revision": 2
+}
