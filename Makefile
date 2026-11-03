@@ -2,10 +2,13 @@
 #
 #   make up              # core one-button start (synapse + postgres)
 #   make up HS=tuwunel   # same for tuwunel / continuwuity
+#   make up PUSH=1       # also start the sygnal push gateway (A1.2), any HS
 #   make smoke           # run server/tests/smoke.py against the running stack
 #   make backup          # dump synapse DB + data volume into ./backups/<ts>/ (A1.1)
 #   make restore RESTORE_DIR=backups/<ts>   # destructive restore of a backup (A1.1)
 #   make e2e             # register/chat/group acceptance test; E2E_PHASE=seed|verify (A1.1)
+#   make push-e2e        # HS -> sygnal push latency acceptance (<5s, A1.2);
+#                        # needs the stack up with PUSH=1 (mock pushkin, no APNs)
 #
 # Everything wraps docker compose on server/compose/docker-compose.yml with
 # server/compose/.env (created by server/scripts/init.sh on first run).
@@ -39,34 +42,48 @@ ifeq ($(strip $(PORT)),)
 PORT := 8008
 endif
 
+# Optional push gateway (A1.2): PUSH=1 (also true/yes) on up/logs/ps adds
+# --profile push (sygnal; stacks onto any HS profile). `down` always carries
+# --profile push so a PUSH=1 stack tears down fully (sygnal and the compose
+# network would otherwise linger; idempotent when push was never started —
+# PUSH=0 does not opt out of `down`). Loopback port mirrors
+# BOTVILLE_PUSH_PORT; homeservers reach sygnal in-network at sygnal:5000.
+PUSH ?=
+PUSH_PROFILE := $(if $(filter 1 true yes,$(PUSH)),--profile push,)
+PUSH_PORT ?= $(shell sed -n 's/^BOTVILLE_PUSH_PORT=//p' $(ENV_FILE) 2>/dev/null | tail -n 1)
+ifeq ($(strip $(PUSH_PORT)),)
+PUSH_PORT := 8019
+endif
+
 # Backup/restore/e2e knobs (A1.1).
 E2E_PHASE ?= seed
 E2E_STATE ?= backups/e2e-state.json
 
-.PHONY: init up down logs smoke ps backup restore e2e
+.PHONY: init up down logs smoke ps backup restore e2e push-e2e
 
 init:
 	bash server/scripts/init.sh
 
 # Core one-button startup: bootstrap .env + rendered synapse config, then
-# start the selected homeserver profile detached. continuwuity additionally
-# registers its first-boot admin account (one-time token from the container
-# logs; see server/scripts/bootstrap-continuwuity.sh).
+# start the selected homeserver profile detached (plus the push gateway with
+# PUSH=1). continuwuity additionally registers its first-boot admin account
+# (one-time token from the container logs; see
+# server/scripts/bootstrap-continuwuity.sh).
 up:
 	bash server/scripts/init.sh
-	$(COMPOSE) --profile $(HS) up -d
+	$(COMPOSE) --profile $(HS) $(PUSH_PROFILE) up -d
 ifeq ($(HS),continuwuity)
 	COMPOSE='$(COMPOSE)' bash server/scripts/bootstrap-continuwuity.sh
 endif
 
 down:
-	$(COMPOSE) --profile $(HS) down --remove-orphans
+	$(COMPOSE) --profile $(HS) --profile push down --remove-orphans
 
 logs:
-	$(COMPOSE) --profile $(HS) logs -f --tail=200
+	$(COMPOSE) --profile $(HS) $(PUSH_PROFILE) logs -f --tail=200
 
 ps:
-	$(COMPOSE) --profile $(HS) ps
+	$(COMPOSE) --profile $(HS) $(PUSH_PROFILE) ps
 
 smoke: init
 	python3 server/tests/smoke.py \
@@ -97,3 +114,17 @@ e2e: init
 		--registration-token "$$(sed -n 's/^BOTVILLE_REGISTRATION_TOKEN=//p' $(ENV_FILE) | tail -n 1)" \
 		--phase $(E2E_PHASE) \
 		--state $(E2E_STATE)
+
+# Push gateway acceptance (A1.2, issue #4): register alice/bob, bob sets an
+# http pusher for the org.botville.mock pushkin, alice sends a DM, assert the
+# notification reaches sygnal within E2E_MAX_PUSH_LATENCY seconds. Requires
+# the stack up with PUSH=1 (make up HS=<hs> PUSH=1). Covers HS -> sygnal
+# only; real APNs delivery needs a real .p8 + device (docs/deploy/push-sygnal.md).
+E2E_MAX_PUSH_LATENCY ?= 5
+push-e2e: init
+	python3 server/tests/push_e2e.py \
+		--base-url http://127.0.0.1:$(PORT) \
+		--registration-token "$$(sed -n 's/^BOTVILLE_REGISTRATION_TOKEN=//p' $(ENV_FILE) | tail -n 1)" \
+		--sygnal-base-url http://127.0.0.1:$(PUSH_PORT) \
+		--max-latency $(E2E_MAX_PUSH_LATENCY) \
+		--pushes-cmd '$(COMPOSE) --profile push exec -T sygnal cat /data/mock-pushes.jsonl'

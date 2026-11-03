@@ -1,0 +1,41 @@
+# Sygnal push gateway configuration template (A1.2).
+#
+# server/scripts/init.sh renders this file into
+# server/compose/generated/sygnal/sygnal.yaml (gitignored). This template
+# intentionally references no $VAR-style placeholders and carries no apps
+# itself; init.sh appends app parts under `apps:`:
+#   - sygnal/mock-app.yaml.part (org.botville.mock) unless BOTVILLE_PUSH_MOCK
+#     is false/0/no (default true — CI/local latency tests need it);
+#   - sygnal/apns-app.yaml.part when BOTVILLE_APNS_ENABLED=true and the
+#     prerequisites are in place (real APNS_KEY_ID/APNS_TEAM_ID/APNS_TOPIC
+#     plus server/compose/secrets/apns.p8).
+# With both off, sygnal.yaml ends up with no apps and init.sh warns.
+# Edit this template, never the generated file. See docs/deploy/push-sygnal.md.
+log:
+  setup:
+    version: 1
+    formatters:
+      normal:
+        format: "%(asctime)s %(levelname)s:%(name)s:%(message)s"
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: normal
+        stream: ext://sys.stdout
+    root:
+      level: INFO
+      handlers: [console]
+    disable_existing_loggers: false
+  access:
+    x_forwarded_for: false
+
+# Listen on all interfaces inside the container (sygnal defaults to
+# 127.0.0.1, unreachable from the homeserver container); the host port is
+# bound to 127.0.0.1 only in docker-compose.yml.
+http:
+  bind_addresses: ["0.0.0.0"]
+  port: 5000
+
+apps:
+  # No apps inline: init.sh appends mock-app.yaml.part / apns-app.yaml.part
+  # here (see the header comment).

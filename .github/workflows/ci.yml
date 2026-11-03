@@ -7,6 +7,14 @@
 # backup-restore (A1.1, synapse only): init -> open registration -> up ->
 #         e2e seed -> backup -> down -v (wipe volumes) -> up (fresh stack) ->
 #         restore -> e2e verify, proving the backup is actually restorable.
+# push-e2e (A1.2, all three homeservers): up with the push profile (sygnal +
+#         org.botville.mock pushkin), then server/tests/push_e2e.py asserts
+#         HS -> sygnal push latency < 5s, an event_id_only payload with no
+#         content keys, and the unknown-app_id rejection semantics. The
+#         continuwuity leg exercises the same init.sh-rendered denylist; its
+#         make up runs the first-boot bootstrap automatically. Real APNs
+#         delivery is out of scope (no Apple account); see
+#         docs/deploy/push-sygnal.md.
 # lint:   compose config for all three profiles, shellcheck, python syntax,
 #         stdlib unit tests for the bootstrap/init scripts (no Docker),
 #         notify/gateway contract validation, a guard that .env.example
@@ -121,6 +129,44 @@ jobs:
           docker compose -f server/compose/docker-compose.yml \
             --env-file server/compose/.env --profile synapse down -v --remove-orphans
 
+  push-e2e:
+    name: push-e2e (${{ matrix.homeserver }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        homeserver: [synapse, tuwunel, continuwuity]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Init .env and select homeserver
+        run: |
+          bash server/scripts/init.sh
+          sed -i "s/^BOTVILLE_HOMESERVER=.*/BOTVILLE_HOMESERVER=${{ matrix.homeserver }}/" server/compose/.env
+          # Same CI-only registration escape hatch as the smoke job.
+          sed -i "s/^BOTVILLE_OPEN_REGISTRATION=.*/BOTVILLE_OPEN_REGISTRATION=true/" server/compose/.env
+
+      - name: Start homeserver + push gateway
+        run: make up HS=${{ matrix.homeserver }} PUSH=1
+
+      - name: Push e2e (HS -> sygnal latency < 5s, mock pushkin)
+        run: make push-e2e
+
+      - name: Dump logs
+        if: failure()
+        run: |
+          docker compose -f server/compose/docker-compose.yml \
+            --env-file server/compose/.env --profile ${{ matrix.homeserver }} \
+            --profile push logs --no-color
+
+      - name: Teardown
+        if: always()
+        run: |
+          docker compose -f server/compose/docker-compose.yml \
+            --env-file server/compose/.env --profile ${{ matrix.homeserver }} \
+            --profile push down -v --remove-orphans
+
   lint:
     name: lint
     runs-on: ubuntu-latest
@@ -134,7 +180,7 @@ jobs:
             server/scripts/lib.sh server/scripts/backup-synapse.sh server/scripts/restore-synapse.sh
 
       - name: Python syntax
-        run: python3 -m py_compile server/tests/smoke.py server/tests/e2e_synapse.py
+        run: python3 -m py_compile server/tests/smoke.py server/tests/e2e_synapse.py server/tests/push_e2e.py server/scripts/render_push_denylist.py
 
       - name: Bootstrap/init script unit tests (stdlib mock, no Docker)
         run: python3 -m unittest discover -s server/tests -p "test_*.py" -v
@@ -156,6 +202,9 @@ jobs:
             echo "== docker compose config --profile ${hs}"
             docker compose -f server/compose/docker-compose.yml \
               --env-file server/compose/.env --profile "${hs}" config --quiet
+            echo "== docker compose config --profile ${hs} --profile push (A1.2)"
+            docker compose -f server/compose/docker-compose.yml \
+              --env-file server/compose/.env --profile "${hs}" --profile push config --quiet
           done
 
       - name: .env.example contains placeholders only
@@ -174,7 +223,28 @@ jobs:
               "BOTVILLE_REGISTRATION_TOKEN": "<change-me>",
               "BOTVILLE_ADMIN_USER": "botville-admin",
               "BOTVILLE_ADMIN_PASSWORD": "<change-me>",
+              "BOTVILLE_PUSH_PORT": "8019",
+              # APNs placeholders only — real Apple values never ship in the
+              # repo (A1.2); init.sh refuses to render the APNs app from
+              # these placeholders. See docs/deploy/push-sygnal.md.
+              "BOTVILLE_APNS_ENABLED": "false",
+              "APNS_APP_ID": "org.botville.app.ios",
+              "APNS_TOPIC": "<bundle-id>",
+              "APNS_KEY_ID": "<key-id>",
+              "APNS_TEAM_ID": "<team-id>",
+              "APNS_PLATFORM": "sandbox",
               "COMPOSE_PROJECT_NAME": "botville",
+              "BOTVILLE_DOCKER_SUBNET": "172.31.250.0/24",
+              # Dynamic-address pool of the compose network; keeps docker's
+              # sequential dynamic allocation away from BOTVILLE_SYGNAL_IP.
+              "BOTVILLE_DOCKER_IP_RANGE": "172.31.250.64/26",
+              # The sygnal container's fixed /32 — the only private range
+              # the homeservers may push to (A1.2); must stay in the subnet
+              # above and not be its .0/.1/.255.
+              "BOTVILLE_SYGNAL_IP": "172.31.250.2",
+              # org.botville.mock test pushkin in generated sygnal.yaml;
+              # push-e2e / CI rely on it staying true.
+              "BOTVILLE_PUSH_MOCK": "true",
               "POSTGRES_USER": "botville",
               "POSTGRES_PASSWORD": "<change-me>",
               "POSTGRES_DB": "synapse",
@@ -185,6 +255,7 @@ jobs:
               "SYNAPSE_IMAGE": "docker.io/matrixdotorg/synapse:v1.164.1@sha256:fa4aa980f279bcf26d4e7ecc2a2c9a701c73f2ebe8841da9bdcf3b2fdf693d75",
               "TUWUNEL_IMAGE": "ghcr.io/matrix-construct/tuwunel:v1.9.4@sha256:0e86c6164d6c9f5b60291938eb61ad8395021c37fe58d47a963ea7edddbedaec",
               "CONTINUWUITY_IMAGE": "ghcr.io/continuwuity/continuwuity:v26.9.1@sha256:c9c62bc5c0a641f3f713945c701b069c7bc30d2612b54d4a5de80a5be19d5420",
+              "SYGNAL_IMAGE": "docker.io/matrixdotorg/sygnal:v0.17.0@sha256:141f5e72fdf99a28e29ca87f3a46c19ed1cf21d5074aa3ef9df7c067e0c1c46a",
           }
 
           problems = []

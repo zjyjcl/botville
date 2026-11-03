@@ -5,14 +5,22 @@
 # `make up` / `make up HS=tuwunel` in the repo root wraps this (see Makefile).
 #
 # Ports are bound to 127.0.0.1 only; expose via a reverse proxy when needed.
-# All four images are pinned by default to tag@sha256:<multi-arch index
-# digest>; the upgrade flow lives in docs/ops/upgrade-images.md. They can be
-# overridden via POSTGRES_IMAGE / SYNAPSE_IMAGE / TUWUNEL_IMAGE /
-# CONTINUWUITY_IMAGE in server/compose/.env — e.g. to :latest to track
-# upstream, which works but is not recommended (not reproducible).
+# All homeserver-profile images plus the optional sygnal push gateway (five
+# total) are pinned by default to tag@sha256:<multi-arch index digest>; the
+# upgrade flow lives in docs/ops/upgrade-images.md. They can be overridden via
+# POSTGRES_IMAGE / SYNAPSE_IMAGE / TUWUNEL_IMAGE / CONTINUWUITY_IMAGE /
+# SYGNAL_IMAGE in server/compose/.env — e.g. to :latest to track upstream,
+# which works but is not recommended (not reproducible).
+#
+# The `push` profile (sygnal, A1.2) stacks onto any homeserver profile:
+#   make up PUSH=1   /   make up HS=tuwunel PUSH=1
+# It is the only cross-stack profile; see docs/deploy/push-sygnal.md.
 #
 # Readiness:
 #   - postgres, synapse: container healthchecks.
+#   - sygnal: container healthcheck probing /health with the image's python
+#     (the runtime image has no curl, so its built-in curl HEALTHCHECK goes
+#     unhealthy; see the sygnal service below).
 #   - tuwunel, continuwuity: their OCI images are OS-less (no shell, no curl),
 #     so no in-container healthcheck is possible; server/tests/smoke.py waits
 #     for GET /_matrix/client/versions instead.
@@ -91,10 +99,68 @@ services:
       TUWUNEL_REGISTRATION_TOKEN: ${BOTVILLE_REGISTRATION_TOKEN:?set in server/compose/.env}
       TUWUNEL_ALLOW_FEDERATION: "false"
       TUWUNEL_TRUSTED_SERVERS: "[]"
+    # TUWUNEL_IP_RANGE_DENYLIST: full upstream default private-range denylist
+    # minus the sygnal container's /32 (BOTVILLE_SYGNAL_IP), rendered by
+    # init.sh so pushes reach sygnal and nothing else. required: false keeps
+    # `docker compose config` working on a checkout that has not run init.sh
+    # (the generated file is gitignored).
+    env_file:
+      - path: ./generated/push-denylist.env
+        required: false
     ports:
       - "127.0.0.1:${BOTVILLE_HTTP_PORT:-8008}:8008"
     volumes:
       - tuwunel-data:/var/lib/tuwunel
+    restart: unless-stopped
+
+  sygnal:
+    # Sygnal push gateway (A1.2), `push` profile — stacks onto any homeserver
+    # profile via `make up HS=<hs> PUSH=1`. Pinned tag@digest like the rest;
+    # override via SYGNAL_IMAGE. Homeservers reach it inside the compose
+    # network at http://sygnal:5000 (pusher data.url); the host mapping below
+    # is a loopback-only convenience for poking /_matrix/push/v1/notify.
+    image: ${SYGNAL_IMAGE:-docker.io/matrixdotorg/sygnal:v0.17.0@sha256:141f5e72fdf99a28e29ca87f3a46c19ed1cf21d5074aa3ef9df7c067e0c1c46a}
+    profiles: [push]
+    environment:
+      # Rendered from sygnal/sygnal.yaml.tmpl by server/scripts/init.sh into
+      # ./generated/sygnal/ (gitignored); SYGNAL_CONF is how the image locates
+      # its config.
+      SYGNAL_CONF: /config/sygnal.yaml
+      # Makes the mock pushkin (bind-mounted below at /custom) importable for
+      # type: botville_mock_pushkin.MockPushkin in the app config.
+      PYTHONPATH: /custom
+    ports:
+      - "127.0.0.1:${BOTVILLE_PUSH_PORT:-8019}:5000"
+    networks:
+      default:
+        # Fixed address: the homeservers' push allow (Synapse
+        # ip_range_whitelist / denylist carve-out, rendered by init.sh) covers
+        # exactly this /32 — the network's .2 by convention. The :- value is
+        # only the fallback for `docker compose config` on a checkout where
+        # init.sh has not rendered .env yet; `make up` always renders .env
+        # (which carries the real value) first.
+        ipv4_address: ${BOTVILLE_SYGNAL_IP:-172.31.250.2}
+    volumes:
+      - ./generated/sygnal:/config:ro
+      - ./sygnal:/custom:ro
+        # Scratch dir for the mock pushkin's JSONL; a bind mount (created 0755
+        # by init.sh — the image runs as root) rather than a named volume so
+        # the file stays readable from the host.
+      - ./generated/sygnal-data:/data
+      # Real APNs key goes here (secrets/, created 0700 by init.sh; apns.p8
+      # mode 600, gitignored); mounted read-only. With no key, only the mock
+      # app is configured.
+      - ./secrets:/secrets:ro
+    healthcheck:
+      # The image's own HEALTHCHECK shells out to curl, but the runtime image
+      # has no curl, so the container would go unhealthy ~70s in; probe
+      # /health with the python that is there. push_e2e.py's unknown-app_id
+      # rejection probe remains the functional readiness check.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
     restart: unless-stopped
 
   continuwuity:
@@ -113,11 +179,30 @@ services:
       CONTINUWUITY_REGISTRATION_TOKEN: ${BOTVILLE_REGISTRATION_TOKEN:?set in server/compose/.env}
       CONTINUWUITY_ALLOW_FEDERATION: "false"
       CONTINUWUITY_TRUSTED_SERVERS: "[]"
+    # CONTINUWUITY_IP_RANGE_DENYLIST: full upstream default private-range
+    # denylist minus the sygnal container's /32 (BOTVILLE_SYGNAL_IP),
+    # rendered by init.sh so pushes reach sygnal and nothing else.
+    # required: false — see the tuwunel service.
+    env_file:
+      - path: ./generated/push-denylist.env
+        required: false
     ports:
       - "127.0.0.1:${BOTVILLE_HTTP_PORT:-8008}:8008"
     volumes:
       - continuwuity-data:/var/lib/continuwuity
     restart: unless-stopped
+
+networks:
+  default:
+    ipam:
+      config:
+        # The dynamic pool (ip_range) keeps docker's sequential dynamic
+        # allocation (.2, .3, ...) away from the sygnal container's fixed
+        # address below; without it whichever container starts first would
+        # take .2 and the other would fail with "address already in use".
+        # init.sh (render_push_denylist.py) validates subnet/range/IP.
+        - subnet: ${BOTVILLE_DOCKER_SUBNET:-172.31.250.0/24}
+          ip_range: ${BOTVILLE_DOCKER_IP_RANGE:-172.31.250.64/26}
 
 volumes:
   postgres-data:

@@ -23,6 +23,7 @@ from pathlib import Path
 SERVER_DIR = Path(__file__).resolve().parents[1]
 BOOTSTRAP = SERVER_DIR / "scripts" / "bootstrap-continuwuity.sh"
 INIT = SERVER_DIR / "scripts" / "init.sh"
+RENDERER = SERVER_DIR / "scripts" / "render_push_denylist.py"
 
 ADMIN_USER = "botville-admin"
 ADMIN_PASSWORD = "correct-horse-battery"
@@ -353,9 +354,32 @@ class InitScriptTest(unittest.TestCase):
         (self.tmp / "scripts").mkdir()
         (self.tmp / "compose" / "synapse").mkdir(parents=True)
         shutil.copy(INIT, self.tmp / "scripts" / "init.sh")
+        # init.sh calls the renderer for generated/push-denylist.env (A1.2).
+        shutil.copy(RENDERER, self.tmp / "scripts" / "render_push_denylist.py")
         (self.tmp / "compose" / ".env.example").write_text(ENV_EXAMPLE, encoding="utf-8")
         (self.tmp / "compose" / "synapse" / "homeserver.yaml.tmpl").write_text(
             TEMPLATE, encoding="utf-8"
+        )
+        # init.sh also renders the sygnal templates (A1.2); placeholder-free
+        # one-liners keep these tests focused on the .env logic. The sygnal
+        # rendering itself has its own tests in test_push_sygnal.py. mock-app
+        # and ip-range-whitelist parts are the real ones (the fixtures never
+        # set BOTVILLE_SYGNAL_IP, so the whitelist part stays unused here).
+        sygnal_dir = self.tmp / "compose" / "sygnal"
+        sygnal_dir.mkdir()
+        (sygnal_dir / "sygnal.yaml.tmpl").write_text(
+            "sygnal:\n  logging: {}\napps:\n",
+            encoding="utf-8",
+        )
+        (sygnal_dir / "mock-app.yaml.part").write_text(
+            '  "org.botville.mock":\n    type: botville_mock_pushkin.MockPushkin\n',
+            encoding="utf-8",
+        )
+        (sygnal_dir / "apns-app.yaml.part").write_text(
+            '  "${APNS_APP_ID}":\n    type: apns\n', encoding="utf-8"
+        )
+        (self.tmp / "compose" / "synapse" / "ip-range-whitelist.part").write_text(
+            'ip_range_whitelist:\n  - "${BOTVILLE_SYGNAL_IP}/32"\n', encoding="utf-8"
         )
         self.env_file = self.tmp / "compose" / ".env"
         self.generated = self.tmp / "compose" / "generated" / "synapse" / "homeserver.yaml"

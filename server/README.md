@@ -15,10 +15,12 @@
 ```bash
 make up              # core 一键启动：Synapse + Postgres，http://127.0.0.1:8008
 make up HS=tuwunel   # 换 Tuwunel（continuwuity 同理）
+make up PUSH=1       # 叠加 sygnal 推送网关（push profile，A1.2；可与任一 HS 组合）
 make smoke           # 标准库冒烟测试：注册→登录→建房(v10)→发消息→回读→sync
 make backup          # 备份到 ./backups/<UTC时间戳>/（目录 700、文件 600，A1.1）
 make restore RESTORE_DIR=backups/<时间戳>   # 破坏性恢复（自动 --yes）
 make e2e             # 验收：注册→私聊→建群；E2E_PHASE=verify 复核备份恢复
+make push-e2e        # 推送验收：HS→sygnal 时延 <5s（mock pushkin，需 PUSH=1 起栈）
 make logs            # 跟踪日志
 make ps              # 容器状态
 make down            # 停止（保留数据卷；手动 down -v 可清空）
@@ -70,11 +72,25 @@ make down            # 停止（保留数据卷；手动 down -v 可清空）
 - 环境变量读取：`init.sh`、bootstrap 脚本与 Makefile 直接读 `server/compose/.env`，
   重复键以**最后一条**为准（与 `docker compose --env-file` 一致）；注意 compose 插值时
   shell 环境变量优先级高于 `.env`。
-- 就绪探测：postgres/synapse 用容器 healthcheck；tuwunel、continuwuity 镜像为
-  OS-less（无 shell/curl），由 `server/tests/smoke.py` 轮询 `/_matrix/client/versions`。
+- 就绪探测：postgres/synapse/sygnal 用容器 healthcheck（sygnal 用镜像内 python
+  探测 `/health`——运行镜像无 curl，自带的 curl HEALTHCHECK 会误报 unhealthy）；
+  tuwunel、continuwuity 镜像为 OS-less（无 shell/curl），由 `server/tests/smoke.py`
+  轮询 `/_matrix/client/versions`。
+- 推送网关（A1.2，[docs/deploy/push-sygnal.md](../docs/deploy/push-sygnal.md)）：
+  `make up PUSH=1` 叠加 `push` profile 启动 sygnal（宿主 `127.0.0.1:8019` → 容器
+  5000；homeserver 走内网 `http://sygnal:5000`）。配置由 `init.sh` 从
+  `sygnal/sygnal.yaml.tmpl` 渲染，默认带 `org.botville.mock` pushkin（写 JSONL，
+  供 `make push-e2e` 测时延；`BOTVILLE_PUSH_MOCK=false` 可移除，生产只跑真实
+  APNs）；真实 APNs 仅当 `.env` 里 `BOTVILLE_APNS_ENABLED=true` 且 APNS_* 为真实值
+  且 `server/compose/secrets/apns.p8` 存在时渲染（**当前无 Apple 账号，真实 APNs
+  送达未验证**）。homeserver 的内网推送放行只有 sygnal 容器的固定 IP
+  `BOTVILLE_SYGNAL_IP`（一个 /32，留空则完全不放行；详见 push-sygnal.md 的
+  「内网推送放行」）。CI 的 `push-e2e` job 在 synapse、tuwunel、continuwuity
+  三家上各跑一遍。
 - 镜像默认全部 pin 为 `tag@sha256:<digest>`（含 Postgres，digest 取多架构 index）；
   可在 `.env` 用 `POSTGRES_IMAGE` / `SYNAPSE_IMAGE` / `TUWUNEL_IMAGE` /
-  `CONTINUWUITY_IMAGE` 覆盖（如临时跟 `:latest`，不推荐）。升级流程与风险见
+  `CONTINUWUITY_IMAGE` / `SYGNAL_IMAGE` 覆盖（如临时跟 `:latest`，不推荐）。
+  升级流程与风险见
   [docs/ops/upgrade-images.md](../docs/ops/upgrade-images.md)；
   continuwuity 的实测版本与 digest 另见 `docs/compat/homeserver-compat.md` §3.3。
 
@@ -83,12 +99,21 @@ make down            # 停止（保留数据卷；手动 down -v 可清空）
 ```
 server/
 ├── compose/
-│   ├── docker-compose.yml        # profiles: synapse | tuwunel | continuwuity
+│   ├── docker-compose.yml        # profiles: synapse | tuwunel | continuwuity (+ push)
 │   ├── .env.example              # 仅占位符（CI 有 lint 守卫）
-│   ├── synapse/homeserver.yaml.tmpl
-│   └── generated/                # 渲染产物，gitignore
+│   ├── synapse/
+│   │   ├── homeserver.yaml.tmpl  # homeserver 配置模板（whitelist 由 part 追加）
+│   │   └── ip-range-whitelist.part  # sygnal /32 放行（BOTVILLE_SYGNAL_IP 非空时追加）
+│   ├── sygnal/
+│   │   ├── sygnal.yaml.tmpl      # sygnal 配置模板（apps 由 part 追加，A1.2）
+│   │   ├── mock-app.yaml.part    # org.botville.mock（BOTVILLE_PUSH_MOCK，默认开）
+│   │   ├── apns-app.yaml.part    # APNs app 片段（APNs 启用且密钥就绪时追加）
+│   │   └── botville_mock_pushkin.py  # 自定义 pushkin：收通知写 JSONL
+│   ├── secrets/                  # 真实 apns.p8 放这里（init.sh 建 700，gitignore，绝不入库）
+│   └── generated/                # 渲染产物 + mock 推送数据，gitignore
 ├── scripts/
-│   ├── init.sh                   # .env 引导/补齐缺失键 + 模板渲染
+│   ├── init.sh                   # .env 引导/补齐缺失键 + 模板渲染（含 sygnal）
+│   ├── render_push_denylist.py   # push denylist 渲染 + subnet/sygnal IP 校验（A1.2）
 │   ├── bootstrap-continuwuity.sh # continuwuity 首启引导注册（标准 UIA，仅 CS API）
 │   ├── lib.sh                    # backup/restore 共享辅助函数
 │   ├── backup-synapse.sh         # DB dump + 数据卷归档 + manifest（A1.1）
@@ -96,7 +121,10 @@ server/
 └── tests/
     ├── smoke.py                  # 仅标准库的 CS API 冒烟测试
     ├── e2e_synapse.py            # seed/verify 两阶段验收测试（A1.1）
-    └── test_bootstrap_continuwuity.py  # bootstrap/init 脚本 mock 单测（CI lint 跑）
+    ├── push_e2e.py               # 推送时延验收（HS→sygnal <5s，A1.2）
+    ├── test_bootstrap_continuwuity.py  # bootstrap/init 脚本 mock 单测（CI lint 跑）
+    ├── test_push_sygnal.py       # mock pushkin + init.sh sygnal 渲染单测（A1.2）
+    └── test_push_denylist.py     # push denylist 渲染/校验单测（A1.2 review B1）
 ```
 
 约束：只用 Matrix 标准接口（禁止 `/_synapse/admin` 与 admin room 命令）；仓库不含任何真实密钥；Apache-2.0。
