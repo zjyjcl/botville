@@ -99,8 +99,8 @@ public struct MatrixLoginCapabilityDiscovery: LoginCapabilityDiscovering {
             return LoginCapabilities(supportsPassword: document.flows.contains { $0.type == "m.login.password" })
         } catch let error as AuthenticationError {
             throw error
-        } catch is URLError {
-            throw AuthenticationError.networkFailure
+        } catch let error as URLError {
+            throw PasswordLoginResultClassifier.error(for: error)
         } catch is DecodingError {
             throw AuthenticationError.discoveryFailed
         } catch {
@@ -143,25 +143,35 @@ public enum PasswordLoginResultClassifier {
     /// they are intentionally never surfaced here.
     public static func error(for error: Error) -> AuthenticationError {
         if let error = error as? AuthenticationError { return error }
-        if error is URLError { return .networkFailure }
+        if let error = error as? URLError { return Self.error(forTransportURLCode: error.code) }
         switch error {
         case ClientBuildError.ServerUnreachable: return .networkFailure
         case ClientBuildError.InvalidServerName, ClientBuildError.WellKnownLookupDisabled,
              ClientBuildError.WellKnownLookupFailed, ClientBuildError.WellKnownDeserializationError:
             return .discoveryFailed
-        case let ClientBuildError.Sdk(message), let ClientBuildError.Generic(message):
-            return looksLikeNetworkFailure(message: message, details: nil) ? .networkFailure : .serverFailure
+        case ClientBuildError.Sdk, ClientBuildError.Generic:
+            // The SDK exposes no transport subtype for these variants.  Their
+            // diagnostic strings are not a stable or safe classification API.
+            return .serverFailure
         case let ClientError.MatrixApi(kind, code, _, _):
             if case .limitExceeded(let milliseconds) = kind {
                 return .rateLimited(retryAfter: milliseconds.map { Double($0) / 1_000 })
+            }
+            switch kind {
+            case .connectionFailed, .connectionTimeout:
+                return .networkFailure
+            default:
+                break
             }
             switch code {
             case "M_LIMIT_EXCEEDED": return .rateLimited(retryAfter: nil)
             case "M_UNKNOWN_TOKEN", "M_FORBIDDEN": return .invalidCredentials
             default: return .serverFailure
             }
-        case let ClientError.Generic(message, details):
-            return looksLikeNetworkFailure(message: message, details: details) ? .networkFailure : .serverFailure
+        case ClientError.Generic, ClientError.ContentScanner:
+            // These variants intentionally carry only unstructured details.
+            // Do not infer a network outage from server-controlled text.
+            return .serverFailure
         default:
             return .serverFailure
         }
@@ -175,9 +185,21 @@ public enum PasswordLoginResultClassifier {
         return code == "M_UNKNOWN_TOKEN"
     }
 
-    private static func looksLikeNetworkFailure(message: String, details: String?) -> Bool {
-        let diagnostic = (message + " " + (details ?? "")).lowercased()
-        return ["connection", "connect", "timeout", "timed out", "network", "dns", "socket", "http client", "transport", "request failed"].contains { diagnostic.contains($0) }
+    private static func error(forTransportURLCode code: URLError.Code) -> AuthenticationError {
+        switch code {
+        case .cannotFindHost, .cannotConnectToHost, .networkConnectionLost,
+             .dnsLookupFailed, .notConnectedToInternet, .internationalRoamingOff,
+             .callIsActive, .timedOut, .secureConnectionFailed,
+             .serverCertificateHasBadDate, .serverCertificateUntrusted,
+             .serverCertificateHasUnknownRoot, .serverCertificateNotYetValid,
+             .clientCertificateRejected, .clientCertificateRequired:
+            return .networkFailure
+        default:
+            // URL loading also reports request construction and response
+            // parsing failures as URLError.  Only the explicit transport
+            // codes above are connectivity failures.
+            return .serverFailure
+        }
     }
 }
 

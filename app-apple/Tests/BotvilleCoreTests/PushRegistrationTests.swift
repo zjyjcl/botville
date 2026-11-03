@@ -11,7 +11,7 @@ final class PushRegistrationTests: XCTestCase {
             appID: "org.example.botville",
             pushKey: "placeholder-device-key",
             appDisplayName: "botville",
-            data: PushPusherData(url: try XCTUnwrap(URL(string: "https://push.example.org/_matrix/push/v1/notify"))),
+            data: try PushPusherData(url: XCTUnwrap(URL(string: "https://push.example.org/_matrix/push/v1/notify"))),
             append: true,
             deviceDisplayName: "iPhone",
             language: "zh-Hans"
@@ -40,6 +40,64 @@ final class PushRegistrationTests: XCTestCase {
         XCTAssertTrue(json["kind"] is NSNull)
         XCTAssertFalse(json.keys.contains("data"))
         XCTAssertEqual(json["append"] as? Bool, false)
+    }
+
+    func testPusherDataRejectsNonHTTPSOrCredentialedURLs() throws {
+        let rejected = [
+            "http://push.example.org/notify",
+            "https://user:password@push.example.org/notify",
+            "https:/missing-host",
+            "mailto:push@example.org",
+            "https://push.example.org:0/notify"
+        ]
+
+        for value in rejected {
+            XCTAssertThrowsError(try PushPusherData(url: XCTUnwrap(URL(string: value)))) { error in
+                XCTAssertEqual(error as? PushPusherDataError, .invalidURL, value)
+            }
+        }
+    }
+
+    func testPusherDataRejectsInvalidURLWhenDecoded() throws {
+        let data = Data("{\"url\":\"http://push.example.org/notify\"}".utf8)
+
+        XCTAssertThrowsError(try JSONDecoder().decode(PushPusherData.self, from: data)) { error in
+            XCTAssertEqual(error as? PushPusherDataError, .invalidURL)
+        }
+    }
+
+    func testPusherDataAndRegistrationRoundTrip() throws {
+        let data = try PushPusherData(url: XCTUnwrap(URL(string: "https://push.example.org/notify")))
+        let registration = PushRegistration(
+            appID: "org.example.botville",
+            pushKey: "placeholder-device-key",
+            appDisplayName: "botville",
+            data: data
+        )
+
+        XCTAssertEqual(try JSONDecoder().decode(PushPusherData.self, from: JSONEncoder().encode(data)), data)
+        XCTAssertEqual(try JSONDecoder().decode(PushRegistration.self, from: JSONEncoder().encode(registration)), registration)
+    }
+
+    func testRegistrationRejectsNestedInvalidPusherURL() throws {
+        let data = Data("""
+        {"app_id":"org.example.botville","pushkey":"placeholder-device-key","app_display_name":"botville","kind":"http","append":false,"data":{"url":"http://push.example.org/notify"}}
+        """.utf8)
+
+        XCTAssertThrowsError(try JSONDecoder().decode(PushRegistration.self, from: data)) { error in
+            XCTAssertEqual(error as? PushPusherDataError, .invalidURL)
+        }
+    }
+
+    func testNoopRegistrarAcceptsValidatedHTTPSRegistration() async throws {
+        let registration = PushRegistration(
+            appID: "org.example.botville",
+            pushKey: "placeholder-device-key",
+            appDisplayName: "botville",
+            data: try PushPusherData(url: XCTUnwrap(URL(string: "https://push.example.org/notify")))
+        )
+
+        try await NoopPushRegistrar().register(registration)
     }
 
     private func jsonObject(_ value: PushRegistration) throws -> [String: Any] {

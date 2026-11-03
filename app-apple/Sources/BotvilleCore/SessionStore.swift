@@ -53,6 +53,42 @@ public struct SessionCredentials: Codable, Equatable, Sendable {
     }
 }
 
+/// A persisted development exception is never a production capability.  The
+/// stored bit predates the build that is restoring it, so the current build
+/// must make the final policy decision.
+struct RestoredHomeserverPolicy: Sendable {
+    let allowLocalHTTP: Bool
+
+    init(storedAllowLocalHTTP: Bool, isDebugBuild: Bool = Self.isDebugBuild) {
+        allowLocalHTTP = isDebugBuild && storedAllowLocalHTTP
+    }
+
+    func validatedURL(_ value: String) throws -> URL {
+        if !allowLocalHTTP,
+           let components = URLComponents(string: value),
+           components.scheme?.lowercased() == "http" {
+            throw SessionRestoreSecurityError.insecureHTTP
+        }
+        return try HomeserverPolicy(allowLocalHTTP: allowLocalHTTP).validatedURL(value)
+    }
+
+    private static let isDebugBuild: Bool = {
+        #if DEBUG
+        true
+        #else
+        false
+        #endif
+    }()
+}
+
+enum SessionRestoreSecurityError: LocalizedError {
+    case insecureHTTP
+
+    var errorDescription: String? {
+        "已拒绝并清除旧的 HTTP 本地会话；Release 仅可恢复 HTTPS 会话，请重新登录。"
+    }
+}
+
 public protocol SessionStore: Sendable {
     func load() throws -> SessionCredentials?
     func save(_ credentials: SessionCredentials) throws

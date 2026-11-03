@@ -8,8 +8,14 @@ import MatrixRustSDK
 /// login() uses an internal short_retry that hides Retry-After from Swift.
 /// Successful credentials still enter the same encrypted SDK session/store.
 public protocol PasswordAuthenticating: Sendable {
-    func login(at server: URL, username: String, password: String) async throws -> Session
+    func login(at server: URL, username: String, password: String, deviceID: String?) async throws -> Session
     func discard(_ session: Session) async
+}
+
+public extension PasswordAuthenticating {
+    func login(at server: URL, username: String, password: String) async throws -> Session {
+        try await login(at: server, username: username, password: password, deviceID: nil)
+    }
 }
 
 public struct MatrixPasswordAuthentication: PasswordAuthenticating {
@@ -24,11 +30,11 @@ public struct MatrixPasswordAuthentication: PasswordAuthenticating {
 
     public init(session: URLSession) { self.session = session }
 
-    public func login(at server: URL, username: String, password: String) async throws -> Session {
+    public func login(at server: URL, username: String, password: String, deviceID: String? = nil) async throws -> Session {
         var request = URLRequest(url: server.appendingPathComponent("_matrix/client/v3/login"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode(LoginRequest(identifier: Identifier(user: username), password: password))
+        request.httpBody = try JSONEncoder().encode(LoginRequest(identifier: Identifier(user: username), password: password, device_id: deviceID))
         let (data, response) = try await session.data(for: request)
         guard let response = response as? HTTPURLResponse else { throw AuthenticationError.networkFailure }
         if let error = MatrixRateLimit.error(response: response, data: data) { throw error }
@@ -56,6 +62,7 @@ public struct MatrixPasswordAuthentication: PasswordAuthenticating {
         let identifier: Identifier
         let password: String
         let initial_device_display_name = "botville C2.1"
+        let device_id: String?
     }
     private struct LoginResponse: Decodable {
         let access_token: String

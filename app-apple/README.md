@@ -20,7 +20,7 @@ swift run BotvilleApp
 
 填写完整 homeserver URL、用户名（或 `@user:server`）和密码。客户端先探测 `/_matrix/client/versions` 和 `/_matrix/client/v3/login` 的密码流；可区分发现失败、网络故障、密码错误和不支持的登录方式。SSO/OIDC 不在本轮范围内。遇到 429 / `M_LIMIT_EXCEEDED` 会显示 `Retry-After`（秒或 HTTP 日期）或 `retry_after_ms` 的等待时长；未提供时长时提示稍后重试并间隔 5 秒重试。等待期间可以取消。登录和恢复共用默认 60 秒的整体超时（可通过 `MatrixService(authenticationTimeout:)` 配置），覆盖探测、请求、SDK 初始化和恢复；超时返回可读错误。
 
-生产默认只接受 HTTPS homeserver。开发时可在 DEBUG 中显式开启本地 HTTP，且仅允许 `http://localhost` 或 `http://127.0.0.1`；默认关闭；Release 界面不提供此开关，已显式启用的开发会话会在 Keychain 保存该设置以便恢复。`Info.plist` 也只为这两个本地地址声明 ATS 例外。URL 不接受账号密码、查询参数、片段或无效端口，且登录探测重定向必须保持同一 origin。
+生产默认只接受 HTTPS homeserver。开发时可在 DEBUG 中显式开启本地 HTTP，且仅允许 `http://localhost` 或 `http://127.0.0.1`；默认关闭；Release 核心登录/恢复路径均忽略已保存的开发 HTTP 开关并拒绝非 HTTPS 会话。仅 Debug 的 `Info-Debug.plist` 声明 `NSAllowsLocalNetworking`；Release 的 `Info.plist` 没有 ATS 例外。具体策略及平台验证边界见[安全加固说明](docs/security-hardening.md)。URL 不接受账号密码、查询参数、片段或无效端口，且登录探测重定向必须保持同一 origin。
 
 ### iOS 模拟器
 
@@ -84,11 +84,11 @@ Tests/BotvilleCoreTests/       认证、会话、发送和重连的单元测试
 
 - UI 只依赖 `BotvilleCore`。`MatrixService` 在主线程发布可观察状态。密码登录使用同源、无持久缓存的 URLSession 请求，以直接显示 SDK 内部重试原本隐藏的 429；返回的会话交给 Rust SDK，消息与同步仍由 SDK 处理。
 - 登录后 SDK `Session` 的 access/refresh token、设备和 homeserver 数据只保存在 Keychain 项 `org.botville.app.session` / `current`。每个会话使用随机 UUID 目录和随机 32-byte key 的 SQLite store，位于 Application Support；目录强制 `0700`，iOS 采用文件保护并排除备份。源码、UserDefaults 和普通文件不保存凭据。
-- 进程重启会重建同一 SDK 会话和存储。登出先请求服务端 logout，成功或 `M_UNKNOWN_TOKEN` 才删除 Keychain 和本地 store；其他失败保留会话供重试。恢复/同步的 `M_UNKNOWN_TOKEN` 会清理并回登录页。损坏、不可用或持续恢复失败时可二次确认“清除本地会话并重新登录”：不依赖读取损坏项，删除此 App 的 Keychain 项与全部本地会话数据库；不会撤销服务器设备会话。清理失败保留重试出口。
+- 进程重启会重建同一 SDK 会话和存储。登出先请求服务端 logout，成功或 `M_UNKNOWN_TOKEN` 才删除 Keychain 和本地 store；其他失败保留会话供重试。恢复/同步的硬失效 `M_UNKNOWN_TOKEN` 会清理并回登录页；soft logout 保留 Keychain 与加密 store，提示在原设备 ID 上重新输入密码，详见[会话安全说明](docs/session-security.md)。损坏、不可用或持续恢复失败时可二次确认“清除本地会话并重新登录”：不依赖读取损坏项，删除此 App 的 Keychain 项与全部本地会话数据库；不会撤销服务器设备会话。清理失败保留重试出口。
 - 房间列表同时展示 joined 与邀请，按最新活动排序。DM/群区分使用 SDK 的 `Room.isDirect()`（`m.direct` 语义），加入/邀请分别按 membership 展示，不以显示名猜测；未读数优先使用 SDK 给出的计数。
 - 文本消息区分排队、已发送、可恢复失败的发送暂停和不可恢复失败的发送暂停，详细操作边界见下方“发送语义”。
 - `/sync` 失败按有限退避重连，网络恢复和 App 回前台会触发补拉；界面显示离线或重连状态。
-- 推送只定义 `PushRegistrar`、pusher 注册参数模型和 `NoopPushRegistrar`。没有添加 Push entitlement、证书或真机注册；真实 APNs/Sygnal 接入依赖 A1.2。
+- 推送只定义 `PushRegistrar`、pusher 注册参数模型和 `NoopPushRegistrar`；pusher URL 在构造与解码时只接受无凭据、含 host 的 HTTPS 地址。没有添加 Push entitlement、证书或真机注册；真实 APNs/Sygnal 接入依赖 A1.2。
 
 ## 发送语义
 
@@ -97,7 +97,7 @@ Tests/BotvilleCoreTests/       认证、会话、发送和重连的单元测试
 - `sendingFailed(isRecoverable: false)` 同样显示“发送失败，已暂停”，但使用原 `transactionId` 的 `retrySend` / `abortSend`；只有这种不可恢复项可取消。所有操作前会再次检查当前状态，不创建第二条消息；状态已变化则提示刷新结果。
 - 发送队列只在登录或本地恢复会话成功时全量启用。`/sync` 成功、网络恢复和前台补拉不会重新启用已暂停的房间队列；暂停仅限当前 Client 会话，会阻塞该房间后续消息，直到用户重试原消息恢复队列。SDK 对新消息只入队、不自行启用 disabled 队列；重新启动或恢复会话时会重新启用原队列，持久的未发送事务可能继续发送，并依原 transaction 去重。
 
-登录/恢复取消后会阻止任何迟到结果激活会话。固定 SDK 的部分 Swift future 不响应 Task 取消，超时包装会及时返回，但候选客户端仍由原任务持有，结束后关闭队列、释放客户端并清理失败登录的 store；清理完成前禁用新登录/恢复/本地清除，防止同时操作同一数据库。恢复取消保留原会话。登录已取得的临时 token 会尝试用独立、5 秒超时的 logout 撤销；离线时不能保证服务器撤销成功，本地不会保存该 token。
+登录/恢复取消后会阻止任何迟到结果激活会话。固定 SDK 的部分 Swift future 不响应 Task 取消，超时包装会及时返回，但候选客户端仍由原任务持有，结束后关闭队列、释放客户端并清理失败登录的 store；清理完成前禁用新登录/恢复/本地清除，防止同时操作同一数据库。恢复取消保留原会话。普通新登录已取得的临时 token 会尝试用独立、5 秒超时的 logout 撤销；离线时不能保证服务器撤销成功，本地不会保存该 token。
 
 ## 验证与验收
 

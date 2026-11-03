@@ -29,6 +29,8 @@ final class PasswordAuthenticationTests: XCTestCase {
             XCTAssertEqual((payload?["identifier"] as? [String: String])?["user"], "@test:example.org")
             XCTAssertEqual(payload?["password"] as? String, "test-password")
             XCTAssertEqual(payload?["initial_device_display_name"] as? String, "botville C2.1")
+            XCTAssertNil(payload?["device_id"])
+            XCTAssertNil(payload?["refresh_token"])
             return .json(200, """
             {"access_token":"test-access","refresh_token":"test-refresh","user_id":"@test:example.org","device_id":"TEST","well_known":{"m.homeserver":{"base_url":"https://unapproved.example"}}}
             """)
@@ -38,6 +40,19 @@ final class PasswordAuthenticationTests: XCTestCase {
         XCTAssertEqual(session.accessToken, "test-access")
         XCTAssertEqual(session.refreshToken, "test-refresh")
         XCTAssertEqual(session.homeserverUrl, server.absoluteString)
+    }
+
+    func testPasswordLoginCanReuseAnExistingDeviceID() async throws {
+        let server = uniqueServer()
+        register(server) { request in
+            let body = try XCTUnwrap(self.requestBody(request))
+            let payload = try JSONSerialization.jsonObject(with: body) as? [String: Any]
+            XCTAssertEqual(payload?["device_id"] as? String, "EXISTING_DEVICE")
+            return .json(200, "{\"access_token\":\"test-access\",\"user_id\":\"@test:example.org\",\"device_id\":\"EXISTING_DEVICE\"}")
+        }
+
+        let session = try await authentication().login(at: server, username: "@test:example.org", password: "test-password", deviceID: "EXISTING_DEVICE")
+        XCTAssertEqual(session.deviceId, "EXISTING_DEVICE")
     }
 
     func testDiscardPostsLogoutForReturnedSession() async throws {

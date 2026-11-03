@@ -42,18 +42,21 @@ struct LoginView: View {
             Form {
                 TextField("Homeserver", text: $homeserver)
                     .autocorrectionDisabled()
+                    .disabled(service.requiresPasswordReauthentication)
 #if os(iOS)
                     .textInputAutocapitalization(.never)
                     .keyboardType(.URL)
 #endif
                 TextField("用户名或用户 ID", text: $username)
                     .autocorrectionDisabled()
+                    .disabled(service.requiresPasswordReauthentication)
 #if os(iOS)
                     .textInputAutocapitalization(.never)
 #endif
                 SecureField("密码", text: $password)
 #if DEBUG
                 Toggle("允许本机 HTTP（仅 localhost/127.0.0.1）", isOn: $allowLocalHTTP)
+                    .disabled(service.requiresPasswordReauthentication)
 #endif
             }
             .frame(maxWidth: 480)
@@ -112,6 +115,11 @@ struct LoginView: View {
         }
         .padding(32)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onChange(of: service.requiresPasswordReauthentication, initial: true) { _, required in
+            guard required else { return }
+            if let value = service.reauthenticationHomeserver { homeserver = value }
+            if let value = service.reauthenticationUserID { username = value }
+        }
     }
 
     private func logIn() {

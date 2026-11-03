@@ -11,8 +11,40 @@ import Foundation
 public struct PushPusherData: Codable, Equatable, Sendable {
     public let url: URL
 
-    public init(url: URL) {
+    /// The pusher endpoint receives device tokens. It must therefore use a
+    /// credential-free HTTPS origin before this wire model can be created.
+    public init(url: URL) throws {
+        try Self.validate(url)
         self.url = url
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let url = try container.decode(URL.self, forKey: .url)
+        try Self.validate(url)
+        self.url = url
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case url
+    }
+
+    private static func validate(_ url: URL) throws {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.scheme?.lowercased() == "https",
+              let host = components.host, !host.isEmpty,
+              components.user == nil, components.password == nil,
+              components.port.map({ (1...65_535).contains($0) }) ?? true else {
+            throw PushPusherDataError.invalidURL
+        }
+    }
+}
+
+public enum PushPusherDataError: LocalizedError, Equatable, Sendable {
+    case invalidURL
+
+    public var errorDescription: String? {
+        "推送服务地址必须是没有凭据的 HTTPS URL。"
     }
 }
 

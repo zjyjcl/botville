@@ -64,11 +64,17 @@ public final class MatrixService: ObservableObject {
     @Published public private(set) var authenticationStatus: String?
     @Published public private(set) var canClearLocalSession = false
     @Published public private(set) var canRetryRestore = false
+    /// The server retained the account but requires its password again.  The
+    /// encrypted local store remains available for re-authentication.
+    @Published public private(set) var requiresPasswordReauthentication = false
+    @Published public private(set) var reauthenticationHomeserver: String?
+    @Published public private(set) var reauthenticationUserID: String?
     private let passwordAuthentication: any PasswordAuthenticating
     private let authenticationTimeout: TimeInterval
     private var authenticationAttempt: AuthenticationAttempt?
     var storeKeyFactory: () throws -> Data = SessionCredentials.makeStoreKey
     private var isLoggingOut = false
+    private var softLogoutCredentials: SessionCredentials?
     private var paginationGeneration: UUID?
 
     public init(sessionStore: any SessionStore = KeychainSessionStore(),
@@ -114,8 +120,18 @@ public final class MatrixService: ObservableObject {
     public func login(homeserver: String, username: String, password: String,
                       allowLocalHTTP: Bool = false) async throws {
         guard !isAuthenticating, !isRestoring, !isLoggedIn, !isLoggingOut else { throw MatrixServiceError.busy }
-        let server = try HomeserverPolicy(allowLocalHTTP: allowLocalHTTP).validatedURL(homeserver)
-        let username = username.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Soft logout is a re-authentication of the saved account, never a
+        // chance to bind its device ID and encrypted store to caller supplied
+        // homeserver or username values.
+        let saved = softLogoutCredentials
+        let requestedHomeserver = saved?.homeserverURL ?? homeserver
+        let requestedUsername = saved?.userID ?? username
+        let requestedAllowLocalHTTP = saved?.allowLocalHTTP ?? allowLocalHTTP
+        // The Debug UI is not this boundary: callers can invoke this public
+        // API directly, so the binary configuration gates HTTP here as well.
+        let effectiveAllowLocalHTTP = RestoredHomeserverPolicy(storedAllowLocalHTTP: requestedAllowLocalHTTP).allowLocalHTTP
+        let server = try HomeserverPolicy(allowLocalHTTP: effectiveAllowLocalHTTP).validatedURL(requestedHomeserver)
+        let username = requestedUsername.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !username.isEmpty, !password.isEmpty else { throw MatrixServiceError.missingCredentials }
         isAuthenticating = true
         sessionError = nil
@@ -124,7 +140,7 @@ public final class MatrixService: ObservableObject {
         do {
             try await attempt.run(timeout: authenticationTimeout) { [self] in
                 defer { isAuthenticating = false; authenticationAttempt = nil; authenticationStatus = nil }
-                try await performLogin(server: server, username: username, password: password, allowLocalHTTP: allowLocalHTTP)
+                try await performLogin(server: server, username: username, password: password, allowLocalHTTP: effectiveAllowLocalHTTP)
             }
         } catch {
             sessionError = error is CancellationError ? "已取消登录。" : error.localizedDescription
@@ -133,45 +149,77 @@ public final class MatrixService: ObservableObject {
     }
 
     private func performLogin(server: URL, username: String, password: String, allowLocalHTTP: Bool) async throws {
-        let storeID = UUID()
+        let previous = softLogoutCredentials
+        let storeID = previous?.storeID ?? UUID()
         var candidate: Client?
         var remoteSession: Session?
         do {
             try Task.checkCancellation()
-            // Never overwrite an unreadable or uncleaned previous account.
+            // A soft logout is the one intentional exception: re-authenticate
+            // against the same origin/device while retaining its encrypted
+            // store.  A normal login never overwrites another account.
             if cleanupRequired { try cleanStoredSession() }
-            guard try sessionStore.load() == nil else { throw MatrixServiceError.storageUnavailable }
+            if let previous {
+                guard try sessionStore.load() == previous,
+                      server.absoluteString == previous.homeserverURL else {
+                    throw MatrixServiceError.storageUnavailable
+                }
+            } else {
+                guard try sessionStore.load() == nil else { throw MatrixServiceError.storageUnavailable }
+            }
             let capabilities = try await retryRateLimits { try await self.discovery.discover(at: server) }
             guard capabilities.supportsPassword else { throw AuthenticationError.unsupportedLoginMethod }
-            let key = try storeKeyFactory()
+            let key: Data
+            if let previous { key = previous.storeKey }
+            else { key = try storeKeyFactory() }
             let path = try directory().create(for: storeID)
             let newClient = try await retryRateLimits { try await self.clientFactory(server.absoluteString, path, key) }
             candidate = newClient
             try Task.checkCancellation()
             let session = try await retryRateLimits {
-                try await self.passwordAuthentication.login(at: server, username: username, password: password)
+                try await self.passwordAuthentication.login(at: server, username: username, password: password, deviceID: previous?.deviceID)
             }
             remoteSession = session
+            if let previous, (session.userId != previous.userID || session.deviceId != previous.deviceID) {
+                throw MatrixServiceError.storageUnavailable
+            }
             try Task.checkCancellation()
             try await retryRateLimits { try await newClient.restoreSession(session: session) }
             try Task.checkCancellation()
             let stored = SessionCredentials(session: session, storeID: storeID, storeKey: key, allowLocalHTTP: allowLocalHTTP)
-            try sessionStore.save(stored)
             credentials = stored
             try await activate(newClient, stored: stored)
+            // Preserve the old Keychain record until the replacement session
+            // has been restored and activated.  A failed soft re-login can
+            // therefore still be retried with its original local store.
+            try sessionStore.save(stored)
+            softLogoutCredentials = nil
+            requiresPasswordReauthentication = false
+            reauthenticationHomeserver = nil
+            reauthenticationUserID = nil
             canClearLocalSession = false
             canRetryRestore = false
         } catch {
             await candidate?.enableAllSendQueues(enable: false)
             candidate = nil
-            if credentials?.storeID == storeID { await clearSession() }
+            if let previous {
+                // A bad password, cancellation, or failed replacement token
+                // must not destroy a valid soft-logout store.
+                // If activation got as far as writing the replacement before
+                // failing, restore the previous Keychain value as well.
+                try? sessionStore.save(previous)
+                credentials = previous
+                softLogoutCredentials = previous
+                requiresPasswordReauthentication = true
+                if client != nil { await detachClient() }
+            } else if credentials?.storeID == storeID { await clearSession() }
             else {
                 do { try directory().remove(for: storeID) }
                 catch { cleanupRequired = true; canClearLocalSession = true }
             }
             // A separate bounded request can revoke credentials even when the
             // authentication task was cancelled. It never logs response bodies.
-            if let remoteSession {
+            if previous == nil, let remoteSession {
                 let transport = passwordAuthentication
                 await Task { await transport.discard(remoteSession) }.value
             }
@@ -202,7 +250,15 @@ public final class MatrixService: ObservableObject {
                 try await performRestore()
             }
         } catch {
-            if PasswordLoginResultClassifier.isExpiredSession(error) {
+            if let securityError = error as? SessionRestoreSecurityError {
+                await clearSession()
+                canRetryRestore = false
+                canClearLocalSession = cleanupRequired
+                sessionError = cleanupRequired ? MatrixServiceError.storageUnavailable.localizedDescription : securityError.localizedDescription
+            } else if isSoftLogoutError(error) {
+                await enterSoftLogout()
+                canRetryRestore = false
+            } else if PasswordLoginResultClassifier.isExpiredSession(error) {
                 await invalidateSession()
                 canRetryRestore = false
             } else {
@@ -224,7 +280,9 @@ public final class MatrixService: ObservableObject {
             if cleanupRequired { try cleanStoredSession() }
             guard let stored = try sessionStore.load() else { return }
             credentials = stored
-            _ = try HomeserverPolicy(allowLocalHTTP: stored.allowLocalHTTP).validatedURL(stored.homeserverURL)
+            // `allowLocalHTTP` is an old, persisted development choice.  A
+            // Release binary must not inherit it from a Debug install.
+            _ = try RestoredHomeserverPolicy(storedAllowLocalHTTP: stored.allowLocalHTTP).validatedURL(stored.homeserverURL)
             let path = try directory().create(for: stored.storeID)
             let restored = try await retryRateLimits { try await self.clientFactory(stored.homeserverURL, path, stored.storeKey) }
             candidate = restored
@@ -280,6 +338,10 @@ public final class MatrixService: ObservableObject {
             throw MatrixServiceError.storageUnavailable
         }
         credentials = nil
+        softLogoutCredentials = nil
+        requiresPasswordReauthentication = false
+        reauthenticationHomeserver = nil
+        reauthenticationUserID = nil
         cleanupRequired = false
         didAttemptRestore = false
         canRetryRestore = false
@@ -293,14 +355,15 @@ public final class MatrixService: ObservableObject {
         credentials = stored
         sessionGeneration = UUID()
         let generation = sessionGeneration
-        let (stream, continuation) = AsyncStream<Void>.makeStream()
+        let (stream, continuation) = AsyncStream<Bool>.makeStream()
         let delegate = AuthErrorBridge(continuation)
         authDelegate = delegate
         authHandle = try client.setDelegate(delegate: delegate)
         authTask = Task { [weak self] in
-            for await _ in stream {
+            for await isSoftLogout in stream {
                 guard let self, generation == self.sessionGeneration, !self.isLoggingOut else { return }
-                await self.invalidateSession()
+                if isSoftLogout { await self.enterSoftLogout() }
+                else { await self.invalidateSession() }
                 return
             }
         }
@@ -366,6 +429,11 @@ public final class MatrixService: ObservableObject {
                     try await Task.sleep(for: .milliseconds(100))
                 } catch {
                     guard !Task.isCancelled, let self, self.syncGeneration == generation else { return }
+                    if isSoftLogoutError(error) {
+                        self.syncTask = nil
+                        await self.enterSoftLogout()
+                        return
+                    }
                     if PasswordLoginResultClassifier.isExpiredSession(error) {
                         // Do not await/cancel this task from inside itself during cleanup.
                         self.syncTask = nil
@@ -557,6 +625,10 @@ public final class MatrixService: ObservableObject {
 
     private func operationFailure(_ error: Error, session: UUID) async -> Error {
         if error is CancellationError || error is MatrixServiceError { return error }
+        if isSoftLogoutError(error) {
+            if session == sessionGeneration { await enterSoftLogout() }
+            return MatrixServiceError.notLoggedIn
+        }
         if PasswordLoginResultClassifier.isExpiredSession(error) {
             if session == sessionGeneration { await invalidateSession() }
             return MatrixServiceError.sessionExpired
@@ -585,6 +657,19 @@ public final class MatrixService: ObservableObject {
         isLoggingOut = true
         await clearSession()
         sessionError = cleanupRequired ? MatrixServiceError.storageUnavailable.localizedDescription : "会话已失效，请重新登录。"
+        isLoggingOut = false
+    }
+
+    private func enterSoftLogout() async {
+        guard !isLoggingOut, let saved = credentials else { return }
+        isLoggingOut = true
+        await detachClient()
+        credentials = saved
+        softLogoutCredentials = saved
+        requiresPasswordReauthentication = true
+        reauthenticationHomeserver = saved.homeserverURL
+        reauthenticationUserID = saved.userID
+        sessionError = "会话需要重新输入密码；将使用当前设备 ID 重新登录，已加密的本地数据会保留。"
         isLoggingOut = false
     }
 
@@ -626,13 +711,24 @@ public final class MatrixService: ObservableObject {
         }
         try sessionStore.delete()
         credentials = nil
+        softLogoutCredentials = nil
+        requiresPasswordReauthentication = false
+        reauthenticationHomeserver = nil
+        reauthenticationUserID = nil
         cleanupRequired = false
     }
 }
 
+private func isSoftLogoutError(_ error: Error) -> Bool {
+    guard case let ClientError.MatrixApi(kind, code, _, _) = error,
+          code == "M_UNKNOWN_TOKEN",
+          case .unknownToken(softLogout: true) = kind else { return false }
+    return true
+}
+
 private final class AuthErrorBridge: ClientDelegate, Sendable {
-    let continuation: AsyncStream<Void>.Continuation
-    init(_ continuation: AsyncStream<Void>.Continuation) { self.continuation = continuation }
-    func didReceiveAuthError(isSoftLogout: Bool) { continuation.yield(()) }
+    let continuation: AsyncStream<Bool>.Continuation
+    init(_ continuation: AsyncStream<Bool>.Continuation) { self.continuation = continuation }
+    func didReceiveAuthError(isSoftLogout: Bool) { continuation.yield(isSoftLogout) }
     func onBackgroundTaskErrorReport(taskName: String, error: BackgroundTaskFailureReason) {}
 }
