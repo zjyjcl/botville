@@ -279,6 +279,8 @@ import SwiftUI
             case .openExternally:
                 if action.navigationType == .linkActivated { onExternalURL(url) }
                 decisionHandler(.cancel)
+            case .deny:
+                decisionHandler(.cancel)
             }
         }
 

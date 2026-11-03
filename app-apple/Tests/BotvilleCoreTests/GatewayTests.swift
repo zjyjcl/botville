@@ -156,6 +156,38 @@ final class GatewayTests: XCTestCase {
         XCTAssertNoThrow(try HTTPGatewayClient(baseURL: "http://localhost:8080", allowLocalHTTP: true))
     }
 
+    func testHTTPSessionGrantIntersectsGatewayOriginsWithLocalLaunchOrigin() async throws {
+        let recorder = RequestRecorder()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GatewayURLProtocol.self]
+        GatewayURLProtocol.recorder = recorder
+        defer { GatewayURLProtocol.recorder = nil }
+        let client = try HTTPGatewayClient(
+            baseURL: URL(string: "https://gateway.example.test")!,
+            session: URLSession(configuration: configuration))
+        let moduleURL = try XCTUnwrap(URL(string: "https://module.example.test/path"))
+        let expiresAt = ISO8601DateFormatter().string(from: Date().addingTimeInterval(300))
+        func token(origins: [String]) -> String {
+            let originJSON = origins.map { "\"\($0)\"" }.joined(separator: ",")
+            return "{\"code\":\"once\",\"code_ttl_seconds\":60,\"expires_at\":\"\(expiresAt)\",\"audience\":\"memory.search\",\"url\":\"https://module.example.test/path?code=once\",\"allowed_origins\":[\(originJSON)]}"
+        }
+        recorder.enqueue(status: 200, body: token(origins: [
+            "https://module.example.test", "https://gateway-added.example.test",
+        ]))
+        let grant = try await client.createModuleWebSession(
+            capabilityID: "memory.search", url: moduleURL,
+            allowedOrigins: ["https://module.example.test", "https://caller-extra.example.test"])
+        XCTAssertEqual(grant.allowedOrigins, ["https://module.example.test"])
+        let body = try XCTUnwrap(recorder.requests.last?.httpBody)
+        let requestJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(requestJSON["allowed_origins"] as? [String], ["https://module.example.test"])
+
+        recorder.enqueue(status: 200, body: token(origins: ["https://gateway-added.example.test"]))
+        await XCTAssertGatewayError(.invalidResponse) {
+            _ = try await client.createModuleWebSession(capabilityID: "memory.search", url: moduleURL)
+        }
+    }
+
     func testMockActionTransitionsAndHighRiskPlaceholderDoesNotAuthorize() async throws {
         let mock = MockGatewayClient()
         let initialCards = try await mock.cards()
@@ -166,14 +198,13 @@ final class GatewayTests: XCTestCase {
         XCTAssertEqual(receipt.card.status, "acted")
         let updatedCards = try await mock.cards()
         XCTAssertEqual(try XCTUnwrap(updatedCards.first).status, "acted")
-        let requestCountBeforeHighRisk = updatedCards.count
         let highRisk = try XCTUnwrap(card.actions.first(where: { $0.id == "approve" }))
         do {
             _ = try await mock.perform(card: card, action: highRisk)
             XCTFail("high risk must not submit")
         } catch HighRiskAuthorizationError.unavailable {}
         let cardsAfterHighRisk = try await mock.cards()
-        XCTAssertEqual(cardsAfterHighRisk.count, requestCountBeforeHighRisk)
+        XCTAssertEqual(cardsAfterHighRisk, updatedCards)
         do {
             _ = try await UnavailableHighRiskAuthorizer().authorize(
                 cardID: card.id, actionID: "approve", revision: card.revision ?? 1)
@@ -193,9 +224,8 @@ final class GatewayTests: XCTestCase {
             })?.value)
         let cookie = try await mock.exchangeSessionCookie(capabilityID: "memory.search", code: code)
         XCTAssertEqual(cookie.statusCode, 204)
-        XCTAssertTrue(cookie.setCookie?.contains("HttpOnly") == true)
         await XCTAssertGatewayError(.invalidResponse) {
-            try await mock.exchangeSessionCookie(capabilityID: "memory.search", code: code)
+            _ = try await mock.exchangeSessionCookie(capabilityID: "memory.search", code: code)
         }
 
         let second = try await mock.createModuleWebSession(
@@ -205,11 +235,11 @@ final class GatewayTests: XCTestCase {
                 $0.name == "code"
             })?.value)
         await XCTAssertGatewayError(.invalidResponse) {
-            try await mock.exchangeSessionCookie(capabilityID: "other.module", code: secondCode)
+            _ = try await mock.exchangeSessionCookie(capabilityID: "other.module", code: secondCode)
         }
         clock.advance(by: 61)
         await XCTAssertGatewayError(.expiredSessionCode) {
-            try await mock.exchangeSessionCookie(capabilityID: "memory.search", code: secondCode)
+            _ = try await mock.exchangeSessionCookie(capabilityID: "memory.search", code: secondCode)
         }
     }
 
@@ -240,6 +270,15 @@ final class GatewayTests: XCTestCase {
         do {
             _ = try await client.perform(card: highRisk, action: highRisk.actions[0])
             XCTFail("unknown risk must stop before transport")
+        } catch HighRiskAuthorizationError.unavailable {}
+        XCTAssertEqual(recorder.requests.count, before)
+        let biometric = try decodeCard(
+            """
+            {"id":"biometric","card_schema_version":"1.0.0","type":"notification","title":"x","fallback_text":"f","priority":"normal","risk":"low","status":"active","blocks":[],"actions":[{"id":"deny","label":"Deny","kind":"deny","style":"secondary","confirmation":{"required":true,"biometric":true}}],"source":{"module":"x"},"revision":1}
+            """)
+        do {
+            _ = try await client.perform(card: biometric, action: biometric.actions[0])
+            XCTFail("biometric action must stop before transport")
         } catch HighRiskAuthorizationError.unavailable {}
         XCTAssertEqual(recorder.requests.count, before)
     }

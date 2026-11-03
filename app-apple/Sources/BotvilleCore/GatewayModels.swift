@@ -17,6 +17,15 @@ public struct GatewayCapabilityManifest: Codable, Sendable, Equatable {
         case cacheTTLSeconds = "cache_ttl_seconds"
         case defaults, capabilities
     }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        manifestVersion = try c.decode(String.self, forKey: .manifestVersion)
+        contractVersion = try c.decode(String.self, forKey: .contractVersion)
+        generatedAt = try c.decode(Date.self, forKey: .generatedAt)
+        cacheTTLSeconds = try? c.decode(Int.self, forKey: .cacheTTLSeconds)
+        defaults = try? c.decode(GatewayManifestDefaults.self, forKey: .defaults)
+        capabilities = (try? c.decode(LossyArray<GatewayCapability>.self, forKey: .capabilities).values) ?? []
+    }
 }
 
 public struct GatewayManifestDefaults: Codable, Sendable, Equatable {
@@ -371,7 +380,6 @@ public protocol ModuleWebSessionProviding: Sendable {
 }
 public struct GatewayCookieExchange: Sendable, Equatable {
     public let statusCode: Int
-    public let setCookie: String?
 }
 
 public protocol HighRiskAuthorizer: Sendable {
@@ -459,5 +467,20 @@ private struct LossyArray<Element: Decodable>: Decodable {
             }
         }
         values = result
+    }
+}
+
+enum GatewayDate {
+    static func decode(_ decoder: Decoder) throws -> Date {
+        let container = try decoder.singleValueContainer()
+        let value = try container.decode(String.self)
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: value) { return date }
+        let standard = ISO8601DateFormatter()
+        standard.formatOptions = [.withInternetDateTime]
+        if let date = standard.date(from: value) { return date }
+        throw DecodingError.dataCorruptedError(
+            in: container, debugDescription: "Expected an ISO 8601 date-time.")
     }
 }

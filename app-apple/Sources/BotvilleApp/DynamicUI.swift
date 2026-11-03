@@ -15,6 +15,11 @@ final class DynamicUIModel: ObservableObject {
     private(set) var client: any GatewayClient = MockGatewayClient()
     private(set) var isMock = true
     private var generation = 0
+    private let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+    private var locale: String {
+        (Locale.preferredLanguages.first ?? Locale.current.identifier)
+            .replacingOccurrences(of: "_", with: "-")
+    }
 
     func configure(mock: Bool, baseURL: String, allowLocalHTTP: Bool) async {
         do {
@@ -40,7 +45,8 @@ final class DynamicUIModel: ObservableObject {
         notice = nil
         defer { if currentGeneration == generation { loading = false } }
         do {
-            let nextManifest = try await client.capabilities(locale: "zh-CN", appVersion: "0.1.0")
+            let nextManifest = try await client.capabilities(
+                locale: locale, appVersion: appVersion)
             guard currentGeneration == generation else { return }
             manifest = nextManifest
             let nextCards = try await client.cards(
@@ -319,10 +325,10 @@ struct DynamicUIView: View {
     }
 
     private func choose(card: GatewayCard, action: GatewayCardAction) {
-        guard card.isActionable, action.disabledReason == nil else { return }
-        if action.effectiveRisk(cardRisk: card.effectiveRisk) == .high
-            || action.confirmation?.biometric == true
-        {
+        switch GatewayActionSelectionPolicy.decision(for: card, action: action) {
+        case .ignore:
+            return
+        case .requireUnavailableAuthorization:
             // C3.1 owns biometric confirmation, challenge and Secure Enclave signing.
             Task {
                 do {
@@ -330,10 +336,11 @@ struct DynamicUIView: View {
                         cardID: card.id, actionID: action.id, revision: card.revision ?? 1)
                 } catch { highRiskMessage = true }
             }
-            return
+        case .requireConfirmation:
+            pendingAction = ActionSelection(card: card, action: action)
+        case .perform:
+            execute(ActionSelection(card: card, action: action))
         }
-        let selection = ActionSelection(card: card, action: action)
-        if action.confirmation?.required == true { pendingAction = selection } else { execute(selection) }
     }
 
     private func execute(_ selection: ActionSelection) {

@@ -26,19 +26,48 @@ final class ModuleWebSessionTests: XCTestCase {
         let policy = ModuleWebNavigationPolicy(allowedOrigins: ["https://module.example.test"])
         XCTAssertEqual(
             policy.decision(for: try XCTUnwrap(URL(string: "https://module.example.test%2Eevil.test/path"))),
-            .openExternally)
+            .deny)
         XCTAssertEqual(
             policy.decision(for: try XCTUnwrap(URL(string: "http://module.example.test/path"))),
-            .openExternally)
+            .deny)
+        XCTAssertEqual(
+            policy.decision(for: try XCTUnwrap(URL(string: "mailto:user@example.test"))),
+            .deny)
         XCTAssertEqual(
             policy.decision(for: try XCTUnwrap(URL(string: "https://module.example.test.evil.test/path"))),
             .openExternally)
         XCTAssertEqual(
             policy.decision(for: try XCTUnwrap(URL(string: "https://mod%75le.example.test/path"))),
-            .openExternally)
+            .deny)
+        XCTAssertEqual(
+            policy.decision(for: try XCTUnwrap(URL(string: "https://user@module.example.test/path"))),
+            .deny)
         XCTAssertEqual(
             policy.decision(for: try XCTUnwrap(URL(string: "https://module.example.test./path"))),
             .openExternally)
+    }
+
+    func testLocalAllowlistNeverExpandsBeyondLaunchOrigin() throws {
+        let launchURL = try XCTUnwrap(URL(string: "https://module.example.test/path"))
+        XCTAssertEqual(
+            ModuleWebOrigin.localAllowlist(for: launchURL, callerAllowedOrigins: nil),
+            ["https://module.example.test"])
+        XCTAssertEqual(
+            ModuleWebOrigin.localAllowlist(
+                for: launchURL,
+                callerAllowedOrigins: ["https://module.example.test", "https://extra.example.test"]),
+            ["https://module.example.test"])
+        XCTAssertNil(
+            ModuleWebOrigin.localAllowlist(
+                for: launchURL, callerAllowedOrigins: ["https://extra.example.test"]))
+        XCTAssertNil(
+            ModuleWebOrigin.localAllowlist(for: launchURL, callerAllowedOrigins: ["not an origin"]))
+        XCTAssertEqual(
+            ModuleWebOrigin.intersectGrant(
+                ["https://module.example.test", "https://gateway-added.example.test"], with: launchURL),
+            ["https://module.example.test"])
+        XCTAssertNil(
+            ModuleWebOrigin.intersectGrant(["https://gateway-added.example.test"], with: launchURL))
     }
 
     func testBridgeOnlyAcceptsMainFrameAtAllowedOrigin() throws {

@@ -92,11 +92,38 @@ public struct ModuleWebOrigin: Hashable, Sendable, CustomStringConvertible {
     public var description: String {
         "\(scheme)://\(host)" + (port.map { ":\($0)" } ?? "")
     }
+
+    /// A module launch always needs its own origin. Caller input may narrow
+    /// that boundary, but may never expand it to another origin.
+    public static func localAllowlist(
+        for requestURL: URL, callerAllowedOrigins: [String]?
+    ) -> [String]? {
+        guard let requestOrigin = ModuleWebOrigin(url: requestURL) else { return nil }
+        guard let callerAllowedOrigins, !callerAllowedOrigins.isEmpty else {
+            return [requestOrigin.description]
+        }
+        let callerOrigins = Set(callerAllowedOrigins.compactMap(ModuleWebOrigin.init(string:)))
+        guard callerOrigins.contains(requestOrigin) else { return nil }
+        return [requestOrigin.description]
+    }
+
+    /// The gateway's grant is authoritative only inside the local boundary.
+    /// Today that boundary is the exact launch origin, which keeps a grant
+    /// from silently adding a second embedded-WebView origin.
+    public static func intersectGrant(
+        _ grantedOrigins: [String], with requestURL: URL
+    ) -> [String]? {
+        guard let requestOrigin = ModuleWebOrigin(url: requestURL),
+            Set(grantedOrigins.compactMap(ModuleWebOrigin.init(string:))).contains(requestOrigin)
+        else { return nil }
+        return [requestOrigin.description]
+    }
 }
 
 public enum ModuleWebNavigationDecision: Equatable, Sendable {
     case allow
     case openExternally
+    case deny
 }
 
 public struct ModuleWebNavigationPolicy: Sendable {
@@ -107,7 +134,8 @@ public struct ModuleWebNavigationPolicy: Sendable {
     }
 
     public func decision(for url: URL) -> ModuleWebNavigationDecision {
-        guard let origin = ModuleWebOrigin(url: url), allowedOrigins.contains(origin) else {
+        guard let origin = ModuleWebOrigin(url: url) else { return .deny }
+        guard allowedOrigins.contains(origin) else {
             return .openExternally
         }
         return .allow

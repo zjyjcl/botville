@@ -140,7 +140,10 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         capabilityID: String, url: URL, allowedOrigins: [String]? = nil, scopes: [String]? = nil,
         ttlSeconds: Int? = nil
     ) async throws -> ModuleWebSessionGrant {
-        guard ModuleWebOrigin(url: url) != nil, (60...3600).contains(ttlSeconds ?? 300) else {
+        guard let localAllowedOrigins = ModuleWebOrigin.localAllowlist(
+            for: url, callerAllowedOrigins: allowedOrigins),
+            (60...3600).contains(ttlSeconds ?? 300)
+        else {
             throw GatewayClientError.invalidResponse
         }
         struct Body: Encodable {
@@ -151,7 +154,7 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         }
         let startedAt = Date()
         let body = try JSONEncoder().encode(
-            Body(url: url, allowed_origins: allowedOrigins, scopes: scopes, ttl_seconds: ttlSeconds))
+            Body(url: url, allowed_origins: localAllowedOrigins, scopes: scopes, ttl_seconds: ttlSeconds))
         let token = try await decode(
             request(["capabilities", capabilityID, "session-tokens"], method: "POST", body: body),
             as: GatewaySessionToken.self)
@@ -160,10 +163,11 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
                 $0.name == "code"
             } ?? []
         let remainingCodeTTL = token.codeTTLSeconds - Int(ceil(Date().timeIntervalSince(startedAt)))
-        guard token.audience == capabilityID, (1...60).contains(token.codeTTLSeconds), remainingCodeTTL > 0,
+        guard let effectiveAllowedOrigins = ModuleWebOrigin.intersectGrant(token.allowedOrigins, with: url),
+            token.audience == capabilityID, (1...60).contains(token.codeTTLSeconds), remainingCodeTTL > 0,
             token.expiresAt > Date(), token.expiresAt.timeIntervalSince(startedAt) <= 3601,
             ModuleWebOrigin(url: token.url) == ModuleWebOrigin(url: url),
-            ModuleWebNavigationPolicy(allowedOrigins: token.allowedOrigins).decision(for: token.url)
+            ModuleWebNavigationPolicy(allowedOrigins: effectiveAllowedOrigins).decision(for: token.url)
                 == .allow,
             !token.code.isEmpty, codeItems.count == 1, codeItems.first?.value == token.code
         else {
@@ -171,7 +175,7 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         }
         // The gateway supplies the URL verbatim. Never append/reconstruct its code.
         return ModuleWebSessionGrant(
-            capabilityID: capabilityID, url: token.url, allowedOrigins: token.allowedOrigins,
+            capabilityID: capabilityID, url: token.url, allowedOrigins: effectiveAllowedOrigins,
             codeTTLSeconds: remainingCodeTTL, expiresAt: token.expiresAt)
     }
 
@@ -184,8 +188,7 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         let (_, response) = try await session.data(for: request)
         guard let response = response as? HTTPURLResponse else { throw GatewayClientError.invalidResponse }
         guard response.statusCode == 204 else { throw GatewayClientError.httpStatus(response.statusCode) }
-        return GatewayCookieExchange(
-            statusCode: 204, setCookie: response.value(forHTTPHeaderField: "Set-Cookie"))
+        return GatewayCookieExchange(statusCode: 204)
     }
 
     private func request(
@@ -261,7 +264,9 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
                     GatewayCapabilityManifest.self, from: Self.resource("mock-capability-manifest")))
         } catch { manifest = .failure(GatewayClientError.invalidResponse) }
         do {
-            var object = try JSONSerialization.jsonObject(with: Self.resource("mock-card")) as! [String: Any]
+            guard var object = try JSONSerialization.jsonObject(with: Self.resource("mock-card"))
+                as? [String: Any]
+            else { throw GatewayClientError.invalidResponse }
             object["expires_at"] = ISO8601DateFormatter().string(from: now().addingTimeInterval(3600))
             object["created_at"] = ISO8601DateFormatter().string(from: now())
             mockCards = [
@@ -314,8 +319,8 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
             (60...3600).contains(ttlSeconds ?? 300),
             Set(scopes ?? []).isSubset(of: Set(capability.scopes))
         else { throw GatewayClientError.invalidResponse }
-        let origins = allowedOrigins ?? [origin.description]
-        guard ModuleWebNavigationPolicy(allowedOrigins: origins).decision(for: url) == .allow,
+        guard let origins = ModuleWebOrigin.localAllowlist(for: url, callerAllowedOrigins: allowedOrigins),
+            ModuleWebNavigationPolicy(allowedOrigins: origins).decision(for: url) == .allow,
             var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         else { throw GatewayClientError.invalidResponse }
         let issuedAt = now()
@@ -344,18 +349,18 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
         guard now() < issued.codeExpiresAt, now() < issued.expiresAt else {
             throw GatewayClientError.expiredSessionCode
         }
-        let ttl = max(0, Int(issued.expiresAt.timeIntervalSince(now())))
-        return GatewayCookieExchange(
-            statusCode: 204,
-            setCookie: "botville_session=mock-cookie; Path=/; Max-Age=\(ttl); HttpOnly; Secure; SameSite=Lax")
+        return GatewayCookieExchange(statusCode: 204)
     }
 
     public nonisolated func mockModuleWebHTML(for session: ModuleWebSession) -> String {
-        """
+        let content: (title: String, body: String) = session.capabilityID == "notify.approvals"
+            ? ("模拟部署日志", "<pre>2026-11-04 10:31:42 dry-run check passed\n2026-11-04 10:31:43 awaiting approval</pre>")
+            : ("记忆检索", "<p>示例模块已打开。短时会话通过 HttpOnly cookie 交给浏览器，页面不读取凭据。</p>")
+        return """
         <!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>body{font:17px -apple-system;padding:28px;color:#173149;background:#f4f8fb}button{padding:12px;border:0;border-radius:10px;background:#236dba;color:white}p{line-height:1.7}</style>
-        </head><body><h1>记忆检索</h1><p>示例模块已打开。短时会话通过 HttpOnly cookie 交给浏览器，页面不读取凭据。</p>
+        </head><body><h1>\(content.title)</h1>\(content.body)
         <button onclick="window.webkit.messageHandlers['botville.session.renew'].postMessage({})">续期会话</button>
         <p><a href="https://example.invalid/outside">测试站外链接提示</a></p></body></html>
         """
@@ -372,7 +377,7 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
 enum GatewayCoding {
     static var decoder: JSONDecoder {
         let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        decoder.dateDecodingStrategy = .custom { try GatewayDate.decode($0) }
         return decoder
     }
 }
