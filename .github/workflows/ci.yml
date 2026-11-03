@@ -66,6 +66,18 @@ jobs:
             --base-url http://127.0.0.1:8008 \
             --registration-token "$token"
 
+      - name: Graceful stop right after traffic (issue #91)
+        run: |
+          # Stop immediately after smoke: the window in which continuwuity's
+          # announcements check used to block shutdown until SIGKILL.
+          cid="$(docker compose -f server/compose/docker-compose.yml --env-file server/compose/.env --profile "${{ matrix.homeserver }}" ps -q "${{ matrix.homeserver }}")"
+          start=$(date +%s)
+          docker stop -t 60 "$cid"
+          took=$(( $(date +%s) - start ))
+          code="$(docker inspect -f '{{.State.ExitCode}}' "$cid")"
+          echo "stop took ${took}s, exit code ${code}"
+          test "$took" -lt 30 && test "$code" != 137
+
       - name: Dump logs
         if: failure()
         run: |
