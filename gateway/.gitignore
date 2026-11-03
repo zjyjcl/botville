@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 botville contributors
+
+# Python 构建/缓存产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+
+# 本地环境（含真实密钥，绝不提交）
+.env
+.venv/
+venv/

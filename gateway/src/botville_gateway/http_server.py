@@ -1,0 +1,436 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 botville contributors
+"""stdlib HTTP 雏形。零运行时依赖（只用 Python 标准库）。
+
+实现的端点子集（对齐 gateway/openapi/gateway.v1.yaml）：
+
+  GET  /health
+  POST /v1/policy/evaluate
+  POST /v1/conversations/{id}/messages
+
+错误体遵循 RFC 9457 problem+json（契约 §1.3）。所有响应（含 4xx/5xx）都带
+`X-Request-Id`，且 `Cache-Control: no-store`。
+
+使用方式：
+  GATEWAY_AUTH_TOKEN=<random> python3 -m botville_gateway
+  GATEWAY_DEV_MODE=true python3 -m botville_gateway   # 显式开发模式，免鉴权
+  GATEWAY_AUTH_TOKEN=<random> GATEWAY_PORT=9000 python3 -m botville_gateway
+"""
+
+from __future__ import annotations
+
+import hmac
+import http.server
+import json
+import re
+import uuid
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+
+from .config import Config, load_config
+from .matrix import InMemoryMatrixTransport
+from .service import (
+    GatewayDeliveryError,
+    GatewayService,
+    IdempotencyConflict,
+    ValidationError,
+)
+from .store import UsageStore
+from .timeutil import iso_utc
+
+_ROUTE_MESSAGES = re.compile(r"^/v1/conversations/([^/]+)/messages$")
+# 客户端回传的 X-Request-Id 必须短且安全，否则伪造/放大审计 ID。
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
+_JSON_MEDIA_TYPE = "application/json"
+
+# 请求体上限：远大于 max_message_chars（8000），同时防止内存拖垮。
+MAX_BODY_BYTES = 1_048_576  # 1 MiB
+
+
+def _problem(
+    status: int,
+    code: str,
+    title: str,
+    request_id: str,
+    *,
+    detail: Optional[str] = None,
+    errors: Optional[list] = None,
+    instance: Optional[str] = None,
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {
+        "type": f"urn:botville:error:{code}",
+        "title": title,
+        "status": status,
+        "code": code,
+        "request_id": request_id,
+    }
+    if detail:
+        body["detail"] = detail
+    if errors:
+        body["errors"] = errors
+    if instance:
+        body["instance"] = instance
+    return body
+
+
+class GatewayHandler(http.server.BaseHTTPRequestHandler):
+    """HTTP 请求处理器。
+
+    `server` 属性由 `GatewayServer` 注入，携带 `config` / `service`。
+    """
+
+    server_version = "botville-gateway"
+    sys_version = ""
+
+    def version_string(self) -> str:  # 不暴露 Python 版本
+        return self.server_version
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        if self.server.config.access_log:  # type: ignore[attr-defined]
+            super().log_message(fmt, *args)
+
+    # ------------------------------------------------------------- helpers
+    def _request_id(self) -> str:
+        """每个请求只生成/校验一次；校验失败则换成服务端新 ID（不回显可疑值）。"""
+        cached = getattr(self, "_rid", None)
+        if cached:
+            return cached
+        raw = self.headers.get("X-Request-Id") if self.headers else None
+        if raw and _REQUEST_ID_RE.fullmatch(raw):
+            self._rid = raw
+        else:
+            self._rid = f"req_{uuid.uuid4().hex}"
+        return self._rid
+
+    def _idempotency_key(self) -> Optional[str]:
+        """读取 Idempotency-Key，按 OpenAPI 声明的 8–128 长度校验。"""
+        raw = self.headers.get("Idempotency-Key") or None
+        if raw is None:
+            return None
+        raw = raw.strip()
+        if not raw or len(raw) < 8:
+            return None  # 过短视为未提供（不拒绝合法请求）
+        if len(raw) > 128:
+            raise ValidationError(
+                "request.invalid", "Idempotency-Key must be 8–128 characters"
+            )
+        return raw
+
+    def _problem_body(
+        self,
+        status: int,
+        code: str,
+        title: str,
+        *,
+        detail: Optional[str] = None,
+        errors: Optional[list] = None,
+    ) -> Dict[str, Any]:
+        return _problem(
+            status, code, title, self._request_id(), detail=detail, errors=errors
+        )
+
+    def _send_problem(
+        self,
+        status: int,
+        code: str,
+        title: str,
+        *,
+        detail: Optional[str] = None,
+        errors: Optional[list] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> None:
+        self._send_json(
+            status,
+            self._problem_body(status, code, title, detail=detail, errors=errors),
+            problem=True,
+            extra_headers=extra_headers,
+        )
+
+    def _send_json(
+        self,
+        status: int,
+        body: Any,
+        *,
+        extra_headers: Optional[Dict[str, str]] = None,
+        problem: bool = False,
+    ) -> None:
+        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        content_type = (
+            "application/problem+json; charset=utf-8"
+            if problem
+            else "application/json; charset=utf-8"
+        )
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            # §1.3：每个响应都带 X-Request-Id，不只是 2xx。
+            self.send_header("X-Request-Id", self._request_id())
+            self.send_header("Cache-Control", "no-store")
+            if extra_headers:
+                for k, v in extra_headers.items():
+                    self.send_header(k, v)
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            # 客户端提前断开：不是服务端错误，别让 handler 线程抛栈。
+            self.close_connection = True
+
+    def _read_json(self) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """读取请求体并反序列化。返回 (body, problem_body)；其中一个为 None。
+
+        校验：Content-Length 可解析且非负、不超过 MAX_BODY_BYTES、
+        Content-Type 为 application/json、JSON 顶层必须是对象。
+        """
+        transfer_encoding = (self.headers.get("Transfer-Encoding") or "").strip().lower()
+        if transfer_encoding and transfer_encoding != "identity":
+            return None, self._problem_body(
+                400,
+                "request.invalid",
+                "Unsupported Transfer-Encoding",
+                detail="chunked request bodies are not supported; send Content-Length",
+            )
+
+        raw_length = (self.headers.get("Content-Length") or "0").strip() or "0"
+        try:
+            length = int(raw_length)
+        except ValueError:
+            return None, self._problem_body(
+                400,
+                "request.invalid",
+                "Invalid Content-Length",
+                detail=f"Content-Length must be an integer, got {raw_length!r}",
+            )
+        if length < 0:
+            return None, self._problem_body(
+                400,
+                "request.invalid",
+                "Invalid Content-Length",
+                detail="Content-Length must not be negative",
+            )
+        if length > MAX_BODY_BYTES:
+            return None, self._problem_body(
+                400,
+                "request.invalid",
+                "Request body too large",
+                detail=f"body exceeds {MAX_BODY_BYTES} bytes",
+            )
+
+        if length == 0:
+            return {}, None
+
+        media_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if media_type != _JSON_MEDIA_TYPE:
+            return None, self._problem_body(
+                400,
+                "request.invalid",
+                "Unsupported Media Type",
+                detail=f"Content-Type must be {_JSON_MEDIA_TYPE}, got {media_type or '(none)'}",
+            )
+
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            # 客户端中途断开；不要尝试读更多（会阻塞）。
+            return None, self._problem_body(
+                400, "request.invalid", "Incomplete request body"
+            )
+
+        try:
+            body = json.loads(raw)
+        except (json.JSONDecodeError, ValueError) as exc:
+            return None, self._problem_body(
+                400, "request.invalid", "Invalid JSON", detail=str(exc)
+            )
+        if not isinstance(body, dict):
+            return None, self._problem_body(
+                400,
+                "request.invalid",
+                "Invalid JSON",
+                detail="request body must be a JSON object",
+            )
+        return body, None
+
+    def _auth_ok(self) -> bool:
+        cfg: Config = self.server.config  # type: ignore[attr-defined]
+        if cfg.auth_token is None:
+            return True
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            self._send_problem(
+                401, "auth.missing", "Authorization header required"
+            )
+            return False
+        token = header.removeprefix("Bearer ").strip()
+        # 常数时间比较，避免按字节短路泄漏 token 前缀。
+        if not hmac.compare_digest(token.encode("utf-8"), cfg.auth_token.encode("utf-8")):
+            self._send_problem(401, "auth.invalid_token", "Invalid bearer token")
+            return False
+        return True
+
+    # ---------------------------------------------------------------- GET
+    def do_GET(self) -> None:
+        self._request_id()
+        try:
+            path = urlparse(self.path).path
+            if path in ("/health", "/v1/health"):
+                self._handle_health()
+            else:
+                self._send_problem(404, "not_found", "Not Found")
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception as exc:  # pragma: no cover - 兜底，避免线程裸抛
+            self._internal_error(exc)
+
+    def do_HEAD(self) -> None:
+        self.do_GET()
+
+    # --------------------------------------------------------------- POST
+    def do_POST(self) -> None:
+        self._request_id()
+        try:
+            path = urlparse(self.path).path
+            if not self._auth_ok():
+                return
+            if path == "/v1/policy/evaluate":
+                self._handle_policy_evaluate()
+            elif m := _ROUTE_MESSAGES.match(path):
+                self._handle_send_message(m.group(1))
+            else:
+                self._send_problem(404, "not_found", "Not Found")
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception as exc:  # pragma: no cover - 兜底
+            self._internal_error(exc)
+
+    # 不支持的方法：仍返回 problem+json，而不是 stdlib 的 501 HTML。
+    def _method_not_allowed(self) -> None:
+        self._request_id()
+        self._send_problem(
+            405,
+            "request.invalid",
+            "Method Not Allowed",
+            detail=f"{self.command} is not supported on this endpoint",
+        )
+
+    do_PUT = _method_not_allowed
+    do_PATCH = _method_not_allowed
+    do_DELETE = _method_not_allowed
+    do_OPTIONS = _method_not_allowed
+    do_TRACE = _method_not_allowed
+
+    def _internal_error(self, exc: BaseException) -> None:
+        if self.server.config.access_log:  # type: ignore[attr-defined]
+            self.log_error("unhandled error: %r", exc)
+        try:
+            self._send_problem(
+                500, "internal.error", "Internal Server Error"
+            )
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+
+    # ----------------------------------------------------------- handlers
+    def _handle_health(self) -> None:
+        svc: GatewayService = self.server.service  # type: ignore[attr-defined]
+        cfg: Config = self.server.config            # type: ignore[attr-defined]
+        transport = self.server.transport           # type: ignore[attr-defined]
+        now = svc.now
+        matrix_ok = transport.healthy()
+        # DB / 模型提供方尚未接入：不报假 ok，直接从 checks 里省略。
+        checks: List[Dict[str, Any]] = [
+            {"name": "matrix", "status": "ok" if matrix_ok else "degraded"},
+        ]
+        status = "ok" if matrix_ok else "degraded"
+        body = {
+            "status": status,
+            "version": cfg.version,
+            "contract_version": cfg.contract_version,
+            "started_at": iso_utc(svc.started_at),
+            "uptime_seconds": max(0, int((now - svc.started_at).total_seconds())),
+            "checks": checks,
+            "modules": [
+                {"name": "core", "enabled": True, "status": "ok"},
+            ],
+        }
+        # OpenAPI /health 描述：`status` 非 `ok` 时返回 503（结构相同）。
+        self._send_json(200 if status == "ok" else 503, body)
+
+    def _handle_policy_evaluate(self) -> None:
+        svc: GatewayService = self.server.service  # type: ignore[attr-defined]
+        body, err = self._read_json()
+        if err:
+            self._send_json(400, err, problem=True)
+            return
+        assert body is not None
+        try:
+            result = svc.evaluate_policy(body)
+        except ValidationError as exc:
+            errors = None
+            if exc.field:
+                errors = [{"field": exc.field, "code": exc.code, "message": exc.detail}]
+            self._send_problem(
+                400, exc.code, "Request validation failed",
+                detail=exc.detail, errors=errors,
+            )
+            return
+        self._send_json(200, result)
+
+    def _handle_send_message(self, conversation_id: str) -> None:
+        svc: GatewayService = self.server.service  # type: ignore[attr-defined]
+        body, err = self._read_json()
+        if err:
+            self._send_json(400, err, problem=True)
+            return
+        assert body is not None
+        try:
+            idempotency_key = self._idempotency_key()
+            receipt = svc.send_ai_message(
+                conversation_id, body, idempotency_key=idempotency_key
+            )
+        except ValidationError as exc:
+            errors = None
+            if exc.field:
+                errors = [{"field": exc.field, "code": exc.code, "message": exc.detail}]
+            self._send_problem(
+                400, exc.code, "Request validation failed",
+                detail=exc.detail, errors=errors,
+            )
+            return
+        except IdempotencyConflict:
+            self._send_problem(
+                409,
+                "idempotency.conflict",
+                "Idempotency-Key reused with different request body",
+            )
+            return
+        except GatewayDeliveryError as exc:
+            # 传输层失败是网关内部错误。契约状态码集合只有 500，
+            # 502/`matrix.unavailable` 未入契约，因此映射为 500 internal.error。
+            if self.server.config.access_log:  # type: ignore[attr-defined]
+                self.log_error("delivery failed: %s: %s", exc.code, exc.detail)
+            self._send_problem(
+                500, "internal.error", "Internal Server Error",
+                detail="message delivery failed; the message was not recorded",
+            )
+            return
+        self._send_json(200, receipt)
+
+
+class GatewayServer(http.server.ThreadingHTTPServer):
+    """注入 config / service / transport，供 handler 访问。"""
+
+    daemon_threads = True
+
+    def __init__(self, config: Config, service: GatewayService, transport: InMemoryMatrixTransport) -> None:
+        self.config = config
+        self.service = service
+        self.transport = transport
+        super().__init__((config.host, config.port), GatewayHandler)
+
+
+def build_server(config: Optional[Config] = None) -> GatewayServer:
+    cfg = config or load_config()
+    transport = InMemoryMatrixTransport()
+    store = UsageStore()
+    svc = GatewayService(cfg, transport, store)
+    return GatewayServer(cfg, svc, transport)
