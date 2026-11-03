@@ -261,3 +261,14 @@ make up HS=tuwunel PUSH=1 && make push-e2e
   botville_mock_pushkin.py）、`server/tests/push_e2e.py`、
   `server/tests/test_push_sygnal.py`、Makefile（`PUSH=1` / `push-e2e`）、
   CI job `push-e2e`。
+
+## 内网推送放行（BOTVILLE_DOCKER_SUBNET）
+
+三家 homeserver 默认拒绝向私有地址发出 HTTP 请求（SSRF 防护），而 Sygnal 在同一 compose 网络（私有网段）里。
+本仓库的做法：把 compose 网络固定为 `BOTVILLE_DOCKER_SUBNET`（默认 `172.31.250.0/24`），只放行这一个网段：
+
+- Synapse：`homeserver.yaml` 的 `ip_range_whitelist` 只含该网段；
+- Tuwunel / continuwuity：`init.sh` 生成 `generated/push-denylist.env`，`*_IP_RANGE_DENYLIST` = 默认私网黑名单减去该网段。
+
+同机多实例时每个实例要用**不同的网段**（如 `botville` 172.31.250.0/24、`botville-zcode` 172.31.251.0/24、`botville-codex` 172.31.252.0/24），否则 compose 建网络时会冲突。
+生产上若 Sygnal 部署在公网 HTTPS 域名后，pusher 的 `data.url` 用公网地址即可，无需放行内网。

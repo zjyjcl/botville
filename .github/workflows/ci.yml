@@ -231,6 +231,7 @@ jobs:
               "APNS_TEAM_ID": "<team-id>",
               "APNS_PLATFORM": "sandbox",
               "COMPOSE_PROJECT_NAME": "botville",
+              "BOTVILLE_DOCKER_SUBNET": "172.31.250.0/24",
               "POSTGRES_USER": "botville",
               "POSTGRES_PASSWORD": "<change-me>",
               "POSTGRES_DB": "synapse",

@@ -42,3 +42,8 @@ registration_shared_secret: "${SYNAPSE_REGISTRATION_SHARED_SECRET}"
 # No federation to public key servers; this stack is local/pairing-only.
 trusted_key_servers: []
 suppress_key_server_warning: true
+
+# Outbound requests (incl. pushes to sygnal) may reach this stack's own
+# docker subnet only; all other private ranges stay blacklisted.
+ip_range_whitelist:
+  - "${BOTVILLE_DOCKER_SUBNET}"
