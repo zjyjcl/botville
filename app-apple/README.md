@@ -1,6 +1,6 @@
 # botville C2.1 — 苹果 App α：消息与推送
 
-SwiftUI + matrix-rust-sdk，最低 iOS 17 / macOS 14。本轮在 C0.1 原型上实现密码登录、持久会话、房间与邀请、文本消息发送状态、断线恢复，以及推送注册协议的占位接口。它处于 `implemented` / `tested` 阶段；尚不是已完成真实设备与真实 homeserver 验收的日常客户端。
+SwiftUI + matrix-rust-sdk，最低 iOS 17 / macOS 14。本轮在 C0.1 原型上实现密码登录、持久会话、房间与邀请、文本消息发送状态、断线恢复，以及推送注册协议的占位接口。它处于 `implemented` / `tested` 阶段；已增加本地 Synapse 的 BotvilleCore 集成验证，真实设备与 UI 验收仍未完成。
 
 本轮对应 [issue #34](https://github.com/zjyjcl/botville/issues/34)。关联 [C1.1 待办清单](docs/c1.1-element-findings.md#5-待办清单本任务验收产物) 的 C11-02/03/04/05/07/11；本轮实现不代表这些条目的全部验收条件已经通过，原 findings 保持不变。
 
@@ -101,25 +101,68 @@ Tests/BotvilleCoreTests/       认证、会话、发送和重连的单元测试
 
 ## 验证与验收
 
+### 可选的本地 Synapse 集成测试
+
+`SynapseIntegrationTests` 使用真实 `MatrixService` / Rust SDK、独立的加密 SQLite 目录和另一个通过 Client-Server API 操作的测试账号。默认 `swift test` 跳过；仅在本地 Synapse 已就绪、开放 dummy UIA 注册，并明确允许停止/启动 `botville-codex-synapse-1` 时运行。在 `app-apple/` 中：
+
+```sh
+mkdir -p .build/c21-e2e-artifacts .build/c21-e2e-tmp
+env -u GIT_CONFIG_COUNT \
+  BOTVILLE_E2E_HOMESERVER=http://127.0.0.1:8028 \
+  BOTVILLE_E2E_CONTAINER=botville-codex-synapse-1 \
+  BOTVILLE_E2E_ARTIFACT_ROOT="$PWD/.build/c21-e2e-artifacts" \
+  TMPDIR=.build/c21-e2e-tmp/ \
+  CLANG_MODULE_CACHE_PATH="$PWD/.build/ModuleCache" \
+  SWIFTPM_MODULECACHE_OVERRIDE="$PWD/.build/ModuleCache" \
+  swift test --disable-sandbox --cache-path .build/cache \
+  --config-path .build/config --security-path .build/security \
+  --filter SynapseIntegrationTests
+```
+
+沿用前述 HTTP(S) 代理与 `NO_PROXY`。此测试只接受本地 HTTP 8028 端口；临时目录必须位于当前工作目录内，容器名必须精确匹配。使用相对 `TMPDIR` 是为了避开当前 Swift 工具链在含中文的绝对 `TMPDIR` 上崩溃的问题。
+
+每次运行以系统安全随机数生成密码、创建两个 `c21_` 账号。凭据只保留在内存 `SessionStore` 和测试进程中，不使用真实 Keychain。会话恢复会先确认旧 service 已释放，再构建新实例，复用同一设备、会话与 SQLite 存储。断线期间只入队一条文本，不手动重新同步或重发；恢复后检查双端时间线、补拉及对端 `/messages` 的精确一次计数。
+
+成功和异常路径都会恢复指定容器、使用密码 UIA 调用 `account/deactivate`（`erase:true`），再验证登录返回 `403 M_USER_DEACTIVATED` 或 `403 M_FORBIDDEN`，最后清空内存凭据并删除本次 SQLite 目录。`429` 只按服务端提示重试，不视为停用成功。测试本身保留容器运行以完成清理；本次任务验收后另由操作者对 **botville-codex** 执行 `docker compose ... down`，不删除卷。
+
+### 构建与单元测试记录
+
 2026-11-04 本地验证：Xcode 27.2（27B52）、Swift 6.4.2。
 
 | 检查 | 结果 |
 | --- | --- |
 | `swift build`，macOS arm64、部署目标 14.0 | 通过 |
-| `swift test` | 32 项 XCTest 全部通过，0 失败 |
+| `swift test`（未设置 E2E 环境变量） | 32 项 XCTest 通过，1 项集成测试跳过，0 失败 |
 | `xcodebuild`，`BotvilleApp-iOS`，generic iOS Simulator、`CODE_SIGNING_ALLOWED=NO` | `BUILD SUCCEEDED`，Debug arm64 + x86_64 |
 
 日志位于 `.build/c21-macos-build.log`、`.build/c21-tests.log` 和 `.build/c21-ios-build.log`（均不纳入 Git）。产物核验确认 `Info.plist` 只含 localhost/127.0.0.1 ATS 例外。链接器显示 ad hoc 签名、没有 TeamIdentifier 或开发者证书，且未请求 Apple 账号。
 
 非阻断警告：上游 Rust 包的 macOS `blake3_neon.o` 标记 macOS 27.0，高于本项目部署目标 14.0；iOS 调试符号会提示上游 Rust 对象构建路径不存在；另有无 AppIntents 依赖时的跳过提示。这些不改变本次编译结论，但最低系统运行兼容性和 Rust 源码调试仍未验收。
 
-单元测试覆盖 URL/HTTPS 与重定向策略、登录能力探测及错误分类、内存假 Keychain 会话存储、SQLite 目录保护、发送状态机，以及重连退避。测试只用内存 fake 和自动删除的临时目录：没有创建真实 Keychain 条目、测试账号或 Docker 数据，也没有运行本地 Continuwuity、macOS UI 或模拟器 UI 的端到端路径。
+单元测试覆盖 URL/HTTPS 与重定向策略、登录能力探测及错误分类、内存会话存储、SQLite 目录保护、发送状态机，以及重连退避。常规单测仅使用 fake 和自动删除的临时目录；可选 Synapse 集成测试会创建并停用本地真实测试账号。两者均不创建真实 Keychain 项，也没有运行 macOS UI 或模拟器 UI。
 
-因此这不是 `deployed` 或 `live_accepted` 结果。后续端到端验收仍需覆盖：重启恢复、真实 Keychain、双端消息/邀请、网络中断恢复、登出与 token 失效清理。
+这些结果不代表完整 App 的 `deployed` 或 `live_accepted`。后续仍需覆盖完整进程重启、真实 Keychain、UI、登出与 token 失效清理的真实端到端路径。
+
+### 本地 Synapse 实测（2026-11-04）
+
+环境为 Synapse **1.141.0** + Postgres，compose 项目 **botville-codex**，`server_name=localhost`，仅发布 `127.0.0.1:8028`。运行镜像的 `matrixdotorg/synapse:v1.141.0` 与要求的 `ghcr.io/element-hq/synapse:v1.141.0` 标签指向同一镜像 ID。
+
+| 实测项 | 结果 |
+| --- | --- |
+| App 密码登录、开发 HTTP 开关、邀请出现在列表并接受 | 通过 |
+| 销毁旧 service，从内存 SessionStore 重建，无需密码 | 通过；真实 SQLite，未测真实 Keychain/完整进程重启 |
+| App→CS API 对端、对端→App 文本及时间线 | 通过 |
+| 仅 stop/start 指定 Synapse，断线时发送一条 | 通过；观察到重连退避及 queued/failed 本地回显 |
+| 自动重连、补齐对端两条文本、待发消息恰好一次 | 通过；不调用手动 sync/retry，对端 `/messages` 连续四次计数均为 1 |
+| 账号停用、登录失败、内存/SQLite 清理 | 最终运行通过；两次运行累计 4 个账号均 deactivated、erase 标记存在，密码哈希和 access token 均为 0，测试目录为空 |
+
+首次运行的功能项均通过，但清理测试只接受 `M_USER_DEACTIVATED`，误将本机实际的 `403 M_FORBIDDEN` 判为失败，重复登录验证又触发了限流。修正测试断言并遵循 `retry_after_ms` 后，第二轮全部通过（260.412 秒）；未修改 App 业务代码。第二轮登录曾收到 `429`，上游 SDK 的[密码登录使用独立 short_retry 配置](https://github.com/matrix-org/matrix-rust-sdk/blob/e675036b27be102b05ec5c5bff843cf8d739338c/crates/matrix-sdk/src/authentication/matrix/login_builder.rs#L189-L190)，并按服务端 Retry-After 等待后成功，因此不能把 client 级 `retryLimit: 0` 解读为登录不会等待重试。
+
+本次日志保留在 `.build/c21-synapse-build.log`、`.build/c21-synapse-unit-tests.log`、`.build/c21-synapse-ios-build.log`、`.build/c21-synapse-e2e-first.log` 和 `.build/c21-synapse-e2e.log`，均不纳入 Git。临时文件、测试 SQLite、内存凭据已清理；未创建 Keychain 项。最后执行指定项目的 `docker compose ... down`（不带 `-v`），其容器和网络已移除，卷保留；未操作其他 compose 项目。
 
 ## 未完成项
 
 - A1.2 完成后接入 Sygnal + APNs，并在真机验证权限、前后台/终止态、深链和换 token；本轮只交付接口与 Noop 实现。
-- 真实 homeserver、macOS UI、iOS 模拟器 UI、真机和进程重启/真实 Keychain 的端到端验收。
+- 非本地 homeserver、macOS UI、iOS 模拟器 UI、真机和进程重启/真实 Keychain 的端到端验收。
 - E2EE 设备验证、密钥备份/恢复和旧加密历史恢复；SSO/OIDC、多账号和设备会话管理。
 - 媒体、搜索、创建/主动加入房间、已读回执，以及 C11 规定的互操作与性能测量。
