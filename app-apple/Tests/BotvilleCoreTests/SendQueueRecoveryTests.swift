@@ -196,6 +196,7 @@ private final class FakeRoom: Room, @unchecked Sendable {
     override func roomInfo() async throws -> RoomInfo { throw ClientError.Generic(msg: "unused", details: nil) }
     override func latestEvent() async -> LatestEventValue { .none }
     override func isDirect() async -> Bool { false }
+    override func latestEncryptionState() async throws -> EncryptionState { .unknown }
     override func timeline() async throws -> Timeline { fakeTimeline }
     override func enableSendQueue(enable: Bool) { queueEnableValues.append(enable) }
 }

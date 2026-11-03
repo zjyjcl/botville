@@ -39,6 +39,74 @@ final class SynapseIntegrationTests: XCTestCase {
         await cleanupAndAssert()
     }
 
+    /// Opt-in C2.6 acceptance coverage. This test neither stops nor starts a
+    /// container; the caller supplies an already-running disposable Synapse.
+    func testLocalSynapseC26EncryptionOptIn() async throws {
+        let homeserver = try requiredHomeserver()
+        let root = try requiredArtifactRoot()
+        api = SynapseAPI(homeserver: homeserver)
+        let runDirectory = root.appendingPathComponent("c26-e2e-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: runDirectory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        artifacts = runDirectory
+
+        do {
+            let app = try await registerAccount(prefix: "c26")
+            let peer = try await registerAccount(prefix: "c26")
+            try await exerciseC26Encryption(homeserver: homeserver, directory: runDirectory, app: app, peer: peer)
+        } catch {
+            await cleanupAndAssert(ensureSynapseRunning: false)
+            throw SynapseTestError(step: safeDescription(error), status: nil, errcode: nil)
+        }
+        await cleanupAndAssert(ensureSynapseRunning: false)
+    }
+
+    private func exerciseC26Encryption(homeserver: URL, directory: URL, app: SynapseAccount, peer: SynapseAccount) async throws {
+        let store = InMemorySessionStore()
+        sessionStore = store
+        weak var released: MatrixService?
+        do {
+            // This prefix is a test-only policy rule; no AI account is created.
+            let policy = AIParticipantPolicy(userIDPatterns: ["^@demo_ai_.*:"])
+            let service = MatrixService(sessionStore: store, storeDirectory: SessionStoreDirectory(baseURL: directory), monitorNetwork: false, aiParticipantPolicy: policy)
+            released = service
+            liveService = service
+            try await service.login(homeserver: homeserver.absoluteString, username: app.localpart, password: app.password, allowLocalHTTP: true)
+
+            let plainDraft = RoomCreationDraft(isDirect: true, invitees: [peer.userID])
+            let plainRoom = try await service.createRoom(draft: plainDraft, consent: EncryptionConsent())
+            let plainAlgorithm = try await api.roomEncryptionAlgorithm(accessToken: app.accessToken, roomID: plainRoom)
+            XCTAssertNil(plainAlgorithm)
+            try await waitFor("plain room SDK badge") { service.rooms.contains { $0.id == plainRoom && $0.encryption == .unencrypted } }
+            phase("C2.6 default unencrypted room")
+
+            var newRoomConsent = EncryptionConsent()
+            let encryptedDraft = RoomCreationDraft(isDirect: true, invitees: [peer.userID])
+            let encryptedTarget = EncryptionTarget.newRoom(encryptedDraft)
+            newRoomConsent.request(for: encryptedTarget)
+            XCTAssertTrue(newRoomConsent.confirm(for: encryptedTarget))
+            let encryptedRoom = try await service.createRoom(draft: encryptedDraft, consent: newRoomConsent)
+            let encryptedAlgorithm = try await api.roomEncryptionAlgorithm(accessToken: app.accessToken, roomID: encryptedRoom)
+            XCTAssertEqual(encryptedAlgorithm, "m.megolm.v1.aes-sha2")
+            try await waitFor("encrypted room SDK badge") { service.rooms.contains { $0.id == encryptedRoom && $0.encryption == .encrypted } }
+            phase("C2.6 confirmed encrypted room")
+
+            var existingRoomConsent = EncryptionConsent()
+            let existingTarget = EncryptionTarget.existingRoom(plainRoom)
+            existingRoomConsent.request(for: existingTarget)
+            XCTAssertTrue(existingRoomConsent.confirm(for: existingTarget))
+            try await service.enableEncryption(roomID: plainRoom, consent: existingRoomConsent)
+            let enabledAlgorithm = try await api.roomEncryptionAlgorithm(accessToken: app.accessToken, roomID: plainRoom)
+            XCTAssertEqual(enabledAlgorithm, "m.megolm.v1.aes-sha2")
+            try await waitFor("enabled room SDK badge") { service.rooms.contains { $0.id == plainRoom && $0.encryption == .encrypted } }
+            // There is no disable API. A repeat enable is a no-op, and state stays encrypted.
+            try await service.enableEncryption(roomID: plainRoom, consent: existingRoomConsent)
+            let repeatedAlgorithm = try await api.roomEncryptionAlgorithm(accessToken: app.accessToken, roomID: plainRoom)
+            XCTAssertEqual(repeatedAlgorithm, "m.megolm.v1.aes-sha2")
+            phase("C2.6 existing room encryption is irreversible")
+        }
+        try await waitFor("C2.6 service release") { released == nil }
+    }
+
     private func exerciseApp(homeserver: URL, directory: URL, app: SynapseAccount, peer: SynapseAccount, roomID: String) async throws {
         let store = InMemorySessionStore()
         sessionStore = store
@@ -141,8 +209,8 @@ final class SynapseIntegrationTests: XCTestCase {
         return root
     }
 
-    private func registerAccount() async throws -> SynapseAccount {
-        let localpart = "c21_\(String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(16)).lowercased())"
+    private func registerAccount(prefix: String = "c21") async throws -> SynapseAccount {
+        let localpart = "\(prefix)_\(String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(16)).lowercased())"
         let password = try randomPassword()
         let account = try await api.register(localpart: localpart, password: password)
         accounts.append(account) // Add immediately so every later failure cleans it.
@@ -163,7 +231,7 @@ final class SynapseIntegrationTests: XCTestCase {
         throw SynapseTestError(step: step, status: nil, errcode: nil)
     }
 
-    private func phase(_ name: String) { print("[C2.1 local Synapse] PASS: \(name)") }
+    private func phase(_ name: String) { print("[local Synapse] PASS: \(name)") }
 
     private func stopSynapse() throws {
         try docker("stop")
@@ -212,9 +280,11 @@ final class SynapseIntegrationTests: XCTestCase {
         #endif
     }
 
-    private func cleanupAndAssert() async {
-        do { try await startAndWaitForSynapse() }
-        catch { XCTFail("cleanup Synapse start failed: \(safeDescription(error))") }
+    private func cleanupAndAssert(ensureSynapseRunning: Bool = true) async {
+        if ensureSynapseRunning {
+            do { try await startAndWaitForSynapse() }
+            catch { XCTFail("cleanup Synapse start failed: \(safeDescription(error))") }
+        }
         var allDeactivated = true
         for (index, account) in accounts.enumerated() {
             var cleanupError: Error?
@@ -267,6 +337,7 @@ final class SynapseIntegrationTests: XCTestCase {
         if let error = error as? SynapseTestError { return error.description }
         if let error = error as? AuthenticationError { return error.localizedDescription }
         if let error = error as? MatrixServiceError { return error.localizedDescription }
+        if let error = error as? EncryptionAuthorizationError { return error.localizedDescription }
         return "failure type=\(String(reflecting: type(of: error)))"
     }
 }
@@ -322,6 +393,19 @@ private final class SynapseAPI: @unchecked Sendable {
         let object = try await request("/_matrix/client/v3/createRoom", token: accessToken, body: ["invite": [invite]])
         guard let roomID = object["room_id"] as? String else { throw SynapseTestError(step: "createRoom", status: nil, errcode: nil) }
         return roomID
+    }
+
+    func roomEncryptionAlgorithm(accessToken: String, roomID: String) async throws -> String? {
+        let escaped = roomID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? roomID
+        do {
+            let state = try await request("/_matrix/client/v3/rooms/\(escaped)/state/m.room.encryption", method: "GET", token: accessToken)
+            guard let algorithm = state["algorithm"] as? String else {
+                throw SynapseTestError(step: "room encryption state", status: nil, errcode: nil)
+            }
+            return algorithm
+        } catch let error as SynapseTestError where error.status == 404 {
+            return nil
+        }
     }
 
     func sendText(accessToken: String, roomID: String, body: String) async throws {

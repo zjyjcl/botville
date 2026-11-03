@@ -90,6 +90,12 @@ Tests/BotvilleCoreTests/       认证、会话、发送和重连的单元测试
 - `/sync` 失败按有限退避重连，网络恢复和 App 回前台会触发补拉；界面显示离线或重连状态。
 - 推送只定义 `PushRegistrar`、pusher 注册参数模型和 `NoopPushRegistrar`；pusher URL 在构造与解码时只接受无凭据、含 host 的 HTTPS 地址。没有添加 Push entitlement、证书或真机注册；真实 APNs/Sygnal 接入依赖 A1.2。
 
+## 加密策略（C2.6）
+
+新建会话支持输入 MXID 开私聊或建群，均默认不加密。确认全部为真人后可主动开启，需二次确认“不可关闭、AI 无法读取、设备验证和备份风险”；已有真人房间同样可开启。含 AI 或成员未知时禁用开启。列表和房间内持续显示文字和图标状态；已加密房间没有关闭入口，邀请 AI 前会提示限制。
+
+AI 判定集中在 `AIParticipantPolicy`，使用部署配置的 MXID 正则/前缀。当前 A1.3 尚未提供命名空间，默认空占位并保守处理，需按部署规则配置后才能确认纯真人。加密房显示 SDK 的设备验证/备份风险，完整恢复流程由 [C11-09 / #97](https://github.com/zjyjcl/botville/issues/97) 跟进。配置方法、数据来源和限制见[加密策略文档](docs/encryption-policy.md)。
+
 ## 发送语义
 
 - `notSentYet` 显示“等待发送”，`sent` 或自己的远端回显显示“已发送”。入队成功不代表服务器已接收。
@@ -100,6 +106,35 @@ Tests/BotvilleCoreTests/       认证、会话、发送和重连的单元测试
 登录/恢复取消后会阻止任何迟到结果激活会话。固定 SDK 的部分 Swift future 不响应 Task 取消，超时包装会及时返回，但候选客户端仍由原任务持有，结束后关闭队列、释放客户端并清理失败登录的 store；清理完成前禁用新登录/恢复/本地清除，防止同时操作同一数据库。恢复取消保留原会话。普通新登录已取得的临时 token 会尝试用独立、5 秒超时的 logout 撤销；离线时不能保证服务器撤销成功，本地不会保存该 token。
 
 ## 验证与验收
+
+### C2.6 本轮验证（2026-11-04）
+
+| 检查 | 结果 |
+| --- | --- |
+| `swift build` | 通过 |
+| `swift test` | 88 项：86 通过、2 项门控集成测试跳过、0 失败；另通过 `--skip KeychainSessionStoreTests.testRealKeychainRoundTripUsesUniqueServiceAndDeletesIt` 排除真实 Keychain 往返，遵守本轮只写工作树的边界 |
+| iOS Simulator `xcodebuild` | `BUILD SUCCEEDED`，arm64 + x86_64，`CODE_SIGNING_ALLOWED=NO`、`CODE_SIGNING_REQUIRED=NO`；未请求签名或 Apple 账号 |
+| C2.6 本地 Synapse 集成 | 1 项通过、0 失败；默认明文创建、确认加密创建、已有房间开启及重复调用保持加密，API 状态与 SDK 标识均验证 |
+
+实测修复了标准 `/sync` 对不存在的加密状态保留 unknown、以及成员摘要人数为零的问题：在线补查 SDK 加密状态；完整成员查询以实际迭代器长度校验，缓存仍保守处理。相关回归覆盖最后分块中的受邀 AI、成员转换缺失及零摘要人数。
+
+集成使用独立 `botville-codex` 项目、`127.0.0.1:8028` 和本工作树已有 Synapse `v1.141.0`。各轮共 8 个 `c26_` 测试账号均已 `deactivate` + `erase:true`，数据库汇总确认全部停用/擦除、密码哈希及 access token 均为 0；其中一次失败轮的重登验证遇到 429，以数据库补证，最终成功轮两账号重登均为 403。测试 SQLite 已删除，仅本项目执行不带 `-v` 的 `down`，保留卷。未操作其他 Compose 项目。
+
+构建和测试日志在本地 `.build/c26-artifacts/`，不入库。上游 Rust 对象的 macOS 最低版本/调试符号警告仍存在；最低系统、真实 UI 和跨设备恢复未验收，完整 C11-09 由 [#97](https://github.com/zjyjcl/botville/issues/97) 跟进。
+
+仅重跑 C2.6 本地测试时，先启动自己的测试 Synapse，在 `app-apple/` 下运行（本测试本身不启停容器）：
+
+```sh
+mkdir -p .build/c26-tmp .build/c26-artifacts
+env BOTVILLE_E2E_HOMESERVER=http://127.0.0.1:8028 \
+  BOTVILLE_E2E_ARTIFACT_ROOT="$PWD/.build/c26-artifacts/e2e" \
+  TMPDIR=.build/c26-tmp/ \
+  CLANG_MODULE_CACHE_PATH="$PWD/.build/ModuleCache" \
+  SWIFTPM_MODULECACHE_OVERRIDE="$PWD/.build/ModuleCache" \
+  swift test --disable-sandbox --cache-path .build/cache \
+  --config-path .build/config --security-path .build/security \
+  --filter SynapseIntegrationTests.testLocalSynapseC26EncryptionOptIn
+```
 
 ### 可选的本地 Synapse 集成测试
 
@@ -156,4 +191,4 @@ env \
 - A1.2 完成后接入 Sygnal + APNs，并在真机验证权限、前后台/终止态、深链和换 token；本轮只交付接口与 Noop 实现。
 - 非本地 homeserver、macOS UI、iOS 模拟器 UI、真机和进程重启/真实 Keychain 的端到端验收。
 - E2EE 设备验证、密钥备份/恢复和旧加密历史恢复；SSO/OIDC、多账号和设备会话管理。
-- 媒体、搜索、创建/主动加入房间、已读回执，以及 C11 规定的互操作与性能测量。
+- 媒体、搜索、按房间 ID/别名主动加入、已读回执，以及 C11 规定的互操作与性能测量；C2.6 仅新增 MXID 建房和邀请入口。

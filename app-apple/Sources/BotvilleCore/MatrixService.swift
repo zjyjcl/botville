@@ -18,6 +18,8 @@ public final class MatrixService: ObservableObject {
     @Published public private(set) var userID: String?
     @Published public private(set) var syncError: String?
     @Published public private(set) var canLoadOlderMessages = false
+    @Published public private(set) var cryptoSafetyWarnings: [String] = []
+    public let aiParticipantPolicy: AIParticipantPolicy
 
     @Published public private(set) var isRestoring = false
     @Published public private(set) var sessionError: String?
@@ -37,6 +39,11 @@ public final class MatrixService: ObservableObject {
     private var sendingGeneration: UUID?
     private var messageActions = Set<String>()
     private var invitationActions = Set<String>()
+    private var securityActions = Set<String>()
+    private var isCreatingRoom = false
+    private var observedEncryptedRooms = Set<String>()
+    private var roomRefreshGeneration = UUID()
+    private var securityReadGenerations: [String: UUID] = [:]
 
     // Injectable for lifecycle tests; production always uses encrypted SQLite.
     var clientFactory: (String, URL, Data) async throws -> Client = { server, directory, key in
@@ -82,11 +89,13 @@ public final class MatrixService: ObservableObject {
                 discovery: any LoginCapabilityDiscovering = MatrixLoginCapabilityDiscovery(),
                 monitorNetwork: Bool = true,
                 passwordAuthentication: any PasswordAuthenticating = MatrixPasswordAuthentication(),
-                authenticationTimeout: TimeInterval = 60) {
+                authenticationTimeout: TimeInterval = 60,
+                aiParticipantPolicy: AIParticipantPolicy = .configured()) {
         self.sessionStore = sessionStore
         self.storeDirectory = storeDirectory
         self.discovery = discovery
         self.passwordAuthentication = passwordAuthentication
+        self.aiParticipantPolicy = aiParticipantPolicy
         self.authenticationTimeout = authenticationTimeout.isFinite && authenticationTimeout > 0 ? authenticationTimeout : 60
         if monitorNetwork {
             let monitor = NWPathMonitor()
@@ -434,7 +443,7 @@ public final class MatrixService: ObservableObject {
                 do {
                     _ = try await client.syncOnceV2(settings: SyncSettingsV2(timeoutMs: initial ? 0 : 30_000))
                     guard !Task.isCancelled, let self, self.syncGeneration == generation else { return }
-                    await self.refreshRooms(from: client, session: session)
+                    await self.refreshRooms(from: client, session: session, resolveUnknownEncryption: true)
                     guard !Task.isCancelled, self.syncGeneration == generation else { return }
                     self.isSyncing = false
                     self.syncError = nil
@@ -469,7 +478,9 @@ public final class MatrixService: ObservableObject {
         }
     }
 
-    private func refreshRooms(from client: Client, session: UUID) async {
+    private func refreshRooms(from client: Client, session: UUID, resolveUnknownEncryption: Bool = false) async {
+        let refresh = UUID()
+        roomRefreshGeneration = refresh
         var updated: [MatrixRoom] = []
         for room in client.rooms() {
             let membership: MatrixRoomMembership
@@ -486,16 +497,169 @@ public final class MatrixService: ObservableObject {
             case .none: timestamp = nil
             }
             let direct = await room.isDirect()
+            guard session == sessionGeneration, refresh == roomRefreshGeneration else { return }
+            var encryption = SDKEncryptionState.map(info?.encryptionState ?? .unknown)
+            // A standard /sync may omit a nonexistent m.room.encryption event.
+            // Resolve that ambiguity only online, preserving offline restore.
+            if resolveUnknownEncryption, membership == .joined, encryption == .unknown,
+               let latestState = try? await room.latestEncryptionState() {
+                encryption = SDKEncryptionState.map(latestState)
+            }
+            guard session == sessionGeneration, refresh == roomRefreshGeneration else { return }
+            if encryption == .encrypted { observedEncryptedRooms.insert(room.id()) }
+            var participants: AIParticipantStatus = .unknown
+            if membership == .joined, aiParticipantPolicy.hasConfiguredRules {
+                let members: RoomMembersIterator?
+                if resolveUnknownEncryption { members = try? await room.members() }
+                else if info != nil { members = try? await room.membersNoSync() }
+                else { members = nil }
+                if let members {
+                    participants = SDKEncryptionState.participants(members, expectedActiveCount: info?.activeMembersCount,
+                                                                   policy: aiParticipantPolicy,
+                                                                   membersAreComplete: resolveUnknownEncryption)
+                }
+            }
             updated.append(MatrixRoom(id: room.id(), name: room.displayName() ?? room.id(),
                                       membership: membership, isDirect: direct,
                                       unreadCount: info?.numUnreadMessages ?? 0,
-                                      latestActivity: timestamp.map { Date(timeIntervalSince1970: Double($0) / 1000) }))
+                                      latestActivity: timestamp.map { Date(timeIntervalSince1970: Double($0) / 1000) },
+                                      encryption: observedEncryptedRooms.contains(room.id()) ? .encrypted : encryption,
+                                      participants: participants))
         }
-        guard session == sessionGeneration, isLoggedIn, !isLoggingOut else { return }
+        guard session == sessionGeneration, refresh == roomRefreshGeneration, isLoggedIn, !isLoggingOut else { return }
         rooms = MatrixRoom.sortedByActivity(updated)
+        if rooms.contains(where: { $0.encryption == .encrypted }) { refreshCryptoSafety(from: client) }
         if let activeRoomID, !rooms.contains(where: { $0.id == activeRoomID && $0.membership == .joined }) {
             closeRoom(activeRoomID)
         }
+    }
+
+    /// The consent is bound to the exact draft; editing recipients invalidates it.
+    public func createRoom(draft: RoomCreationDraft, consent: EncryptionConsent) async throws -> String {
+        guard let client, isLoggedIn, !isLoggingOut else { throw MatrixServiceError.notLoggedIn }
+        guard !isCreatingRoom else { throw MatrixServiceError.busy }
+        try draft.validate()
+        let invitees = try draft.validatedInvitees()
+        let participants = aiParticipantPolicy.classify(memberIDs: invitees + [userID].compactMap { $0 })
+        let encrypted = try consent.validatedEncryption(for: .newRoom(draft), participants: participants,
+                                                        currentEncryption: .unencrypted)
+        let session = sessionGeneration
+        isCreatingRoom = true
+        defer { if session == sessionGeneration { isCreatingRoom = false } }
+        do {
+            let name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let roomID = try await client.createRoom(request: CreateRoomParameters(
+                name: name.isEmpty ? nil : name, isEncrypted: encrypted, isDirect: draft.isDirect,
+                visibility: .private, preset: .privateChat, invite: invitees))
+            guard session == sessionGeneration, !isLoggingOut else { throw CancellationError() }
+            await refreshRooms(from: client, session: session, resolveUnknownEncryption: true)
+            guard session == sessionGeneration, !isLoggingOut else { throw CancellationError() }
+            return roomID
+        } catch { throw await operationFailure(error, session: session) }
+    }
+
+    /// There intentionally is no disable API. Re-read SDK state and all active
+    /// members after confirmation, before sending m.room.encryption via the SDK.
+    public func enableEncryption(roomID: String, consent: EncryptionConsent) async throws {
+        guard let client, isLoggedIn, !isLoggingOut else { throw MatrixServiceError.notLoggedIn }
+        guard !securityActions.contains(roomID) else { throw MatrixServiceError.busy }
+        guard let room = try client.getRoom(roomId: roomID), room.membership() == .joined else {
+            throw MatrixServiceError.roomUnavailable
+        }
+        let session = sessionGeneration
+        securityActions.insert(roomID)
+        securityReadGenerations[roomID] = UUID()
+        defer { if session == sessionGeneration { securityActions.remove(roomID) } }
+        let snapshot: (RoomEncryptionState, AIParticipantStatus)
+        do { snapshot = try await readRoomSecurity(room) }
+        catch { throw await operationFailure(error, session: session) }
+        guard session == sessionGeneration, !isLoggingOut else { throw CancellationError() }
+        publishSecurity(roomID, encryption: snapshot.0, participants: snapshot.1)
+        if snapshot.0 == .encrypted || observedEncryptedRooms.contains(roomID) { return }
+        guard try consent.validatedEncryption(for: .existingRoom(roomID), participants: snapshot.1,
+                                              currentEncryption: snapshot.0) else {
+            throw MatrixServiceError.encryptionConfirmationRequired
+        }
+        do {
+            try await room.enableEncryption()
+            guard session == sessionGeneration, !isLoggingOut else { throw CancellationError() }
+            // Success means the state event was accepted. SDK readback controls
+            // the badge; a failed read never claims encryption was confirmed.
+            let state = try? await room.latestEncryptionState()
+            guard session == sessionGeneration, !isLoggingOut else { throw CancellationError() }
+            publishSecurity(roomID, encryption: state.map(SDKEncryptionState.map) ?? .unknown,
+                            participants: snapshot.1)
+            refreshCryptoSafety(from: client)
+        } catch { throw await operationFailure(error, session: session) }
+    }
+
+    public func inviteUser(_ userID: String, to roomID: String,
+                           acknowledgedEncryptionWarning: Bool = false) async throws {
+        guard let client, isLoggedIn, !isLoggingOut else { throw MatrixServiceError.notLoggedIn }
+        let draft = RoomCreationDraft(isDirect: true, name: "", invitees: [userID])
+        let invitee = try draft.validatedInvitees()[0]
+        guard !securityActions.contains(roomID) else { throw MatrixServiceError.busy }
+        guard let room = try client.getRoom(roomId: roomID), room.membership() == .joined else {
+            throw MatrixServiceError.roomUnavailable
+        }
+        let session = sessionGeneration
+        securityActions.insert(roomID)
+        securityReadGenerations[roomID] = UUID()
+        defer { if session == sessionGeneration { securityActions.remove(roomID) } }
+        do {
+            let state = SDKEncryptionState.map(try await room.latestEncryptionState())
+            guard session == sessionGeneration, !isLoggingOut else { throw CancellationError() }
+            if (state != .unencrypted || observedEncryptedRooms.contains(roomID)),
+               aiParticipantPolicy.classify(memberIDs: [invitee]) != .humanOnly,
+               !acknowledgedEncryptionWarning {
+                throw MatrixServiceError.aiInvitationConfirmationRequired
+            }
+            try await room.inviteUserById(userId: invitee)
+            guard session == sessionGeneration, !isLoggingOut else { throw CancellationError() }
+            // Do not retain a previous human-only result while invitation sync
+            // catches up. The next member snapshot must classify the invitee.
+            publishSecurity(roomID, encryption: state, participants: .unknown)
+        } catch { throw await operationFailure(error, session: session) }
+    }
+
+    public func refreshRoomSecurity(_ roomID: String) async {
+        guard let client, isLoggedIn, !isLoggingOut, !securityActions.contains(roomID),
+              let room = try? client.getRoom(roomId: roomID), room.membership() == .joined else { return }
+        let session = sessionGeneration
+        let generation = UUID()
+        securityReadGenerations[roomID] = generation
+        do {
+            let snapshot = try await readRoomSecurity(room)
+            guard session == sessionGeneration, securityReadGenerations[roomID] == generation, !isLoggingOut else { return }
+            publishSecurity(roomID, encryption: snapshot.0, participants: snapshot.1)
+            refreshCryptoSafety(from: client)
+        } catch {
+            guard session == sessionGeneration, securityReadGenerations[roomID] == generation, !isLoggingOut else { return }
+            publishSecurity(roomID, encryption: SDKEncryptionState.map(room.encryptionState()), participants: .unknown)
+            _ = await operationFailure(error, session: session)
+        }
+    }
+
+    private func readRoomSecurity(_ room: Room) async throws -> (RoomEncryptionState, AIParticipantStatus) {
+        let encryption = SDKEncryptionState.map(try await room.latestEncryptionState())
+        let members = try await room.members()
+        return (encryption, SDKEncryptionState.participants(members, expectedActiveCount: room.activeMembersCount(),
+                                                           policy: aiParticipantPolicy, membersAreComplete: true))
+    }
+
+    private func publishSecurity(_ roomID: String, encryption: RoomEncryptionState, participants: AIParticipantStatus) {
+        if encryption == .encrypted { observedEncryptedRooms.insert(roomID) }
+        roomRefreshGeneration = UUID()
+        rooms = rooms.map {
+            $0.id == roomID ? $0.withSecurity(encryption: observedEncryptedRooms.contains(roomID) ? .encrypted : encryption,
+                                            participants: participants) : $0
+        }
+    }
+
+    private func refreshCryptoSafety(from client: Client) {
+        let encryption = client.encryption()
+        cryptoSafetyWarnings = SDKEncryptionState.warnings(verification: encryption.verificationState(),
+                                                           backup: encryption.backupState(), recovery: encryption.recoveryState())
     }
 
     public func acceptInvitation(_ roomID: String) async throws { try await respondToInvitation(roomID, accept: true) }
@@ -721,6 +885,12 @@ public final class MatrixService: ObservableObject {
         connectionStatus = .idle
         syncError = nil
         invitationActions.removeAll()
+        securityActions.removeAll()
+        securityReadGenerations.removeAll()
+        isCreatingRoom = false
+        observedEncryptedRooms.removeAll()
+        roomRefreshGeneration = UUID()
+        cryptoSafetyWarnings = []
         await client?.enableAllSendQueues(enable: false)
         await previous?.value
         client = nil

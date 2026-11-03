@@ -12,15 +12,26 @@ public struct MatrixRoom: Identifiable, Hashable, Sendable {
     public let isDirect: Bool
     public let unreadCount: UInt64
     public let latestActivity: Date?
+    public let encryption: RoomEncryptionState
+    public let participants: AIParticipantStatus
 
     public init(id: String, name: String, membership: MatrixRoomMembership = .joined,
-                isDirect: Bool = false, unreadCount: UInt64 = 0, latestActivity: Date? = nil) {
+                isDirect: Bool = false, unreadCount: UInt64 = 0, latestActivity: Date? = nil,
+                encryption: RoomEncryptionState = .unknown, participants: AIParticipantStatus = .unknown) {
         self.id = id
         self.name = name
         self.membership = membership
         self.isDirect = isDirect
         self.unreadCount = unreadCount
         self.latestActivity = latestActivity
+        self.encryption = encryption
+        self.participants = participants
+    }
+
+    func withSecurity(encryption: RoomEncryptionState, participants: AIParticipantStatus) -> MatrixRoom {
+        MatrixRoom(id: id, name: name, membership: membership, isDirect: isDirect,
+                   unreadCount: unreadCount, latestActivity: latestActivity,
+                   encryption: encryption, participants: participants)
     }
 
     static func sortedByActivity(_ rooms: [MatrixRoom]) -> [MatrixRoom] {
@@ -43,6 +54,7 @@ public struct MatrixMessage: Identifiable, Equatable, Sendable {
 
 public enum MatrixServiceError: LocalizedError {
     case invalidHomeserver, missingCredentials, notLoggedIn, roomUnavailable, emptyMessage, busy, sendNoLongerFailed, storageUnavailable, sessionExpired, operationFailed
+    case encryptionConfirmationRequired, aiInvitationConfirmationRequired
 
     public var errorDescription: String? {
         switch self {
@@ -56,6 +68,8 @@ public enum MatrixServiceError: LocalizedError {
         case .sessionExpired: return "会话已失效，请重新登录。"
         case .operationFailed: return "操作失败，请稍后重试。"
         case .busy: return "操作正在进行，请稍候。"
+        case .encryptionConfirmationRequired: return "开启加密需要重新确认；房间和成员状态可能已变化。"
+        case .aiInvitationConfirmationRequired: return "此房间已加密或加密状态尚未确认。AI 将无法读取加密消息，请确认后再邀请。"
         }
     }
 }
