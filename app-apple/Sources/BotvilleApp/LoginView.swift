@@ -14,6 +14,7 @@ struct LoginView: View {
     @State private var isLoggingIn = false
     @State private var errorMessage: String?
     @State private var confirmLocalClear = false
+    @State private var confirmSoftLogout = false
     @State private var isClearing = false
 #if DEBUG
     @State private var allowLocalHTTP = false
@@ -42,18 +43,21 @@ struct LoginView: View {
             Form {
                 TextField("Homeserver", text: $homeserver)
                     .autocorrectionDisabled()
+                    .disabled(service.requiresPasswordReauthentication)
 #if os(iOS)
                     .textInputAutocapitalization(.never)
                     .keyboardType(.URL)
 #endif
                 TextField("用户名或用户 ID", text: $username)
                     .autocorrectionDisabled()
+                    .disabled(service.requiresPasswordReauthentication)
 #if os(iOS)
                     .textInputAutocapitalization(.never)
 #endif
                 SecureField("密码", text: $password)
 #if DEBUG
                 Toggle("允许本机 HTTP（仅 localhost/127.0.0.1）", isOn: $allowLocalHTTP)
+                    .disabled(service.requiresPasswordReauthentication)
 #endif
             }
             .frame(maxWidth: 480)
@@ -82,7 +86,11 @@ struct LoginView: View {
             }
 
             if service.canClearLocalSession {
-                Button("清除本地会话并重新登录", role: .destructive) { confirmLocalClear = true }
+                if service.requiresPasswordReauthentication {
+                    Button("退出登录", role: .destructive) { confirmSoftLogout = true }
+                        .disabled(isLoggingIn || service.isAuthenticating || service.isRestoring || isClearing)
+                }
+                Button("清除本地会话", role: .destructive) { confirmLocalClear = true }
                     .disabled(isLoggingIn || service.isAuthenticating || service.isRestoring || isClearing)
             }
 
@@ -97,21 +105,25 @@ struct LoginView: View {
             .buttonStyle(.borderedProminent)
             .disabled(!canLogIn)
         }
-        .confirmationDialog("清除本地会话并重新登录？", isPresented: $confirmLocalClear, titleVisibility: .visible) {
-            Button("清除本地会话", role: .destructive) {
-                isClearing = true
-                Task {
-                    defer { isClearing = false }
-                    do { try await service.clearLocalSession(); errorMessage = nil; password = "" }
-                    catch { errorMessage = error.localizedDescription }
-                }
-            }
+        .confirmationDialog("清除本地会话？", isPresented: $confirmLocalClear, titleVisibility: .visible) {
+            Button("清除本地会话", role: .destructive) { clearLocalSession() }
             Button("取消", role: .cancel) {}
         } message: {
             Text("将删除此 App 的 Keychain 会话和本地消息数据库，包括尚未发送的消息。服务器上的消息不会删除；此操作不会撤销服务器上的设备会话。")
         }
+        .confirmationDialog("退出登录？", isPresented: $confirmSoftLogout, titleVisibility: .visible) {
+            Button("退出登录并清除本地会话", role: .destructive) { clearLocalSession() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("将删除此 App 的 Keychain 会话和本地消息数据库，包括尚未发送的消息。服务器上的消息和设备会话不会撤销；之后可使用其他账号登录。")
+        }
         .padding(32)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onChange(of: service.requiresPasswordReauthentication, initial: true) { _, required in
+            guard required else { return }
+            if let value = service.reauthenticationHomeserver { homeserver = value }
+            if let value = service.reauthenticationUserID { username = value }
+        }
     }
 
     private func logIn() {
@@ -140,6 +152,15 @@ struct LoginView: View {
             } catch {
                 errorMessage = error.localizedDescription
             }
+        }
+    }
+
+    private func clearLocalSession() {
+        isClearing = true
+        Task {
+            defer { isClearing = false }
+            do { try await service.clearLocalSession(); errorMessage = nil; password = "" }
+            catch { errorMessage = error.localizedDescription }
         }
     }
 }

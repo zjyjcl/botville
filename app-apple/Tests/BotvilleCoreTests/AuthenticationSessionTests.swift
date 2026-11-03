@@ -6,6 +6,12 @@ import MatrixRustSDK
 import XCTest
 
 final class AuthenticationSessionTests: XCTestCase {
+    override func tearDown() {
+        DiscoveryURLProtocol.handler = nil
+        DiscoveryURLProtocol.paths = []
+        super.tearDown()
+    }
+
     func testHomeserverPolicyRequiresHTTPSExceptExplicitLoopbackDevelopment() throws {
         XCTAssertEqual(try HomeserverPolicy().validatedURL(" https://matrix.example.org/base ").absoluteString, "https://matrix.example.org/base")
         XCTAssertThrowsError(try HomeserverPolicy().validatedURL("http://127.0.0.1:8008"))
@@ -69,7 +75,7 @@ final class AuthenticationSessionTests: XCTestCase {
     func testSDKBuildErrorsRemainDistinctFromPasswordErrors() {
         XCTAssertEqual(PasswordLoginResultClassifier.error(for: ClientBuildError.ServerUnreachable(message: "redacted")), .networkFailure)
         XCTAssertEqual(PasswordLoginResultClassifier.error(for: ClientBuildError.WellKnownDeserializationError(message: "redacted")), .discoveryFailed)
-        XCTAssertEqual(PasswordLoginResultClassifier.error(for: ClientBuildError.Sdk(message: "connection timeout")), .networkFailure)
+        XCTAssertEqual(PasswordLoginResultClassifier.error(for: ClientBuildError.Sdk(message: "connection timeout")), .serverFailure)
         XCTAssertFalse(PasswordLoginResultClassifier.isExpiredSession(ClientBuildError.ServerUnreachable(message: "redacted")))
     }
 
@@ -82,7 +88,27 @@ final class AuthenticationSessionTests: XCTestCase {
         XCTAssertFalse(PasswordLoginResultClassifier.isExpiredSession(forbidden))
         XCTAssertEqual(PasswordLoginResultClassifier.error(for: URLError(.timedOut)), .networkFailure)
         XCTAssertEqual(PasswordLoginResultClassifier.error(for: AuthenticationError.unsupportedLoginMethod), .unsupportedLoginMethod)
-        XCTAssertEqual(PasswordLoginResultClassifier.error(for: ClientError.Generic(msg: "HTTP client connection timeout", details: nil)), .networkFailure)
+        XCTAssertEqual(PasswordLoginResultClassifier.error(for: ClientError.Generic(msg: "HTTP client connection timeout", details: nil)), .serverFailure)
+    }
+
+    func testNetworkClassificationUsesURLErrorAndSDKVariantsRatherThanDiagnostics() {
+        XCTAssertEqual(PasswordLoginResultClassifier.error(for: URLError(.cannotConnectToHost)), .networkFailure)
+        XCTAssertEqual(PasswordLoginResultClassifier.error(for: URLError(.badServerResponse)), .serverFailure)
+        XCTAssertEqual(PasswordLoginResultClassifier.error(for: URLError(.cannotParseResponse)), .serverFailure)
+        XCTAssertEqual(PasswordLoginResultClassifier.error(for: ClientError.MatrixApi(kind: .connectionFailed, code: "M_UNKNOWN", msg: "business failure", details: nil)), .networkFailure)
+        XCTAssertEqual(PasswordLoginResultClassifier.error(for: ClientError.MatrixApi(kind: .connectionTimeout, code: "M_UNKNOWN", msg: "business failure", details: nil)), .networkFailure)
+        XCTAssertEqual(PasswordLoginResultClassifier.error(for: ClientError.Generic(msg: "network timeout", details: "connection refused")), .serverFailure)
+    }
+
+    func testDiscoveryUsesTheTypedURLFailureClassification() async {
+        DiscoveryURLProtocol.handler = { _ in throw URLError(.cannotParseResponse) }
+        let session = URLSession(configuration: fakeConfiguration())
+        do {
+            _ = try await MatrixLoginCapabilityDiscovery(session: session).discover(at: URL(string: "https://matrix.example.org")!)
+            XCTFail("expected response failure")
+        } catch let error as AuthenticationError {
+            XCTAssertEqual(error, .serverFailure)
+        } catch { XCTFail("unexpected error \(error)") }
     }
 
     func testInMemorySessionStoreRoundTripAndDelete() throws {
@@ -104,7 +130,9 @@ final class AuthenticationSessionTests: XCTestCase {
     }
 
     func testSessionStoreDirectoryCreatesAndRemovesOnlyItsSessionDirectory() throws {
-        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temporary = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".build/authentication-tests/\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: temporary) }
         let directory = SessionStoreDirectory(baseURL: temporary)
         let id = UUID()

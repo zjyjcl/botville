@@ -19,6 +19,11 @@ final class BotvilleCoreTests: XCTestCase {
             "http://matrix.example.org",
             "https://",
             "https://alice:secret@matrix.example.org",
+            "https://matrix.example.org%40evil.example",
+            "https://matrix.example.org%00.evil.example",
+            "https://matrix.example.org%5c.evil.example",
+            "https://[fe80::1%25en0]",
+            "https://matrix.example.org:999999999999999999999",
             "https://matrix.example.org?access_token=secret",
             "https://matrix.example.org#credentials"
         ]

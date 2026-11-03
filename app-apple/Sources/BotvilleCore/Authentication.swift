@@ -15,18 +15,102 @@ public struct HomeserverPolicy: Sendable {
 
     public func validatedURL(_ value: String) throws -> URL {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let components = URLComponents(string: trimmed),
+        guard let url = URL(string: trimmed),
+              let components = try? EndpointURLPolicy.validatedComponents(url),
               let scheme = components.scheme?.lowercased(),
-              let host = components.host?.lowercased(), !host.isEmpty,
-              components.user == nil, components.password == nil,
+              let host = components.host?.lowercased(),
               components.query == nil, components.fragment == nil,
-              components.port.map({ (1...65_535).contains($0) }) ?? true,
-              components.url != nil,
               scheme == "https" || (allowLocalHTTP && scheme == "http" && (host == "localhost" || host == "127.0.0.1")) else {
             throw AuthenticationError.invalidHomeserver
         }
-        return components.url!
+        return url
     }
+}
+
+/// Validates the URL authority in its percent-encoded form. `URLComponents`
+/// exposes a decoded host, so checking only `host`, `user`, and `password`
+/// would allow encoded delimiters to create a differently interpreted origin.
+enum EndpointURLPolicy {
+    static func validatedComponents(_ url: URL, originalSource: String? = nil) throws -> URLComponents {
+        let source = originalSource ?? url.absoluteString
+        guard isSafeURLString(source),
+              source.removingPercentEncoding.map({ isSafeURLString($0) }) ?? false,
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let host = components.host, !host.isEmpty,
+              let encodedHost = components.percentEncodedHost, !encodedHost.isEmpty,
+              !encodedHost.contains("%"),
+              components.user == nil, components.password == nil,
+              components.fragment == nil else {
+            throw URLAuthorityError.invalid
+        }
+
+        guard !containsUnsafeHostCharacter(host),
+              !containsUnsafeHostCharacter(encodedHost) else {
+            throw URLAuthorityError.invalid
+        }
+
+        let explicitPort = try explicitPort(in: source)
+        guard components.port == explicitPort,
+              components.port.map({ (1...65_535).contains($0) }) ?? true else {
+            throw URLAuthorityError.invalid
+        }
+        return components
+    }
+
+    static func isSafeURLString(_ value: String) -> Bool {
+        value.rangeOfCharacter(from: CharacterSet.whitespacesAndNewlines.union(.controlCharacters)) == nil
+    }
+
+    private static func containsUnsafeHostCharacter(_ host: String) -> Bool {
+        host.unicodeScalars.contains { scalar in
+            CharacterSet.whitespacesAndNewlines.contains(scalar)
+                || scalar.value < 0x20 || scalar.value == 0x7F
+        } || host.contains("\\") || host.contains("/") || host.contains("@") || host.contains("%")
+    }
+
+    /// Returns nil when the authority has no explicit port.  Parsing the raw
+    /// authority prevents an overflowing or empty port from being hidden as a
+    /// nil `URLComponents.port` value.
+    private static func explicitPort(in source: String) throws -> Int? {
+        guard let schemeBoundary = source.range(of: "://") else { throw URLAuthorityError.invalid }
+        let afterScheme = source[schemeBoundary.upperBound...]
+        let authorityEnd = afterScheme.firstIndex(where: { $0 == "/" || $0 == "?" || $0 == "#" }) ?? afterScheme.endIndex
+        let authority = String(afterScheme[..<authorityEnd])
+        guard !authority.isEmpty, !authority.contains("@") else { throw URLAuthorityError.invalid }
+
+        let portText: Substring?
+        if authority.first == "[" {
+            guard let closingBracket = authority.firstIndex(of: "]") else { throw URLAuthorityError.invalid }
+            let suffix = authority[authority.index(after: closingBracket)...]
+            guard !suffix.contains("[") && !suffix.contains("]") else { throw URLAuthorityError.invalid }
+            if suffix.isEmpty {
+                portText = nil
+            } else {
+                guard suffix.first == ":" else { throw URLAuthorityError.invalid }
+                portText = suffix.dropFirst()
+            }
+        } else {
+            let colonCount = authority.reduce(into: 0) { if $1 == ":" { $0 += 1 } }
+            guard colonCount <= 1 else { throw URLAuthorityError.invalid }
+            if let colon = authority.lastIndex(of: ":") {
+                guard colon != authority.startIndex else { throw URLAuthorityError.invalid }
+                portText = authority[authority.index(after: colon)...]
+            } else {
+                portText = nil
+            }
+        }
+
+        guard let portText else { return nil }
+        guard !portText.isEmpty,
+              portText.allSatisfy({ $0.isASCII && $0.isNumber }),
+              let port = Int(portText),
+              (1...65_535).contains(port) else {
+            throw URLAuthorityError.invalid
+        }
+        return port
+    }
+
+    private enum URLAuthorityError: Error { case invalid }
 }
 
 public enum AuthenticationError: LocalizedError, Equatable, Sendable {
@@ -99,8 +183,8 @@ public struct MatrixLoginCapabilityDiscovery: LoginCapabilityDiscovering {
             return LoginCapabilities(supportsPassword: document.flows.contains { $0.type == "m.login.password" })
         } catch let error as AuthenticationError {
             throw error
-        } catch is URLError {
-            throw AuthenticationError.networkFailure
+        } catch let error as URLError {
+            throw PasswordLoginResultClassifier.error(for: error)
         } catch is DecodingError {
             throw AuthenticationError.discoveryFailed
         } catch {
@@ -143,25 +227,35 @@ public enum PasswordLoginResultClassifier {
     /// they are intentionally never surfaced here.
     public static func error(for error: Error) -> AuthenticationError {
         if let error = error as? AuthenticationError { return error }
-        if error is URLError { return .networkFailure }
+        if let error = error as? URLError { return Self.error(forTransportURLCode: error.code) }
         switch error {
         case ClientBuildError.ServerUnreachable: return .networkFailure
         case ClientBuildError.InvalidServerName, ClientBuildError.WellKnownLookupDisabled,
              ClientBuildError.WellKnownLookupFailed, ClientBuildError.WellKnownDeserializationError:
             return .discoveryFailed
-        case let ClientBuildError.Sdk(message), let ClientBuildError.Generic(message):
-            return looksLikeNetworkFailure(message: message, details: nil) ? .networkFailure : .serverFailure
+        case ClientBuildError.Sdk, ClientBuildError.Generic:
+            // The SDK exposes no transport subtype for these variants.  Their
+            // diagnostic strings are not a stable or safe classification API.
+            return .serverFailure
         case let ClientError.MatrixApi(kind, code, _, _):
             if case .limitExceeded(let milliseconds) = kind {
                 return .rateLimited(retryAfter: milliseconds.map { Double($0) / 1_000 })
+            }
+            switch kind {
+            case .connectionFailed, .connectionTimeout:
+                return .networkFailure
+            default:
+                break
             }
             switch code {
             case "M_LIMIT_EXCEEDED": return .rateLimited(retryAfter: nil)
             case "M_UNKNOWN_TOKEN", "M_FORBIDDEN": return .invalidCredentials
             default: return .serverFailure
             }
-        case let ClientError.Generic(message, details):
-            return looksLikeNetworkFailure(message: message, details: details) ? .networkFailure : .serverFailure
+        case ClientError.Generic, ClientError.ContentScanner:
+            // These variants intentionally carry only unstructured details.
+            // Do not infer a network outage from server-controlled text.
+            return .serverFailure
         default:
             return .serverFailure
         }
@@ -175,9 +269,21 @@ public enum PasswordLoginResultClassifier {
         return code == "M_UNKNOWN_TOKEN"
     }
 
-    private static func looksLikeNetworkFailure(message: String, details: String?) -> Bool {
-        let diagnostic = (message + " " + (details ?? "")).lowercased()
-        return ["connection", "connect", "timeout", "timed out", "network", "dns", "socket", "http client", "transport", "request failed"].contains { diagnostic.contains($0) }
+    private static func error(forTransportURLCode code: URLError.Code) -> AuthenticationError {
+        switch code {
+        case .cannotFindHost, .cannotConnectToHost, .networkConnectionLost,
+             .dnsLookupFailed, .notConnectedToInternet, .internationalRoamingOff,
+             .callIsActive, .timedOut, .secureConnectionFailed,
+             .serverCertificateHasBadDate, .serverCertificateUntrusted,
+             .serverCertificateHasUnknownRoot, .serverCertificateNotYetValid,
+             .clientCertificateRejected, .clientCertificateRequired:
+            return .networkFailure
+        default:
+            // URL loading also reports request construction and response
+            // parsing failures as URLError.  Only the explicit transport
+            // codes above are connectivity failures.
+            return .serverFailure
+        }
     }
 }
 

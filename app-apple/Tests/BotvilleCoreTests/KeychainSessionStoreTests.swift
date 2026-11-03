@@ -78,7 +78,7 @@ final class KeychainSessionStoreTests: XCTestCase {
     }
 
     func testCreateFailureRemovesOnlyNewSessionDirectory() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("botville-session-store-\(UUID().uuidString)", isDirectory: true)
+        let root = testDirectory().appendingPathComponent("botville-session-store-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let storeID = UUID()
         let directory = SessionStoreDirectory(baseURL: root)
@@ -89,7 +89,7 @@ final class KeychainSessionStoreTests: XCTestCase {
     }
 
     func testCreateFailurePreservesExistingSessionDirectory() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("botville-session-store-existing-\(UUID().uuidString)", isDirectory: true)
+        let root = testDirectory().appendingPathComponent("botville-session-store-existing-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let storeID = UUID()
         let directory = SessionStoreDirectory(baseURL: root)
@@ -123,6 +123,12 @@ final class KeychainSessionStoreTests: XCTestCase {
         XCTAssertNil(try store.load())
     }
     #endif
+
+    private func testDirectory() -> URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".build/keychain-store-tests", isDirectory: true)
+    }
 
     private func credentials() -> SessionCredentials {
         SessionCredentials(accessToken: "test-access", refreshToken: "test-refresh", userID: "@test:example.invalid", deviceID: "TEST", homeserverURL: "https://matrix.example.invalid", oauthData: nil, storeID: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!, storeKey: Data(repeating: 1, count: 32))
