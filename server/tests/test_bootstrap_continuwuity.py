@@ -351,7 +351,7 @@ TEMPLATE = (
 
 # Mirrors compose/appservice/botville-gateway.yaml.tmpl closely enough to
 # exercise init.sh's appservice rendering (A1.3), including the derived
-# regex-escaped server name.
+# regex-escaped server name (also in the exclusive aliases namespace, #107).
 APPSERVICE_TEMPLATE = (
     "id: botville-gateway\n"
     'as_token: "${APPSERVICE_AS_TOKEN}"\n'
@@ -360,6 +360,9 @@ APPSERVICE_TEMPLATE = (
     "  users:\n"
     "    - exclusive: true\n"
     "      regex: '^@ai_.*:${BOTVILLE_SERVER_NAME_REGEX}$'\n"
+    "  aliases:\n"
+    "    - exclusive: true\n"
+    "      regex: '^#botville_conv_.*:${BOTVILLE_SERVER_NAME_REGEX}$'\n"
 )
 
 HEX64 = r"[0-9a-f]{64}"
@@ -516,6 +519,8 @@ class InitScriptTest(unittest.TestCase):
         # Dots in the server name are escaped so the anchored regex cannot
         # match lookalike domains.
         self.assertIn(r"regex: '^@ai_.*:old\.example$'", rendered)
+        # #107: the exclusive alias namespace renders the same way.
+        self.assertIn(r"regex: '^#botville_conv_.*:old\.example$'", rendered)
         self.assertNotIn("${", rendered)
         # as_token = full control over the @ai_* namespace -> 0600 like .env.
         self.assertEqual(stat.S_IMODE(self.appservice.stat().st_mode), 0o600)

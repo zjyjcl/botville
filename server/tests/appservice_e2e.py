@@ -16,15 +16,20 @@ gateway transport from gateway/src — no install needed:
   5. alice reads /messages and asserts sender == the AI user and body matches;
   6. the rendered registration carries a valid hs_token (64 hex, differs from
      the as_token; PR #99 review);
-  7. gateway HTTP e2e (PR #99 review blocker 1): alice creates a room with
-     room_alias_name=botville_conv_<conversation_id> and invites
-     @ai_<persona>:<server>; the real gateway HTTP server (build_server,
-     appservice transport, port 0) receives POST
+  7. gateway HTTP e2e (PR #99 review blocker 1): the appservice side (AS
+     token, masquerading as @ai_<persona>:<server>) creates a room with
+     room_alias_name=botville_conv_<conversation_id> and invites alice —
+     #botville_conv_* is the AS's exclusive alias namespace, so a human
+     createRoom could not claim it; the real gateway HTTP server
+     (build_server, appservice transport, port 0) receives POST
      /v1/conversations/<conversation_id>/messages with
-     sender_persona_id=<persona>; alice reads the room and asserts the event
-     sender/body (persona -> @ai_* mapping + alias -> room resolution);
+     sender_persona_id=<persona>; alice joins and reads the room and asserts
+     the event sender/body (persona -> @ai_* mapping + alias -> room
+     resolution);
   8. a normal UIA registration inside the @ai_* namespace must be rejected
      with errcode M_EXCLUSIVE (exclusive namespace);
+  8b. a human createRoom with room_alias_name=botville_conv_<rand> must be
+      rejected with errcode M_EXCLUSIVE (exclusive alias namespace, #107);
   9. the transport refuses out-of-namespace senders client-side (no request);
   10. raw masquerade (?user_id=@bob:...) with the as_token must be rejected by
       the homeserver (M_EXCLUSIVE / M_FORBIDDEN).
@@ -59,7 +64,13 @@ from botville_gateway.matrix import DeliveryError  # noqa: E402
 from botville_gateway.matrix_appservice import AppServiceMatrixTransport  # noqa: E402
 
 # Reuse the A1.1 e2e helpers (step runner, UIA registration, room creation).
-from e2e_synapse import create_room, quote_room, register_user, run_step  # noqa: E402
+from e2e_synapse import (  # noqa: E402
+    create_room,
+    join_room,
+    quote_room,
+    register_user,
+    run_step,
+)
 
 # Conversation -> room alias convention (gateway GATEWAY_ROOM_ALIAS_PREFIX
 # default; see docs/deploy/appservice.md).
@@ -156,6 +167,29 @@ def expect_normal_ai_registration_rejected(base_url, registration_token):
     raise smoke.Failure(
         "registration of {} neither succeeded nor was rejected".format(body["username"])
     )
+
+
+def expect_human_alias_claim_rejected(alice):
+    """A human createRoom claiming a #botville_conv_* alias must be refused
+    with errcode M_EXCLUSIVE — the aliases namespace is exclusive to the
+    appservice (#107). Any other errcode means the rendered registration lost
+    its aliases section (or the homeserver does not enforce alias namespaces);
+    we assert the exact Matrix errcode and accept the usual 400/403 statuses
+    so both homeserver implementations stay honest."""
+    alias_name = ROOM_ALIAS_PREFIX + secrets.token_hex(6)
+    status, resp = request_json(
+        "POST",
+        alice.url("/_matrix/client/v3/createRoom"),
+        body={"room_alias_name": alias_name, "preset": "private_chat"},
+        token=alice.access_token,
+    )
+    errcode = (resp or {}).get("errcode")
+    expect(
+        status in (400, 403) and errcode == "M_EXCLUSIVE",
+        "human createRoom claiming {} returned HTTP {} errcode {!r}, expected "
+        "400/403 M_EXCLUSIVE: {!r}".format(alias_name, status, errcode, resp),
+    )
+    return "HTTP {} {}".format(status, errcode)
 
 
 def expect_registration_tokens(registration_path, env_as_token):
@@ -319,22 +353,42 @@ def main():
     conv = {}
 
     def _create_aliased_room():
-        # PR #99 review blocker 1: the gateway-level flow. Alice creates a room
-        # whose alias follows the botville_conv_<conversation_id> convention
-        # and invites @ai_<persona>:<server>; the gateway then only sees the
-        # persona/conversation ids.
+        # PR #99 review blocker 1: the gateway-level flow. #botville_conv_* is
+        # the appservice's exclusive alias namespace (#107), so the room must
+        # be created on the AS side (as_token + ?user_id masquerade of the AI
+        # persona) claiming the alias and inviting the human user; the gateway
+        # then only sees the persona/conversation ids.
         conv["conversation_id"] = secrets.token_hex(6)
         conv["persona"] = "e2e" + secrets.token_hex(3)
         conv["sender"] = "@ai_{}:{}".format(conv["persona"], server_name)
         conv["text"] = "gateway http e2e {}".format(secrets.token_hex(4))
         transport.ensure_user(conv["sender"])
-        room["alias_id"] = create_room(
-            alice["client"],
-            room_alias_name=ROOM_ALIAS_PREFIX + conv["conversation_id"],
-            invite=[conv["sender"]],
-            preset="private_chat",
+        status, resp = request_json(
+            "POST",
+            base_url
+            + "/_matrix/client/v3/createRoom?"
+            + urllib.parse.urlencode({"user_id": conv["sender"]}),
+            body={
+                "room_alias_name": ROOM_ALIAS_PREFIX + conv["conversation_id"],
+                "invite": [alice["client"].user_id],
+                "preset": "private_chat",
+            },
+            token=as_token,
         )
-        return "{} invites {}".format(room["alias_id"], conv["sender"])
+        expect(
+            status in (200, 201),
+            "AS-side createRoom claiming #{}<conv> returned HTTP {}: {!r}".format(
+                ROOM_ALIAS_PREFIX, status, resp
+            ),
+        )
+        room_id = (resp or {}).get("room_id")
+        expect(room_id, "createRoom without room_id: {!r}".format(resp))
+        room["alias_id"] = room_id
+        # Alice was only invited: join before reading /messages.
+        join_room(alice["client"], room_id)
+        return "{} claims #{}<conv>, invites alice".format(
+            conv["sender"], ROOM_ALIAS_PREFIX
+        )
 
     def _gateway_http_deliver():
         with GatewayHttpFixture(base_url, server_name, as_token) as gateway:
@@ -397,7 +451,7 @@ def main():
         lambda: expect_registration_tokens(args.registration_file, as_token),
     )
     run_step(
-        "alice creates aliased room #{}<conv> and invites @ai_<persona>".format(
+        "AS side claims aliased room #{}<conv> and invites alice".format(
             ROOM_ALIAS_PREFIX
         ),
         _create_aliased_room,
@@ -416,6 +470,12 @@ def main():
     run_step(
         "normal ai_* UIA registration rejected (M_EXCLUSIVE)",
         lambda: expect_normal_ai_registration_rejected(base_url, registration_token),
+    )
+    run_step(
+        "human createRoom claiming #{}<alias> rejected (M_EXCLUSIVE)".format(
+            ROOM_ALIAS_PREFIX
+        ),
+        lambda: expect_human_alias_claim_rejected(alice["client"]),
     )
     run_step(
         "transport refuses out-of-namespace senders (client-side)",

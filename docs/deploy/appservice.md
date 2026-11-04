@@ -42,10 +42,19 @@ masquerade）；运行时不使用 `/_synapse/admin`，也不使用 admin room �
     users:
       - exclusive: true
         regex: '^@ai_.*:<server_name 的正则转义>$'
+    aliases:
+      - exclusive: true
+        regex: '^#botville_conv_.*:<server_name 的正则转义>$'
   ```
 
   两端锚定（`^…$`）。`<server_name>` 由 `init.sh` 做**正则转义**后注入
   （`example.com` → `example\.com`），避免域名中的点被当成通配。
+- **房间别名也是 exclusive 命名空间**（#107）：`#botville_conv_*:<server>`
+  只能由 appservice 认领；人类用户 `createRoom` 带
+  `room_alias_name=botville_conv_*` 会被 HS 拒绝（`M_EXCLUSIVE`，两家 HS
+  由 `appservice-e2e` 断言同一 errcode）。别名前缀必须与网关
+  `GATEWAY_ROOM_ALIAS_PREFIX`（默认 `botville_conv_`）一致：**改前缀须同步
+  改模板里的 aliases 正则**，否则别名解析与命名空间排他会分叉。
 - AS 的 `sender_localpart`（`botville-gateway`）与命名空间外的普通账号互不冲突。
 - **启用 exclusive 命名空间的前置检查**：若部署里已经存在**普通方式**注册的
   `@ai_*` 用户，注册 appservice 后 AS（持 as_token 者）将取得这些账号的控制
@@ -66,17 +75,20 @@ masquerade）；运行时不使用 `/_synapse/admin`，也不使用 admin room �
 | --- | --- | --- |
 | `sender_persona_id` | persona id：`^[a-z0-9._=-]{1,64}$`（**小写即合法**，大写/空白/特殊字符直接 400） | Matrix 用户 `@ai_<persona_id>:<server_name>`；首次使用时经 `m.login.application_service` 免密注册 |
 | `sender_persona_id` | 或完整 Matrix 用户 ID（`@` 开头） | 必须已落在 `@ai_*:<server_name>` 命名空间内，否则 400（`appservice.namespace`） |
-| 路径 `conversation_id` | conversation id：字符集同 persona | 房间别名 `#<GATEWAY_ROOM_ALIAS_PREFIX><conversation_id>:<server_name>`（默认前缀 `botville_conv_`），网关经标准接口 `GET /_matrix/client/v3/directory/room/{alias}` 解析成 room id 并进程内缓存；别名不存在 → **404 `conversation.not_found`**；字符集非法 → 400 |
+| 路径 `conversation_id` | conversation id：字符集同 persona | 房间别名 `#<GATEWAY_ROOM_ALIAS_PREFIX><conversation_id>:<server_name>`（默认前缀 `botville_conv_`），网关经标准接口 `GET /_matrix/client/v3/directory/room/{alias}` 解析成 room id 并进程内缓存（TTL `GATEWAY_ROOM_ALIAS_CACHE_TTL`，默认 60s，过期重新解析）；别名不存在 → **404 `conversation.not_found`**；字符集非法 → 400 |
 | 路径 `conversation_id` | 或完整 Matrix room ID（`!` 开头） | 直接使用，不做目录解析 |
 
-**房间别名约定**：客户端（或部署脚本）建会话房间时设置
-`room_alias_name = botville_conv_<conversation_id>` 并邀请相关
-`@ai_<persona>:<server_name>`，之后只拿 `conversation_id` 调网关即可。示例：
+**房间别名约定**：`#botville_conv_*` 是 appservice 的 exclusive 别名命名
+空间，**会话房间由 appservice 一侧创建**（人类账号无法认领该前缀的别名，
+`createRoom` 会得到 `M_EXCLUSIVE`）：以 as_token 加 `?user_id=@ai_<persona>`
+masquerade 建房、设置 `room_alias_name = botville_conv_<conversation_id>` 并
+邀请人类用户；之后只拿 `conversation_id` 调网关即可。示例：
 
 ```json
-POST /_matrix/client/v3/createRoom
+POST /_matrix/client/v3/createRoom?user_id=@ai_persona_demo:localhost
+Authorization: Bearer <as_token>
 { "room_alias_name": "botville_conv_conv_demo",
-  "invite": ["@ai_persona_demo:localhost"], "preset": "private_chat" }
+  "invite": ["@human:localhost"], "preset": "private_chat" }
 ```
 
 ```json
@@ -146,10 +158,11 @@ Tuwunel 的 `appservice_dir`（`[global]` 配置项，容器环境变量
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `GATEWAY_MATRIX_TRANSPORT` | `memory` | `memory`=内存假后端（B1.1 现状）；`appservice`=真实代发 |
-| `GATEWAY_HOMESERVER_URL` | — | homeserver 的 Client-Server API 地址（如 `http://127.0.0.1:8008`）；明文 `http://` 只允许 loopback / 无点单标签容器名（如 `synapse`/`tuwunel`），跨主机必须 `https://` |
+| `GATEWAY_HOMESERVER_URL` | — | homeserver 的 Client-Server API 地址（如 `http://127.0.0.1:8008`）；明文 `http://` 只允许 loopback（`localhost`/`127.0.0.1`/`::1`）与无点单标签容器名（如 `synapse`/`tuwunel`），其余（含任意非 `::1` 的 IPv6、空 host）拒绝；跨主机必须 `https://` |
 | `GATEWAY_MATRIX_SERVER_NAME` | — | homeserver 的 `server_name`（主机名或 IP，可带 `:端口`；统一小写），用于命名空间校验 |
 | `GATEWAY_AS_TOKEN` | — | 与 `server/compose/.env` 的 `APPSERVICE_AS_TOKEN` 一致；非空、≥32 字符、不含空白，否则拒绝启动 |
-| `GATEWAY_ROOM_ALIAS_PREFIX` | `botville_conv_` | conversation → 房间别名 localpart 前缀（见上文 ID 语义） |
+| `GATEWAY_ROOM_ALIAS_PREFIX` | `botville_conv_` | conversation → 房间别名 localpart 前缀（见上文 ID 语义）；**改前缀须同步改注册模板的 aliases 正则** |
+| `GATEWAY_ROOM_ALIAS_CACHE_TTL` | `60` | 别名 → room_id 进程内缓存 TTL（秒）；过期后重新 directory lookup 并刷新；`0` = 不缓存（每次 lookup），负数拒绝启动 |
 | `GATEWAY_ALLOW_INSECURE_HS` | `false` | 显式放行明文 `http://` 的跨主机 homeserver（接受 as_token 明文传输风险） |
 
 `appservice` 模式缺任一项（或 as_token 仍是 `<change-me>`/过短/含空白）时
@@ -219,18 +232,21 @@ PYTHONPATH=gateway/src python3 -m botville_gateway
   make appservice-e2e            # 注册→建房邀请→AI 代发→回读断言→网关 HTTP 链路→双向越权拒绝
   ```
 
-  脚本 `server/tests/appservice_e2e.py`：人类用户（UIA）建房并邀请
-  `@ai_e2e_<随机>`；`AppServiceMatrixTransport` 以该身份注册（
-  `m.login.application_service`）、自动进房并发消息；人类用户回读断言
-  sender/body。随后走**网关 HTTP 链路**：alice 建房时设置
-  `room_alias_name=botville_conv_<随机>` 并邀请 `@ai_<persona>`，进程内启动
-  真实网关（`build_server`，appservice 传输，端口 0），向
-  `/v1/conversations/<conversation_id>/messages` 发
-  `sender_persona_id=<persona>`，断言 2xx 且 alice 在房间读到
-  `sender=@ai_<persona>:<server>`、body 一致。同时断言渲染出的注册文件里
-  `hs_token` 非空（64 hex、与 as_token 不同）。最后断言普通 UIA 注册
-  `ai_*` 被拒且 errcode 是 `M_EXCLUSIVE`、网关命名空间外发送被拒、直接拿
-  as_token masquerade `@bob` 被 HS 拒。
+脚本 `server/tests/appservice_e2e.py`：人类用户（UIA）建房并邀请
+`@ai_e2e_<随机>`；`AppServiceMatrixTransport` 以该身份注册（
+`m.login.application_service`）、自动进房并发消息；人类用户回读断言
+sender/body。随后走**网关 HTTP 链路**：AS 侧以 `@ai_<persona>` 身份
+（as_token masquerade）建房、认领别名 `room_alias_name=botville_conv_<随机>`
+并邀请 alice（exclusive 别名只能 AS 认领，#107），alice 进房；进程内启动
+真实网关（`build_server`，appservice 传输，端口 0），向
+`/v1/conversations/<conversation_id>/messages` 发
+`sender_persona_id=<persona>`，断言 2xx 且 alice 在房间读到
+`sender=@ai_<persona>:<server>`、body 一致。同时断言渲染出的注册文件里
+`hs_token` 非空（64 hex、与 as_token 不同）。最后断言普通 UIA 注册
+`ai_*` 被拒、人类 `createRoom` 认领 `botville_conv_*` 别名被拒（两者
+errcode 都是 `M_EXCLUSIVE`；若更换的 HS 对排他返回不同错误码，须在本文档
+登记并同步调整断言，保持两家一致）、网关命名空间外发送被拒、直接拿
+as_token masquerade `@bob` 被 HS 拒。
 - **常见失败**：
   - `APPSERVICE_AS_TOKEN missing or placeholder`：没跑 `make init`，或手工
     `.env` 没补该键；
@@ -242,6 +258,9 @@ PYTHONPATH=gateway/src python3 -m botville_gateway
     `TUWUNEL_APPSERVICE_DIR` 是否设置），改完记得重启容器；
   - 普通 `ai_*` 注册居然成功：注册文件不是 exclusive（被手改过）或 homeserver
     没加载它；
+  - 人类建房报 `M_EXCLUSIVE`：`#botville_conv_*` 是 appservice 的 exclusive
+    别名命名空间（#107），会话房间须由 AS 侧创建（见上文房间别名约定）——
+    这是预期拒绝，不是故障；
   - Tuwunel 起不来/不认注册文件：先看 `docker compose logs tuwunel`；若日志
     显示解析 `url: null` 失败，说明该版本要求字符串 URL——此时保持机制不变，
     在部署层给 Tuwunel 单独渲染一个 `url` 占位（如 `http://127.0.0.1:1`）并

@@ -9,7 +9,7 @@
     在注册文件声明的 exclusive user namespace 内免密建号；
   - `?user_id=` masquerade：以 `@ai_*` 身份 join / send；
   - `GET /_matrix/client/v3/directory/room/{alias}`：把 conversation 别名解析
-    成 room id（进程内缓存）；
+    成 room id（进程内缓存，TTL 默认 60s，`room_cache_ttl_seconds` 可覆盖）；
   - `GET /_matrix/client/v3/account/whoami`：带 AS token 的健康检查。
 
 注册文件由部署层渲染（`server/compose/appservice/botville-gateway.yaml.tmpl`
@@ -35,12 +35,13 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional, Set, Tuple
 
 from .matrix import DeliveryError, SentEvent
 
@@ -50,6 +51,14 @@ AI_NAMESPACE_PREFIX = "@ai_"
 
 # conversation 别名 localpart 的默认前缀（GATEWAY_ROOM_ALIAS_PREFIX 可覆盖）。
 DEFAULT_ROOM_ALIAS_PREFIX = "botville_conv_"
+
+# 别名 → room_id 缓存的默认 TTL 秒数（构造参数 room_cache_ttl_seconds /
+# GATEWAY_ROOM_ALIAS_CACHE_TTL 可覆盖；0 = 不缓存，负数拒绝）。与
+# config.DEFAULT_ROOM_ALIAS_CACHE_TTL 保持一致。
+DEFAULT_ROOM_CACHE_TTL_SECONDS = 60.0
+
+# 缓存过期用单调时钟（不受系统时间回拨影响）；模块级绑定便于单测推进时间。
+_monotonic = time.monotonic
 
 # persona / conversation id 的字符集（小写即合法；大写在映射前就被拒绝，
 # 不做静默小写化，避免调用方把 "Persona" 与 "persona" 当两个身份）。
@@ -82,16 +91,24 @@ class AppServiceMatrixTransport:
         server_name: str,
         namespace_prefix: str = AI_NAMESPACE_PREFIX,
         room_alias_prefix: str = DEFAULT_ROOM_ALIAS_PREFIX,
+        room_cache_ttl_seconds: float = DEFAULT_ROOM_CACHE_TTL_SECONDS,
         timeout: float = 30.0,
     ) -> None:
+        if room_cache_ttl_seconds < 0:
+            raise ValueError(
+                "room_cache_ttl_seconds must be >= 0 (0 disables the "
+                "alias->room cache), got {!r}".format(room_cache_ttl_seconds)
+            )
         self._base = homeserver_url.rstrip("/")
         self._as_token = as_token
         self._server_name = server_name
         self._prefix = namespace_prefix
         self._room_alias_prefix = room_alias_prefix
+        self._room_cache_ttl = room_cache_ttl_seconds
         self._timeout = timeout
         self._ensured: Set[str] = set()
-        self._rooms: Dict[str, str] = {}
+        # conversation_id -> (room_id, 过期时刻 monotonic 秒)；TTL=0 时不写入。
+        self._rooms: Dict[str, Tuple[str, float]] = {}
         self._lock = threading.Lock()
         # 不跟随重定向；忽略 http_proxy 等环境变量（部署网关的机器上代理
         # 配置与 homeserver 内网地址无关，走代理反而会泄漏 AS token）。
@@ -202,8 +219,10 @@ class AppServiceMatrixTransport:
 
         `!` 开头：直接当 room id 用；否则视为 conversation id（字符集同
         persona），解析房间别名 `#<room_alias_prefix><id>:<server_name>`
-        （`GET /_matrix/client/v3/directory/room/{alias}`，带 AS token），
-        成功后进程内缓存。别名不存在 → `conversation.not_found`。
+        （`GET /_matrix/client/v3/directory/room/{alias}`，带 AS token）。
+        成功后进程内缓存（TTL `room_cache_ttl_seconds`，默认 60s；过期后
+        重新 lookup 并刷新，别名重指向不至于被永久缓存；0 = 不缓存）。
+        别名不存在 → `conversation.not_found`。
         """
         if room_id.startswith("!"):
             return room_id
@@ -213,10 +232,11 @@ class AppServiceMatrixTransport:
                 f"conversation_id {room_id!r} is neither a Matrix room id (!...) "
                 f"nor a conversation id matching ^[a-z0-9._=-]{{1,64}}$",
             )
+        # TTL=0 时 _rooms 永远是空的：每次都走 directory lookup。
         with self._lock:
             cached = self._rooms.get(room_id)
-        if cached is not None:
-            return cached
+        if cached is not None and cached[1] > _monotonic():
+            return cached[0]
         alias = f"#{self._room_alias_prefix}{room_id}:{self._server_name}"
         try:
             resp = self._request(
@@ -238,8 +258,9 @@ class AppServiceMatrixTransport:
                 "appservice.response",
                 f"directory response for {alias} has no room_id",
             )
-        with self._lock:
-            self._rooms[room_id] = resolved
+        if self._room_cache_ttl > 0:
+            with self._lock:
+                self._rooms[room_id] = (resolved, _monotonic() + self._room_cache_ttl)
         return resolved
 
     @staticmethod

@@ -167,7 +167,8 @@ class MatrixTransport(Protocol):
 persona/conversation id）：`sender_persona_id` 是 persona id
 （`^[a-z0-9._=-]{1,64}$`，大写即非法）→ 用户 `@ai_<persona>:<server_name>`；
 `conversation_id` → 房间别名 `#botville_conv_<conversation_id>:<server_name>`
-（`GET /_matrix/client/v3/directory/room/{alias}` 解析并缓存，别名不存在 →
+（`GET /_matrix/client/v3/directory/room/{alias}` 解析并按 TTL 缓存，默认 60s
+（`GATEWAY_ROOM_ALIAS_CACHE_TTL`），别名不存在 →
 404 `conversation.not_found`）；`@`/`!` 开头的完整 Matrix ID 直接使用。语义
 与建房侧约定详见 [`docs/deploy/appservice.md`](../docs/deploy/appservice.md)。
 
@@ -200,7 +201,8 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_HOMESERVER_URL` | *(空)* | appservice 模式必填：homeserver 的 CS API 地址（`http(s)://…`）；明文 `http://` 只允许 loopback / 无点单标签容器名，跨主机要 `https://`（`GATEWAY_ALLOW_INSECURE_HS=true` 可显式放开） |
 | `GATEWAY_MATRIX_SERVER_NAME` | *(空)* | appservice 模式必填：homeserver 的 `server_name`（主机名或 IP，可带 `:端口`；统一小写） |
 | `GATEWAY_AS_TOKEN` | *(空)* | appservice 模式必填：与部署层注册文件的 `APPSERVICE_AS_TOKEN` 一致；留空/`<change-me>`/短于 32 字符/含空白都拒绝启动，不进 repr/日志 |
-| `GATEWAY_ROOM_ALIAS_PREFIX` | `botville_conv_` | conversation → 房间别名 localpart 前缀（`^[a-z0-9._=-]{1,64}$`） |
+| `GATEWAY_ROOM_ALIAS_PREFIX` | `botville_conv_` | conversation → 房间别名 localpart 前缀（`^[a-z0-9._=-]{1,64}$`）；改前缀须同步改部署模板的 exclusive aliases 正则（`server/compose/appservice/botville-gateway.yaml.tmpl`） |
+| `GATEWAY_ROOM_ALIAS_CACHE_TTL` | `60` | 别名 → room_id 进程内缓存 TTL（秒），过期重新 directory lookup；`0` = 不缓存，负数拒绝启动 |
 | `GATEWAY_ALLOW_INSECURE_HS` | `false` | 显式放行明文 `http://` 的跨主机 homeserver（接受 as_token 明文传输风险） |
 
 非法配置（端口非数字、时区不存在、`HH:MM` 格式错）在 `Config` 构造时抛 `ConfigError`，

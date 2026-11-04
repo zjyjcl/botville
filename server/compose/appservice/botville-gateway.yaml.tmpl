@@ -30,3 +30,14 @@ namespaces:
       # "examplexcom". Single-quoted on purpose: backslashes must survive
       # YAML parsing.
       regex: '^@ai_.*:${BOTVILLE_SERVER_NAME_REGEX}$'
+  aliases:
+    - exclusive: true
+      # Conversation room aliases #<prefix><conversation_id>:<server>. Must
+      # stay in sync with GATEWAY_ROOM_ALIAS_PREFIX on the gateway side
+      # (default botville_conv_, gateway/src/botville_gateway/config.py):
+      # changing the prefix means editing this regex in the same deploy, or
+      # alias resolution and namespace enforcement fork. Exclusive (#107):
+      # only the appservice may claim #botville_conv_* aliases — human
+      # createRoom with that room_alias_name is rejected (M_EXCLUSIVE), so
+      # conversation rooms are created AS-side (see docs/deploy/appservice.md).
+      regex: '^#botville_conv_.*:${BOTVILLE_SERVER_NAME_REGEX}$'
