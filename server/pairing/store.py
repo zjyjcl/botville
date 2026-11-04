@@ -68,6 +68,7 @@ REDEEM_UNKNOWN = "unknown_invite"
 REDEEM_USED = "invite_already_used"
 REDEEM_EXPIRED = "invite_expired"
 REDEEM_BAD_SECRET = "invalid_secret"
+REDEEM_PREDATES_SEVER = "invite_predates_sever"
 
 
 def hash_secret(secret):
@@ -144,7 +145,7 @@ class PairingStore:
                           expires_at=expires_at)
         return expires_at
 
-    def check_invite(self, invite_id, secret, now=None):
+    def check_invite(self, invite_id, secret, now=None, server_name=None):
         """Read-only invite validation with the redeem_invite() rules.
 
         Returns (True, None) when the invite is currently consumable, else
@@ -156,9 +157,15 @@ class PairingStore:
         now = time.time() if now is None else now
         with self._lock:
             row = self._conn.execute(
-                "SELECT secret_hash, expires_at, used_at FROM invites WHERE id = ?",
+                "SELECT secret_hash, created_at, expires_at, used_at"
+                " FROM invites WHERE id = ?",
                 (invite_id,),
             ).fetchone()
+            peer = None
+            if server_name is not None:
+                peer = self._conn.execute(
+                    "SELECT state, severed_at, severed_by FROM peers"
+                    " WHERE server_name = ?", (server_name,)).fetchone()
         if row is None:
             return False, REDEEM_UNKNOWN
         if row["used_at"] is not None:
@@ -167,6 +174,13 @@ class PairingStore:
             return False, REDEEM_EXPIRED
         if not hmac.compare_digest(row["secret_hash"], hash_secret(secret)):
             return False, REDEEM_BAD_SECRET
+        # An invite issued before we severed this peer must not revive it
+        # (only a fresh invite can); other parties' invites are unaffected
+        # (review r2 #4: no global invite burn on sever).
+        if peer is not None and peer["state"] == "severed" and \
+                peer["severed_by"] == "local" and peer["severed_at"] is not None \
+                and row["created_at"] <= peer["severed_at"]:
+            return False, REDEEM_PREDATES_SEVER
         return True, None
 
     def redeem_invite(self, invite_id, secret, server_name, api_url,

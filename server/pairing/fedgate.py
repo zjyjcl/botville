@@ -53,6 +53,7 @@ client IP (the pairing service only trusts that header from configured
 proxies, review B3).
 """
 
+import collections
 import http.client
 import json
 import logging
@@ -125,6 +126,22 @@ def _strip_quotes(value):
     return value
 
 
+_CTL_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+
+
+def headers_are_clean(headers):
+    """False when any header is folded (obs-fold) or carries a control
+    character other than HTAB, in its name or value; or when the parser
+    recorded defects. Fail-closed input check for the gate."""
+    if getattr(headers, "defects", None):
+        return False
+    for name, value in headers.items():
+        if not isinstance(value, str) or _CTL_RE.search(name) or \
+                _CTL_RE.search(value):
+            return False
+    return True
+
+
 def parse_x_matrix_origin(auth_headers):
     """Origin declared by the request's single X-Matrix Authorization header.
 
@@ -152,7 +169,9 @@ def parse_x_matrix_origin(auth_headers):
       - any parse anomaly -> None.
 
     Returns the origin string, or None (deny). The gate guarantees that
-    whenever it accepts an origin, Synapse parses the *same* origin from
+    whenever it accepts an origin (and headers_are_clean() has already
+    refused folded / CTL-bearing headers, without which the claim is
+    false across parsers), Synapse parses the *same* origin from
     the same bytes; whether the signature is genuine is then the
     homeserver's job (it is not checked on /_matrix/media/* — see the
     module docstring).
@@ -161,6 +180,8 @@ def parse_x_matrix_origin(auth_headers):
                       if value[:8].lower() == "x-matrix"]
     if len(matrix_headers) != 1:
         return None
+    if _CTL_RE.search(matrix_headers[0]):
+        return None  # folded / CR / LF / other CTL: parsers disagree
     parts = re.split(r"^X-Matrix +", matrix_headers[0], maxsplit=1)
     if len(parts) != 2:
         return None  # no space-separated parameter section
@@ -304,17 +325,31 @@ def _http_url(value, name):
 # --- sink log throttle ---------------------------------------------------------
 
 _sink_log_lock = threading.Lock()
-_sink_log_at = {}
+_sink_log_at = collections.OrderedDict()  # bounded LRU: origin -> last log
+SINK_LOG_MAX_ORIGINS = 1024
+SINK_LOG_GLOBAL_PER_INTERVAL = 20
+_sink_log_window = [0.0, 0]  # [window start, lines logged in window]
 
 
 def _should_log_sink(origin, now=None, interval=SINK_LOG_INTERVAL):
-    """True at most once per `interval` per origin (drop-log throttle)."""
+    """Drop-log throttle: at most once per `interval` per origin AND at
+    most SINK_LOG_GLOBAL_PER_INTERVAL lines per interval overall, with a
+    bounded per-origin table, so rotating fresh origins can neither flood
+    the log nor grow memory (review r2 #1)."""
     now = time.monotonic() if now is None else now
     with _sink_log_lock:
-        last = _sink_log_at.get(origin, 0.0)
-        if now - last < interval:
+        if now - _sink_log_window[0] >= interval:
+            _sink_log_window[0], _sink_log_window[1] = now, 0
+        if _sink_log_window[1] >= SINK_LOG_GLOBAL_PER_INTERVAL:
+            return False
+        last = _sink_log_at.get(origin)
+        if last is not None and now - last < interval:
             return False
         _sink_log_at[origin] = now
+        _sink_log_at.move_to_end(origin)
+        while len(_sink_log_at) > SINK_LOG_MAX_ORIGINS:
+            _sink_log_at.popitem(last=False)
+        _sink_log_window[1] += 1
         return True
 
 
@@ -368,6 +403,18 @@ class FedgateHandler(BaseHTTPRequestHandler):
         self._send_json(status, payload)
 
     def _handle(self):
+        # Header hygiene (review r2, B1 residue): Python's email parser keeps
+        # obs-fold continuation lines verbatim ("...\r\n origin=...") while
+        # Twisted/Synapse folds them into one space, so the same bytes yield
+        # different X-Matrix parameters on each side. ANY cross-parser
+        # normalisation difference is a bypass, so we do not try to mimic
+        # Twisted: a folded header or any control character (other than
+        # HTAB) in any header name/value is refused outright, before any
+        # routing. This also closes CRLF injection into the upstream request.
+        if not headers_are_clean(self.headers):
+            self._reject(400, {"errcode": "M_UNKNOWN",
+                               "error": "malformed request headers"})
+            return
         # Raw request-target, not urlsplit(): "//x/y" would otherwise be
         # parsed as a network-location and hide the empty segment.
         path = self.path.split("?", 1)[0]

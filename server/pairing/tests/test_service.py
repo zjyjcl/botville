@@ -636,10 +636,14 @@ class ApiTest(ServiceTestBase):
         status, _ = testutil.http_json(
             "DELETE", self.url("/v1/pairing/peers/hs-b"), token=ADMIN)
         self.assertEqual(status, 200)
-        # The outstanding invite must no longer be redeemable.
+        # The outstanding invite must not revive the severed peer...
         status, resp = self.redeem(invite_id, secret)
         self.assertEqual(status, 403)
-        self.assertIn("already used", resp["error"])
+        self.assertIn("predates the sever", resp["error"])
+        # ...but it stays valid for an unrelated server (no global burn).
+        status, _ = self.redeem(invite_id, secret, server_name="hs-c",
+                                api_url="https://hs-c.example:8448/_matrix/pairing")
+        self.assertEqual(status, 200)
 
     def test_sever_survives_unreachable_peer(self):
         # Peer api_url points at a closed port: severing must still succeed

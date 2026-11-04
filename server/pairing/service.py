@@ -72,6 +72,7 @@ from urllib.parse import unquote, urlsplit
 from .store import (
     REDEEM_BAD_SECRET,
     REDEEM_EXPIRED,
+    REDEEM_PREDATES_SEVER,
     REDEEM_UNKNOWN,
     REDEEM_USED,
     PairingStore,
@@ -107,6 +108,8 @@ REDEEM_ERRORS = {
     REDEEM_USED: (403, "M_FORBIDDEN", "invite already used"),
     REDEEM_EXPIRED: (403, "M_FORBIDDEN", "invite expired"),
     REDEEM_BAD_SECRET: (403, "M_FORBIDDEN", "invalid invite secret"),
+    REDEEM_PREDATES_SEVER: (403, "M_FORBIDDEN",
+                            "invite predates the sever of this peer"),
 }
 
 
@@ -660,7 +663,8 @@ class PairingHandler(BaseHTTPRequestHandler):
         # BEFORE any outbound key fetch — an unauthenticated caller must
         # not be able to trigger requests or use the service as a
         # liveness oracle.
-        ok, reason = self.app.store.check_invite(invite_id, secret)
+        ok, reason = self.app.store.check_invite(invite_id, secret,
+                                                  server_name=server_name)
         if not ok:
             self.app.store.record_event("redeem_rejected",
                                         invite_id=invite_id,
@@ -751,10 +755,19 @@ class PairingHandler(BaseHTTPRequestHandler):
         # redeem response carries the per-peer shared secret for
         # notify-severed authentication (review B2); it travels only over
         # the TLS connection to the peer's gate.
+        shared_secret = resp.get("shared_secret") if isinstance(resp, dict) else None
+        if not (isinstance(shared_secret, str)
+                and re.fullmatch(r"[0-9a-f]{64}", shared_secret)):
+            # A peer handing back an unusable secret would later break our
+            # signed notify-severed (review r2 #5); refuse the pairing.
+            self.app.store.record_event("accept_rejected",
+                                        server_name=remote_name,
+                                        reason="bad_shared_secret")
+            self._error(502, "M_UNKNOWN",
+                        "peer returned an invalid shared secret")
+            return
         self.app.store.upsert_peer_active(
-            remote_name, api_url,
-            shared_secret=resp.get("shared_secret")
-            if isinstance(resp, dict) else None)
+            remote_name, api_url, shared_secret=shared_secret)
         self._send_json(200, {"ok": True, "server_name": remote_name})
 
     def _handle_sever(self, server_name):
@@ -769,9 +782,10 @@ class PairingHandler(BaseHTTPRequestHandler):
             self._error(404, "M_NOT_FOUND", "unknown peer")
             return
         self.app.store.sever_peer(server_name, "local")
-        # A severed pairing must not stay cancellable: burn every unused
-        # invite so holders of an outstanding QR cannot resurrect it.
-        invalidated = self.app.store.invalidate_unused_invites()
+        # A severed pairing must not stay cancellable: invites issued before
+        # this sever are refused for this peer at redeem time
+        # (REDEEM_PREDATES_SEVER); unrelated pending invites stay valid.
+        invalidated = 0
         # Best-effort heads-up, HMAC-signed with the pairing-time shared
         # secret (review B2): our own gate already refuses the peer both
         # ways from our side (they can neither push to us nor ask us to
@@ -783,8 +797,13 @@ class PairingHandler(BaseHTTPRequestHandler):
             {"server_name": self.config.server_name}).encode("utf-8")
         headers = None
         if peer.get("shared_secret"):
-            headers = build_notify_headers(
-                peer["shared_secret"], self.config.server_name, body_bytes)
+            try:
+                headers = build_notify_headers(
+                    peer["shared_secret"], self.config.server_name, body_bytes)
+            except (ValueError, TypeError) as exc:
+                log.warning("cannot sign notify-severed for %s: %s",
+                            server_name, exc)
+                headers = None
         # else: legacy pairing from before shared secrets existed; the
         # notify is sent unsigned and will be refused by a current peer.
         notified = False
@@ -934,6 +953,10 @@ def main(argv=None):
     httpd = build_server(config)
     start_pruner(httpd.app)
     host, port = httpd.server_address[:2]
+    if not config.trusted_proxies:
+        log.warning("PAIRING_TRUSTED_PROXIES is empty: X-Forwarded-For is "
+                    "ignored; behind fedgate every peer shares one rate-limit "
+                    "bucket. Set it to fedgate's address.")
     log.info("pairing service listening on %s:%s (db=%s, server_name=%s)",
              host, port, config.db_path, config.server_name)
     try:

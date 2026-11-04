@@ -8,6 +8,8 @@ matrix for every path class.
 import http.client
 import json
 import os
+import socket
+import re
 import sqlite3
 import sys
 import tempfile
@@ -309,6 +311,57 @@ class AllowedPeersTest(unittest.TestCase):
         self.assertFalse(ok)
 
 
+# --- reference parser for the differential test (review r2) ------------------
+
+def twisted_unfold(raw_header_block):
+    """Twisted HTTPChannel header semantics: obs-fold continuation lines
+    are joined with one space after lstrip(b" \t")."""
+    headers = []
+    for line in raw_header_block.split(b"\r\n"):
+        if line[:1] in (b" ", b"\t") and headers:
+            name, value = headers[-1]
+            headers[-1] = (name, value + b" " + line.lstrip(b" \t"))
+        elif line:
+            name, _, value = line.partition(b":")
+            headers.append((name.strip(), value.strip()))
+    return [(n.decode("latin-1"), v.decode("latin-1")) for n, v in headers]
+
+
+def synapse_origin(auth_values):
+    """Synapse v1.164.1 Authenticator: last X-Matrix header wins, params
+    built into a dict (last duplicate wins), quotes stripped."""
+    origin = None
+    for value in auth_values:
+        if not value.startswith("X-Matrix "):
+            continue
+        params = re.split(r"^X-Matrix +", value, maxsplit=1)[1]
+        parsed = {}
+        for item in re.split(r"[ \t]*,[ \t]*", params):
+            key, _, raw = item.partition("=")
+            raw = raw.strip()
+            if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
+                raw = raw[1:-1].replace('\\\\', '\\').replace('\\"', '"')
+            parsed[key.lower()] = raw
+        origin = parsed.get("origin")
+    return origin
+
+
+def raw_socket_request(port, request_bytes, timeout=5):
+    """Send exact bytes (folded headers etc.); returns the status code."""
+    sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    try:
+        sock.sendall(request_bytes)
+        data = b""
+        while b"\r\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        return int(data.split(b" ", 2)[1]) if data else None
+    finally:
+        sock.close()
+
+
 class FedgateMatrixTest(unittest.TestCase):
     """fedgate in front of a fake homeserver + fake pairing service."""
 
@@ -343,6 +396,85 @@ class FedgateMatrixTest(unittest.TestCase):
 
     def url(self, path):
         return "http://127.0.0.1:{}{}".format(self.port, path)
+
+
+    # --- obs-fold / control characters (review r2, B1 residue) --------------
+
+    FOLDED_CASES = [
+        # Fold smuggling a second origin (Twisted: duplicate -> last wins).
+        b'Authorization: X-Matrix origin="hs-a",key="ed25519:x",sig="S",\r\n origin="hs-evil"\r\n',
+        # Tab-indented continuation.
+        b'Authorization: X-Matrix origin="hs-a",sig="S",\r\n\torigin="hs-evil"\r\n',
+        # Fold on an unrelated header must also be refused.
+        b'Authorization: X-Matrix origin="hs-a",sig="S"\r\nX-Trace: a\r\n b\r\n',
+    ]
+
+    def _send_raw(self, header_lines, path="/_matrix/federation/v1/send/t1"):
+        req = (b"PUT " + path.encode() + b" HTTP/1.1\r\nHost: x\r\n"
+               b"Content-Length: 2\r\n" + header_lines + b"\r\n{}")
+        return raw_socket_request(self.port, req)
+
+    def test_folded_headers_rejected_raw_socket(self):
+        self.paired("hs-a")
+        for case in self.FOLDED_CASES:
+            before = len(self.hs_cls.received)
+            status = self._send_raw(case)
+            self.assertEqual(status, 400, case)
+            self.assertEqual(len(self.hs_cls.received), before,
+                             "folded request reached upstream: {!r}".format(case))
+
+    def test_folded_header_rejected_on_pairing_route(self):
+        before = len(self.pairing_cls.received)
+        status = self._send_raw(b"X-Note: a\r\n b\r\n",
+                                path="/_matrix/pairing/redeem")
+        self.assertEqual(status, 400)
+        self.assertEqual(len(self.pairing_cls.received), before)
+
+    def test_control_characters_rejected(self):
+        self.paired("hs-a")
+        for ctl in (b"\x00", b"\x0b", b"\x1b", b"\x7f"):
+            before = len(self.hs_cls.received)
+            status = self._send_raw(
+                b'Authorization: X-Matrix origin="hs-a",sig="S' + ctl + b'"\r\n')
+            self.assertIn(status, (400, 403), ctl)
+            self.assertEqual(len(self.hs_cls.received), before, ctl)
+
+    def test_parser_rejects_ctl_in_header_value(self):
+        self.assertIsNone(fedgate.parse_x_matrix_origin(
+            ['X-Matrix origin="hs-a",sig="S",\r\n origin="hs-evil"']))
+
+    def test_gate_origin_matches_upstream_parse(self):
+        # Differential property: whenever the gate forwards a request, the
+        # origin Synapse would derive from the bytes the upstream received
+        # (Twisted unfolding + Synapse last-wins) equals the gate's origin.
+        self.paired("hs-a")
+        variants = [
+            b'Authorization: X-Matrix origin="hs-a",key="ed25519:a",sig="S"\r\n',
+            b'Authorization: X-Matrix origin=hs-a,sig=S\r\n',
+            b'Authorization: X-Matrix  origin="hs-a" , sig="S"\r\n',
+            b'Authorization: X-Matrix origin="hs-a",sig="S"\r\nAuthorization: X-Matrix origin="hs-evil",sig="T"\r\n',
+            b'Authorization: X-Matrix origin="hs-a",origin="hs-evil",sig="S"\r\n',
+        ] + self.FOLDED_CASES
+        forwarded = 0
+        for case in variants:
+            before = len(self.hs_cls.received)
+            status = self._send_raw(case, path="/_matrix/federation/v1/event/e1")
+            gate_origin = fedgate.parse_x_matrix_origin(
+                [v.decode("latin-1") for v in
+                 (line.split(b": ", 1)[1] for line in case.split(b"\r\n")
+                  if line.lower().startswith(b"authorization: "))])
+            if len(self.hs_cls.received) == before:
+                self.assertGreaterEqual(status, 400, case)
+                continue
+            forwarded += 1
+            seen = self.hs_cls.received[-1]["authorization"] or []
+            upstream_origin = synapse_origin(
+                [v for n, v in twisted_unfold(
+                    b"".join(b"Authorization: " + v.encode("latin-1") + b"\r\n"
+                             for v in seen))])
+            self.assertEqual(upstream_origin, "hs-a", case)
+            self.assertEqual(gate_origin, "hs-a", case)
+        self.assertEqual(forwarded, 3)
 
     def paired(self, server_name="hs-a"):
         self.db.upsert_peer_active(server_name, "https://peer/x")
