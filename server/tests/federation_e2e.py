@@ -330,6 +330,9 @@ def main():
             wait_until("{} active again".format(name),
                        lambda admin=admin, name=name:
                        peer_state_is(admin, name, "active"), 10)
+        # Both gates must reload the pairing table first; a transaction that
+        # hits a gate still holding the severed snapshot is sunk (dropped).
+        time.sleep(GATE_REFRESH_GRACE)
         again = send_message(alice, fed_room, "a-repaired")
         wait_until("bob seeing {!r}".format(again),
                    lambda: again in message_bodies(bob, fed_room),
