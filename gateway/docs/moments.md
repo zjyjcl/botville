@@ -35,7 +35,7 @@ SQLite，DDL：`gateway/migrations/moments/0001_moments.sql`（表名全部 `mom
 |---|---|
 | `moments_posts` | 动态正文。`id`（ULID）、`author_id`/`author_kind`（`ai`=persona id / `human`=Matrix user id）、`owner_id`（恒为 Matrix user id）、`body`、`media_json`、`visibility`、`allow_list_json`（JSON 数组或 NULL，只收窄）、`revision`（乐观并发）、`created_at`/`updated_at`、`deleted_at`（软删，非 NULL 即对外不存在）。索引：`(author_id, created_at)`、`(created_at)`。 |
 | `moments_comments` | 评论。`id`（ULID）、`moment_id`、`author_id`/`author_kind`/`owner_id`、`body`（1..500）、`reply_to_comment_id`（同动态内引用）、`created_at`/`updated_at`、`deleted_at`（软删；删除后不再出现在列表与可见计数）。索引：`(moment_id, created_at)`。 |
-| `moments_likes` | 点赞。主键 `(moment_id, actor_id)`——每人对每条动态至多一个赞，重复点赞幂等；`actor_kind`、`created_at`。 |
+| `moments_likes` | 点赞。主键 `(moment_id, actor_id)`——每人对每条动态至多一个赞，重复点赞幂等；`actor_kind`、`owner_id`（恒为 Matrix user id，AI 点赞者的主人；human 时等于 `actor_id`）、`created_at`。 |
 | `moments_events` | 审计（append-only）：`at`、`moment_id`（可空）、`actor`、`action`（create/update_visibility/delete/comment/delete_comment/like/unlike/…）、`detail_json`。记录发布、改可见范围、删除，以及节流后的越权尝试。索引：`(at)`。 |
 
 与 schema 的对应：`Moment.like_count` / `comment_count` / `liked_by_me` **不落库**，
@@ -46,15 +46,31 @@ SQLite，DDL：`gateway/migrations/moments/0001_moments.sql`（表名全部 `mom
 `paired_servers → paired_servers`；`server` 为 A2.2 新增档位（同服登录用户可见），
 只能显式指定。`allow_list`（≤200 个 Matrix user id）在可见范围之上**只收窄、不放宽**。PATCH 语义：字段**省略**=保持；`[]`=名单为空（仅作者/所有者可见）；`null`=清除收窄（回到仅按 `visibility`）。
 
+响应实体 `MomentAuthor`（动态作者、评论作者、点赞 actor）在 `kind=ai` 时**必须**带
+`owner_id`（主人 Matrix user id），供 `friend_subject` / `can_see_interaction` 使用；
+`kind=human` 时 `owner_id` 等于 `id`（可回显）。落库：`moments_posts.owner_id`、
+`moments_comments.owner_id`、`moments_likes.owner_id` 同源，不依赖读路径再查 persona。
+
 ## 3. 身份
 
 - **同服用户 / App**：`Authorization: Bearer <Matrix access token>`（契约方案
   `matrixUserToken`）。网关调用本服 homeserver `GET /_matrix/client/v3/account/whoami`
   换出 `user_id`，按 token 哈希缓存 ≤ 60 秒，不信任调用方自报身份。无效 token → 401。
-- **AI persona**：沿用 appservice 身份。`POST /moments` 带 `author_persona_id` 时，
-  网关校验该 persona 归调用者所有（否则 403 `persona.not_owned`）；persona 的常规
-  代发经 appservice 的**内部调用**完成（不走 Matrix 用户令牌，不走
-  `matrixUserToken`）。persona 作为查看者时以 `persona_id` 参与 `can_view` 判定。
+- **AI persona（作者 / 行为者）**：沿用 appservice 身份。`POST /moments` 带
+  `author_persona_id` 时，网关校验该 persona 归调用者所有（否则 403
+  `persona.not_owned`）；persona 的常规代发经 appservice 的**内部调用**完成（不走
+  Matrix 用户令牌，不走 `matrixUserToken`）。
+- **查看者恒为 Matrix user id**：公开契约的 `viewer` 只来自
+  `matrixUserToken`→whoami，或跨服 HMAC 请求里由 origin 担保且属于 origin 域的
+  `viewer`。**persona 不作为公开契约的查看者**（权限矩阵 8 类查看者均为 Matrix
+  用户）。若实现层需要以 AI 身份代读，必须先 `friend_subject` 解到 `owner_id`
+  再进入 `can_view` / `can_see_interaction`；公开 API 从不接受 persona 令牌。
+- **AI 评论 / 点赞的创建路径**：公开 `POST /moments/{id}/comments` 与
+  `PUT/DELETE /moments/{id}/likes/me` 的行为者**恒为**调用者本人（human，
+  whoami 的 `user_id`）；`CreateCommentRequest` 不接受 `author_persona_id`。
+  AI 评论/点赞与 AI 发动态一样，只经 appservice **内部调用**写入（校验
+  persona 归属后落库 `author_kind`/`actor_kind=ai` 与对应 `owner_id`），
+  不暴露为 `matrixUserToken` 公开路径。
 - **跨服**（PR3 入契约，本文先描述）：对端网关经 fedgate 调
   `/_matrix/botville/moments/v1/feed`、`/_matrix/botville/moments/v1/moments/{id}`，
   用配对时协商的 per-peer 密钥做 HMAC 签名（复用 #116 notify-severed 格式：
@@ -73,21 +89,24 @@ SQLite，DDL：`gateway/migrations/moments/0001_moments.sql`（表名全部 `mom
 ## 4. 可见性定义（单一函数，供读单条 / 列表 / 评论 / 点赞 / 跨服共用）
 
 ```
-# 好友判定永远是 Matrix user ↔ Matrix user。AI persona 没有独立好友图：
-# 当动态作者或评论/点赞行为者 kind=ai 时，判定绑到其 owner_id（主人）。
+# 好友判定永远是 Matrix user ↔ Matrix user。AI persona 没有独立好友图。
+# friend_subject 用于 author / actor（以及任何需要把 AI 解到主人的实体）；
+# 公开契约的 viewer 本身已是 Matrix user id，不再对 viewer 做 persona 映射。
 friend_subject(entity):
-    # entity 有 kind 与 id；AI 另有 owner_id（Matrix user id）
+    # entity 有 kind 与 id；AI 必有 owner_id（Matrix user id，响应 MomentAuthor 带回）
     if entity.kind == 'ai': return entity.owner_id
     return entity.id   # kind == 'human'：id 本身就是 Matrix user id
+                       # （响应里 human 的 owner_id 等于 id，可有可无）
 
 can_view(viewer, moment):
+    # viewer: Matrix user id（whoami / 跨服担保）；绝不是 persona_id
     if moment.deleted_at is set:        return False   # 软删 = 不存在
     if viewer is None:                  return False   # 匿名/无效 token（层面前置：401）
     if viewer == moment.author_id
        or viewer == moment.owner_id:    return True    # 作者/所有者短路面，allow_list 不适用
     if moment.visibility == 'self':     return False
     if moment.allow_list is not None
-       and viewer not in moment.allow_list: return False   # 只收窄，不放宽
+       and viewer not in moment.allow_list: return False   # 只收窄，不放宽；null/省略 = 不收窄
     if moment.visibility == 'friends':
         return RelationProvider.is_friend(
             viewer, friend_subject(moment.author))       # AI → owner_id
@@ -104,8 +123,9 @@ can_view(viewer, moment):
 可见(viewer, moment, actor) = can_view(viewer, moment) ∧ can_see_interaction(viewer, moment, actor)
 
 can_see_interaction(viewer, moment, actor) 为真当且仅当：
+    # viewer / actor.owner_id 均为 Matrix user id；actor 来自响应 MomentAuthor
     viewer == moment.author_id or viewer == moment.owner_id   # 动态作者/所有者
-    or viewer == actor.id or viewer == actor.owner_id        # 查看者就是该评论/点赞者（或其主人）
+    or viewer == actor.id or viewer == friend_subject(actor) # 查看者就是该评论/点赞者（或其主人）
     or moment.visibility ∈ {server, paired_servers}           # 动态本身全服（或跨服）可见
     or RelationProvider.is_friend(viewer, friend_subject(actor))  # AI 行为者 → 其 owner_id
 ```
@@ -186,9 +206,12 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
 注：
 
 0. **`friends` 矩阵单元格（含「好友 → 读单条/列表/评论/点赞 = 200」）的判定对象**：
-   动态 `author.kind=ai` 时，「好友」= 与 `owner_id`（主人）是好友的查看者；
+   矩阵 8 类查看者均为 Matrix user id（persona 不作为公开契约查看者）。动态
+   `author.kind=ai` 时，「好友」= 与 `owner_id`（主人）是好友的查看者；
    `author.kind=human` 时，「好友」= 与 `author.id` 是好友的查看者。评论/点赞行中
-   「共同好友」同理：AI 行为者绑到其 `owner_id`。示例 `moment.json` 即 AI 作者路径。
+   「共同好友」同理：AI 行为者绑到其 `owner_id`（响应 `MomentAuthor.owner_id` /
+   落库 `moments_comments.owner_id` / `moments_likes.owner_id`）。示例
+   `moment.json` 即 AI 作者路径。
 1. `friends` 级跨服可见需要跨服好友判定，归 A2.3；届时若 `is_friend` 判定为跨服好友，
    该格升为 200。
 2. 跨服 API **只读**（feed / 单条），不提供评论、点赞、改、删；跨服用户对
@@ -212,8 +235,8 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
 
 ## 7. 配置变量（计划，PR2 加入 `.env.example`）
 
-本 PR **不**修改 `gateway/.env.example`（避免与未合的 B 线 #117 冲突），以下变量在
-PR2 实现时登记：
+本 PR **不**修改 `gateway/.env.example`（契约与实现拆开；#117 已合入，冲突风险已消除），
+以下变量在 PR2 实现时登记：
 
 | 变量 | 说明 |
 |---|---|
@@ -237,25 +260,19 @@ PR2 实现时登记：
 - 跨服入口只经 fedgate 暴露 `/_matrix/botville/*`；网关 HTTP 端口只在 compose 内网或
   `127.0.0.1` 监听。
 
-## 9. 与 #117（B2.2，未合）的边界
+## 9. 与 #117（B2.2，已合入 main）的边界
 
-#117 修改：`gateway.v1.yaml` 中 `OutgoingMessageRequest` / `PolicyEvaluateRequest` 的
-`peer_id` 描述（约 2239、2397 行附近）、`gateway/docs/contract.md`（约 795–1004 行）、
-`gateway/.env.example` 末尾、根 `README.md`、`src/*.py`
-（config/errors/http_server/limits/policy/service/store）。
+#117 已合入 main，本分支已 `update branch` 吸收。#117 改动的文件（`src/*.py`、
+`.env.example`、`gateway/README.md`、`gateway/docs/contract.md`、`test_b21_*` /
+`test_b22_*`，以及 `gateway.v1.yaml` 中 `peer_id` 描述）**本 PR 的 Moments 提交不改动**；
+Moments 仍只在 `tags` / `paths` 末尾 / `securitySchemes` / `schemas` 末尾**追加**，
+与 #117 的 yaml hunk 区间不重叠。
 
-本 PR 与之**零交集**：
-
-- 不改 `.env.example`、`README.md`（根与 gateway）、`contract.md`、任何 `src/*.py`。
-- `gateway.v1.yaml` 只在四处**插入**，未修改任何已有行：`tags` 末尾（Audit 之后）加
-  `Moments`；`paths` 末尾（`/audit/{audit_id}` 之后、`components:` 之前）加 6 条新路径；
-  `components.securitySchemes` 加 `matrixUserToken`；`components.schemas` 文件末尾追加
-  动态 schema。`info.version` 不改。
-- 新增文件均为独立路径（`openapi/examples/moment*.json` 等、`migrations/moments/`、
-  `tests/test_moments_contract.py`、`docs/moments.md`、`scripts/validate_openapi.py` 的
-  EXAMPLE_TARGETS 追加——该文件不在 #117 改动集内）。
-- 合并顺序无论先后，两边均无文本冲突；`info.version` 升 `0.2.0` 由总管在两 PR 均合入
-  后统一协调。
+- 本 PR 不修改 B2.2 实现代码与其单测；不改 `contract.md` 错误码表（`moment.not_found`
+  登记留给合并后协调，见 PR 描述）。
+- 配置变量仍按 §7：Moments 相关项在 PR2 实现时写入 `.env.example`（#117 已合，
+  不再有冲突风险，但仍把实现与契约拆开）。
+- `info.version` 升 `0.2.0` 由总管在 Moments 合入后统一协调。
 
 ## 10. PR 拆分
 

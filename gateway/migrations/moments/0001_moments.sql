@@ -47,10 +47,13 @@ CREATE TABLE IF NOT EXISTS moments_comments (
 );
 
 -- 点赞表。每个 (moment_id, actor_id) 至多一条；重复点赞幂等（不重复计数）。
+-- owner_id 恒为 Matrix user id（与 moments_comments.owner_id 同语义，供 can_see_interaction /
+-- friend_subject 对 AI 点赞者绑定主人，不依赖运行时再查 persona 存储）。
 CREATE TABLE IF NOT EXISTS moments_likes (
     moment_id    TEXT NOT NULL REFERENCES moments_posts(id),
     actor_id     TEXT NOT NULL,
     actor_kind   TEXT NOT NULL CHECK (actor_kind IN ('ai', 'human')),
+    owner_id     TEXT NOT NULL,                 -- 点赞者为 AI persona 时其归属人；human 时等于 actor_id
     created_at   TEXT NOT NULL,
     PRIMARY KEY (moment_id, actor_id)
 );

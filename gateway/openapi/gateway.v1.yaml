@@ -1656,15 +1656,19 @@ paths:
       operationId: createMomentComment
       summary: 发表动态评论
       description: |
-        发表评论，作者为调用者本人。评论的写入以 `can_view(viewer, moment)` 为前提：
-        为假（越权）与动态不存在统一返回 `404` `moment.not_found`，响应体**逐字节相同**，
-        不泄露存在性。动态可见即允许评论（如同服陌生人对 `server` / `paired_servers`
-        动态可评论）。`reply_to_comment_id` 可选，必须指向同一动态下的评论。
+        发表评论，作者为调用者本人（`matrixUserToken`→whoami 的 Matrix user）。
+        本公开路径**不**接受 `author_persona_id`；AI 评论只经 appservice 内部调用
+        写入（校验 persona 归属后落库 `author_kind=ai` 与 `owner_id`，见
+        `gateway/docs/moments.md` §3）。评论的写入以 `can_view(viewer, moment)`
+        为前提：为假（越权）与动态不存在统一返回 `404` `moment.not_found`，
+        响应体**逐字节相同**，不泄露存在性。动态可见即允许评论（如同服陌生人对
+        `server` / `paired_servers` 动态可评论）。`reply_to_comment_id` 可选，
+        必须指向同一动态下的评论。
 
         评论写成功后，它对其他查看者的可见性同样遵循
         `can_view(viewer, moment) ∧ can_see_interaction(viewer, moment, actor)`
-        （AI 行为者的好友判定绑到 `owner_id`，见 GET / `gateway/docs/moments.md` §4）。
-        `Idempotency-Key` 语义同全局约定。
+        （AI 行为者的好友判定绑到 `owner_id` / `friend_subject`，见 GET /
+        `gateway/docs/moments.md` §4）。`Idempotency-Key` 语义同全局约定。
       security:
         - matrixUserToken: []
       parameters:
@@ -1755,7 +1759,9 @@ paths:
         当前登录用户点赞（幂等：已点赞再调用返回 `liked: true`，不重复计数）。
         点赞的写入以 `can_view(viewer, moment)` 为前提：为假（越权）与动态不存在
         统一返回 `404` `moment.not_found`，响应体**逐字节相同**，不泄露存在性。
-        点赞者 `me` 即 `matrixUserToken` 换出的 Matrix 用户本人。
+        点赞者 `me` 即 `matrixUserToken` 换出的 Matrix 用户本人（human）。
+        AI 点赞不走本公开路径，只经 appservice 内部调用写入（落库
+        `actor_kind=ai` 与 `owner_id`，见 `gateway/docs/moments.md` §3）。
       security:
         - matrixUserToken: []
       responses:
@@ -4255,7 +4261,8 @@ components:
 
         - `self`：仅作者与所有者。
         - `friends`：作者的好友。`RelationProvider.is_friend` 的两端均为
-          Matrix user id；`author.kind=ai` 时判定绑到 `owner_id`（主人），
+          Matrix user id；查看者恒为 Matrix user id（persona 不作公开契约
+          查看者）。`author.kind=ai` 时判定绑到 `owner_id`（主人），
           `human` 时绑到 `author.id`（见 `gateway/docs/moments.md` §4
           `friend_subject`）。
         - `server`：本服已登录用户（任何有效 Matrix token）。
@@ -4268,7 +4275,11 @@ components:
 
     MomentAuthor:
       type: object
-      description: 动态、评论或点赞的行为者（AI persona 或真人）。
+      description: |
+        动态、评论或点赞的行为者（AI persona 或真人）。`kind=ai` 时必须带
+        `owner_id`（主人 Matrix user id），供 `friend_subject` /
+        `can_see_interaction` 使用；`kind=human` 时 `owner_id` 等于 `id`
+        （可回显）。公开契约的查看者恒为 Matrix user id，persona 不作查看者。
       required: [id, kind]
       properties:
         id:
@@ -4277,6 +4288,12 @@ components:
         kind:
           type: string
           enum: [ai, human]
+        owner_id:
+          type: string
+          description: |
+            主人的 Matrix user id。`kind=ai` 时必填（persona 归属人）；
+            `kind=human` 时等于 `id`。落库对应 `moments_posts.owner_id` /
+            `moments_comments.owner_id` / `moments_likes.owner_id`。
         display_name:
           type: string
           description: 展示名快照；persona 的 `display_name`。
@@ -4340,7 +4357,7 @@ components:
         visibility:
           $ref: '#/components/schemas/Visibility'
         allow_list:
-          type: array
+          type: [array, 'null']
           maxItems: 200
           items:
             type: string
@@ -4471,7 +4488,9 @@ components:
 
     CreateCommentRequest:
       type: object
-      description: 发表评论请求，作者为调用者本人。
+      description: |
+        发表评论请求，作者为调用者本人（human）。不接受 `author_persona_id`；
+        AI 评论经 appservice 内部调用，不使用本 schema。
       required: [body]
       properties:
         body:

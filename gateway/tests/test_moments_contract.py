@@ -9,8 +9,9 @@
   2. 契约中 Moments 路径齐全，评论/点赞的读写操作 description 均以 can_view
      为前提（字面包含 "can_view"），且交互描述含 can_see_interaction /
      friend_subject 或 owner_id 绑定说明；安全方案为 matrixUserToken；
-  3. Visibility 枚举与 moment 示例一致；UpdateMomentRequest.allow_list 可 null；
-     真人发布缺省 visibility 写明为 friends。
+  3. Visibility 枚举与 moment 示例一致；UpdateMomentRequest / Moment.allow_list 可 null；
+     真人发布缺省 visibility 写明为 friends；MomentAuthor / moments_likes 含 owner_id；
+     文档明确 persona 不作公开契约查看者、AI 评论/点赞走 appservice 内部。
 """
 
 from __future__ import annotations
@@ -57,6 +58,7 @@ MOMENTS_INDEXES = [
     "idx_moments_posts_author_created",
     "idx_moments_posts_created",
     "idx_moments_comments_moment_created",
+    "idx_moments_events_at",
 ]
 
 VISIBILITY_ENUM = ["self", "friends", "server", "paired_servers"]
@@ -188,6 +190,51 @@ class TestMomentsContract(unittest.TestCase):
         ) as handle:
             moment = json.load(handle)
         self.assertIn(moment["visibility"], VISIBILITY_ENUM)
+
+
+    def test_moment_allow_list_accepts_null(self):
+        """响应 Moment.allow_list 与描述一致：可 array 或 null。"""
+        schema = self.contract["components"]["schemas"]["Moment"]
+        allow = schema["properties"]["allow_list"]
+        t = allow.get("type")
+        if isinstance(t, list):
+            types = set(t)
+        else:
+            variants = allow.get("oneOf") or allow.get("anyOf") or [allow]
+            types = set()
+            for variant in variants:
+                vt = variant.get("type")
+                if isinstance(vt, list):
+                    types.update(vt)
+                elif vt:
+                    types.add(vt)
+        self.assertIn("null", types)
+        self.assertIn("array", types)
+
+    def test_moment_author_documents_owner_id(self):
+        author = self.contract["components"]["schemas"]["MomentAuthor"]
+        self.assertIn("owner_id", author["properties"])
+        desc = author.get("description") or ""
+        self.assertIn("owner_id", desc)
+        self.assertRegex(desc, r"persona|查看者")
+
+    def test_likes_ddl_has_owner_id(self):
+        with open(DDL_PATH, "r", encoding="utf-8") as handle:
+            ddl = handle.read()
+        # moments_likes 表定义内必须有 owner_id 列
+        start = ddl.index("CREATE TABLE IF NOT EXISTS moments_likes")
+        end = ddl.index(";", start)
+        block = ddl[start:end]
+        self.assertIn("owner_id", block)
+
+    def test_docs_viewer_is_matrix_user(self):
+        docs = os.path.join(GATEWAY_ROOT, "docs", "moments.md")
+        with open(docs, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("persona 不作为公开契约的查看者", text)
+        self.assertIn("AI 评论 / 点赞的创建路径", text)
+        self.assertIn("moments_likes.owner_id", text)
+
 
 
 if __name__ == "__main__":

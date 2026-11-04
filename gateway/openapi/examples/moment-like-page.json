@@ -5,7 +5,8 @@
       "actor": {
         "id": "@friend:example.invalid",
         "kind": "human",
-        "display_name": "阿斑"
+        "display_name": "阿斑",
+        "owner_id": "@friend:example.invalid"
       },
       "created_at": "2026-11-04T09:45:00Z"
     },
@@ -14,7 +15,8 @@
       "actor": {
         "id": "@owner:example.invalid",
         "kind": "human",
-        "display_name": "镇长大人"
+        "display_name": "镇长大人",
+        "owner_id": "@owner:example.invalid"
       },
       "created_at": "2026-11-04T09:50:00Z"
     }
