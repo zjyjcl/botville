@@ -20,6 +20,19 @@ class ValidationError(Exception):
         self.code = code
         self.detail = detail
         self.field = field
+        self.http_status: int = 400
+
+
+class PeerValidationError(ValidationError):
+    """peer_id 校验失败（422 request.invalid）。
+
+    结构上是请求校验错误（code=request.invalid），但语义上属于会话成员约束，
+    映射为 422 而非 400（§6.4、B2.2）。HTTP 层按 `http_status` 属性路由。
+    """
+
+    def __init__(self, detail: str) -> None:
+        super().__init__("request.invalid", detail, field="peer_id")
+        self.http_status = 422
 
 
 class LimitError(Exception):

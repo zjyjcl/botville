@@ -191,9 +191,10 @@ class TestConcurrentLimit(unittest.TestCase):
         self.assertEqual(
             len([e for e in store.all_events() if e.kind == EventKind.SENT]), 3
         )
-        # 被拦截的请求不占名额、不投递，但记 blocked 事件
+        # 被拦截的请求不占名额、不投递；B2.2 #117 B6 起同 (persona, conv, reason)
+        # 的 blocked 事件去重，只记一条（防洪泛挤掉计数事件）
         self.assertEqual(
-            len([e for e in store.all_events() if e.kind == EventKind.BLOCKED]), 5
+            len([e for e in store.all_events() if e.kind == EventKind.BLOCKED]), 1
         )
         # 全部结束后没有残留预留
         self.assertEqual(svc.pending_reservations, 0)
