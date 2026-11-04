@@ -83,6 +83,17 @@ EXAMPLE_TARGETS = {
     "problem.json": "#/components/responses/Forbidden/content/application~1problem+json/schema",
     "problem-conversation-e2ee.json": "#/paths/~1conversations~1{conversation_id}~1messages/post/responses/403/content/application~1problem+json/schema",
     "problem-create-conversation-e2ee.json": "#/paths/~1conversations/post/responses/422/content/application~1problem+json/schema",
+    # A2.2 moments (issue #7)
+    "moment.json": "#/paths/~1moments~1{moment_id}/get/responses/200/content/application~1json/schema",
+    "create-moment-request.json": "#/paths/~1moments/post/requestBody/content/application~1json/schema",
+    "update-moment-request.json": "#/paths/~1moments~1{moment_id}/patch/requestBody/content/application~1json/schema",
+    "moment-page.json": "#/paths/~1moments/get/responses/200/content/application~1json/schema",
+    "moment-comment.json": "#/components/schemas/MomentComment",
+    "create-comment-request.json": "#/paths/~1moments~1{moment_id}~1comments/post/requestBody/content/application~1json/schema",
+    "comment-page.json": "#/paths/~1moments~1{moment_id}~1comments/get/responses/200/content/application~1json/schema",
+    "moment-like-state.json": "#/paths/~1moments~1{moment_id}~1likes~1me/put/responses/200/content/application~1json/schema",
+    "moment-like-page.json": "#/paths/~1moments~1{moment_id}~1likes/get/responses/200/content/application~1json/schema",
+    "problem-moment-not-found.json": "#/components/responses/NotFound/content/application~1problem+json/schema",
 }
 
 SECRET_PATTERNS = [
