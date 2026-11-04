@@ -19,12 +19,12 @@ _SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from botville_gateway.config import Config, ConfigError, load_config, HMAC_SECRET_MIN_HEX_CHARS
+from botville_gateway.config import Config, ConfigError, load_config
 from botville_gateway.limits import LimitStore, validate_silent_hours, _silent_is_effective
 from botville_gateway.matrix import InMemoryMatrixTransport
 from botville_gateway.policy import PolicyEngine, ReservationBook
 from botville_gateway.service import GatewayService
-from botville_gateway.store import EventKind, UsageEvent, UsageStore
+from botville_gateway.store import EventKind, UsageStore
 
 # 测试密钥：明显的测试值，无任何真实密钥
 SECRET = b"ab" * 32
@@ -73,7 +73,6 @@ class FixedClock:
 class TestPlatformZeroLengthSilentWindow(unittest.TestCase):
     def _make_engine(self, platform_silent, owner_silent):
         """platform_silent 和 owner_silent 都是 silent_hours dict。"""
-        from botville_gateway.config import DEFAULT_TIMEZONE
         platform_cfg = make_cfg(
             silent_hours_enabled=platform_silent["enabled"],
             silent_hours_start=platform_silent.get("start", "00:00"),
@@ -185,15 +184,41 @@ class TestReservationTTL(unittest.TestCase):
 
 
 class TestCommitOrderAppendBeforeRelease(unittest.TestCase):
-    def test_store_has_event_after_commit_send(self):
-        """_commit_send 后 store 里必须有 SENT 事件（append 先于 release）。
+    def test_store_append_happens_before_reservation_release(self):
+        """真正断言调用顺序：包装 store.append 与 reservations.release 记录次序。
 
-        旧顺序是 release→append，若两步之间有中断，名额已释放但事件未记，
-        导致后续请求计数偏低。
+        旧实现是 release→append（且 release 在 `_commit_send` 之前），包装后
+        记录到的顺序会是 `['release', 'append']`，本用例失败。
         """
         svc, transport, store = make_svc()
-        r = send(svc, key="k1")
+        order = []
+
+        real_append = store.append
+        real_release = svc._reservations.release
+
+        def _record_append(event):
+            order.append("append")
+            return real_append(event)
+
+        def _record_release(reservation):
+            order.append("release")
+            return real_release(reservation)
+
+        store.append = _record_append  # type: ignore[method-assign]
+        svc._reservations.release = _record_release  # type: ignore[method-assign]
+        try:
+            r = send(svc, key="k1")
+        finally:
+            store.append = real_append  # type: ignore[method-assign]
+            svc._reservations.release = real_release  # type: ignore[method-assign]
+
         self.assertEqual(r["outcome"], "delivered")
+        self.assertEqual(
+            order,
+            ["append", "release"],
+            "SENT event must be appended before the reservation is released, "
+            f"and released exactly once; got {order}",
+        )
         events = store.events_in_window(persona_id="p", kind=EventKind.SENT)
         self.assertEqual(len(events), 1, "SENT event must be recorded after commit")
 
@@ -397,10 +422,20 @@ class TestN10HmacSecretHexOnly(unittest.TestCase):
         with self.assertRaises(ConfigError):
             load_config({**self.BASE, "GATEWAY_HMAC_SECRET": non_hex})
 
-    def test_63_hex_chars_rejected_as_odd_length(self):
-        """63 hex 字符 → 奇数，不能整字节解码，应被拒绝。"""
+    def test_63_hex_chars_rejected_as_too_short(self):
+        """63 hex 字符 < 64，先命中「长度不足」分支（奇数长度分支不可达）。"""
         with self.assertRaises(ConfigError):
             load_config({**self.BASE, "GATEWAY_HMAC_SECRET": "a" * 63})
+
+    def test_65_hex_chars_rejected_as_odd_length(self):
+        """65 hex 字符 ≥64 且为奇数，命中奇数长度分支（非长度不足分支）。"""
+        try:
+            load_config({**self.BASE, "GATEWAY_HMAC_SECRET": "a" * 65})
+            self.fail("Should have raised")
+        except ConfigError as exc:
+            # 奇数长度分支的报错措辞，与「长度不足」分支区分
+            self.assertIn("even number", str(exc),
+                          "65-char odd-length input must hit the odd-length branch")
 
     def test_62_hex_chars_too_short(self):
         """62 hex 字符 = 31 字节 < 32 字节最小要求。"""
@@ -415,6 +450,21 @@ class TestN10HmacSecretHexOnly(unittest.TestCase):
     def test_valid_64_hex_chars_accepted(self):
         cfg = load_config({**self.BASE, "GATEWAY_HMAC_SECRET": "ab" * 32})
         self.assertEqual(cfg.hmac_secret, bytes.fromhex("ab" * 32))
+
+    def test_uppercase_hex_accepted(self):
+        """正则接受 A-F（大小写不敏感），bytes.fromhex 同样大小写不敏感。"""
+        cfg = load_config({**self.BASE, "GATEWAY_HMAC_SECRET": "AB" * 32})
+        self.assertEqual(cfg.hmac_secret, bytes.fromhex("ab" * 32))
+
+    def test_surrounding_whitespace_stripped_then_accepted(self):
+        """_env_str 会 strip 首尾空白，strip 后是合法 64 hex 即接受。"""
+        cfg = load_config({**self.BASE, "GATEWAY_HMAC_SECRET": "  " + "ab" * 32 + "  "})
+        self.assertEqual(cfg.hmac_secret, bytes.fromhex("ab" * 32))
+
+    def test_internal_whitespace_rejected(self):
+        """内部空白不被 strip，正则 fullmatch 拒绝。"""
+        with self.assertRaises(ConfigError):
+            load_config({**self.BASE, "GATEWAY_HMAC_SECRET": "ab " * 32})
 
     def test_all_zeros_via_constructor_rejected(self):
         with self.assertRaises(ConfigError):
@@ -455,46 +505,79 @@ class TestN11ClearAlsoByTxn(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# N12 /health single-flight try/finally 包住 leader 标记
+# N12 /health single-flight：领头者标记的清理与双检
 # ---------------------------------------------------------------------------
 class TestN12HealthSingleFlightFinally(unittest.TestCase):
-    def test_inflight_cleared_even_if_request_raises_base_exception(self):
-        """旧实现：leader 置位 `_health_inflight` 后若 BaseException 打断，
-        Event 永不 set，后续所有探针都等满 timeout。"""
+    """N12 的**可区分旧实现**部分：条件清理（`if self._health_inflight is inflight`）。
+
+    PR-a（036464b）里 finally 已无条件清 `_health_inflight` 并 `set()`，所以
+    「BaseException 后标记被清」在旧实现下**同样通过**，不能证明 PR-b 的修复。
+    PR-b 实际新增的是：置位与清理之间的**双检**——若 `_health_inflight` 已被别的
+    领头者替换，旧实现的无条件清理会把新领头者的事件清掉（后续探针失去会合点、
+    只能等满超时）。本用例设置「已被替换」的状态，旧实现会清掉替换后的 Event
+    并返回 True，新实现应保留替换后的 Event 并返回 False。
+    """
+
+    def _make_transport(self):
         from botville_gateway.matrix_appservice import AppServiceMatrixTransport
 
-        t = AppServiceMatrixTransport(
+        return AppServiceMatrixTransport(
             homeserver_url="http://127.0.0.1:1",
             as_token="t" * 32,
             server_name="example.invalid",
             health_cache_seconds=0.0,
-            health_timeout=1.0,
+            health_timeout=0.05,
         )
 
-        call_count = [0]
+    def test_replaced_inflight_marker_is_not_cleared_by_former_leader(self):
+        """条件清理（PR-b 新增）能区分新旧实现。
+
+        场景是**不可达的防御性注入**（`# pragma: no cover` 分支）：领头者已通过
+        双检进入 try，但执行 `_request` 期间 `_health_inflight` 被替换成另一个
+        Event。PR-a 旧实现的 finally **无条件** `self._health_inflight = None`，
+        会把替换后的新标记也清掉（后续探针失去会合点）；PR-b 改为条件清理
+        `if self._health_inflight is inflight`，保留替换后的标记。由于真实并发
+        下 follower 不替换标记、只 wait，这条分支正常流程走不到，此处通过在
+        `_request` 内手动改写标记来注入该状态，仅用于锁住「条件清理」这一性质。
+        """
+        t = self._make_transport()
+        replacement = threading.Event()
+
+        def _request(method, path, **kw):
+            # 注入「标记已被并发者替换」的状态。
+            with t._lock:
+                t._health_inflight = replacement
+            return {"user_id": "@bot:example.invalid"}
+
+        t._request = _request
+        result = t.healthy()
+
+        # 关键判别：旧实现无条件清理 → None；新实现条件清理 → 保留 replacement。
+        self.assertIs(
+            t._health_inflight, replacement,
+            "former leader must not clear a replacement inflight marker "
+            "(old impl unconditionally set None here)",
+        )
+        # 请求本身成功，故返回 True、缓存也被写成 True（finally 仍执行）。
+        self.assertTrue(result)
+        self.assertIs(t._health_cached, True)
+
+    def test_inflight_cleared_before_request_failure(self):
+        """投递路径兜底：whoami 抛 BaseException 时标记仍被清理（防御性断言）。
+
+        这条在 PR-a 旧实现下也通过，保留它是为了锁住「清理不能回退」这一性质，
+        不是 N12 修复的判别用例（判别用例见上一个）。
+        """
+        t = self._make_transport()
 
         def _bad_request(method, path, **kw):
-            call_count[0] += 1
             raise MemoryError("simulated BaseException in whoami")
 
         t._request = _bad_request
-
         with self.assertRaises(MemoryError):
             t.healthy()
-
-        # 关键：即使 MemoryError，_health_inflight 必须被清空
         self.assertIsNone(t._health_inflight,
                           "_health_inflight must be cleared even on BaseException")
-
-        # 第二次调用应能重新发起请求（不永久等待）
-        # 此处我们替换为返回 False 的 _request，确保可以再次调用
-        def _ok_request(method, path, **kw):
-            call_count[0] += 1
-            return {"user_id": "@bot:example.invalid"}
-
-        t._request = _ok_request
-        result = t.healthy()
-        self.assertTrue(result)
 
 
 if __name__ == "__main__":

@@ -413,13 +413,17 @@ class AppServiceMatrixTransport:
             with self._lock:
                 return bool(self._health_result)
         ok = False
-        try:
+        with self._lock:
+            # 双检：置位到进 try 之间若有并发者已抢到领头权（不可能，但
+            # 防御未来改动），确认自己仍是 owner，避免误清新领头者的事件。
+            still_leader = self._health_inflight is inflight
+        if not still_leader:  # pragma: no cover - 防御性分支
+            # 已不是 owner：等结果但**不**写缓存，避免把别人的结论覆盖成 False。
+            if not inflight.wait(self._health_timeout + 1):
+                return False
             with self._lock:
-                # 双检：置位到进 try 之间若有并发者已抢到领头权（不可能，但
-                # 防御未来改动），确认自己仍是 owner，避免误清新领头者的事件。
-                still_leader = self._health_inflight is inflight
-            if not still_leader:  # pragma: no cover - 防御性分支
-                return bool(inflight.wait(self._health_timeout + 1) and ok)
+                return bool(self._health_result)
+        try:
             try:
                 self._request(
                     "GET",

@@ -205,8 +205,8 @@ class ReservationBook:
     线程被异常终止（进程内未捕获的 `BaseException`、线程被杀、或调用方忘记
     release），名额会永久留在账上——消息数/ token 预算/最小间隔就此被一条
     幽灵消息卡死。因此每条预留带 `expires_at`，任何一次读写账本时先回收过期
-    条目。TTL 取 `GATEWAY_RESERVATION_TTL_SECONDS`（默认 300s，远大于传输超时
-    30s 的两倍），保证正常慢投递不会被误回收。
+    条目。TTL 由 `ReservationBook(ttl_seconds=…)` 注入，默认 300s（远大于传输
+    超时 30s 的两倍），保证正常慢投递不会被误回收。
     """
 
     def __init__(self, *, ttl_seconds: float = DEFAULT_RESERVATION_TTL_SECONDS) -> None:

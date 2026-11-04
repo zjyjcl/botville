@@ -159,7 +159,8 @@ class _NoEchoTransport:
 
 
 class TestLedgerKeyedByServiceTxn(unittest.TestCase):
-    """B1 / N2：账本键取 service 自己算出的 txnId，且无 key 时不写账本。"""
+    """B1 / N2：账本键取 `(conversation_id, sender, txnId)` 三元组（txnId 由
+    service 自算），且无 key 时不写账本。"""
 
     def test_no_key_sends_do_not_grow_ledger(self):
         svc, transport, store = make_svc(make_cfg())

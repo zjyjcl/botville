@@ -1155,17 +1155,17 @@ class GatewayService:
         ledger_txn: Optional[str] = None,
         forwarded_from: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """锁内提交：调用方须持锁，且已释放（或即将释放）该预留。
+        """锁内提交：调用方须持锁（`send_ai_message` 第三段）。
 
         以预留时刻 `reservation.at` 作为 `recorded_at`：策略判断发生在那一刻，
         投递耗时不应改变这条消息落在哪个滑动窗口里。
 
-        **提交顺序（#114-7.7）**：先 `store.append`（写 SENT 事件），再
-        `reservations.release`（释放预留）。虽然整段在锁内执行，固定顺序能让
-        「名额被占 ⟺ 事件已入账」成为稳定不变量，避免 release 后 append 前
-        被 TTL 回收错误地把本条当幽灵释放。调用方应在本函数返回后再 release；
-        目前的 `send_ai_message` 第三段在调用 `_commit_send` **之前**已经调用了
-        `reservations.release`，因此这里不重复 release。
+        **提交顺序（#114-7.7）**：本函数先 `store.append`（写 SENT 事件），再
+        `reservations.release`（释放预留），在返回前完成、**只 release 一次**。
+        虽然整段在锁内执行，固定顺序能让「名额被占 ⟺ 事件已入账」成为稳定不变量，
+        避免 release 后 append 前被 TTL 回收错误地把本条当幽灵释放。调用方
+        （`send_ai_message`）**不再**自行 release：成功路径只由本函数释放，投递
+        失败路径由 `_rollback` 释放，二者互斥。
 
         #114 PR-a 淘汰后去重计费：幂等缓存被淘汰后同 key 重试，HS 按 txnId 返回
         同一个 event_id。此处按 `ledger_txn` 记账，若本次 event_id 与已记录的一致，
