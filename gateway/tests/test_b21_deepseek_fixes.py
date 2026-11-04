@@ -356,28 +356,28 @@ class TestTxnIdFromIdempotencyKey(unittest.TestCase):
 
     def test_same_key_same_txn_id(self):
         from botville_gateway.service import GatewayService
-        tid1 = GatewayService._txn_id_for("key-abc")
-        tid2 = GatewayService._txn_id_for("key-abc")
+        tid1 = make_service(make_config())[0]._txn_id_for("key-abc")
+        tid2 = make_service(make_config())[0]._txn_id_for("key-abc")
         self.assertEqual(tid1, tid2)
 
     def test_different_keys_different_txn_ids(self):
         from botville_gateway.service import GatewayService
         self.assertNotEqual(
-            GatewayService._txn_id_for("key-1"),
-            GatewayService._txn_id_for("key-2"),
+            make_service(make_config())[0]._txn_id_for("key-1"),
+            make_service(make_config())[0]._txn_id_for("key-2"),
         )
 
     def test_none_key_is_random(self):
         from botville_gateway.service import GatewayService
-        t1 = GatewayService._txn_id_for(None)
-        t2 = GatewayService._txn_id_for(None)
+        t1 = make_service(make_config())[0]._txn_id_for(None)
+        t2 = make_service(make_config())[0]._txn_id_for(None)
         self.assertNotEqual(t1, t2)
 
     def test_txn_id_is_safe_matrix_chars(self):
         """txnId 只含 [0-9a-f]（hexdigest 字符集），Matrix 路径无需转义。"""
         import re
         from botville_gateway.service import GatewayService
-        tid = GatewayService._txn_id_for("idempotency-key-xyz")
+        tid = make_service(make_config())[0]._txn_id_for("idempotency-key-xyz")
         self.assertRegex(tid, r'^[0-9a-f]{1,64}$')
 
     def test_retry_with_same_idempotency_key_returns_cached_not_resent(self):
@@ -403,7 +403,7 @@ class TestTxnIdFromIdempotencyKey(unittest.TestCase):
             idempotency_key="stable-key",
         )
         self.assertEqual(
-            transport.sent[0].txn_id, GatewayService._txn_id_for("stable-key")
+            transport.sent[0].txn_id, svc._txn_id_for("stable-key")
         )
 
     def test_transport_gets_random_txn_id_without_key(self):

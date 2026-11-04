@@ -512,7 +512,7 @@ class AppServiceTransportConfigTest(unittest.TestCase):
     """GATEWAY_MATRIX_TRANSPORT 相关配置：默认保持现状、appservice fail closed。"""
 
     BASE_ENV = {
-        "GATEWAY_AUTH_TOKEN": "gateway-token",
+        "GATEWAY_HMAC_SECRET": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "GATEWAY_AUTH_TOKEN": "gateway-token",
         "GATEWAY_HOMESERVER_URL": "http://127.0.0.1:8008",
         "GATEWAY_MATRIX_SERVER_NAME": "localhost",
         # 64-hex 长度（init.sh 生成的形态）；也满足 >=32 的强度下限。
@@ -520,7 +520,7 @@ class AppServiceTransportConfigTest(unittest.TestCase):
     }
 
     def test_default_transport_is_memory(self):
-        cfg = load_config({"GATEWAY_AUTH_TOKEN": "gateway-token"})
+        cfg = load_config({"GATEWAY_HMAC_SECRET": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "GATEWAY_AUTH_TOKEN": "gateway-token"})
         self.assertEqual(cfg.matrix_transport, "memory")
         self.assertIsNone(cfg.homeserver_url)
         self.assertIsNone(cfg.as_token)

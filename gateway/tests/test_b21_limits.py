@@ -20,6 +20,7 @@ import unittest
 import urllib.error
 import urllib.request
 from datetime import timedelta, timezone
+from unittest import mock
 
 GATEWAY_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SRC = os.path.join(GATEWAY_ROOT, "src")
@@ -1002,10 +1003,25 @@ class TestServiceLimitsAndUsage(unittest.TestCase):
         cfg = make_config(rate_limit_messages=100, idempotency_ttl_seconds=10)
         svc, transport, store, limits, clock = make_service(cfg)
         payload = {"sender_persona_id": "p", "content": {"type": "text", "text": "a"}}
-        svc.send_ai_message("c", payload, idempotency_key="key-expire")
-        clock.advance(seconds=11)
-        svc.send_ai_message("c", payload, idempotency_key="key-expire")
-        self.assertEqual(len(transport.sent), 2)
+        with mock.patch.object(
+            transport, "send_text", wraps=transport.send_text
+        ) as send_text:
+            r1 = svc.send_ai_message("c", payload, idempotency_key="key-expire")
+            self.assertEqual(send_text.call_count, 1)
+            self.assertIn("key-expire", svc._idempotency)
+            clock.advance(seconds=11)
+            r2 = svc.send_ai_message("c", payload, idempotency_key="key-expire")
+            # #114 PR-a / N4：先证明缓存**真的**过期了——否则本用例区分不了
+            # 「缓存过期后重投」和「缓存命中返回原回执」（两者的回执断言一致）。
+            # 过期 → 重新投递，传输因此被调用第二次；HS 语义下同 txnId 不追加新
+            # 事件（`sent` 仍是 1），所以只有调用次数能证明缓存确实被淘汰了。
+            self.assertEqual(send_text.call_count, 2)
+            self.assertEqual(len(transport.sent), 1)
+        # 但 HS（内存传输同语义）按 txnId 去重，返回同一事件；账本命中，不重复计费。
+        self.assertEqual(r1["delivery"]["matrix_event_id"], r2["delivery"]["matrix_event_id"])
+        self.assertEqual(
+            len(store.events_in_window(persona_id="p", kind=EventKind.SENT)), 1
+        )
 
     def test_queue_is_bounded(self):
         cfg = make_config(max_queue_entries=2, silent_hours_enabled=True,
@@ -1064,6 +1080,7 @@ def http_config(**overrides):
     base = dict(
         host="127.0.0.1", port=0, dev_mode=True, rate_limit_messages=60,
         silent_hours_enabled=False, auth_token=None,
+        hmac_secret=b"test-hmac-secret" * 2,
     )
     base.update(overrides)
     return Config(**base)

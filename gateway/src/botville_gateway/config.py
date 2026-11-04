@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import os
 import re
+import secrets as _secrets
+import sys
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Mapping, Optional
@@ -22,6 +24,14 @@ CONTRACT_VERSION = "0.1.0"
 # Token values that mean "no auth configured"; starting with these is unsafe
 # unless GATEWAY_DEV_MODE=true is explicitly set.
 _INSECURE_TOKENS: frozenset = frozenset({"", "<change-me>"})
+
+# 部署密钥（GATEWAY_HMAC_SECRET）的最低强度：HMAC 的保密性全部押在密钥上，
+# 32 字节（256 bit）与 SHA-256 的输出宽度对齐。
+HMAC_SECRET_MIN_LENGTH = 32
+# 与 _INSECURE_TOKENS 同语义的字节形态（直接构造 Config 时也按占位处理）。
+_INSECURE_SECRET_BYTES: frozenset = frozenset({b"", b"<change-me>"})
+# dev 模式自动生成密钥只警告一次，避免每次构造 Config（测试）都刷屏。
+_hmac_dev_warning_emitted = False
 
 # dev 模式（免鉴权）只允许绑定这些本机地址，否则等于把无鉴权网关暴露到网络上。
 LOOPBACK_HOSTS: frozenset = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -73,6 +83,17 @@ DEFAULT_MAX_QUEUE_ENTRIES = 1_000
 
 class ConfigError(ValueError):
     """配置值非法（启动时应直接失败，而不是带病运行）。"""
+
+
+def _dev_hmac_secret() -> bytes:
+    """dev 模式未配置密钥时**每进程**生成一次的随机密钥（模块级缓存）。"""
+    global _DEV_HMAC_SECRET
+    if _DEV_HMAC_SECRET is None:
+        _DEV_HMAC_SECRET = _secrets.token_bytes(HMAC_SECRET_MIN_LENGTH)
+    return _DEV_HMAC_SECRET
+
+
+_DEV_HMAC_SECRET: Optional[bytes] = None
 
 
 def _env_int(env: Mapping[str, str], name: str, default: int, *, minimum: int = 0) -> int:
@@ -222,6 +243,10 @@ class Config:
     matrix_server_name: Optional[str] = None
     # as_token 等同 @ai_* 命名空间管理员凭据：不进 repr（日志/断言消息不泄露）。
     as_token: Optional[str] = field(default=None, repr=False)
+    # #114 PR-a：部署密钥，用于 txnId / text_sha256 的 HMAC。同样不进 repr。
+    # 非 dev 模式必须显式配置且 >= HMAC_SECRET_MIN_LENGTH 字节；dev 模式未配置
+    # 时由 __post_init__ 每进程随机生成（重启后 txnId/hash 不稳定）。
+    hmac_secret: Optional[bytes] = field(default=None, repr=False)
     # conversation → 房间别名 localpart 的前缀（#<prefix><conversation_id>:<server>）。
     room_alias_prefix: str = DEFAULT_ROOM_ALIAS_PREFIX
     # 别名 → room_id 缓存 TTL 秒数（GATEWAY_ROOM_ALIAS_CACHE_TTL；0 = 不缓存）。
@@ -289,6 +314,35 @@ class Config:
                 f"GATEWAY_DEV_MODE=true requires GATEWAY_HOST to be a loopback address "
                 f"(127.0.0.1, ::1, or localhost), got {self.host!r}. "
                 "Set a real GATEWAY_AUTH_TOKEN and disable dev mode for non-loopback deployments."
+            )
+        # #114 PR-a: GATEWAY_HMAC_SECRET 校验（fail-closed）。
+        # frozen dataclass 的 __post_init__ 不能直接赋值；用 object.__setattr__。
+        secret = self.hmac_secret
+        if secret is None or secret in _INSECURE_SECRET_BYTES:
+            if not self.dev_mode:
+                raise ConfigError(
+                    "GATEWAY_HMAC_SECRET is unset or uses the default placeholder. "
+                    "Set a strong random secret (>= 32 bytes, e.g. "
+                    "`python3 -c \"import secrets; print(secrets.token_hex(32))\"`). "
+                    "Use GATEWAY_DEV_MODE=true only for local development."
+                )
+            # dev 模式：自动生成每进程随机密钥（重启后 txnId/hash 不稳定）。
+            generated = _dev_hmac_secret()
+            object.__setattr__(self, "hmac_secret", generated)
+            global _hmac_dev_warning_emitted
+            if not _hmac_dev_warning_emitted:
+                _hmac_dev_warning_emitted = True
+                print(
+                    "WARNING: GATEWAY_HMAC_SECRET is not set — using a per-process random "
+                    "secret. txnId and text_sha256 will change on restart. "
+                    "Set GATEWAY_HMAC_SECRET (>= 32 bytes) for stable values.",
+                    file=sys.stderr,
+                )
+        elif len(self.hmac_secret) < HMAC_SECRET_MIN_LENGTH:  # type: ignore[arg-type]
+            raise ConfigError(
+                f"GATEWAY_HMAC_SECRET must be at least {HMAC_SECRET_MIN_LENGTH} bytes "
+                f"(got {len(self.hmac_secret)}). "  # type: ignore[arg-type]
+                f"Generate with: python3 -c \"import secrets; print(secrets.token_hex(32))\""
             )
         # A1.3：transport=appservice 时必须带齐全的三件套（fail closed），
         # 否则启动即失败，而不是回落到内存假后端悄悄"成功"。
@@ -392,6 +446,18 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
     token = _env_str(source, "GATEWAY_AUTH_TOKEN", "")
     dev_mode = _env_bool(source, "GATEWAY_DEV_MODE", False)
     as_token = _env_str(source, "GATEWAY_AS_TOKEN", "")
+    # #114 PR-a: 部署密钥（HMAC）。十六进制串 → bytes；空/<change-me> → None
+    # （由 Config 校验决定 dev 放行还是 fail-closed）。接受任意十六进制长度，强度
+    # 校验在 __post_init__ 统一做（>= HMAC_SECRET_MIN_LENGTH 字节）。
+    hmac_secret_raw = _env_str(source, "GATEWAY_HMAC_SECRET", "")
+    if hmac_secret_raw in ("", "<change-me>"):
+        hmac_secret: Optional[bytes] = None
+    else:
+        try:
+            hmac_secret = bytes.fromhex(hmac_secret_raw)
+        except ValueError:
+            # 非 hex（如原始字节串）按 utf-8 编码兜底；长度校验在 __post_init__。
+            hmac_secret = hmac_secret_raw.encode("utf-8")
     server_name = _env_str(source, "GATEWAY_MATRIX_SERVER_NAME", "") or None
     if server_name is not None:
         # 统一小写 + 形状校验（大小写漂移会让 @ai_* 命名空间两侧对不上）。
@@ -425,6 +491,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         homeserver_url=_env_str(source, "GATEWAY_HOMESERVER_URL", "") or None,
         matrix_server_name=server_name,
         as_token=None if as_token in _INSECURE_TOKENS else as_token,
+        hmac_secret=hmac_secret,
         room_alias_prefix=(
             _env_str(source, "GATEWAY_ROOM_ALIAS_PREFIX", DEFAULT_ROOM_ALIAS_PREFIX)
             or DEFAULT_ROOM_ALIAS_PREFIX

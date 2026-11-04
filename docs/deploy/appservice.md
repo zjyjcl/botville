@@ -161,6 +161,7 @@ Tuwunel 的 `appservice_dir`（`[global]` 配置项，容器环境变量
 | `GATEWAY_HOMESERVER_URL` | — | homeserver 的 Client-Server API 地址（如 `http://127.0.0.1:8008`）；明文 `http://` 只允许 loopback（`localhost`/`127.0.0.1`/`::1`）与无点单标签容器名（如 `synapse`/`tuwunel`），其余（含任意非 `::1` 的 IPv6、空 host）拒绝；跨主机必须 `https://` |
 | `GATEWAY_MATRIX_SERVER_NAME` | — | homeserver 的 `server_name`（主机名或 IP，可带 `:端口`；统一小写），用于命名空间校验 |
 | `GATEWAY_AS_TOKEN` | — | 与 `server/compose/.env` 的 `APPSERVICE_AS_TOKEN` 一致；非空、≥32 字符、不含空白，否则拒绝启动 |
+| `GATEWAY_HMAC_SECRET` | — | **必填**（#114 PR-a）：≥32 字节随机值（十六进制），用于 txnId 与 `text_sha256` 的 HMAC；留空或为 `<change-me>` 时网关拒绝启动（fail-closed） |
 | `GATEWAY_ROOM_ALIAS_PREFIX` | `botville_conv_` | conversation → 房间别名 localpart 前缀（见上文 ID 语义）；**改前缀须同步改注册模板的 aliases 正则** |
 | `GATEWAY_ROOM_ALIAS_CACHE_TTL` | `60` | 别名 → room_id 进程内缓存 TTL（秒）；过期后重新 directory lookup 并刷新；`0` = 不缓存（每次 lookup），负数拒绝启动 |
 | `GATEWAY_ALLOW_INSECURE_HS` | `false` | 显式放行明文 `http://` 的跨主机 homeserver（接受 as_token 明文传输风险） |
@@ -177,6 +178,7 @@ GATEWAY_MATRIX_TRANSPORT=appservice \
 GATEWAY_HOMESERVER_URL=http://127.0.0.1:8008 \
 GATEWAY_MATRIX_SERVER_NAME=localhost \
 GATEWAY_AS_TOKEN=<与 server 侧一致的随机值> \
+GATEWAY_HMAC_SECRET=<change-me> \
 GATEWAY_AUTH_TOKEN=<网关自己的随机值> \
 PYTHONPATH=gateway/src python3 -m botville_gateway
 ```

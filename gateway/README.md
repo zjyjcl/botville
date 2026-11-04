@@ -60,7 +60,7 @@ python3 -m unittest discover -s gateway/tests -v
 # 2) 起雏形（显式开发模式，不校验 Authorization）
 GATEWAY_DEV_MODE=true PYTHONPATH=gateway/src python3 -m botville_gateway
 #    生产/联调：必须设置真实 token
-#    GATEWAY_AUTH_TOKEN=<random> PYTHONPATH=gateway/src python3 -m botville_gateway
+#    GATEWAY_AUTH_TOKEN=<random> GATEWAY_HMAC_SECRET=<random-hex> PYTHONPATH=gateway/src python3 -m botville_gateway
 #    或安装后：pip install -e gateway && botville-gateway
 
 # 3) 冒烟
@@ -232,6 +232,7 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_HOST` | `127.0.0.1` | 监听地址 |
 | `GATEWAY_PORT` | `8080` | 监听端口（1–65535；环境变量给 0 或超范围会启动失败） |
 | `GATEWAY_AUTH_TOKEN` | *(空)* | **必填**：留空或仍为 `<change-me>` 时**拒绝启动**（fail closed）；生产设为随机值，请求需 `Authorization: Bearer <token>`；用 `hmac.compare_digest` 常数时间比较 |
+| `GATEWAY_HMAC_SECRET` | *(空)* | **必填**（#114 PR-a）：≥32 字节随机值（十六进制），用于 txnId 与 `text_sha256` 的 HMAC；非 dev 模式留空或为 `<change-me>` 时拒绝启动，dev 模式未设置则每进程随机生成 |
 | `GATEWAY_DEV_MODE` | `false` | 仅本地开发：`true` 时允许无 token 启动并免鉴权（启动横幅打 WARNING）；设了真实 token 永远优先 |
 | `RATE_LIMIT_MESSAGES` | `60` | 窗口内每个 persona 最多消息数；`0` = 关闭限速 |
 | `RATE_LIMIT_WINDOW_SECONDS` | `3600` | 滑动窗口长度（秒，≥1） |
