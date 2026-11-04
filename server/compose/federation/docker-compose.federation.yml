@@ -1,0 +1,234 @@
+# Botville paired-federation test stack (A2.1).
+#
+# Independent compose project (botville-fed) — the main
+# server/compose/docker-compose.yml stack is untouched. Boots TWO Synapse
+# instances (hs-a, hs-b), each fronted by its own fedgate (the pairing
+# gate, server/pairing/fedgate.py) and pairing service
+# (server/pairing/service.py), so `make federation-e2e` can prove:
+#   1. unpaired servers cannot federate,
+#   2. pairing enables invite/join/messages both ways,
+#   3. either side severing cuts traffic in both directions.
+#
+# Layout per instance (hs-a shown; hs-b mirrors it):
+#
+#   hs-a:8448 (docker net alias) -> fedgate-a --TLS--> synapse-a:8008
+#                                  |-> /_matrix/pairing/* -> pairing-a:8090
+#                                  `-> peers DB (ro connection, 1s cache)
+#
+# Peers resolve each other by server_name: fedgate-a carries the network
+# alias `hs-a`, so Synapse's well-known -> SRV -> :8448 fallback lands on
+# the gate. All inter-server traffic must pass a fedgate; the Synapse
+# federation listeners are never exposed to the host.
+#
+# Host port mappings are loopback-only test conveniences:
+#   18101/18102  synapse-a/b client API (federation_e2e.py users)
+#   18111/18112  pairing-a/b admin API (federation_e2e.py pairing steps)
+#
+# Everything under ./generated/ is produced at run time (certs by
+# server/scripts/federation-certs.sh, homeserver configs + admin tokens by
+# server/scripts/federation-setup.py) and is gitignored. The Synapse pin
+# mirrors server/compose/docker-compose.yml (SYNAPSE_IMAGE, keep in sync);
+# the two python:3.12-slim services run the repo's stdlib-only pairing
+# code via bind mount — no build step, no third-party deps.
+#
+# CI-only relaxations (documented in the generated homeserver.yaml):
+# federation_verify_certificates=false (self-signed fedgate certs),
+# federation_ip_range_blacklist=[] (compose subnet), open registration
+# for the e2e bootstrap. Never copy them into a real deployment; see
+# docs/deploy/paired-federation.md.
+
+name: botville-fed
+
+services:
+  synapse-a:
+    image: ${SYNAPSE_IMAGE:-docker.io/matrixdotorg/synapse:v1.164.1@sha256:fa4aa980f279bcf26d4e7ecc2a2c9a701c73f2ebe8841da9bdcf3b2fdf693d75}
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        python -m synapse.app.homeserver --config-path /config/homeserver.yaml
+        --generate-keys --keys-directory /data &&
+        exec python -m synapse.app.homeserver --config-path /config/homeserver.yaml
+        --keys-directory /data
+    ports:
+      - "127.0.0.1:18101:8008"
+    volumes:
+      - ./generated/hs-a:/config:ro
+      - fed-synapse-a-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8008/health', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  synapse-b:
+    image: ${SYNAPSE_IMAGE:-docker.io/matrixdotorg/synapse:v1.164.1@sha256:fa4aa980f279bcf26d4e7ecc2a2c9a701c73f2ebe8841da9bdcf3b2fdf693d75}
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        python -m synapse.app.homeserver --config-path /config/homeserver.yaml
+        --generate-keys --keys-directory /data &&
+        exec python -m synapse.app.homeserver --config-path /config/homeserver.yaml
+        --keys-directory /data
+    ports:
+      - "127.0.0.1:18102:8008"
+    volumes:
+      - ./generated/hs-b:/config:ro
+      - fed-synapse-b-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8008/health', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  pairing-a:
+    # The botville pairing backend (A2.1), stdlib-only source bind-mounted
+    # from server/pairing; python -m pairing.service runs it directly.
+    image: python:3.12-slim
+    working_dir: /app
+    command: python -m pairing.service
+    environment:
+      PAIRING_DB: /data/pairing.db
+      PAIRING_ADMIN_TOKEN: ${PAIRING_ADMIN_TOKEN_A:?run python3 server/scripts/federation-setup.py first}
+      PAIRING_SERVER_NAME: hs-a
+      # The URL the peer sees; /_matrix/pairing is fedgate's forwarding
+      # prefix, so both servers only need their 8448 gate exposed.
+      PAIRING_API_URL: https://hs-a:8448/_matrix/pairing
+      PAIRING_HOST: 0.0.0.0
+      PAIRING_PORT: "8090"
+      # Verify the redeeming server really controls the server_name it
+      # claims (its /_matrix/key/v2/server must agree). $$ escapes compose
+      # interpolation; the template reaches the process verbatim.
+      PAIRING_VERIFY_PEER_KEY: "true"
+      PAIRING_PEER_KEY_URL_TEMPLATE: "https://$${server_name}:8448/_matrix/key/v2/server"
+      # CI-only: fedgate TLS is self-signed here. Never enable elsewhere.
+      PAIRING_INSECURE_TLS: "true"
+    ports:
+      - "127.0.0.1:18111:8090"
+    volumes:
+      - ../../pairing:/app/pairing:ro
+      - fed-pairing-a-state:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+  pairing-b:
+    image: python:3.12-slim
+    working_dir: /app
+    command: python -m pairing.service
+    environment:
+      PAIRING_DB: /data/pairing.db
+      PAIRING_ADMIN_TOKEN: ${PAIRING_ADMIN_TOKEN_B:?run python3 server/scripts/federation-setup.py first}
+      PAIRING_SERVER_NAME: hs-b
+      PAIRING_API_URL: https://hs-b:8448/_matrix/pairing
+      PAIRING_HOST: 0.0.0.0
+      PAIRING_PORT: "8090"
+      PAIRING_VERIFY_PEER_KEY: "true"
+      PAIRING_PEER_KEY_URL_TEMPLATE: "https://$${server_name}:8448/_matrix/key/v2/server"
+      PAIRING_INSECURE_TLS: "true"
+    ports:
+      - "127.0.0.1:18112:8090"
+    volumes:
+      - ../../pairing:/app/pairing:ro
+      - fed-pairing-b-state:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+  fedgate-a:
+    # The authoritative gate (A2.1): the only exposed port of instance A,
+    # aliased as `hs-a` so peers' server_name resolution lands here.
+    image: python:3.12-slim
+    working_dir: /app
+    command: python -m pairing.fedgate
+    environment:
+      FEDGATE_HOST: 0.0.0.0
+      FEDGATE_PORT: "8448"
+      FEDGATE_TLS_CERT: /certs/hs-a.crt
+      FEDGATE_TLS_KEY: /certs/hs-a.key
+      FEDGATE_UPSTREAM: http://synapse-a:8008
+      FEDGATE_PAIRING_DB: /data/pairing.db
+      PAIRING_UPSTREAM: http://pairing-a:8090
+    volumes:
+      - ../../pairing:/app/pairing:ro
+      - ./generated/certs:/certs:ro
+      # The pairing SQLite runs in WAL mode and readers must be able to
+      # write the -shm wal-index next to the database file, so the state
+      # volume is mounted rw even though fedgate only ever SELECTs (the
+      # connection itself still opens with sqlite mode=ro).
+      - fed-pairing-a-state:/data
+    networks:
+      default:
+        aliases: [hs-a]
+    depends_on:
+      synapse-a:
+        condition: service_healthy
+      pairing-a:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import ssl, urllib.request; urllib.request.urlopen('https://127.0.0.1:8448/health', context=ssl._create_unverified_context(), timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+  fedgate-b:
+    image: python:3.12-slim
+    working_dir: /app
+    command: python -m pairing.fedgate
+    environment:
+      FEDGATE_HOST: 0.0.0.0
+      FEDGATE_PORT: "8448"
+      FEDGATE_TLS_CERT: /certs/hs-b.crt
+      FEDGATE_TLS_KEY: /certs/hs-b.key
+      FEDGATE_UPSTREAM: http://synapse-b:8008
+      FEDGATE_PAIRING_DB: /data/pairing.db
+      PAIRING_UPSTREAM: http://pairing-b:8090
+    volumes:
+      - ../../pairing:/app/pairing:ro
+      - ./generated/certs:/certs:ro
+      # rw for the WAL -shm wal-index; see the note on fedgate-a.
+      - fed-pairing-b-state:/data
+    networks:
+      default:
+        aliases: [hs-b]
+    depends_on:
+      synapse-b:
+        condition: service_healthy
+      pairing-b:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import ssl, urllib.request; urllib.request.urlopen('https://127.0.0.1:8448/health', context=ssl._create_unverified_context(), timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+networks:
+  default:
+    ipam:
+      config:
+        # Dedicated subnet (main stack: 172.31.250.0/24) so this project
+        # never collides with or routes into other botville stacks.
+        - subnet: 172.30.81.0/24
+
+volumes:
+  fed-synapse-a-data:
+  fed-synapse-b-data:
+  fed-pairing-a-state:
+  fed-pairing-b-state:

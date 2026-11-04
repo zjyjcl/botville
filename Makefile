@@ -10,6 +10,11 @@
 #   make push-e2e        # HS -> sygnal push latency acceptance (<5s, A1.2);
 #                        # needs the stack up with PUSH=1 (mock pushkin, no APNs)
 #   make appservice-e2e  # appservice acceptance: gateway sends as an @ai_* user (A1.3)
+#   make federation-e2e  # paired-federation acceptance (A2.1): independent
+#                        # botville-fed compose project with two Synapse
+#                        # instances behind fedgate/pairing — unpaired deny,
+#                        # paired invite/join/messages, sever both ways
+#   make federation-down # tear down (-v) only the botville-fed project
 #
 # Everything wraps docker compose on server/compose/docker-compose.yml with
 # server/compose/.env (created by server/scripts/init.sh on first run).
@@ -60,7 +65,8 @@ endif
 E2E_PHASE ?= seed
 E2E_STATE ?= backups/e2e-state.json
 
-.PHONY: init up down logs smoke ps backup restore e2e push-e2e appservice-e2e
+.PHONY: init up down logs smoke ps backup restore e2e push-e2e appservice-e2e \
+	federation-e2e federation-down
 
 init:
 	bash server/scripts/init.sh
@@ -141,3 +147,31 @@ appservice-e2e: init
 	python3 server/tests/appservice_e2e.py \
 		--base-url http://127.0.0.1:$(PORT) \
 		--env-file $(ENV_FILE)
+
+# --- paired federation (A2.1, independent compose project) -----------------
+# botville-fed runs TWO Synapse instances (hs-a/hs-b), each behind its own
+# fedgate gate + pairing service (server/pairing, stdlib-only python
+# containers). docker-compose.federation.yml is standalone: it never
+# touches the main stack's project, network or volumes, and only maps
+# loopback test ports (18101/18102 client, 18111/18112 pairing admin).
+# Certs/configs/admin tokens are generated at run time into
+# server/compose/federation/generated/ (gitignored). CI-only Synapse
+# relaxations (federation_verify_certificates=false, private-range
+# blacklist cleared, open registration) live in the generated configs —
+# see docs/deploy/paired-federation.md.
+FED_DIR := server/compose/federation
+FED_COMPOSE_FILE := $(FED_DIR)/docker-compose.federation.yml
+FED_ENV := $(FED_DIR)/generated/federation.env
+FED_COMPOSE := docker compose -p botville-fed -f $(FED_COMPOSE_FILE) --env-file $(FED_ENV)
+
+federation-e2e:
+	bash server/scripts/federation-certs.sh
+	python3 server/scripts/federation-setup.py
+	$(FED_COMPOSE) up -d
+	python3 server/tests/federation_e2e.py --env-file $(FED_ENV)
+
+federation-down:
+	# down -v needs the env file for interpolation; regenerate it if this
+	# checkout never ran federation-e2e (cheap, no Docker involved).
+	@test -f "$(FED_ENV)" || python3 server/scripts/federation-setup.py
+	$(FED_COMPOSE) down -v --remove-orphans
