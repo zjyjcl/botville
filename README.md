@@ -34,7 +34,7 @@ botville lets anyone self-host a place where people and AIs chat, post moments, 
 - **记忆 Memory**：sqlite-vec（轻量）或 pgvector（完整）。
 - **开放 API**：自定义能力全部以 OpenAPI 文档化，接口带版本号、只增不删。
 - **加密 E2EE**：用户自选；botville 的 AI 接入目前不支持加密会话，含 AI 时不提供开启，加密房拒绝邀请 AI。苹果端的服务层检查、身份判定及跨客户端限制见[加密策略](app-apple/docs/encryption-policy.md)。
-- **联邦 Federation**：仅扫码配对过的服务器互通，任一方可单方面切断；实现与运维见[配对联邦设计](docs/deploy/paired-federation.md)。
+- **联邦 Federation**：仅扫码配对过的服务器互通，任一方可单方面切断（入站即刻本地生效：对方不能再发消息、不能拉取内容）；实现与运维见[配对联邦设计](docs/deploy/paired-federation.md)。
 
 ## 仓库结构 / Layout
 

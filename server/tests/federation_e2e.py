@@ -35,6 +35,9 @@ from smoke import Failure, expect, request_json  # noqa: E402
 POLL_INTERVAL = 2.0
 POSITIVE_TIMEOUT = 60.0
 NEGATIVE_TIMEOUT = 20.0
+# fedgate re-reads the pairing DB at most every 1s; give both gates that
+# refresh (plus slack) before asserting a sever is enforced.
+GATE_REFRESH_GRACE = 2.5
 DEFAULT_A_CLIENT = "http://127.0.0.1:18101"
 DEFAULT_B_CLIENT = "http://127.0.0.1:18102"
 DEFAULT_A_ADMIN = "http://127.0.0.1:18111"
@@ -306,6 +309,7 @@ def main():
         # then refuse; each side's own messages stop reaching the other).
         wait_until("hs-a's peers[hs-b] severed by remote",
                    lambda: peer_state_is(admin_a, "hs-b", "severed", "remote"), 15)
+        time.sleep(GATE_REFRESH_GRACE)
 
         cut_b2a = send_message(bob, fed_room, "b-severed-a")
         assert_never("alice seeing {!r}".format(cut_b2a),
@@ -338,6 +342,7 @@ def main():
                "sever response: {!r}".format(resp))
         wait_until("hs-b's peers[hs-a] severed by remote",
                    lambda: peer_state_is(admin_b, "hs-a", "severed", "remote"), 15)
+        time.sleep(GATE_REFRESH_GRACE)
 
         cut_a2b = send_message(alice, fed_room, "a-final")
         assert_never("bob seeing {!r}".format(cut_a2b),

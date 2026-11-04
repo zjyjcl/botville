@@ -8,15 +8,17 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 
 
-def http_json(method, url, body=None, token=None, headers=None, timeout=10):
+def http_json(method, url, body=None, token=None, headers=None, data=None,
+              timeout=10):
     """HTTP request returning (status, decoded body or None).
 
     HTTP error responses are returned, not raised, so tests can assert on
-    errcodes."""
-    data = None
-    hdrs = {"Accept": "application/json"}
-    if body is not None:
+    errcodes. `data` sends raw bytes verbatim (for signature tests that
+    must control the exact body); `body` serialises a JSON object."""
+    if data is None and body is not None:
         data = json.dumps(body).encode("utf-8")
+    hdrs = {"Accept": "application/json"}
+    if data is not None:
         hdrs["Content-Type"] = "application/json"
     if token:
         hdrs["Authorization"] = "Bearer " + token

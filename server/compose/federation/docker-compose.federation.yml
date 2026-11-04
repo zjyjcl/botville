@@ -21,7 +21,15 @@
 # the gate. All inter-server traffic must pass a fedgate; the Synapse
 # federation listeners are never exposed to the host.
 #
-# Host port mappings are loopback-only test conveniences:
+# Static addresses (172.30.81.0/24): fedgate-a/b are .10/.11, pairing-a/b
+# .20/.21. fedgate overwrites X-Forwarded-For with the direct client IP
+# when proxying /_matrix/pairing/{redeem,notify-severed} to the pairing
+# service, and each pairing service lists ONLY its own fedgate in
+# PAIRING_TRUSTED_PROXIES — so per-IP rate limits key on the real
+# originating container, not on the proxy (review B3).
+#
+# Host port mappings are loopback-only test conveniences (never copy into
+# a real deployment; they let the host bypass fedgate entirely):
 #   18101/18102  synapse-a/b client API (federation_e2e.py users)
 #   18111/18112  pairing-a/b admin API (federation_e2e.py pairing steps)
 #
@@ -109,11 +117,17 @@ services:
       PAIRING_PEER_KEY_URL_TEMPLATE: "https://{server_name}:443/_matrix/key/v2/server"
       # CI-only: fedgate TLS is self-signed here. Never enable elsewhere.
       PAIRING_INSECURE_TLS: "true"
+      # fedgate-a (.10) is the only reverse proxy this pairing service
+      # trusts for X-Forwarded-For; anything else is treated as spoofed.
+      PAIRING_TRUSTED_PROXIES: 172.30.81.10
     ports:
       - "127.0.0.1:18111:8090"
     volumes:
       - ../../pairing:/app/pairing:ro
       - fed-pairing-a-state:/data
+    networks:
+      default:
+        ipv4_address: 172.30.81.20
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=5)"]
       interval: 10s
@@ -136,11 +150,17 @@ services:
       PAIRING_VERIFY_PEER_KEY: "true"
       PAIRING_PEER_KEY_URL_TEMPLATE: "https://{server_name}:443/_matrix/key/v2/server"
       PAIRING_INSECURE_TLS: "true"
+      # fedgate-b (.11) is the only reverse proxy this pairing service
+      # trusts for X-Forwarded-For; anything else is treated as spoofed.
+      PAIRING_TRUSTED_PROXIES: 172.30.81.11
     ports:
       - "127.0.0.1:18112:8090"
     volumes:
       - ../../pairing:/app/pairing:ro
       - fed-pairing-b-state:/data
+    networks:
+      default:
+        ipv4_address: 172.30.81.21
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=5)"]
       interval: 10s
@@ -175,6 +195,9 @@ services:
     networks:
       default:
         aliases: [hs-a]
+        # Static address so pairing-a's PAIRING_TRUSTED_PROXIES can pin
+        # this reverse proxy by IP (X-Forwarded-For handling, review B3).
+        ipv4_address: 172.30.81.10
     depends_on:
       synapse-a:
         condition: service_healthy
@@ -209,6 +232,9 @@ services:
     networks:
       default:
         aliases: [hs-b]
+        # Static address so pairing-b's PAIRING_TRUSTED_PROXIES can pin
+        # this reverse proxy by IP (X-Forwarded-For handling, review B3).
+        ipv4_address: 172.30.81.11
     depends_on:
       synapse-b:
         condition: service_healthy

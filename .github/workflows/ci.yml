@@ -290,7 +290,7 @@ jobs:
             server/tests/push_e2e.py server/tests/appservice_e2e.py server/tests/federation_e2e.py \
             server/scripts/render_push_denylist.py server/scripts/federation-setup.py \
             server/pairing/__init__.py server/pairing/store.py server/pairing/service.py \
-            server/pairing/fedgate.py
+            server/pairing/fedgate.py server/pairing/validate.py
 
       - name: Bootstrap/init script unit tests (stdlib mock, no Docker)
         run: python3 -m unittest discover -s server/tests -p "test_*.py" -v

@@ -6,31 +6,58 @@ default) and the authoritative gate for Matrix server-server traffic:
 
   /_matrix/key/v2/server*     open (our public key; no room content) —
                               forwarded to the upstream homeserver.
-  /_matrix/federation/*       gated: requires an Authorization header of
-  /_matrix/key/v2/query*        the form `X-Matrix origin=...` (quoted or
-  /_matrix/media/*              unquoted; first X-Matrix header wins) whose
-                              origin is an *active* peer; otherwise
+  /_matrix/federation/*       gated: requires exactly one Authorization
+  /_matrix/key/v2/query*        header of the form `X-Matrix origin=...`
+  /_matrix/media/*              (quoted or unquoted) whose origin is an
+                              *active* peer; otherwise
                               403 {"errcode":"M_FORBIDDEN",
                                    "error":"server not paired"}.
-  /_matrix/pairing/*          forwarded to PAIRING_UPSTREAM (the pairing
-                              service) so peers need only this one port.
+                              PUT /send from an unpaired origin is sunk:
+                              200 {"pdus":{}} and nothing reaches the
+                              homeserver (see _sink_transaction).
+  /_matrix/pairing/redeem      forwarded to PAIRING_UPSTREAM (the pairing
+  /_matrix/pairing/notify-...  service) so peers need only this one port;
+  ...severed                   every other /_matrix/pairing/* path is 404
+                              (admin endpoints stay off the public port).
   anything else               404.
 
 Signature verification stays with the homeserver; fedgate only decides
 *whether a conversation may happen at all* (default deny — no pairing
-record means no access). The active-peer set is read from the pairing
-service's SQLite database (same volume) and cached for at most 1s, so a
-sever takes effect immediately without touching the homeserver.
+record means no access). The X-Matrix parsing is kept in lockstep with
+Synapse's (v1.164.1) _parse_auth_header — with one deliberate
+difference: anything Synapse would disambiguate by "last one wins"
+(multiple X-Matrix headers, repeated parameter names) is rejected here
+outright, so the origin the gate checks is always the origin the
+homeserver will authenticate (review B1; stdlib has no ed25519, so the
+gate cannot verify signatures itself). Residual risk: Synapse does not
+verify federation signatures on /_matrix/media/* endpoints, so a sender
+able to forge an X-Matrix origin of an *active* peer can fetch media —
+documented in docs/deploy/paired-federation.md.
 
-Method, headers, body and status are forwarded verbatim; responses are
-streamed (Content-Length passthrough, or connection-close framing when
-the upstream sends none). Hop-by-hop headers are dropped both ways.
+The active-peer set is read from the pairing service's SQLite database
+(same volume) and cached for at most 1s, so a sever takes effect
+immediately without touching the homeserver. A database that cannot be
+read is NOT treated as "no peers": the last good snapshot keeps serving
+for a short grace period, then gated requests answer 503
+M_UNAVAILABLE and /health answers 503 {"ok":false,"db":false} — a loud
+failure instead of silently dropping legitimate traffic.
+
+Method, headers, body and status are forwarded (end-to-end headers
+verbatim); responses are streamed (Content-Length passthrough, or
+chunked re-framing when the upstream sends none). Hop-by-hop headers
+and the client's Content-Length are never forwarded — the length is
+recomputed from the (already read) body. When proxying to
+PAIRING_UPSTREAM, any client-supplied X-Forwarded-For/X-Real-IP/
+Forwarded headers are dropped and X-Forwarded-For is set to the direct
+client IP (the pairing service only trusts that header from configured
+proxies, review B3).
 """
 
 import http.client
 import json
 import logging
 import os
+import re
 import sqlite3
 import ssl
 import sys
@@ -40,12 +67,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 from urllib.request import pathname2url
 
+from .validate import is_valid_server_name, path_is_suspicious
+
 log = logging.getLogger("pairing.fedgate")
 
 ALLOWED_REFRESH_SECONDS = 1.0
+ALLOWED_STALE_OK_SECONDS = 30.0
 UPSTREAM_TIMEOUT = 120.0
 STREAM_CHUNK = 65536
 MAX_BODY_BYTES = 64 * 1024 * 1024  # federation state dumps can be large
+SINK_MAX_BODY_BYTES = 1024 * 1024  # unpaired /send bodies are drained, capped
+SINK_LOG_INTERVAL = 60.0  # per-origin "dropped transaction" log throttle
 
 # Path prefixes (matched against the path only, query excluded).
 OPEN_PREFIXES = ("/_matrix/key/v2/server",)
@@ -56,6 +88,17 @@ GATED_PREFIXES = (
     "/_matrix/media/",
 )
 PAIRING_PREFIX = "/_matrix/pairing/"
+# Only the two peer-facing endpoints are proxied to PAIRING_UPSTREAM; the
+# admin API (invites/accept/peers/allowed/DELETE) must stay on the
+# loopback/internal port (review: pairing-surface).
+PAIRING_FORWARD_PATHS = (
+    "/_matrix/pairing/redeem",
+    "/_matrix/pairing/notify-severed",
+)
+
+# Client-supplied forwarding hints are spoofable; never forwarded — when
+# proxying to the pairing service, fedgate writes its own (review B3).
+FORWARDED_HINTS = {"x-forwarded-for", "x-real-ip", "forwarded"}
 
 # RFC 2616 hop-by-hop headers; never forwarded in either direction.
 HOP_BY_HOP = {
@@ -68,33 +111,77 @@ class ConfigError(Exception):
     """Invalid or missing configuration; fatal at startup."""
 
 
-# --- X-Matrix origin parsing -------------------------------------------------
+# --- X-Matrix origin parsing (review B1) ---------------------------------------
+
+def _strip_quotes(value):
+    """Synapse v1.164.1 strip_quotes, copied verbatim in behaviour.
+
+    A value that starts with '"' loses its first and last character and
+    has backslash escapes unfolded ('\\\\.' -> '.'); anything else is
+    returned as-is (no whitespace stripping — Synapse doesn't either).
+    """
+    if value.startswith('"'):
+        return re.sub(r"\\(.)", lambda match: match.group(1), value[1:-1])
+    return value
+
 
 def parse_x_matrix_origin(auth_headers):
-    """Origin declared by the first X-Matrix Authorization header.
+    """Origin declared by the request's single X-Matrix Authorization header.
 
     `auth_headers` is e.g. BaseHTTPRequestHandler.headers.get_all(
     "Authorization"). The Matrix server-server auth format is
     `X-Matrix origin="name",destination="...",key="...",sig="..."` —
     values may be quoted or bare; parameter names are case-insensitive.
-    Returns the origin string, or None when no usable X-Matrix header
-    exists (malformed X-Matrix headers also yield None: default deny).
+
+    Parsing mirrors Synapse v1.164.1's Authenticator/_parse_auth_header
+    (scheme split on `X-Matrix +`, parameters split on `[ \\t]*,[ \\t]*`
+    at the first '=', quoted values unquoted with backslash escapes
+    unfolded, parameter names lower-cased) with one deliberate
+    hardening: Synapse lets repeated headers/parameters overwrite each
+    other ("last one wins"), which would let a second header name an
+    origin different from the one this gate checks — the exact B1
+    bypass. Here ANY ambiguity fails closed:
+
+      - more or fewer than one X-Matrix Authorization header -> None
+        (non-X-Matrix Authorization headers are ignored, like Synapse);
+      - a repeated parameter name -> None;
+      - missing `origin` or `sig` -> None;
+      - origin that is not a valid DNS-style server_name in canonical
+        lower-case form -> None (peers rows are keyed lower-case, so a
+        case mismatch can never be an accidental allow);
+      - any parse anomaly -> None.
+
+    Returns the origin string, or None (deny). The gate guarantees that
+    whenever it accepts an origin, Synapse parses the *same* origin from
+    the same bytes; whether the signature is genuine is then the
+    homeserver's job (it is not checked on /_matrix/media/* — see the
+    module docstring).
     """
-    for value in auth_headers or []:
-        scheme, sep, rest = value.partition(" ")
-        if not sep or scheme.lower() != "x-matrix":
-            continue
-        for item in rest.split(","):
-            key, eq, raw = item.partition("=")
-            if not eq or key.strip().lower() != "origin":
-                continue
-            origin = raw.strip()
-            if len(origin) >= 2 and origin[0] == '"' and origin[-1] == '"':
-                origin = origin[1:-1]
-            if origin:
-                return origin
+    matrix_headers = [value for value in (auth_headers or [])
+                      if value[:8].lower() == "x-matrix"]
+    if len(matrix_headers) != 1:
         return None
-    return None
+    parts = re.split(r"^X-Matrix +", matrix_headers[0], maxsplit=1)
+    if len(parts) != 2:
+        return None  # no space-separated parameter section
+    params = {}
+    try:
+        for item in re.split(r"[ \t]*,[ \t]*", parts[1]):
+            key, eq, raw = item.partition("=")
+            if not eq or not key:
+                return None  # parameter without '=' (Synapse: parse error)
+            name = key.lower()
+            if name in params:
+                return None  # ambiguous: Synapse would let the last one win
+            params[name] = raw
+        origin = _strip_quotes(params["origin"])
+        if "sig" not in params:
+            return None
+    except (KeyError, IndexError, ValueError, re.error):
+        return None  # fail closed on anything unexpected
+    if not is_valid_server_name(origin):
+        return None
+    return origin
 
 
 # --- active-peer cache -------------------------------------------------------
@@ -104,44 +191,65 @@ class AllowedPeers:
 
     fedgate and the pairing service share the SQLite file (WAL), so a
     sever becomes visible here on the next refresh without any signal
-    from the pairing service. A missing/unreadable database means an
-    empty set — default deny.
+    from the pairing service.
+
+    A missing/unreadable database is NOT "no peers" (that would silently
+    200-sink legitimate traffic forever, review: sink-vs-db-failure):
+    the last good snapshot keeps serving for ALLOWED_STALE_OK_SECONDS
+    (30s), after which refresh_if_stale() reports the set as unavailable
+    — gated requests then answer 503 M_UNAVAILABLE (never sunk) and
+    /health reports {"ok": false, "db": false}.
     """
 
-    def __init__(self, db_path, refresh_interval=ALLOWED_REFRESH_SECONDS):
+    def __init__(self, db_path, refresh_interval=ALLOWED_REFRESH_SECONDS,
+                 stale_ok_seconds=ALLOWED_STALE_OK_SECONDS):
         self._db_path = db_path
         self._interval = refresh_interval
+        self._stale_ok = stale_ok_seconds
         self._lock = threading.Lock()
         self._names = frozenset()
-        self._loaded_at = 0.0
+        self._ok = False
+        self._attempt_at = 0.0
+        self._success_at = 0.0
 
     def _load(self):
+        # Percent-encode the path for the file: URI (spaces / non-ASCII
+        # in checkout paths must not corrupt the query string). Raises
+        # sqlite3.Error when the database is missing or unreadable.
+        conn = sqlite3.connect(
+            "file:{}?mode=ro".format(pathname2url(self._db_path)),
+            uri=True, timeout=5)
         try:
-            # Percent-encode the path for the file: URI (spaces / non-ASCII
-            # in checkout paths must not corrupt the query string).
-            conn = sqlite3.connect(
-                "file:{}?mode=ro".format(pathname2url(self._db_path)),
-                uri=True, timeout=5)
-            try:
-                rows = conn.execute(
-                    "SELECT server_name FROM peers WHERE state = 'active'"
-                ).fetchall()
-            finally:
-                conn.close()
-            return frozenset(row[0] for row in rows)
-        except sqlite3.Error:
-            return frozenset()
+            rows = conn.execute(
+                "SELECT lower(server_name) FROM peers WHERE state = 'active'"
+            ).fetchall()
+        finally:
+            conn.close()
+        return frozenset(row[0] for row in rows)
 
     def refresh_if_stale(self, now=None):
+        """Returns (ok, names); ok is False once the DB is unreadable
+        beyond the stale-grace window (then `names` is the last snapshot
+        and must not be trusted for allows)."""
         now = time.monotonic() if now is None else now
         with self._lock:
-            if now - self._loaded_at >= self._interval:
-                self._names = self._load()
-                self._loaded_at = now
-            return self._names
+            if now - self._attempt_at >= self._interval:
+                self._attempt_at = now
+                try:
+                    self._names = self._load()
+                    self._ok = True
+                    self._success_at = now
+                except sqlite3.Error as exc:
+                    log.warning("pairing DB read failed (%s); stale-ok=%s",
+                                exc, now - self._success_at <= self._stale_ok)
+                    if now - self._success_at > self._stale_ok:
+                        self._ok = False
+                    # else: keep serving the last good snapshot.
+            return self._ok, self._names
 
     def contains(self, server_name):
-        return server_name in self.refresh_if_stale()
+        ok, names = self.refresh_if_stale()
+        return ok and server_name in names
 
 
 # --- configuration -------------------------------------------------------------
@@ -191,6 +299,23 @@ def _http_url(value, name):
         raise ConfigError(
             "{} must be a plain http:// URL to an internal service".format(name))
     return value.rstrip("/")
+
+
+# --- sink log throttle ---------------------------------------------------------
+
+_sink_log_lock = threading.Lock()
+_sink_log_at = {}
+
+
+def _should_log_sink(origin, now=None, interval=SINK_LOG_INTERVAL):
+    """True at most once per `interval` per origin (drop-log throttle)."""
+    now = time.monotonic() if now is None else now
+    with _sink_log_lock:
+        last = _sink_log_at.get(origin, 0.0)
+        if now - last < interval:
+            return False
+        _sink_log_at[origin] = now
+        return True
 
 
 # --- HTTP handler ----------------------------------------------------------------
@@ -243,9 +368,23 @@ class FedgateHandler(BaseHTTPRequestHandler):
         self._send_json(status, payload)
 
     def _handle(self):
-        path = urlsplit(self.path).path
+        # Raw request-target, not urlsplit(): "//x/y" would otherwise be
+        # parsed as a network-location and hide the empty segment.
+        path = self.path.split("?", 1)[0]
+        # Path hygiene (review: bypass-via-path): refuse traversal
+        # segments, empty segments and encoded separators before any
+        # prefix matching, so an upstream router can never be fed a path
+        # that normalises into a different route.
+        if path_is_suspicious(path):
+            self._reject(404, {"errcode": "M_UNRECOGNIZED",
+                               "error": "malformed request path"})
+            return
         if path == "/health":
-            self._send_json(200, {"ok": True})
+            ok, _names = self.server.allowed.refresh_if_stale()
+            if ok:
+                self._send_json(200, {"ok": True})
+            else:
+                self._send_json(503, {"ok": False, "db": False})
             return
         if path == "/.well-known/matrix/server":
             delegated = getattr(self.config, "well_known_server", None)
@@ -256,11 +395,13 @@ class FedgateHandler(BaseHTTPRequestHandler):
                                    "error": "no well-known delegation"})
             return
         if path.startswith(PAIRING_PREFIX):
-            if not self.config.pairing_upstream:
+            forwardable = path in PAIRING_FORWARD_PATHS
+            if not forwardable or not self.config.pairing_upstream:
                 self._reject(404, {"errcode": "M_UNRECOGNIZED",
-                                   "error": "pairing upstream not configured"})
+                                   "error": "pairing endpoint not served by"
+                                            " fedgate"})
                 return
-            self._proxy(self.config.pairing_upstream)
+            self._proxy(self.config.pairing_upstream, overwrite_forwarded=True)
             return
         if any(path.startswith(p) for p in OPEN_PREFIXES):
             self._proxy(self.config.upstream)
@@ -268,9 +409,19 @@ class FedgateHandler(BaseHTTPRequestHandler):
         if any(path.startswith(p) for p in GATED_PREFIXES):
             origin = parse_x_matrix_origin(
                 self.headers.get_all("Authorization"))
-            if origin is None or not self.server.allowed.contains(origin):
-                if origin is not None and self.command == "PUT" and \
-                        path.startswith(SEND_PREFIX):
+            if origin is None:
+                self._reject(403, {"errcode": "M_FORBIDDEN",
+                                   "error": "server not paired"})
+                return
+            ok, names = self.server.allowed.refresh_if_stale()
+            if not ok:
+                # Unreadable pairing DB: never sink (that would be a
+                # silent, permanent drop) — fail loud instead.
+                self._reject(503, {"errcode": "M_UNAVAILABLE",
+                                   "error": "pairing database unavailable"})
+                return
+            if origin not in names:
+                if self.command == "PUT" and path.startswith(SEND_PREFIX):
                     self._sink_transaction(origin)
                     return
                 self._reject(403, {"errcode": "M_FORBIDDEN",
@@ -289,19 +440,34 @@ class FedgateHandler(BaseHTTPRequestHandler):
         403 here would leave both sides backed off long after a re-pair.
         Answering 200 with no per-PDU results drops the PDUs/EDUs (nothing
         reaches the homeserver) without poisoning the sender's retry state.
-        Missing events are fetched via the DAG once the servers re-pair.
+        Missing PDUs are fetched via the DAG once the servers re-pair —
+        EDUs (to-device, key shares) are gone for good, which is the
+        documented price of this trade-off.
+
+        The body is drained only up to SINK_MAX_BODY_BYTES (1 MiB):
+        unauthenticated senders do not get to burn 64 MiB of memory per
+        request; oversized bodies end with the connection closed. The
+        drop log is throttled per origin so a flood cannot flood the log.
         """
         try:
-            self._read_request_body()
+            self._read_request_body(max_bytes=SINK_MAX_BODY_BYTES)
         except (ValueError, OSError):
             self.close_connection = True
-        log.info("dropped /send transaction from unpaired origin %s", origin)
+            return
+        if _should_log_sink(origin):
+            log.info("dropped /send transaction from unpaired origin %s",
+                     origin)
         self._send_json(200, {"pdus": {}})
 
     # --- proxy core --------------------------------------------------------
 
-    def _read_request_body(self):
-        """Read the client body: Content-Length or chunked (capped)."""
+    def _read_request_body(self, max_bytes=MAX_BODY_BYTES):
+        """Read the client body: Content-Length or chunked (capped).
+
+        The cap is enforced *before* large chunks are read, so a caller
+        cannot make the gate buffer more than max_bytes (+ one chunk
+        header) of an oversized body.
+        """
         if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
             body = b""
             while True:
@@ -314,19 +480,19 @@ class FedgateHandler(BaseHTTPRequestHandler):
                         if trailer in (b"\r\n", b"\n", b""):
                             break
                     return body
+                if len(body) + size > max_bytes:
+                    raise ValueError("request body too large")
                 body += self.rfile.read(size)
                 self.rfile.read(2)  # CRLF after each chunk
-                if len(body) > MAX_BODY_BYTES:
-                    raise ValueError("request body too large")
         length = self.headers.get("Content-Length")
         if not length:
             return None
         length = int(length)
-        if length > MAX_BODY_BYTES:
+        if length < 0 or length > max_bytes:
             raise ValueError("request body too large")
         return self.rfile.read(length) if length else b""
 
-    def _proxy(self, upstream):
+    def _proxy(self, upstream, overwrite_forwarded=False):
         target = urlsplit(upstream)
         try:
             body = self._read_request_body()
@@ -337,16 +503,30 @@ class FedgateHandler(BaseHTTPRequestHandler):
 
         # Forward end-to-end headers verbatim (Authorization/X-Matrix
         # included — the homeserver still verifies signatures); join
-        # repeated headers per RFC 7230 list semantics.
+        # repeated headers per RFC 7230 list semantics. The client's
+        # Content-Length is never forwarded: the body was already read
+        # (chunked bodies de-chunked) and http.client recomputes the
+        # length from those bytes, so a CL/TE mismatch cannot smuggle a
+        # second request past the upstream's framing (review:
+        # CL/TE re-framing).
         headers = {}
         for key, value in self.headers.items():
-            if key.lower() in HOP_BY_HOP or key.lower() == "host":
+            lowered = key.lower()
+            if lowered in HOP_BY_HOP or lowered in ("host", "content-length"):
                 continue
+            if overwrite_forwarded and lowered in FORWARDED_HINTS:
+                continue  # client-supplied forwarding hints are spoofable
             if key in headers:
                 headers[key] += ", " + value
             else:
                 headers[key] = value
         headers["Host"] = target.netloc
+        if overwrite_forwarded:
+            # fedgate is the reverse proxy the pairing service trusts for
+            # X-Forwarded-For (PAIRING_TRUSTED_PROXIES must list this
+            # host): report the direct client IP, discarding whatever the
+            # client claimed (review B3).
+            headers["X-Forwarded-For"] = self.client_address[0]
 
         conn = http.client.HTTPConnection(
             target.hostname, target.port or 80, timeout=UPSTREAM_TIMEOUT)
