@@ -22,6 +22,10 @@ info:
 
     所有示例、令牌与密钥均为占位符（`<change-me>`），本契约不含任何真实凭据。
 
+    **请求体上限**：任何 `POST` / `PUT` 请求体不得超过 **1 MiB（1048576 字节）**。
+    超限返回 `400 request.invalid`，`errors[].code` 为 `too_large`（**不新增 413**，
+    状态码集合保持不变）。详见 contract.md §1.1。
+
     **开放枚举**：所有响应侧的枚举字段（卡片类型、块类型、操作类型、能力状态等）
     都按开放枚举声明——客户端遇到未知值必须按契约给出的降级规则处理，
     不得因未知值导致整条响应解码失败。请求侧枚举仍为封闭集合。
@@ -2153,6 +2157,14 @@ components:
           type: string
         usage:
           $ref: '#/components/schemas/UsageDelta'
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+          maxProperties: 8
+          description: |
+            透传元数据（#92）：由发送请求原样带回，不参与策略判断、不进消息正文，
+            仅供调用方对账。
         created_at:
           type: string
           format: date-time
@@ -2215,6 +2227,11 @@ components:
             type: string
           maxProperties: 8
           description: 透传元数据，不参与策略判断，不写入消息正文。
+        peer_id:
+          type: string
+          description: |
+            会话对端（persona）标识。三层限额的 peer 层只在请求带上该字段时
+            生效；与 `POST /policy/evaluate` 的 `peer_id` 语义相同。
       additionalProperties: false
 
     UsageDelta:
@@ -2339,6 +2356,15 @@ components:
         token_estimate:
           type: integer
           minimum: 0
+          description: |
+            预计消耗 token；网关按 `max(token_estimate, estimate_tokens(content))`
+            计量，客户端值只是下限，不能用 `0` 绕过 token 预算。
+        peer_id:
+          type: string
+          description: |
+            会话对端（persona）标识，用于触发 peer 层限额。省略时不参与 peer 层
+            计算；实发路径请与 `OutgoingMessageRequest.peer_id` 保持一致，否则
+            预检与实发结论可能不同。
       additionalProperties: false
 
     MessageReceipt:
@@ -2440,15 +2466,32 @@ components:
     LimitRules:
       type: object
       description: |
-        各字段都是「该层可选设置」；省略表示该层不额外限制，不等于关闭其他层。
-        最终生效值取三层中最严者。
+        各字段都是「该层可选设置」；**省略**表示该层不额外限制，不等于关闭其他层。
+        最终生效值取三层中最严者（逐项比较，不是整层覆盖）。
+
+        **窗口类限额按「速率对」取最严**：`messages_per_window` 与
+        `tokens_per_window` 各自和它的 `window_seconds` 是一个整体，比较的是
+        `count / window`；胜出层成对采用自己的 `count` + `window`（该层省略
+        `window_seconds` 时回退平台窗口）。**`window_seconds` 不单独比较**：
+        只缩短窗口同样算放宽，`PUT /limits` 会返回 `422 limit.out_of_range`。
+
+        **`0` 的语义**：本 schema 内的 `0` 是有效限额（例如 `messages_per_window: 0`
+        表示一条都不允许），不是「不限」。要表达「该层不限制」请省略该字段。
+
+        严格方向：`proactive_per_day` / `town_tokens_per_day` / `max_message_chars`
+        越小越严；`min_seconds_between_messages` 与 `silent_hours.enabled: true`
+        越大/越严。
+        owner / peer 层任何一项比平台层宽松 → `422 limit.out_of_range`。
       properties:
         window_seconds:
           type: integer
           minimum: 60
           maximum: 2592000
           default: 86400
-          description: 窗口类限额（messages_per_window、tokens_per_window）的窗口长度。
+          description: |
+            窗口类限额（`messages_per_window`、`tokens_per_window`）的窗口长度。
+            与同一层的计数项**成对**参与比较，不单独参与「取最严」；该层省略时
+            沿用平台窗口。
         messages_per_window:
           type: integer
           minimum: 0
@@ -2657,6 +2700,14 @@ components:
     UsageEvent:
       type: object
       required: [id, occurred_at, kind]
+      description: |
+        一条用量审计记录。
+
+        **不含消息正文**（#92）：为保护用户隐私，事件**不存储**消息内容。
+        `text_length` 存储原始字节数（字符数），`text_sha256` 存储正文的
+        SHA-256 十六进制摘要，二者可用于对账与去重排查，但无法反推原文。
+        旧字段 `text_preview` 已从 B2.1 起**不再写入**；历史事件若存在该字段，
+        客户端必须忽略它（`additionalProperties` 遵循前向兼容原则）。
       properties:
         id:
           type: string
@@ -2691,6 +2742,15 @@ components:
           description: 仅 `card_action` kind 时有值；与 `AuditRecord.id` 对应。
         request_id:
           type: string
+        text_length:
+          type: integer
+          minimum: 0
+          description: 消息正文的字符数（不含正文本身）。可用于统计分析与对账。
+        text_sha256:
+          type: string
+          description: |
+            消息正文的 SHA-256 十六进制摘要。用于去重与对账，不可反推原文。
+            正文为空时此字段省略。
 
     UsageEventPage:
       allOf:

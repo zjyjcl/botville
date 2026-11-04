@@ -58,6 +58,16 @@ DEFAULT_SILENT_START = "23:00"
 DEFAULT_SILENT_END = "07:30"
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 
+# 平台层 token 预算默认值（窗口由 RATE_LIMIT_WINDOW_SECONDS 决定）。
+# 与 RATE_LIMIT_MESSAGES 一致：配置里的 0 表示「平台不设该限额」，
+# 而 `/limits` API 里的 0 表示「一个都不允许」（契约规则语义）。
+DEFAULT_TOKEN_BUDGET = 200_000
+DEFAULT_PROACTIVE_PER_DAY = 6
+DEFAULT_MAX_USAGE_EVENTS = 10_000
+DEFAULT_MAX_IDEMPOTENCY_ENTRIES = 2_000
+DEFAULT_IDEMPOTENCY_TTL = 86_400
+DEFAULT_MAX_QUEUE_ENTRIES = 1_000
+
 
 class ConfigError(ValueError):
     """配置值非法（启动时应直接失败，而不是带病运行）。"""
@@ -216,6 +226,15 @@ class Config:
     room_alias_cache_ttl_seconds: int = DEFAULT_ROOM_ALIAS_CACHE_TTL
     # 显式放行明文 http:// 的非本机 homeserver（跨主机部署应使用 https）。
     allow_insecure_homeserver: bool = False
+    # B2.1：平台层 token 预算（0 = 不限）
+    platform_token_budget: int = DEFAULT_TOKEN_BUDGET
+    # B2.1：平台层主动发言/日上限（0 = 不限）
+    platform_proactive_per_day: int = DEFAULT_PROACTIVE_PER_DAY
+    # B2.1：内存容量上限（容量达到上限时按 LRU 淘汰）
+    max_usage_events: int = DEFAULT_MAX_USAGE_EVENTS
+    max_idempotency_entries: int = DEFAULT_MAX_IDEMPOTENCY_ENTRIES
+    idempotency_ttl_seconds: int = DEFAULT_IDEMPOTENCY_TTL
+    max_queue_entries: int = DEFAULT_MAX_QUEUE_ENTRIES
 
     def __post_init__(self) -> None:
         # 构造时校验，避免明显错误的配置拖到第一次请求才炸。
@@ -230,6 +249,19 @@ class Config:
             raise ConfigError("rate_limit_window_seconds must be >= 1")
         if self.max_message_chars < 1:
             raise ConfigError("max_message_chars must be >= 1")
+        if self.platform_token_budget < 0:
+            raise ConfigError("platform_token_budget must be >= 0")
+        if self.platform_proactive_per_day < 0:
+            raise ConfigError("platform_proactive_per_day must be >= 0")
+        # 容量上限必须 ≥ 1：0 会让 store 立刻清空，滑动窗口永远看不到历史事件。
+        if self.max_usage_events < 1:
+            raise ConfigError("max_usage_events must be >= 1")
+        if self.max_idempotency_entries < 1:
+            raise ConfigError("max_idempotency_entries must be >= 1")
+        if self.idempotency_ttl_seconds < 0:
+            raise ConfigError("idempotency_ttl_seconds must be >= 0")
+        if self.max_queue_entries < 1:
+            raise ConfigError("max_queue_entries must be >= 1")
         try:
             ZoneInfo(self.silent_hours_timezone)
         except (ZoneInfoNotFoundError, ValueError) as exc:
@@ -395,4 +427,22 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
             source, "GATEWAY_ROOM_ALIAS_CACHE_TTL", DEFAULT_ROOM_ALIAS_CACHE_TTL
         ),
         allow_insecure_homeserver=_env_bool(source, "GATEWAY_ALLOW_INSECURE_HS", False),
+        platform_token_budget=_env_int(
+            source, "PLATFORM_TOKEN_BUDGET", DEFAULT_TOKEN_BUDGET
+        ),
+        platform_proactive_per_day=_env_int(
+            source, "PLATFORM_PROACTIVE_PER_DAY", DEFAULT_PROACTIVE_PER_DAY
+        ),
+        max_usage_events=_env_int(
+            source, "MAX_USAGE_EVENTS", DEFAULT_MAX_USAGE_EVENTS, minimum=1
+        ),
+        max_idempotency_entries=_env_int(
+            source, "MAX_IDEMPOTENCY_ENTRIES", DEFAULT_MAX_IDEMPOTENCY_ENTRIES, minimum=1
+        ),
+        idempotency_ttl_seconds=_env_int(
+            source, "IDEMPOTENCY_TTL_SECONDS", DEFAULT_IDEMPOTENCY_TTL
+        ),
+        max_queue_entries=_env_int(
+            source, "MAX_QUEUE_ENTRIES", DEFAULT_MAX_QUEUE_ENTRIES, minimum=1
+        ),
     )

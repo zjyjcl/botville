@@ -43,7 +43,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Set, Tuple
 
-from .matrix import DeliveryError, SentEvent
+from .matrix import DeliveryError, SentEvent, resolve_txn_id
 
 # 注册文件里 exclusive user namespace 的 localpart 前缀（与
 # server/compose/appservice/botville-gateway.yaml.tmpl 保持一致）。
@@ -93,6 +93,8 @@ class AppServiceMatrixTransport:
         room_alias_prefix: str = DEFAULT_ROOM_ALIAS_PREFIX,
         room_cache_ttl_seconds: float = DEFAULT_ROOM_CACHE_TTL_SECONDS,
         timeout: float = 30.0,
+        health_timeout: float = 2.0,
+        health_cache_seconds: float = 5.0,
     ) -> None:
         if room_cache_ttl_seconds < 0:
             raise ValueError(
@@ -106,6 +108,12 @@ class AppServiceMatrixTransport:
         self._room_alias_prefix = room_alias_prefix
         self._room_cache_ttl = room_cache_ttl_seconds
         self._timeout = timeout
+        # /health 专用：whoami 用短超时 + 结果缓存（#99 加固 2）。/health 可能被
+        # 探针高频轮询，HS 慢或挂起时不能把每个请求都拖住整个 timeout。
+        self._health_timeout = health_timeout
+        self._health_cache_seconds = health_cache_seconds
+        self._health_cached: Optional[bool] = None
+        self._health_checked_at = 0.0
         self._ensured: Set[str] = set()
         # conversation_id -> (room_id, 过期时刻 monotonic 秒)；TTL=0 时不写入。
         self._rooms: Dict[str, Tuple[str, float]] = {}
@@ -124,6 +132,7 @@ class AppServiceMatrixTransport:
         *,
         body: Optional[Dict[str, Any]] = None,
         query: Optional[Dict[str, str]] = None,
+        timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """一次 HTTP 调用；2xx 返回解析后的 JSON（空响应→{}），否则抛 DeliveryError。"""
         url = self._base + path
@@ -137,7 +146,7 @@ class AppServiceMatrixTransport:
         headers["Authorization"] = "Bearer " + self._as_token
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with self._opener.open(req, timeout=self._timeout) as resp:
+            with self._opener.open(req, timeout=self._timeout if timeout is None else timeout) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as exc:
             raw = exc.read()
@@ -273,10 +282,16 @@ class AppServiceMatrixTransport:
 
         200 响应必须带与请求一致的 `user_id`，否则按命名空间错误处理
         （不缓存失败结果）。
+
+        并发（#99 加固 3）：缓存读写在 `self._lock` 下；注册请求本身在锁外，
+        因为它是网络调用。双检语义：锁内读缓存 → 锁外注册 → 锁内再写入，
+        中途别的线程可能已写入同一 user_id，此时重复写是幂等的。代价是同一
+        user_id 的并发首次注册可能各发一次请求，HS 侧 M_USER_IN_USE 兜底。
         """
         self._check_sender(user_id)
-        if user_id in self._ensured:
-            return
+        with self._lock:
+            if user_id in self._ensured:
+                return
         try:
             resp = self._request(
                 "POST",
@@ -319,6 +334,7 @@ class AppServiceMatrixTransport:
         text: str,
         reply_to: Optional[str] = None,
         content_type: str = "text",
+        txn_id: Optional[str] = None,
     ) -> SentEvent:
         sender = self.resolve_sender(sender_id)
         room = self.resolve_room(room_id)
@@ -332,8 +348,11 @@ class AppServiceMatrixTransport:
         if reply_to:
             content["m.relates_to"] = {"m.in_reply_to": {"event_id": reply_to}}
 
+        # txnId 由调用方的 Idempotency-Key 稳定推导（#99 加固 1）：同一 key
+        # 的重试打到同一事务，HS 按 (room, sender, txnId) 去重，不会重复消息。
+        txn = resolve_txn_id(txn_id)
         path = "/_matrix/client/v3/rooms/{}/send/m.room.message/{}".format(
-            urllib.parse.quote(room, safe=""), uuid.uuid4().hex
+            urllib.parse.quote(room, safe=""), urllib.parse.quote(txn, safe="")
         )
         try:
             resp = self._request("PUT", path, body=content, query={"user_id": sender})
@@ -363,13 +382,34 @@ class AppServiceMatrixTransport:
         """带 AS 身份的健康检查：whoami 校验可达性 **和** token 有效性。
 
         （只打 /versions 的话，token 配错也返回 ok，/health 会误报。）
+
+        #99 加固 2：whoami 用 `health_timeout`（默认 2s）而不是
+        `timeout`（默认 30s）——`/health` 被探针高频轮询，HS 挂起时不能让
+        探针请求排队等满 30 秒。结果缓存 `health_cache_seconds`（默认 5s）：
+        缓存期内直接返回上次结论，不重复打 HS。
         """
+        now = time.monotonic()
+        with self._lock:
+            if (
+                self._health_cached is not None
+                and now - self._health_checked_at < self._health_cache_seconds
+            ):
+                return self._health_cached
+        ok = False
         try:
-            self._request("GET", "/_matrix/client/v3/account/whoami")
+            self._request(
+                "GET",
+                "/_matrix/client/v3/account/whoami",
+                timeout=self._health_timeout,
+            )
+            ok = True
         except DeliveryError:
-            return False
+            ok = False
         except OSError:
             # _request 已尽量归一为 DeliveryError；这里兜底，/health 不因
             # 传输层异常变成 500。
-            return False
-        return True
+            ok = False
+        with self._lock:
+            self._health_cached = ok
+            self._health_checked_at = time.monotonic()
+        return ok
