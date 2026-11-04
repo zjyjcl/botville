@@ -179,11 +179,24 @@ def assert_never(desc, fn, quiet=NEGATIVE_TIMEOUT, poll=POLL_INTERVAL):
 
 
 def sync_invited_rooms(client):
+    """Rooms the client has (ever) been invited to, via incremental sync.
+
+    Synapse caches identical initial-sync responses, so repeated
+    `/sync?timeout=0` without `since` keeps returning a stale snapshot;
+    track next_batch per client and accumulate invites instead."""
+    seen = client.__dict__.setdefault("_fed_invites", set())
+    query = {"timeout": 0}
+    since = client.__dict__.get("_fed_since")
+    if since:
+        query["since"] = since
     status, resp = request_json(
-        "GET", client.url("/_matrix/client/v3/sync", query={"timeout": 0}),
+        "GET", client.url("/_matrix/client/v3/sync", query=query),
         token=client.access_token)
     expect(status == 200, "sync returned HTTP {}: {!r}".format(status, resp))
-    return list((((resp or {}).get("rooms") or {}).get("invite") or {}).keys())
+    resp = resp or {}
+    client.__dict__["_fed_since"] = resp.get("next_batch", since)
+    seen.update(((resp.get("rooms") or {}).get("invite") or {}).keys())
+    return list(seen)
 
 
 def peer_state_is(admin, server_name, state, severed_by=None):

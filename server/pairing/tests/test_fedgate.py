@@ -237,6 +237,31 @@ class FedgateMatrixTest(unittest.TestCase):
         sent = self.hs_cls.received[-1]
         self.assertEqual(sent["authorization"], [auth])
 
+    def test_send_from_unpaired_origin_is_sunk(self):
+        # /send from an unpaired origin: 200 {"pdus": {}} (no Synapse
+        # backoff poisoning) and nothing reaches the homeserver.
+        before = len(self.hs_cls.received)
+        status, resp = testutil.http_json(
+            "PUT", self.url("/_matrix/federation/v1/send/txn1"),
+            body={"pdus": [{"x": 1}]},
+            headers={"Authorization": 'X-Matrix origin="hs-z",sig="s"'})
+        self.assertEqual(status, 200)
+        self.assertEqual(resp, {"pdus": {}})
+        self.assertEqual(len(self.hs_cls.received), before)
+
+    def test_send_without_signature_still_403(self):
+        status, _ = testutil.http_json(
+            "PUT", self.url("/_matrix/federation/v1/send/txn1"), body={})
+        self.assertEqual(status, 403)
+
+    def test_well_known_delegation(self):
+        status, _ = self.get("/.well-known/matrix/server")
+        self.assertEqual(status, 404)
+        self.httpd.config.well_known_server = "hs-a:443"
+        status, resp = self.get("/.well-known/matrix/server")
+        self.assertEqual(status, 200)
+        self.assertEqual(resp, {"m.server": "hs-a:443"})
+
     def test_federation_denied_when_not_paired(self):
         auth = 'X-Matrix origin="hs-stranger",sig="s"'
         status, resp = self.get(

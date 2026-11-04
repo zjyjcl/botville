@@ -11,12 +11,13 @@
 #
 # Layout per instance (hs-a shown; hs-b mirrors it):
 #
-#   hs-a:8448 (docker net alias) -> fedgate-a --TLS--> synapse-a:8008
+#   hs-a:443 (docker net alias) -> fedgate-a --TLS--> synapse-a:8008
 #                                  |-> /_matrix/pairing/* -> pairing-a:8090
 #                                  `-> peers DB (ro connection, 1s cache)
 #
 # Peers resolve each other by server_name: fedgate-a carries the network
-# alias `hs-a`, so Synapse's well-known -> SRV -> :8448 fallback lands on
+# alias `hs-a`; fedgate answers /.well-known/matrix/server on :443 with
+# `hs-a:443` (explicit port => no SRV lookup, which stalls on Docker DNS), landing on
 # the gate. All inter-server traffic must pass a fedgate; the Synapse
 # federation listeners are never exposed to the host.
 #
@@ -97,15 +98,15 @@ services:
       PAIRING_ADMIN_TOKEN: ${PAIRING_ADMIN_TOKEN_A:?run python3 server/scripts/federation-setup.py first}
       PAIRING_SERVER_NAME: hs-a
       # The URL the peer sees; /_matrix/pairing is fedgate's forwarding
-      # prefix, so both servers only need their 8448 gate exposed.
-      PAIRING_API_URL: https://hs-a:8448/_matrix/pairing
+      # prefix, so both servers only need their 443 gate exposed.
+      PAIRING_API_URL: https://hs-a:443/_matrix/pairing
       PAIRING_HOST: 0.0.0.0
       PAIRING_PORT: "8090"
       # Verify the redeeming server really controls the server_name it
       # claims (its /_matrix/key/v2/server must agree). Python str.format placeholder;
       # compose leaves braces alone, so it reaches the process verbatim.
       PAIRING_VERIFY_PEER_KEY: "true"
-      PAIRING_PEER_KEY_URL_TEMPLATE: "https://{server_name}:8448/_matrix/key/v2/server"
+      PAIRING_PEER_KEY_URL_TEMPLATE: "https://{server_name}:443/_matrix/key/v2/server"
       # CI-only: fedgate TLS is self-signed here. Never enable elsewhere.
       PAIRING_INSECURE_TLS: "true"
     ports:
@@ -129,11 +130,11 @@ services:
       PAIRING_DB: /data/pairing.db
       PAIRING_ADMIN_TOKEN: ${PAIRING_ADMIN_TOKEN_B:?run python3 server/scripts/federation-setup.py first}
       PAIRING_SERVER_NAME: hs-b
-      PAIRING_API_URL: https://hs-b:8448/_matrix/pairing
+      PAIRING_API_URL: https://hs-b:443/_matrix/pairing
       PAIRING_HOST: 0.0.0.0
       PAIRING_PORT: "8090"
       PAIRING_VERIFY_PEER_KEY: "true"
-      PAIRING_PEER_KEY_URL_TEMPLATE: "https://{server_name}:8448/_matrix/key/v2/server"
+      PAIRING_PEER_KEY_URL_TEMPLATE: "https://{server_name}:443/_matrix/key/v2/server"
       PAIRING_INSECURE_TLS: "true"
     ports:
       - "127.0.0.1:18112:8090"
@@ -156,7 +157,8 @@ services:
     command: python -m pairing.fedgate
     environment:
       FEDGATE_HOST: 0.0.0.0
-      FEDGATE_PORT: "8448"
+      FEDGATE_PORT: "443"
+      FEDGATE_WELL_KNOWN_SERVER: "hs-a:443"
       FEDGATE_TLS_CERT: /certs/hs-a.crt
       FEDGATE_TLS_KEY: /certs/hs-a.key
       FEDGATE_UPSTREAM: http://synapse-a:8008
@@ -179,7 +181,7 @@ services:
       pairing-a:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import ssl, urllib.request; urllib.request.urlopen('https://127.0.0.1:8448/health', context=ssl._create_unverified_context(), timeout=5)"]
+      test: ["CMD", "python", "-c", "import ssl, urllib.request; urllib.request.urlopen('https://127.0.0.1:443/health', context=ssl._create_unverified_context(), timeout=5)"]
       interval: 10s
       timeout: 5s
       retries: 30
@@ -192,7 +194,8 @@ services:
     command: python -m pairing.fedgate
     environment:
       FEDGATE_HOST: 0.0.0.0
-      FEDGATE_PORT: "8448"
+      FEDGATE_PORT: "443"
+      FEDGATE_WELL_KNOWN_SERVER: "hs-b:443"
       FEDGATE_TLS_CERT: /certs/hs-b.crt
       FEDGATE_TLS_KEY: /certs/hs-b.key
       FEDGATE_UPSTREAM: http://synapse-b:8008
@@ -212,7 +215,7 @@ services:
       pairing-b:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import ssl, urllib.request; urllib.request.urlopen('https://127.0.0.1:8448/health', context=ssl._create_unverified_context(), timeout=5)"]
+      test: ["CMD", "python", "-c", "import ssl, urllib.request; urllib.request.urlopen('https://127.0.0.1:443/health', context=ssl._create_unverified_context(), timeout=5)"]
       interval: 10s
       timeout: 5s
       retries: 30

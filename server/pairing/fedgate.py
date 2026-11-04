@@ -49,6 +49,7 @@ MAX_BODY_BYTES = 64 * 1024 * 1024  # federation state dumps can be large
 
 # Path prefixes (matched against the path only, query excluded).
 OPEN_PREFIXES = ("/_matrix/key/v2/server",)
+SEND_PREFIX = "/_matrix/federation/v1/send/"
 GATED_PREFIXES = (
     "/_matrix/federation/",
     "/_matrix/key/v2/query",
@@ -168,7 +169,7 @@ class FedgateConfig:
         if bool(tls_cert) != bool(tls_key):
             raise ConfigError(
                 "FEDGATE_TLS_CERT and FEDGATE_TLS_KEY must be set together")
-        return cls(
+        config = cls(
             host=env.get("FEDGATE_HOST", "0.0.0.0"),
             port=int(env.get("FEDGATE_PORT", "8448")),
             upstream=upstream,
@@ -177,6 +178,11 @@ class FedgateConfig:
             tls_cert=tls_cert or None,
             tls_key=tls_key or None,
         )
+        # Optional /.well-known/matrix/server delegation ("host:port").
+        # An explicit port in the delegated name makes peers skip the SRV
+        # lookup, which on Docker's embedded DNS can stall ~10s per name.
+        config.well_known_server = env.get("FEDGATE_WELL_KNOWN_SERVER", "") or None
+        return config
 
 
 def _http_url(value, name):
@@ -193,6 +199,14 @@ class FedgateHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "botville-fedgate/1.0"
     timeout = 300  # long federation transactions must not idle-time out
+
+    def setup(self):
+        # TLS handshake runs here, in the per-connection thread, so a slow
+        # or stalled client cannot block the accept loop.
+        if isinstance(self.request, ssl.SSLSocket):
+            self.request.settimeout(30)
+            self.request.do_handshake()
+        super().setup()
 
     @property
     def config(self):
@@ -233,6 +247,14 @@ class FedgateHandler(BaseHTTPRequestHandler):
         if path == "/health":
             self._send_json(200, {"ok": True})
             return
+        if path == "/.well-known/matrix/server":
+            delegated = getattr(self.config, "well_known_server", None)
+            if delegated:
+                self._send_json(200, {"m.server": delegated})
+            else:
+                self._reject(404, {"errcode": "M_NOT_FOUND",
+                                   "error": "no well-known delegation"})
+            return
         if path.startswith(PAIRING_PREFIX):
             if not self.config.pairing_upstream:
                 self._reject(404, {"errcode": "M_UNRECOGNIZED",
@@ -247,6 +269,10 @@ class FedgateHandler(BaseHTTPRequestHandler):
             origin = parse_x_matrix_origin(
                 self.headers.get_all("Authorization"))
             if origin is None or not self.server.allowed.contains(origin):
+                if origin is not None and self.command == "PUT" and \
+                        path.startswith(SEND_PREFIX):
+                    self._sink_transaction(origin)
+                    return
                 self._reject(403, {"errcode": "M_FORBIDDEN",
                                    "error": "server not paired"})
                 return
@@ -254,6 +280,23 @@ class FedgateHandler(BaseHTTPRequestHandler):
             return
         self._reject(404, {"errcode": "M_UNRECOGNIZED",
                            "error": "path not served by fedgate"})
+
+    def _sink_transaction(self, origin):
+        """Swallow a /send transaction from an unpaired/severed origin.
+
+        Synapse backs a destination off for 10+ minutes on *any* error to
+        a /send transaction and only resets that on inbound traffic, so a
+        403 here would leave both sides backed off long after a re-pair.
+        Answering 200 with no per-PDU results drops the PDUs/EDUs (nothing
+        reaches the homeserver) without poisoning the sender's retry state.
+        Missing events are fetched via the DAG once the servers re-pair.
+        """
+        try:
+            self._read_request_body()
+        except (ValueError, OSError):
+            self.close_connection = True
+        log.info("dropped /send transaction from unpaired origin %s", origin)
+        self._send_json(200, {"pdus": {}})
 
     # --- proxy core --------------------------------------------------------
 
@@ -331,14 +374,19 @@ class FedgateHandler(BaseHTTPRequestHandler):
                     self.wfile.write(chunk)
                     remaining -= len(chunk)
             else:
-                # No length upstream (e.g. streamed): frame by closing.
-                self.close_connection = True
+                # No length upstream (Synapse answers chunked). Re-frame
+                # with chunked encoding: close-delimited bodies left
+                # Twisted federation clients waiting until their 10s
+                # timeout (observed in federation-e2e).
+                self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
                 while True:
-                    chunk = resp.read(STREAM_CHUNK)
+                    chunk = resp.read1(STREAM_CHUNK) if hasattr(resp, "read1") else resp.read(STREAM_CHUNK)
                     if not chunk:
                         break
-                    self.wfile.write(chunk)
+                    self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
         except (OSError, http.client.HTTPException) as exc:
             log.warning("proxy %s %s -> %s failed: %s",
                         self.command, urlsplit(self.path).path, upstream, exc)
@@ -360,7 +408,8 @@ def build_server(config):
     if config.tls_cert:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(config.tls_cert, config.tls_key)
-        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+        httpd.socket = context.wrap_socket(
+            httpd.socket, server_side=True, do_handshake_on_connect=False)
     return httpd
 
 

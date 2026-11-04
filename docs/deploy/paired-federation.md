@@ -148,3 +148,9 @@ fedgate：
 ## 出站硬化（后续，不在本 PR）
 
 切断的验收语义已由双方入站闸门闭环；「我方 homeserver 主动出站仍会尝试」的硬化（配对变更时重渲染 HS 白名单并编排重启，Tuwunel/continuwuity 用 allowed/forbidden 列表）列为后续任务。同样不在本 PR：App 侧扫码 UI（C2.2）、跨服 AI 关系（A2.3）、公网 TLS 证书的获取与续期流程。
+
+## 实测要点（federation-e2e 调试结论）
+
+- **`/send` 事务对未配对/已切断方返回 `200 {"pdus":{}}` 并丢弃**（不转发给 HS）。原因：Synapse 对 `/send` 的任何错误码都会把目标退避 10 分钟以上，且只在收到对方入站请求时才复位；若回 403，切断后再配对时双方会互相退避、长时间不通。丢弃后消息仍然**送不到**（满足「切断后不能发」），重新配对后缺失事件通过 DAG（get_missing_events/backfill）补齐。其余联邦接口（拉取 state/event/backfill/媒体、邀请、profile）对未配对方仍是 403。
+- **fedgate 提供 `/.well-known/matrix/server`**（`FEDGATE_WELL_KNOWN_SERVER`，如 `hs-a:443`）：委派名带显式端口，对端就跳过 SRV 查询（Docker 内置 DNS 上 SRV 查询每次约卡 10s，会让联邦请求超时）。CI 栈中 fedgate 监听 443。
+- 上游 HS 的 chunked 响应由 fedgate 以 chunked 重新分帧（以关连接分帧时 Twisted 客户端会一直等到超时）；TLS 握手放在每连接线程中，不阻塞 accept。
