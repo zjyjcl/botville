@@ -133,7 +133,7 @@ def assemble_context(
     items: List[Dict[str, Any]],
     message_store: MessageStore,
     persona_store: "PersonaStore",
-    owner_persona_id: str,
+    owner_persona_id: Optional[str],
     conversation_id: Optional[str] = None,
     nonce_factory: Optional[Callable[[], str]] = None,
 ) -> IsolationResult:
@@ -141,6 +141,7 @@ def assemble_context(
 
     - persona 区：仅当 persona 存储中该 persona 的 `owner_id` 等于调用方
       `owner_persona_id`（owner 鉴权通过）且能读到时填充；否则 persona 区为空字符串。
+      `owner_persona_id` 为 `None` 时无法通过鉴权，persona 区始终为空（fail-closed）。
     - conversation 区：trusted 条目文本按顺序拼接（换行分隔）。
     - untrusted_data 区：每段独立 nonce 包裹，原文先转义后拼接。
     - system 区：固定声明，不含任何外部原文。
@@ -275,7 +276,10 @@ class PersonaStore:
     def get(self, persona_id: str) -> Optional[PersonaRecord]:
         return self._records.get(persona_id)
 
-    def get_for_owner(self, persona_id: str, owner_id: str) -> Optional[PersonaRecord]:
+    def get_for_owner(self, persona_id: str, owner_id: Optional[str]) -> Optional[PersonaRecord]:
+        # fail-closed：调用方未证明 owner（None）时一律读不到，persona 区为空。
+        if owner_id is None:
+            return None
         record = self._records.get(persona_id)
         if record is None or record.owner_id != owner_id:
             return None

@@ -493,6 +493,187 @@ class TestContextZones(unittest.TestCase):
 
 
 # ============================================================================
+# 3b. B2 回归：persona 区 owner 缺省必须 fail-closed
+# ============================================================================
+
+class TestPersonaOwnerFailClosed(unittest.TestCase):
+    """B2 审查阻断：owner_id 缺省为 persona_id 会绕过鉴权（自有人设自读）。
+
+    契约 §7.2：非 owner 或读不到 → persona 区为空。未证明 owner 即等同非 owner。
+    """
+
+    def _svc(self):
+        svc = _make_service()
+        # 自有人设：owner_id == persona_id —— 旧实现会因此误判鉴权通过。
+        svc.persona_store.register(
+            PersonaRecord("p_self", "p_self", "SelfName", "self bio", "self style")
+        )
+        return svc
+
+    def _assemble(self, svc, **kw):
+        return svc.assemble_context(
+            {"persona_id": "p_self", "items": [{"kind": "external", "text": "hi"}]},
+            **kw,
+        )
+
+    def test_no_owner_id_persona_zone_empty(self):
+        """未传 owner_id（HTTP 路径现状）→ 不能证明 owner → persona 区为空。"""
+        r = self._assemble(self._svc())
+        self.assertEqual(r["zones"]["persona"], "")
+
+    def test_explicit_owner_id_fills_persona_zone(self):
+        """显式传正确 owner_id → persona 区填充。"""
+        r = self._assemble(self._svc(), owner_id="p_self")
+        persona_zone = r["zones"]["persona"]
+        self.assertIn("SelfName", persona_zone)
+        self.assertIn("self bio", persona_zone)
+
+    def test_wrong_owner_id_persona_zone_empty(self):
+        r = self._assemble(self._svc(), owner_id="other")
+        self.assertEqual(r["zones"]["persona"], "")
+
+    def test_get_for_owner_none_is_fail_closed(self):
+        """PersonaStore.get_for_owner(owner_id=None) 直接返回 None。"""
+        svc = self._svc()
+        self.assertIsNone(svc.persona_store.get_for_owner("p_self", None))
+
+
+# ============================================================================
+# 3c. B3 回归：conversation_id 归属校验 → 422
+# ============================================================================
+
+class TestConversationOwnership(unittest.TestCase):
+    """B3 审查阻断：assemble 从不校验 conversation_id 归属（契约 422 要求）。"""
+
+    def _svc(self):
+        return _make_service()
+
+    def _payload(self, conversation_id, persona_id="p1"):
+        return {
+            "persona_id": persona_id,
+            "conversation_id": conversation_id,
+            "items": [{"kind": "external", "text": "hi"}],
+        }
+
+    def test_unregistered_conversation_raises_422(self):
+        svc = self._svc()
+        with self.assertRaises(UnprocessableError) as cm:
+            svc.assemble_context(self._payload("does-not-exist-xyz"))
+        self.assertEqual(cm.exception.http_status, 422)
+        self.assertEqual(cm.exception.field, "conversation_id")
+
+    def test_conversation_without_persona_raises_422(self):
+        svc = self._svc()
+        svc.register_conversation("conv_other", ["p2"])
+        with self.assertRaises(UnprocessableError) as cm:
+            svc.assemble_context(self._payload("conv_other"))
+        self.assertEqual(cm.exception.http_status, 422)
+        self.assertEqual(cm.exception.field, "conversation_id")
+
+    def test_conversation_member_allowed(self):
+        svc = self._svc()
+        svc.register_conversation("conv_ok", ["p1"])
+        r = svc.assemble_context(self._payload("conv_ok"))
+        self.assertEqual(r["outcome"], "allowed")
+
+    def test_conversation_omitted_still_allowed(self):
+        """省略 conversation_id 时不校验（与契约一致）。"""
+        svc = self._svc()
+        r = svc.assemble_context(
+            {"persona_id": "p1", "items": [{"kind": "external", "text": "hi"}]}
+        )
+        self.assertEqual(r["outcome"], "allowed")
+
+
+# ============================================================================
+# 3d. B1 回归：send 回执 trust / provenance.forwarded_from 与 assemble 一致
+# ============================================================================
+
+class TestSendReceiptTrust(unittest.TestCase):
+    """B1 审查阻断：回执硬编码 trust=trusted 且 provenance 缺 forwarded_from。
+
+    契约 §7.1「只能降不得升」+「网关写入消息的 provenance 并在判定时取低」。
+    """
+
+    def _send(self, svc, **extra):
+        payload = {
+            "sender_persona_id": "p1",
+            "content": {"type": "text", "text": "hello"},
+        }
+        payload.update(extra)
+        return svc.send_ai_message("conv1", payload)
+
+    def _seed_external(self, svc):
+        """注入一条联邦副本：本地副本 external=True → §7.1 规则 2 untrusted。"""
+        svc.message_store.register(
+            MessageRecord("$fedd", "federated text", "human", True)
+        )
+
+    def test_forward_of_external_downgrades_receipt(self):
+        svc = _make_service()
+        self._seed_external(svc)
+        receipt = self._send(svc, provenance={"forwarded_from": "$fedd"})
+        self.assertEqual(receipt["outcome"], "delivered")
+        message = receipt["message"]
+        self.assertEqual(message["trust"], TRUST_UNTRUSTED)
+        self.assertEqual(message["provenance"]["forwarded_from"], "$fedd")
+
+    def test_forward_receipt_trust_matches_assemble(self):
+        """回执 trust 与按 message.id / matrix_event_id assemble 的结果一致。"""
+        svc = _make_service()
+        self._seed_external(svc)
+        message = self._send(svc, provenance={"forwarded_from": "$fedd"})["message"]
+
+        for source_id in (message["id"], message["matrix_event_id"]):
+            with self.subTest(source_id=source_id):
+                r = svc.assemble_context({
+                    "persona_id": "p1",
+                    "items": [{
+                        "kind": "message",
+                        "source_id": source_id,
+                        "text": "hello",
+                    }],
+                })
+                self.assertEqual(r["items"][0]["trust"], TRUST_UNTRUSTED)
+                self.assertNotIn("hello", r["zones"]["conversation"])
+
+    def test_no_forward_stays_trusted(self):
+        """无转发 → 规则 7 trusted；provenance 不含 forwarded_from。"""
+        svc = _make_service()
+        message = self._send(svc)["message"]
+        self.assertEqual(message["trust"], TRUST_TRUSTED)
+        self.assertNotIn("forwarded_from", message["provenance"])
+        self.assertEqual(message["provenance"]["origin"], "ai")
+        self.assertFalse(message["provenance"]["external"])
+
+    def test_forward_chain_missing_source_fails_closed(self):
+        """forwarded_from 指向本地查不到的 event → fail-closed untrusted。"""
+        svc = _make_service()
+        receipt = self._send(svc, provenance={"forwarded_from": "$unknown_ev"})
+        self.assertEqual(receipt["message"]["trust"], TRUST_UNTRUSTED)
+        self.assertEqual(
+            receipt["message"]["provenance"]["forwarded_from"], "$unknown_ev"
+        )
+
+    def test_forward_never_produces_system(self):
+        """system 不能由转发产生（§7.1）。
+
+        转发链结果是「AI 出站 hop（规则 7 trusted）」与「原始 system」取低：
+        `_lower_trust(trusted, system) == trusted`，因此本消息为 trusted；
+        关键是它**不能**保留 system。
+        """
+        svc = _make_service()
+        # 本地副本本身是网关系统消息（origin=system）
+        svc.message_store.register(
+            MessageRecord("$sys_ev", "system notice", "system", False)
+        )
+        receipt = self._send(svc, provenance={"forwarded_from": "$sys_ev"})
+        self.assertNotEqual(receipt["message"]["trust"], TRUST_SYSTEM)
+        # AI 出站 hop 为规则 7 trusted，取低后仍为 trusted（system 不参与取低）。
+        self.assertEqual(receipt["message"]["trust"], TRUST_TRUSTED)
+
+
+# ============================================================================
 # 4. 隔离失败（200 blocked）字段与 usage_events
 # ============================================================================
 

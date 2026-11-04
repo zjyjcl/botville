@@ -63,7 +63,7 @@ from .isolation import (
     _TextMismatch,
     assemble_context,
 )
-from .trust import MessageRecord
+from .trust import MessageRecord, determine_message_trust
 from .limits import LAYER_PLATFORM, LimitStore, PLATFORM_SCOPE_ID
 from .matrix import DeliveryError, MatrixTransport, SentEvent
 from .policy import (
@@ -485,8 +485,10 @@ class GatewayService:
     ) -> Dict[str, Any]:
         """POST /context/assemble 实现（§7.2）。
 
-        owner_id 是调用方 persona 的所有者（用于 persona 区鉴权）；
-        HTTP 层鉴权后注入；测试可直接传 persona_id 本身（自己是自己的 owner）。
+        owner_id 是调用方 persona 的所有者（用于 persona 区鉴权）；由 HTTP 层在
+        鉴权后注入。当前 HTTP 层只有站点级 bearer token、没有 per-caller 身份，因此
+        HTTP 路径不会注入 owner_id —— 即无法证明 owner，persona 区 fail-closed 为空。
+        测试或内部调用方需要 persona 区时，显式传 `owner_id=` 即可。
         """
         # ---- 1. 结构校验（400 request.invalid）----
         # additionalProperties: false（ContextAssembleRequest）
@@ -535,6 +537,18 @@ class GatewayService:
             raise ValidationError(
                 "request.invalid", "'conversation_id' must be a string", "conversation_id"
             )
+
+        # §7.2：conversation_id 不属于该 persona → 422 request.invalid
+        # （契约 ~1233-1235）。会话已注册时校验 persona ∈ 成员列表；未注册同样
+        # 视为「不属于」fail-closed。省略 conversation_id 时不校验（与契约一致）。
+        if conversation_id is not None:
+            members = self._conversation_registry.get(conversation_id)
+            if members is None or persona_id not in members:
+                raise UnprocessableError(
+                    f"conversation_id {conversation_id!r} is not registered for "
+                    f"persona {persona_id!r}",
+                    "conversation_id",
+                )
 
         items = payload.get("items")
         if not isinstance(items, list) or len(items) == 0:
@@ -590,8 +604,9 @@ class GatewayService:
                 )
 
         # ---- 3. 调用 isolation 模块组装 ----
-        # owner_id 缺省与 persona_id 相同（测试路径）
-        effective_owner = owner_id if owner_id is not None else persona_id
+        # B2：owner_id 不再缺省为 persona_id —— 那会让「自己是自己 owner」的
+        # 自有人设绕过鉴权。未提供/未证明 owner 时传 None，persona 区 fail-closed 为空
+        # （§7.2：非 owner 或读不到 → persona 区为空）。
         now = self._now()
 
         try:
@@ -600,7 +615,7 @@ class GatewayService:
                 items=items,
                 message_store=self._message_store,
                 persona_store=self._persona_store,
-                owner_persona_id=effective_owner,
+                owner_persona_id=owner_id,
                 conversation_id=conversation_id,
                 nonce_factory=nonce_factory,
             )
@@ -1162,6 +1177,36 @@ class GatewayService:
 
         # B2.3：把已投递消息写入本地消息存储（message.id + matrix_event_id 双键），
         # 供 /context/assemble 按 source_id 取原始 trust 与正文（§7.1 规则 6/7）。
+        # 回执 Message.trust / provenance 必须与 assemble 走同一判定路径（§7.1 只降
+        # 不升）：先注册 MessageRecord，再用 determine_message_trust 沿 forwarded_from
+        # 链取低，以此作为回执 trust；provenance 写入 forwarded_from（与存储一致）。
+        message_id = f"msg_{uuid.uuid4().hex}"
+        if not deduped:
+            with self._lock:
+                self._message_store.register(
+                    MessageRecord(
+                        source_id=event.event_id,
+                        text=text,
+                        origin="ai",
+                        external=False,
+                        forwarded_from=forwarded_from,
+                    )
+                )
+                self._message_store.register(
+                    MessageRecord(
+                        source_id=message_id,
+                        text=text,
+                        origin="ai",
+                        external=False,
+                        forwarded_from=forwarded_from,
+                    )
+                )
+
+        # 按 §7.1 沿 forwarded_from 链取低：与 /context/assemble 走同一路径，保证
+        # 回执 trust 与后续 assemble(source_id=event_id) 一致。deduped 时记录已在
+        # 首次提交时注册，判定结果不变。fail-closed：查不到/超限/非法 → untrusted。
+        receipt_trust, _ = determine_message_trust(event.event_id, self._message_store)
+
         message = self._message_payload(
             conversation_id=conversation_id,
             sender=sender,
@@ -1172,26 +1217,10 @@ class GatewayService:
             metadata=metadata,
             event_id=event.event_id,
             created_at=event.sent_at,
+            message_id=message_id,
+            trust=receipt_trust,
+            forwarded_from=forwarded_from,
         )
-        if not deduped:
-            record = MessageRecord(
-                source_id=event.event_id,
-                text=text,
-                origin="ai",
-                external=False,
-                forwarded_from=forwarded_from,
-            )
-            with self._lock:
-                self._message_store.register(record)
-                self._message_store.register(
-                    MessageRecord(
-                        source_id=message["id"],
-                        text=text,
-                        origin="ai",
-                        external=False,
-                        forwarded_from=forwarded_from,
-                    )
-                )
 
         return self._receipt(
             decision,
@@ -1248,13 +1277,19 @@ class GatewayService:
         metadata: Optional[Dict[str, str]] = None,
         event_id: str,
         created_at: datetime,
+        message_id: str,
+        trust: str,
+        forwarded_from: Optional[str] = None,
     ) -> Dict[str, Any]:
         # 原样保留请求的 content.type：markdown 不得降级为 text（#92）。
         content: Dict[str, Any] = {"type": content_type, "text": text}
         if mentions:
             content["mentions"] = list(mentions)
+        provenance: Dict[str, Any] = {"origin": "ai", "external": False}
+        if forwarded_from is not None:
+            provenance["forwarded_from"] = forwarded_from
         msg: Dict[str, Any] = {
-            "id": f"msg_{uuid.uuid4().hex}",
+            "id": message_id,
             "matrix_event_id": event_id,
             "conversation_id": conversation_id,
             "sender": {
@@ -1264,8 +1299,10 @@ class GatewayService:
                 "persona_id": sender,
             },
             "content": content,
-            "trust": "trusted",
-            "provenance": {"origin": "ai", "external": False},
+            # §7.1：trust 由网关判定（只降不升）。出站 AI 消息按规则 7 为 trusted，
+            # 但 forwarded_from 链上出现 untrusted 时取低 → untrusted，不硬编码。
+            "trust": trust,
+            "provenance": provenance,
             "created_at": iso_utc(created_at),
             "redacted": False,
         }
