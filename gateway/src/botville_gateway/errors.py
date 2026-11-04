@@ -35,6 +35,20 @@ class PeerValidationError(ValidationError):
         self.http_status = 422
 
 
+class UnprocessableError(ValidationError):
+    """语义不合法（422 request.invalid）。
+
+    与 `ValidationError`（400，结构/类型错误）区分：值合法但违反语义约束，
+    例如发送路径出现调用方 `trust` / `external` 声明（§7.1）、
+    `items[].kind` 未知、`items[].text` 与 `source_id` 存储正文不一致（§7.2）。
+    HTTP 层按 `http_status` 属性路由到 422。
+    """
+
+    def __init__(self, detail: str, field: Optional[str] = None) -> None:
+        super().__init__("request.invalid", detail, field=field)
+        self.http_status = 422
+
+
 class LimitError(Exception):
     """限额语义不合法（映射为 422 `limit.out_of_range`）。
 
