@@ -1967,14 +1967,16 @@ components:
         示例占位：`<change-me>`。
 
         **调用方身份（#124，contract.md §1.2.2）**：`GATEWAY_CALLER_TOKENS` 可配置
-        per-caller token（`caller_id:token:owner_id`，token ≥32 字节）；服务端先对请求
-        token 与存储 token 各做 `HMAC-SHA256(进程随机键)` 统一长度，再
-        `hmac.compare_digest` 全量比较（不提前返回）。`owner_id` 由 token 推出并用于
-        `/context/assemble` 的 persona 区鉴权；推不出时 persona 区为空（正常结果，非错误）。
+        per-caller token（每条形如 `caller_id:token:owner_id`，多条用分号 `;` 或换行分隔，
+        token ≥32 字节）；服务端先对请求 token 与存储 token 各做 `HMAC-SHA256(进程随机键)`
+        统一长度，再 `hmac.compare_digest` 全量比较（不提前返回）。`owner_id` 由 token 推出，
+        **只用于 `/context/assemble` 的 persona 区**：推不出或非 owner 时 persona 区为空
+        （正常结果，非错误），该接口**一律 `200`**。`403 persona.not_owned` 只用于
+        **`/context/assemble` 以外**的 persona 写操作（如以 `author_persona_id` 写动态）。
         `GATEWAY_LEGACY_TOKEN_ENABLED` 默认 `true`（兼容站点级 token），**开启调用方 token
         后建议关闭**；配置了 caller token 而旧 token 仍开启时启动打 WARNING。
         日志只记 `caller_id`，不记 token、token 哈希或 owner_id 明文。本节不新增请求字段，
-        也不改变状态码集合（鉴权失败仍为 `401 auth.invalid_token` / `403 auth.insufficient_scope`）。
+        也不新增错误码（鉴权失败仍为 `401 auth.invalid_token`）。
     matrixUserToken:
       type: http
       scheme: bearer
@@ -3349,10 +3351,24 @@ components:
       type: object
       description: |
         互聊熔断规则。`max_ai_messages_per_hour` 越小越严；`on_break` 默认 `stop`。
-        平台层由 `PLATFORM_MAX_AI_MESSAGES_PER_HOUR` / `PLATFORM_AI_LOOP_ON_BREAK` 设置，
-        **默认 `0` = 平台不设该项**（不输出该键，与 `RATE_LIMIT_MESSAGES=0` 既有语义一致）。
-        `may_clear_at`：`used ≥ limit` 时取第 `(used − limit + 1)` 早的计入事件出窗时刻
-        （向上取整到秒）；在途预留按 `at + 3600` 保守计入。`used == limit` 时退化为第 1 早。
+
+        **平台层数值项（`PLATFORM_MAX_AI_MESSAGES_PER_HOUR`）**：默认 `0` = 平台不设该项
+        （省略键，不输出该键，与 `RATE_LIMIT_MESSAGES=0` 既有语义一致）。
+        **`PLATFORM_AI_LOOP_ON_BREAK` 单独说明（不适用「0=不设」）**：它是枚举项，默认
+        `stop` 就是平台底线值；**枚举严格序：`stop` 严于 `notify`**（`notify` 当前版本
+        按 `stop` 执行，fail-closed）。
+
+        **两种 `0` 的语义不同**：
+        - 平台 env `0`（`PLATFORM_MAX_AI_MESSAGES_PER_HOUR=0`）= 不设该项（省略键）；
+        - API 的 `max_ai_messages_per_hour: 0`（本 schema 内）= 有效限额，一条都不允许；
+          此时 `may_clear_at = null`（永不因滑窗恢复），见下。
+
+        `may_clear_at`（N8）：
+        - `limit > 0`：取第 `(used − limit + 1)` 早的计入事件出窗时刻（向上取整到秒）；
+          最终取 `max(计算值, ceil(now)+1s)`，永不返回过去或当前时刻，避免活锁；
+          在途预留（未超 TTL 的 `ReservationBook` 条目）按 `at+3600` 计入排序。
+        - `limit = 0`：`may_clear_at = null`，窗口内永远不会因事件出窗而恢复名额。
+        - `used == limit` 时退化为既有「第 1 早」口径。
       properties:
         max_ai_messages_per_hour:
           type: integer
@@ -3482,6 +3498,13 @@ components:
 
     EffectiveLimits:
       type: object
+      description: |
+        三层限额的生效值与各层原始规则。
+
+        **示例口径**：`examples/effective-limits.json` 是一个**已配置平台层值的部署**的
+        响应样例（`anti_spam` / `ai_loop` 等平台键有具体值），**不是默认部署的输出**。
+        默认部署按 §6.3 的平台 env 语义（`0` = 不设该项）**省略**这些平台键，生效值
+        只由 owner / peer 层决定；读取示例时不要把它当成默认值。
       required: [scope, scope_id, generated_at, effective, layers]
       properties:
         scope:
