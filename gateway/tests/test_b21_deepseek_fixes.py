@@ -111,7 +111,6 @@ class TestB1RatePair(unittest.TestCase):
         with self.assertRaises(LimitError) as ctx:
             self.put({"window_seconds": 60})
         self.assertEqual(ctx.exception.code, "limit.out_of_range")
-        self.assertIn("rate", ctx.exception.errors[0]["message"])
 
     def test_platform_2_3600_plus_owner_window_60_is_422(self):
         """平台 2/3600，owner 显式写 messages:2 window:60 → 速率放宽 → 422。"""
@@ -231,6 +230,7 @@ class TestB2PeerInSend(unittest.TestCase):
              "rules": {"tokens_per_window": 10}},
             now=clock(),
         )
+        # 未注册会话按 B2.1 采信 peer_id（#117 B1：不做成员校验）。
         result = send(svc, "hello world", peer_id="peer_x", token_estimate=20)
         self.assertEqual(result["outcome"], "blocked")
         codes = [r["code"] for r in result["decision"]["reasons"]]
@@ -248,6 +248,7 @@ class TestB2PeerInSend(unittest.TestCase):
              "rules": {"messages_per_window": 1}},
             now=clock(),
         )
+        # 未注册会话按 B2.1 采信 peer_id（#117 B1：不做成员校验）。
         r1 = send(svc, "first", peer_id="peer_x")
         r2 = send(svc, "second", peer_id="peer_x")
         self.assertEqual(r1["outcome"], "delivered")
@@ -277,6 +278,7 @@ class TestB2PeerInSend(unittest.TestCase):
              "rules": {"messages_per_window": 1}},
             now=clock(),
         )
+        # 未注册会话按 B2.1 采信 peer_id（#117 B1：不做成员校验）。
         # 第 1 条 evaluate → allow
         ev1 = svc.evaluate_policy({
             "persona_id": "p", "peer_id": "peer_x", "content": "x",

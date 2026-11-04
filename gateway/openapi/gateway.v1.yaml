@@ -2715,9 +2715,18 @@ components:
           type: string
           description: |
             会话对端（persona）标识。三层限额的 peer 层只在请求带上该字段时
-            生效；与 `POST /policy/evaluate` 的 `peer_id` 语义相同。
-            **当会话成员中存在配置了 peer 层限额的对方 persona、而请求未带 `peer_id`
-            时，返回 `422 request.invalid`（`errors[].field = peer_id`）**。
+            生效，并按 `(sender_persona_id, peer_id)` 计数；与
+            `POST /policy/evaluate` 的 `peer_id` 语义相同。
+            **校验范围取决于会话成员是否已登记**（#117 审查修订）：会话成员的
+            真实来源（HTTP 会话注册 / 房间成员同步）尚未接入，因此
+            - **未登记会话**：按 B2.1 采信 `peer_id`，**不校验成员**；带上即生效。
+            - **已登记会话**：`peer_id` 须 ∈ 会话成员且 ≠ `sender_persona_id`，否则
+              返回 `422 request.invalid`（`errors[].field = peer_id`）。
+              当会话中**对方**（排除 sender 自身）存在配置了 peer 层限额的 persona、
+              而请求未带 `peer_id` 时，同样返回 `422 request.invalid`；仅 sender 自己
+              有 peer 层规则时不报错。
+            **空串 `peer_id`（`""`）返回 `400 request.invalid`**（`errors[].field = peer_id`），
+            不走策略路径。
             会话成员中无任何 peer 层规则时省略 `peer_id` 与 B2.1 行为一致（兼容条件）。
       additionalProperties: false
 
@@ -2873,11 +2882,18 @@ components:
         peer_id:
           type: string
           description: |
-            会话对端（persona）标识，用于触发 peer 层限额。省略时不参与 peer 层
-            计算；实发路径请与 `OutgoingMessageRequest.peer_id` 保持一致，否则
-            预检与实发结论可能不同。
-            **当会话成员中存在配置了 peer 层限额的对方 persona、而请求未带 `peer_id`
-            时，返回 `422 request.invalid`（`errors[].field = peer_id`）**。
+            会话对端（persona）标识，用于触发 peer 层限额，并按
+            `(persona_id, peer_id)` 计数。省略时不参与 peer 层计算；实发路径请与
+            `OutgoingMessageRequest.peer_id` 保持一致，否则预检与实发结论可能不同。
+            **校验范围取决于会话是否已登记**（#117 审查修订）：会话成员来源
+            （HTTP 注册 / 房间成员同步）尚未接入，因此
+            - **未登记会话或未带 `conversation_id`**：按 B2.1 采信 `peer_id`，**不校验成员**；
+              带上即生效。
+            - **已登记会话**：`peer_id` 须 ∈ 会话成员且 ≠ `persona_id`，否则返回
+              `422 request.invalid`（`errors[].field = peer_id`）。当会话中**对方**
+              （排除 sender 自身）存在配置了 peer 层限额的 persona、而请求未带 `peer_id`
+              时同样返回 422；仅 sender 自己有 peer 层规则时不报错。
+            **空串 `peer_id`（`""`）返回 `400 request.invalid`**（`errors[].field = peer_id`）。
             会话成员中无任何 peer 层规则时省略 `peer_id` 与 B2.1 行为一致（兼容条件）。
       additionalProperties: false
 

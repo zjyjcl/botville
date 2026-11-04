@@ -197,6 +197,15 @@ def validate_rules(raw: Any) -> Dict[str, Any]:
                 f"rules.{count_key}", raw[count_key], minimum, maximum
             )
     if _WINDOW_KEY in raw:
+        # #114-4：window_seconds 只能与 messages_per_window 或 tokens_per_window 成对出现。
+        # 单独写 window_seconds 不生效且语义不合法，422 limit.out_of_range。
+        has_count = any(count_key in raw for count_key, _, _ in RATE_PAIRS)
+        if not has_count:
+            raise _range_error(
+                f"rules.{_WINDOW_KEY}",
+                f"rules.{_WINDOW_KEY} must be paired with messages_per_window or tokens_per_window; "
+                "writing window_seconds alone has no effect and is rejected to prevent silent misconfiguration",
+            )
         # 仍然接受该字段（契约声明了它），只是不再独立参与「取最严」。
         minimum, maximum = _SCALAR_RANGES[_WINDOW_KEY]
         out[_WINDOW_KEY] = _check_int(
@@ -578,6 +587,18 @@ class LimitStore:
                 "one or more rules are looser than the platform floor",
                 errors=errors,
             )
+
+    def any_peer_rules(self, persona_ids: List[str]) -> bool:
+        """返回 persona_ids 中是否有任一 persona 配置了 peer 层规则（B2.2 §6.4）。
+
+        用于校验请求是否需要强制携带 peer_id：会话成员中存在 peer 层规则 →
+        未带 peer_id 的请求应返回 422 request.invalid。
+        """
+        with self._lock:
+            for pid in persona_ids:
+                if self._layers.get((LAYER_PEER, SCOPE_PEER, pid)) is not None:
+                    return True
+        return False
 
     # -------------------------------------------------------------- effective
     def effective(

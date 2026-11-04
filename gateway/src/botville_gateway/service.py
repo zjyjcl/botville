@@ -46,10 +46,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import Config
-from .errors import GatewayDeliveryError, IdempotencyConflict, LimitError, ValidationError
+from .errors import GatewayDeliveryError, IdempotencyConflict, LimitError, PeerValidationError, ValidationError
 from .limits import LAYER_PLATFORM, LimitStore, PLATFORM_SCOPE_ID
 from .matrix import DeliveryError, MatrixTransport, SentEvent
 from .policy import (
+    CODE_AI_LOOP_TRIPPED,
+    CODE_ANTI_SPAM_CONSECUTIVE,
     CODE_SILENT_HOURS,
     DECISION_BLOCK,
     DECISION_DEFER,
@@ -145,7 +147,9 @@ class GatewayService:
     ) -> None:
         self._config = config
         self._transport = transport
-        self._store = store if store is not None else UsageStore(config.max_usage_events)
+        self._store = store if store is not None else UsageStore(
+            config.max_usage_events, config.usage_retention_seconds
+        )
         self._limits = (
             limit_store if limit_store is not None else LimitStore(config)
         )
@@ -165,6 +169,8 @@ class GatewayService:
         self._idempotency_guards: Dict[str, _KeyGuard] = {}
         self._queue: "OrderedDict[str, _QueueItem]" = OrderedDict()
         self._started_at = now_fn()
+        # B2.2 peer_id 校验：最小内存会话注册表（内部 API，测试用）。
+        self._conversation_registry: Dict[str, List[str]] = {}
 
     # ------------------------------------------------------------- accessors
     @property
@@ -192,6 +198,73 @@ class GatewayService:
     def pending_queue(self) -> List[_QueueItem]:
         with self._lock:
             return list(self._queue.values())
+
+    def register_conversation(self, conversation_id: str, persona_ids: List[str]) -> None:
+        """注册会话成员列表（内部 API，测试用；不加 HTTP 端点）。
+
+        用于 peer_id 校验：evaluate_policy / send_ai_message 时检查
+        peer_id ∈ persona_ids 且 ≠ sender。
+        """
+        with self._lock:
+            self._conversation_registry[conversation_id] = list(persona_ids)
+
+    def record_human_message(
+        self, conversation_id: str, at: Optional[datetime] = None
+    ) -> None:
+        """记录人类消息到达事件（内部 API，不加 HTTP 端点）。
+
+        写 UsageEvent kind=HUMAN，用于 anti_spam / ai_loop 计数重置。
+        同时提前解除该会话 persona 的 anti_spam 冷却（通过 EventKind.HUMAN 事件的存在，
+        policy engine 在 _anti_spam_view 中检查 human_at 来决定计数起点）。
+        """
+        now = at or self._now()
+        self._store.append(
+            UsageEvent.make(
+                EventKind.HUMAN,
+                persona_id="__human__",
+                conversation_id=conversation_id,
+                at=now,
+            )
+        )
+        # B6 (#117)：人类消息重置该会话的 blocked 去重记录（全部 persona）。
+        self._engine.clear_blocked_records(None, conversation_id)
+
+    def _check_peer_id(
+        self,
+        *,
+        conversation_id: Optional[str],
+        sender: str,
+        peer_id: Optional[str],
+    ) -> None:
+        """peer_id 校验（B2.2 §6.4，审查 #117 B1 后退回 B2.1 兼容语义）：
+
+        - 会话未注册（或 evaluate 无 conversation_id）：peer_id 原样采信，
+          **不校验成员**；带 peer_id 时 peer 层生效并写入 peer 计数（B2.1 行为）。
+        - 会话已注册 + 带 peer_id：peer_id ∈ 成员且 ≠ sender，否则 422。
+        - 会话已注册 + 无 peer_id：若**对方**（排除 sender）有 peer 层规则 → 422。
+
+        会话成员的真实来源（HTTP 注册 / 房间成员同步）尚未接入；首版只有内部
+        API `register_conversation`，因此未注册会话按 B2.1 采信 peer_id。
+        """
+        registered = (
+            self._conversation_registry.get(conversation_id)
+            if conversation_id is not None
+            else None
+        )
+        if registered is None:
+            return
+        if peer_id is not None:
+            if peer_id not in registered or peer_id == sender:
+                raise PeerValidationError(
+                    f"peer_id {peer_id!r} must be a conversation member and differ from sender {sender!r}"
+                )
+        else:
+            # 无 peer_id：仅当「对方」（排除 sender）有 peer 层规则时强制 422。
+            others = [p for p in registered if p != sender]
+            if self._limits.any_peer_rules(others):
+                raise PeerValidationError(
+                    "peer_id is required when a conversation peer has peer-layer rules configured"
+                )
 
     # --------------------------------------------------------------- limits
     def get_limits(
@@ -254,12 +327,16 @@ class GatewayService:
             raise ValidationError("request.invalid", "'to' must not precede 'from'", "to")
         tz = _resolve_timezone(timezone_name)
 
-        events = self._store.events_in_window(
-            persona_id=persona_id,
-            conversation_id=conversation_id,
-            since=start,
-            until=end,
-        )
+        events = [
+            e
+            for e in self._store.events_in_window(
+                persona_id=persona_id,
+                conversation_id=conversation_id,
+                since=start,
+                until=end,
+            )
+            if e.contract_kind  # filter out HUMAN events
+        ]
         counts: Dict[str, int] = {}
         for event in events:
             counts[event.contract_kind] = counts.get(event.contract_kind, 0) + 1
@@ -322,7 +399,8 @@ class GatewayService:
             for e in self._store.events_in_window(
                 persona_id=persona_id, since=start, until=end
             )
-            if wanted_kinds is None or e.contract_kind in wanted_kinds
+            if e.contract_kind  # EventKind.HUMAN has empty contract_kind → filter out
+            and (wanted_kinds is None or e.contract_kind in wanted_kinds)
         ]
         events.sort(key=lambda e: e.recorded_at, reverse=True)
 
@@ -372,6 +450,9 @@ class GatewayService:
         peer_id = payload.get("peer_id")
         if peer_id is not None and not isinstance(peer_id, str):
             raise ValidationError("request.invalid", "'peer_id' must be a string", "peer_id")
+        if peer_id == "":
+            # 与 send 路径一致：空串不是合法 peer 标识 → 400 request.invalid（#117）。
+            raise ValidationError("request.invalid", "'peer_id' must not be empty", "peer_id")
         text = payload.get("content") or ""
         if not isinstance(text, str):
             raise ValidationError("request.invalid", "'content' must be a string", "content")
@@ -389,6 +470,11 @@ class GatewayService:
                 f"'kind' must be one of {sorted(EVALUATE_KINDS)}, got {kind!r}",
                 "kind",
             )
+        self._check_peer_id(
+            conversation_id=conversation_id,
+            sender=persona_id,
+            peer_id=peer_id,
+        )
         decision = self._engine.evaluate(
             persona_id=persona_id,
             conversation_id=conversation_id,
@@ -472,6 +558,7 @@ class GatewayService:
                     reply_to=validated["reply_to"],
                     mentions=validated["mentions"],
                     metadata=validated["metadata"],
+                    peer_id=validated["peer_id"],
                 )
                 if idempotency_key:
                     self._idempotency_put(idempotency_key, fingerprint, receipt)
@@ -575,6 +662,9 @@ class GatewayService:
         peer_id = payload.get("peer_id")
         if peer_id is not None and not isinstance(peer_id, str):
             raise ValidationError("request.invalid", "'peer_id' must be a string", "peer_id")
+        if peer_id == "":
+            # 空串不是合法的 peer 标识：send 与 evaluate 两端统一按 400 拒绝（#117 2.10）。
+            raise ValidationError("request.invalid", "'peer_id' must not be empty", "peer_id")
 
         metadata = payload.get("metadata")
         if metadata is not None:
@@ -616,7 +706,7 @@ class GatewayService:
             "metadata": dict(metadata) if metadata else None,
             "token_estimate": token_estimate,
             "allow_deferred": allow_deferred,
-            "peer_id": peer_id or None,
+            "peer_id": peer_id,
         }
 
     def _prepare_send(
@@ -642,6 +732,11 @@ class GatewayService:
         `peer_id` 必须传进 `evaluate()`（B2）：否则 peer 层的 messages/tokens
         限额只在预检里生效，实发会把三层退化成两层。
         """
+        self._check_peer_id(
+            conversation_id=conversation_id,
+            sender=sender,
+            peer_id=peer_id,
+        )
         now = self._now()
         decision = self._engine.evaluate(
             persona_id=sender,
@@ -651,17 +746,37 @@ class GatewayService:
             token_estimate=token_estimate,
             allow_deferred=allow_deferred,
             now=now,
+            commit_state=True,  # 实发路径：冷却到期清零等状态变更落库（#117 N4）
         )
 
         if decision.decision == DECISION_BLOCK:
+            # B3/B5 (#117)：冷却锚点独立于事件表；由实发路径写入，不依赖 reasons 顺序。
+            anti_spam_consecutive = any(
+                check.key == CODE_ANTI_SPAM_CONSECUTIVE and not check.allowed
+                for check in decision.checks
+            )
+            if anti_spam_consecutive:
+                self._engine.note_anti_spam_trip(sender, conversation_id, now)
+            reason_code = self._primary_reason_code(decision)
+            # B6 (#117)：**所有** blocked 码都按 (persona, conv, reason_code) 去重，
+            # 只有冷却期一条码去重时，其它码（message.length / ai_loop.tripped /
+            # messages.window.exceeded …）的写放大仍能把 SENT 计数事件挤出容量上限，
+            # 从而重置 rate/token/anti_spam/ai_loop 计数。不写事件时仍返回 blocked 回执。
+            if not self._engine.should_record_blocked(
+                sender, conversation_id, reason_code
+            ):
+                return _PreparedSend(
+                    decision, receipt=self._receipt(decision, outcome="blocked")
+                )
             self._store.append(
                 UsageEvent.make(
                     EventKind.BLOCKED,
                     persona_id=sender,
                     conversation_id=conversation_id,
-                    reason_code=decision.reasons[0].code if decision.reasons else None,
+                    reason_code=reason_code,
                     text=text,
                     at=now,
+                    peer_id=peer_id,
                 )
             )
             return _PreparedSend(decision, receipt=self._receipt(decision, outcome="blocked"))
@@ -684,9 +799,10 @@ class GatewayService:
                     EventKind.DEFERRED,
                     persona_id=sender,
                     conversation_id=conversation_id,
-                    reason_code=decision.reasons[0].code if decision.reasons else None,
+                    reason_code=self._primary_reason_code(decision),
                     text=text,
                     at=now,
+                    peer_id=peer_id,
                 )
             )
             return _PreparedSend(
@@ -696,7 +812,11 @@ class GatewayService:
 
         # allow：先预留名额（消息数 / token 预扣 / 最小间隔），投递完成后再提交。
         reservation = self._reservations.reserve(
-            persona_id=sender, tokens=decision.estimated_tokens, at=now
+            persona_id=sender,
+            tokens=decision.estimated_tokens,
+            at=now,
+            conversation_id=conversation_id,
+            peer_id=peer_id,
         )
         return _PreparedSend(
             decision, reservation=reservation, tokens_out=decision.estimated_tokens
@@ -720,6 +840,7 @@ class GatewayService:
         reply_to: Optional[str],
         mentions: Optional[List[str]],
         metadata: Optional[Dict[str, str]],
+        peer_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """锁内提交：调用方须持锁，且已释放（或即将释放）该预留。
 
@@ -735,8 +856,11 @@ class GatewayService:
                 text=text,
                 at=reservation.at,
                 tokens_out=tokens_out,
+                peer_id=peer_id,
             )
         )
+        # B6 (#117)：delivered 后清 blocked 去重记录，下次进入 blocked 状态可重新写一条。
+        self._engine.clear_blocked_records(sender, conversation_id)
 
         return self._receipt(
             decision,
@@ -902,6 +1026,21 @@ class GatewayService:
 
     # ------------------------------------------------------------- helpers
     @staticmethod
+    def _primary_reason_code(decision: PolicyDecision) -> Optional[str]:
+        """blocked/deferred 事件的 reason_code（#117 B5）。
+
+        优先取 anti_spam.* / ai_loop.* 的失败 check 码：这些检查的锚点/选码语义
+        不能被其它同时失败的检查（rate/token/interval/silent）挤掉。否则退回
+        `reasons[0].code`。不依赖 reasons 的顺序。
+        """
+        for check in decision.checks:
+            if check.allowed or not check.code:
+                continue
+            if check.code.startswith("anti_spam.") or check.code.startswith("ai_loop."):
+                return check.code
+        return decision.reasons[0].code if decision.reasons else None
+
+    @staticmethod
     def _txn_id_for(idempotency_key: Optional[str]) -> str:
         """Matrix 事务 ID（#99 加固 1）：由幂等键稳定推导，重试落在同一 txnId。
 
@@ -1039,6 +1178,8 @@ def _usage_event_body(event: UsageEvent) -> Dict[str, Any]:
         body["text_length"] = event.text_length
     if event.text_sha256:
         body["text_sha256"] = event.text_sha256
+    if event.peer_id:
+        body["peer_id"] = event.peer_id
     return body
 
 
