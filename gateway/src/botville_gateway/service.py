@@ -51,7 +51,6 @@ from .limits import LAYER_PLATFORM, LimitStore, PLATFORM_SCOPE_ID
 from .matrix import DeliveryError, MatrixTransport, SentEvent
 from .policy import (
     CODE_AI_LOOP_TRIPPED,
-    CODE_ANTI_SPAM_COOLDOWN,
     CODE_ANTI_SPAM_CONSECUTIVE,
     CODE_SILENT_HOURS,
     DECISION_BLOCK,
@@ -227,6 +226,8 @@ class GatewayService:
                 at=now,
             )
         )
+        # B6 (#117)：人类消息重置该会话的 blocked 去重记录（全部 persona）。
+        self._engine.clear_blocked_records(None, conversation_id)
 
     def _check_peer_id(
         self,
@@ -745,6 +746,7 @@ class GatewayService:
             token_estimate=token_estimate,
             allow_deferred=allow_deferred,
             now=now,
+            commit_state=True,  # 实发路径：冷却到期清零等状态变更落库（#117 N4）
         )
 
         if decision.decision == DECISION_BLOCK:
@@ -756,10 +758,12 @@ class GatewayService:
             if anti_spam_consecutive:
                 self._engine.note_anti_spam_trip(sender, conversation_id, now)
             reason_code = self._primary_reason_code(decision)
-            # 冷却期内重复 blocked：同 (persona, conv, cooldown) 只写一条事件，
-            # 防止被拒请求的写放大挤掉计数事件与锚点。
-            if reason_code == CODE_ANTI_SPAM_COOLDOWN and not (
-                self._engine.should_record_cooldown_block(sender, conversation_id)
+            # B6 (#117)：**所有** blocked 码都按 (persona, conv, reason_code) 去重，
+            # 只有冷却期一条码去重时，其它码（message.length / ai_loop.tripped /
+            # messages.window.exceeded …）的写放大仍能把 SENT 计数事件挤出容量上限，
+            # 从而重置 rate/token/anti_spam/ai_loop 计数。不写事件时仍返回 blocked 回执。
+            if not self._engine.should_record_blocked(
+                sender, conversation_id, reason_code
             ):
                 return _PreparedSend(
                     decision, receipt=self._receipt(decision, outcome="blocked")
@@ -855,6 +859,8 @@ class GatewayService:
                 peer_id=peer_id,
             )
         )
+        # B6 (#117)：delivered 后清 blocked 去重记录，下次进入 blocked 状态可重新写一条。
+        self._engine.clear_blocked_records(sender, conversation_id)
 
         return self._receipt(
             decision,

@@ -973,6 +973,15 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
   部署须保证 `max_usage_events` 足以保留 `max(window_seconds, cooldown_seconds)` 内
   的所有事件；容量不足时事件可能被淘汰，导致计数偏低（fail-open，提前放行），属
   已知局限（冷却状态独立存储，不受此影响）。
+  此外，部署**还须保证 `USAGE_RETENTION_SECONDS >= max(window_seconds, cooldown_seconds)`**
+  （`usage_retention_seconds`）：保留期短于窗口/冷却时，窗口内事件会被保留期淘汰，
+  同样导致计数偏低（fail-open，静默放行）。默认 30 天已覆盖所有可配窗口上限。
+- **blocked 事件去重与容量淘汰（#117 B6）**：`(persona, conversation_id, reason_code)`
+  的 blocked 事件**只记一条**；重试仍返回 `blocked` 回执，但不重复写 `kind=blocked`。
+  成功 `delivered` 或出现经网关人类消息时清空该 (persona, conversation) 的去重记录。
+  容量淘汰时**优先丢弃最旧的 `kind=blocked` 事件**，仍超才淘汰计数事件（`sent` /
+  `deferred` / `human`），因此反复提交被拦请求**不能**挤掉计数、不能重置
+  `rate` / `token` / `anti_spam` / `ai_loop` 的已用额度。
 
 ### 6.4 peer 计数语义与 B2.1 兼容性（B2.2）
 

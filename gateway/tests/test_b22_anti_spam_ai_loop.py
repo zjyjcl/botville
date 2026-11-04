@@ -1187,6 +1187,135 @@ class TestB22ReviewFixes(unittest.TestCase):
             send(self.svc, "bot1", "conv1", peer_id="")
         self.assertEqual(ctx.exception.http_status, 400)
 
+    # ------------------------------------------------------------------
+    # T13 (#117 B6/N6a) ai_loop max=2、max_events=20：blocked 重试 30 次仍 blocked，
+    #     冷却/限额不被重置，SENT 计数事件仍在
+    # ------------------------------------------------------------------
+    def test_blocked_flood_cannot_reset_ai_loop_counts(self):
+        config = make_config()
+        clock = FixedClock()
+        transport = InMemoryMatrixTransport()
+        store = UsageStore(max_events=20)
+        limits = LimitStore(config)
+        svc = GatewayService(config, transport, store, limits, now_fn=clock)
+        put_ai_loop(limits, "bot1", max_per_hour=2)
+
+        for _ in range(2):
+            r = send(svc, "bot1", "conv1")
+            self.assertEqual(r["outcome"], "delivered", r)
+        # 第3条：熔断触发
+        r = send(svc, "bot1", "conv1")
+        self.assertEqual(r["outcome"], "blocked", r)
+        codes = [x["code"] for x in r["decision"]["reasons"]]
+        self.assertIn(CODE_AI_LOOP_TRIPPED, codes)
+
+        # 30 次被拒重试：全部仍 blocked（计数事件未被挤掉）
+        for _ in range(30):
+            r = send(svc, "bot1", "conv1")
+            self.assertEqual(r["outcome"], "blocked", r)
+
+        sent = [e for e in store.all_events() if e.kind == EventKind.SENT]
+        self.assertEqual(len(sent), 2, "SENT 计数事件不得被 blocked 洪泛挤掉")
+
+        decision = svc._engine.evaluate(
+            persona_id="bot1",
+            conversation_id="conv1",
+            now=clock(),
+        )
+        ai_loop = next(
+            (c for c in decision.checks if c.key == "ai_loop.per_hour"), None
+        )
+        self.assertIsNotNone(ai_loop)
+        self.assertFalse(ai_loop.allowed, "限额不得被重试重置")
+        self.assertGreaterEqual(ai_loop.used, 2, "已用计数不得被重试清零")
+
+    # ------------------------------------------------------------------
+    # T14 (#117 B6/N6b) anti_spam max=50：发 10 条后连发 30 条超长
+    #     （reason=message.length），anti_spam used 不得降为 0
+    # ------------------------------------------------------------------
+    def test_blocked_flood_message_length_does_not_reset_anti_spam(self):
+        config = make_config(max_message_chars=8000)
+        clock = FixedClock()
+        transport = InMemoryMatrixTransport()
+        store = UsageStore(max_events=20)  # 小容量：旧实现下 30 条 blocked 会挤掉 SENT
+        limits = LimitStore(config)
+        svc = GatewayService(config, transport, store, limits, now_fn=clock)
+        limits.put(
+            {
+                "layer": "owner",
+                "scope": "persona",
+                "scope_id": "bot1",
+                "rules": {
+                    "max_message_chars": 20,
+                    "anti_spam": {
+                        "max_consecutive_ai_messages": 50,
+                        "cooldown_seconds": 60,
+                    },
+                },
+            },
+            now=clock(),
+        )
+
+        for _ in range(10):
+            r = send(svc, "bot1", "conv1")
+            self.assertEqual(r["outcome"], "delivered", r)
+        # 30 条超长：被 blocked（message.length），不是 anti_spam.cooldown
+        for _ in range(30):
+            r = send(svc, "bot1", "conv1", text="x" * 30)
+            self.assertEqual(r["outcome"], "blocked", r)
+            codes = [x["code"] for x in r["decision"]["reasons"]]
+            self.assertIn(CODE_MESSAGE_LENGTH, codes)
+
+        sent = [e for e in store.all_events() if e.kind == EventKind.SENT]
+        self.assertEqual(len(sent), 10, "SENT 计数事件不得被 blocked 洪泛挤掉")
+
+        decision = svc._engine.evaluate(
+            persona_id="bot1",
+            conversation_id="conv1",
+            now=clock(),
+        )
+        anti_spam = next(
+            (c for c in decision.checks if c.key == "anti_spam.consecutive"), None
+        )
+        self.assertIsNotNone(anti_spam)
+        self.assertEqual(anti_spam.used, 10, "anti_spam used 不得被洪泛清零")
+        self.assertTrue(anti_spam.allowed)
+
+    # ------------------------------------------------------------------
+    # T15 (#117 N6c) 真·仅在途：PolicyEngine + ReservationBook.reserve 后 evaluate，
+    #     messages / tokens 的 reset_at 非 None 且 > now（不依赖已落库事件）
+    # ------------------------------------------------------------------
+    def test_inflight_only_blocks_with_future_reset_at(self):
+        config = make_config(
+            rate_limit_messages=1,
+            platform_token_budget=100,
+            rate_limit_window_seconds=3600,
+            silent_hours_enabled=False,
+        )
+        clock = FixedClock()
+        store = UsageStore(max_events=0)
+        reservations = ReservationBook()
+        engine = PolicyEngine(
+            config, store, limit_store=None, now_fn=clock, reservations=reservations
+        )
+        now = clock()
+        # 预留 tokens=100 占满平台 token 预算（budget=100）+ 1 个消息名额（limit=1）
+        reservations.reserve(
+            persona_id="bot1", tokens=100, at=now, conversation_id="conv1"
+        )
+
+        decision = engine.evaluate(persona_id="bot1", text="hello", now=now)
+        checks = {c.key: c for c in decision.checks}
+        for key in ("messages.window", "tokens.window"):
+            check = checks.get(key)
+            self.assertIsNotNone(check, f"{key} missing")
+            self.assertFalse(check.allowed, f"{key} 应仅在途阻塞")
+            self.assertIsNotNone(check.reset_at, f"{key}.reset_at must not be None")
+            reset_dt = datetime.datetime.strptime(
+                check.reset_at, "%Y-%m-%dT%H:%M:%SZ"
+            ).replace(tzinfo=timezone.utc)
+            self.assertGreater(reset_dt, now, f"{key}.reset_at must be > now")
+
 
 if __name__ == "__main__":
     unittest.main()

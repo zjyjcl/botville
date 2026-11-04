@@ -257,11 +257,12 @@ class PolicyEngine:
         # B2.2 §6.3 冷却状态：与容量有界的事件表解耦（#117 B3/B5）。
         # - `_cooldowns[(persona, conv)]` = 首次触发 anti_spam.consecutive 的时刻；
         # - `_count_since[(persona, conv)]` = 冷却结束/人类消息之后的连续计数起点；
-        # - `_cooldown_notified` = 本次冷却是否已写过一条 blocked 事件（去重，防洪泛）。
+        # - `_blocked_recorded[(persona, conv, reason_code)]` = 该组合是否已写过
+        #   blocked 事件（**按 reason_code** 去重，防洪泛写放大挤掉计数事件，#117 B6）。
         self._state_lock = threading.Lock()
         self._cooldowns: "OrderedDict[Tuple[str, str], datetime]" = OrderedDict()
         self._count_since: "OrderedDict[Tuple[str, str], datetime]" = OrderedDict()
-        self._cooldown_notified: Dict[Tuple[str, str], bool] = {}
+        self._blocked_recorded: "OrderedDict[Tuple[str, str, str], bool]" = OrderedDict()
 
     # ------------------------------------------------------------------ API
     def evaluate(
@@ -275,7 +276,15 @@ class PolicyEngine:
         allow_deferred: bool = True,
         kind: str = "message",
         now: Optional[datetime] = None,
+        commit_state: bool = False,
     ) -> PolicyDecision:
+        """策略裁决。
+
+        `commit_state=False`（默认）为**只读预检**：不改任何冷却/计数状态，
+        只回答「若现在发送会怎样」（`/policy/evaluate` 走这条，#117 N4）。
+        `commit_state=True` 仅由 service 的实发路径（`_prepare_send`）传入：
+        冷却到期清零等状态变更才会落库（该调用在 `service._lock` 内）。
+        """
         now = now or self._now()
         # 计量取 max（B3）：客户端给的 token_estimate 只是**下限**，不能低于按
         # 正文估算的值；否则 `token_estimate: 0` 可以完全绕过 token 预算
@@ -406,6 +415,7 @@ class PolicyEngine:
                 conversation_id=conversation_id,
                 now=now,
                 effective=effective,
+                commit_state=commit_state,
             )
             if anti_spam is not None:
                 checks.append(anti_spam)
@@ -917,11 +927,11 @@ class PolicyEngine:
         return (persona_id, conversation_id)
 
     def _trim_state_locked(self) -> None:
-        """冷却/计数起点表按 max_usage_events 设上限（最旧优先淘汰）。"""
+        """冷却/计数起点/去重表按 max_usage_events 设上限（最旧优先淘汰，#117 N3）。"""
         limit = self._config.max_usage_events
         if limit <= 0:
             return
-        for book in (self._cooldowns, self._count_since):
+        for book in (self._cooldowns, self._count_since, self._blocked_recorded):
             while len(book) > limit:
                 book.popitem(last=False)
 
@@ -941,25 +951,59 @@ class PolicyEngine:
             self._cooldowns.move_to_end(key)
             # 冷却结束后的计数起点由冷却结束时决定，旧起点作废。
             self._count_since.pop(key, None)
-            self._cooldown_notified[key] = False
+            # 新冷却开始：清掉该 (persona,conv) 的所有 blocked 去重记录，
+            # 这样冷却期内的首次 blocked 会重新写一条事件。
+            for k in [k for k in self._blocked_recorded if k[:2] == key]:
+                del self._blocked_recorded[k]
             self._trim_state_locked()
+
+    def should_record_blocked(
+        self, persona_id: str, conversation_id: str, reason_code: Optional[str]
+    ) -> bool:
+        """同 (persona, conv, reason_code) 的 blocked 事件只在首次写一条（#117 B6）。
+
+        返回 True 表示应写 UsageEvent；之后的重试返回 False（不写），
+        防止被拒请求的写放大把计数事件挤出容量上限。`reason_code=None` 时
+        退化为按 (persona, conv, "") 去重。
+        """
+        key = self._anti_spam_key(persona_id, conversation_id)
+        rec_key = (key[0], key[1], reason_code or "")
+        with self._state_lock:
+            if self._blocked_recorded.get(rec_key):
+                return False
+            self._blocked_recorded[rec_key] = True
+            self._blocked_recorded.move_to_end(rec_key)
+            self._trim_state_locked()
+            return True
+
+    def clear_blocked_records(
+        self, persona_id: Optional[str], conversation_id: str
+    ) -> None:
+        """清掉该会话（或该 persona×会话）的全部 blocked 去重记录（#117 B6）。
+
+        成功 delivered（`_commit_send`）或 `record_human_message` 时调用：
+        计数事件已落库，后续若再进入 blocked 状态应允许重新写一条。
+        `persona_id=None` 表示清该会话下所有 persona 的记录（人类消息场景）。
+        """
+        with self._state_lock:
+            for k in [
+                k
+                for k in self._blocked_recorded
+                if k[1] == conversation_id
+                and (persona_id is None or k[0] == persona_id)
+            ]:
+                del self._blocked_recorded[k]
 
     def should_record_cooldown_block(
         self, persona_id: str, conversation_id: str
     ) -> bool:
         """冷却期内同 (persona, conversation) 的 blocked 事件只在首次写一条。
 
-        返回 True 表示应写 UsageEvent；之后的重试返回 False（不写），
-        避免被拒请求的写放大把计数事件挤出容量上限。
+        旧入口，保留以兼容现有调用点；新代码用 `should_record_blocked`。
         """
-        key = self._anti_spam_key(persona_id, conversation_id)
-        with self._state_lock:
-            if key not in self._cooldowns:
-                return True
-            if self._cooldown_notified.get(key):
-                return False
-            self._cooldown_notified[key] = True
-            return True
+        return self.should_record_blocked(
+            persona_id, conversation_id, CODE_ANTI_SPAM_COOLDOWN
+        )
 
     def _last_human_at(
         self, conversation_id: str, now: datetime
@@ -981,6 +1025,7 @@ class PolicyEngine:
         conversation_id: str,
         now: datetime,
         effective: Optional[EffectiveLimits],
+        commit_state: bool = False,
     ) -> Optional[PolicyCheck]:
         """防刷屏：同 persona、同会话连续 AI 消息数 + 冷却（B2.2 §6.3）。
 
@@ -990,7 +1035,11 @@ class PolicyEngine:
         进入冷却；冷却锚定首次触发时刻，冷却期内再请求 → blocked（cooldown），
         **不延长冷却**。冷却结束 → 连续数清零（以冷却结束时刻作为计数起点）。
         blocked 事件不计入连续数。
+
+        `commit_state=False`（预检）时只读：**不** pop `_cooldowns`、不写
+        `_count_since`，只按内存中已有状态推算「若现在发送会怎样」（#117 N4）。
         """
+
         if effective is None:
             return None
         max_item = self._limits_for(effective, "anti_spam.max_consecutive_ai_messages")
@@ -1010,9 +1059,10 @@ class PolicyEngine:
         human_at = self._last_human_at(conversation_id, now)
         if anchor is not None and human_at is not None and human_at > anchor:
             anchor = None
-            with self._state_lock:
-                self._cooldowns.pop(key, None)
-                self._cooldown_notified.pop(key, None)
+            if commit_state:
+                with self._state_lock:
+                    self._cooldowns.pop(key, None)
+                self.clear_blocked_records(persona_id, conversation_id)
             stored_since = human_at
 
         if anchor is not None:
@@ -1032,15 +1082,18 @@ class PolicyEngine:
                     code=CODE_ANTI_SPAM_COOLDOWN,
                     source_id=source_id,
                 )
-            # 冷却已结束（cooldown_seconds=0 时触发即结束）：计数起点 = 冷却结束
-            # 时刻。0 秒冷却取 now：触发那条之后的请求立刻重新从 0 起计，不活锁。
-            stored_since = now if cooldown_seconds <= 0 else cooldown_end
-            with self._state_lock:
-                self._cooldowns.pop(key, None)
-                self._cooldown_notified.pop(key, None)
-                self._count_since[key] = stored_since
-                self._count_since.move_to_end(key)
-                self._trim_state_locked()
+            # 冷却已结束（cooldown_seconds=0 时触发即结束）：计数起点 = 冷却**结束**
+            # 时刻（= anchor + cooldown_seconds）。0 秒冷却下即触发时刻本身，
+            # 不取 now：否则触发那条也会被算进下一周期，导致每周期放行 max+1 条
+            # （#117 N2）。
+            stored_since = cooldown_end
+            if commit_state:
+                with self._state_lock:
+                    self._cooldowns.pop(key, None)
+                    self._count_since[key] = stored_since
+                    self._count_since.move_to_end(key)
+                    self._trim_state_locked()
+                self.clear_blocked_records(persona_id, conversation_id)
 
         count_since = stored_since
         if human_at is not None and (

@@ -176,14 +176,17 @@ class UsageStore:
     def _evict_locked(
         self, retention_seconds: int = 0, *, now: Optional[datetime] = None
     ) -> None:
-        """超限时优先丢弃早于保留期的事件，容量仍超才按最旧淘汰（B2.2 #114-7 保留期）。
+        """超限时优先丢弃早于保留期的事件，容量仍超时优先丢 BLOCKED、再按最旧淘汰
+       （B2.2 #114-7 保留期 / #117 B6）。
 
         `retention_seconds > 0` 时先将早于 `now - retention_seconds` 的事件批量清除，
-        再检查容量；容量仍超时按最旧优先裁剪到 90% 上限（兜底至少留 1 条）。
-        `retention_seconds=0` 时退化为纯容量淘汰，与旧行为一致。
+        再检查容量。容量仍超时**优先丢弃最旧的 BLOCKED 事件**（保护作为计数来源的
+        SENT/DEFERRED/HUMAN），仍超才按最旧优先裁剪到 90% 上限（兜底至少留 1 条）。
+        `retention_seconds=0` 时退化为纯容量淘汰，优先级同上。
 
-        `now` 取**被 append 事件的时间**（service 注入的时钟），不读 `datetime.now()`：
-        注入/回放时钟下淘汰边界才不会失真（#117 B4）。
+        `now` 取**被 append 事件的时间**（service 注入的时钟，即事件 `recorded_at`），
+        不读 `datetime.now()`：注入/回放时钟下淘汰边界才不会失真（#117 B4 / N9）。
+        仅在未注入时钟且未传 `now` 的回退路径才读墙钟（生产不会触发）。
         """
         if self._max_events <= 0 and retention_seconds <= 0:
             return
@@ -198,6 +201,20 @@ class UsageStore:
         overflow = len(self._events) - self._max_events
         if overflow <= 0:
             return
+        # B6 (#117)：容量淘汰优先丢 BLOCKED（最旧优先），保护计数事件。
+        blocked_indices = [
+            i for i, e in enumerate(self._events) if e.kind == EventKind.BLOCKED
+        ]
+        if blocked_indices:
+            drop = min(overflow, len(blocked_indices))
+            drop_set = set(blocked_indices[:drop])
+            self._events = [
+                e for i, e in enumerate(self._events) if i not in drop_set
+            ]
+            overflow = len(self._events) - self._max_events
+        if overflow <= 0:
+            return
+        # 仍超：按最旧优先裁剪到 90% 上限（兜底至少留 1 条）。
         keep = max(1, int(self._max_events * 0.9))
         del self._events[: len(self._events) - keep]
 
