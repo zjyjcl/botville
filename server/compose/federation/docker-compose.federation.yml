@@ -102,10 +102,10 @@ services:
       PAIRING_HOST: 0.0.0.0
       PAIRING_PORT: "8090"
       # Verify the redeeming server really controls the server_name it
-      # claims (its /_matrix/key/v2/server must agree). $$ escapes compose
-      # interpolation; the template reaches the process verbatim.
+      # claims (its /_matrix/key/v2/server must agree). Python str.format placeholder;
+      # compose leaves braces alone, so it reaches the process verbatim.
       PAIRING_VERIFY_PEER_KEY: "true"
-      PAIRING_PEER_KEY_URL_TEMPLATE: "https://$${server_name}:8448/_matrix/key/v2/server"
+      PAIRING_PEER_KEY_URL_TEMPLATE: "https://{server_name}:8448/_matrix/key/v2/server"
       # CI-only: fedgate TLS is self-signed here. Never enable elsewhere.
       PAIRING_INSECURE_TLS: "true"
     ports:
@@ -133,7 +133,7 @@ services:
       PAIRING_HOST: 0.0.0.0
       PAIRING_PORT: "8090"
       PAIRING_VERIFY_PEER_KEY: "true"
-      PAIRING_PEER_KEY_URL_TEMPLATE: "https://$${server_name}:8448/_matrix/key/v2/server"
+      PAIRING_PEER_KEY_URL_TEMPLATE: "https://{server_name}:8448/_matrix/key/v2/server"
       PAIRING_INSECURE_TLS: "true"
     ports:
       - "127.0.0.1:18112:8090"
