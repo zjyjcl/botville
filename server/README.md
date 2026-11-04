@@ -3,7 +3,7 @@
 - Matrix 服务器部署：Synapse + Postgres，或 Tuwunel / continuwuity；Docker Compose profile 按模块启用
 - 只依赖标准 Client-Server、Application Service、Push Gateway 接口；CI 双服务器测试
 - Sygnal 推送网关 + APNs；appservice 注册 AI 账号命名空间
-- 仅配对联邦与扫码配对后端（可单方面切断）
+- 仅配对联邦与扫码配对后端（可单方面切断；入站闸门本地即刻生效，出站停止依赖通知对端）
 - 动态存储与可见范围、AI 关系存储与多 AI 群
 - 小镇状态服务（位置与状态同步、降频/关闭）、素材存储
 - 安装向导、升级与导出脚本
@@ -22,6 +22,8 @@ make restore RESTORE_DIR=backups/<时间戳>   # 破坏性恢复（自动 --yes�
 make e2e             # 验收：注册→私聊→建群；E2E_PHASE=verify 复核备份恢复
 make push-e2e        # 推送验收：HS→sygnal 时延 <5s（mock pushkin，需 PUSH=1 起栈）
 make appservice-e2e  # 验收：网关以 @ai_* 身份代发（A1.3；synapse/tuwunel）
+make federation-e2e  # 配对联邦验收（A2.1；独立 botville-fed 项目，双 Synapse + fedgate）
+make federation-down # 只销毁 botville-fed 项目（down -v）
 make logs            # 跟踪日志
 make ps              # 容器状态
 make down            # 停止（保留数据卷；手动 down -v 可清空）
@@ -121,11 +123,21 @@ server/
 │   │   ├── mock-app.yaml.part    # org.botville.mock（BOTVILLE_PUSH_MOCK，默认开）
 │   │   ├── apns-app.yaml.part    # APNs app 片段（APNs 启用且密钥就绪时追加）
 │   │   └── botville_mock_pushkin.py  # 自定义 pushkin：收通知写 JSONL
+│   ├── federation/               # 配对联邦测试栈（A2.1，独立项目 botville-fed）
+│   │   ├── docker-compose.federation.yml  # hs-a/hs-b 双 Synapse + pairing + fedgate
+│   │   └── generated/            # 运行时证书/配置/token，gitignore
 │   ├── secrets/                  # 真实 apns.p8 放这里（init.sh 建 700，gitignore，绝不入库）
 │   └── generated/                # 渲染产物 + mock 推送数据，gitignore（appservice/ 下 0600）
+├── pairing/                      # 配对联邦组件（A2.1，纯标准库；python -m pairing.service|fedgate）
+│   ├── store.py                  # SQLite：invites（一次性，仅存 sha256）/ peers / events 审计
+│   ├── service.py                # 配对 HTTP API（invite/redeem/accept/sever，限速，对端 key 校验）
+│   ├── fedgate.py                # 8448 反代闸门：X-Matrix origin ∈ active 配对表，否则 403
+│   └── tests/                    # 单测（无 Docker；python3 -m unittest discover -s server/pairing/tests）
 ├── scripts/
 │   ├── init.sh                   # .env 引导/补齐缺失键 + 模板渲染（含 sygnal）
 │   ├── render_push_denylist.py   # push denylist 渲染 + subnet/sygnal IP 校验（A1.2）
+│   ├── federation-certs.sh       # 联邦测试栈自签证书（运行时生成，gitignore，A2.1）
+│   ├── federation-setup.py       # 联邦测试栈 Synapse 配置 + admin token 渲染（A2.1）
 │   ├── bootstrap-continuwuity.sh # continuwuity 首启引导注册（标准 UIA，仅 CS API）
 │   ├── lib.sh                    # backup/restore 共享辅助函数
 │   ├── backup-synapse.sh         # DB dump + 数据卷归档 + manifest（A1.1）
@@ -135,6 +147,7 @@ server/
     ├── e2e_synapse.py            # seed/verify 两阶段验收测试（A1.1）
     ├── push_e2e.py               # 推送时延验收（HS→sygnal <5s，A1.2）
     ├── appservice_e2e.py         # appservice 代发验收（A1.3，复用 gateway/src）
+    ├── federation_e2e.py         # 配对联邦验收：未配对拒绝/配对互发/双向切断（A2.1）
     ├── test_bootstrap_continuwuity.py  # bootstrap/init 脚本 mock 单测（CI lint 跑）
     ├── test_push_sygnal.py       # mock pushkin + init.sh sygnal 渲染单测（A1.2）
     └── test_push_denylist.py     # push denylist 渲染/校验单测（A1.2 review B1）

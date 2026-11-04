@@ -8,6 +8,9 @@ backups/
 *.tar.gz
 # rendered by server/scripts/init.sh from .env + templates
 server/compose/generated/
+# generated at run time by federation-certs.sh / federation-setup.py (A2.1):
+# self-signed fedgate certs, throwaway Synapse configs, pairing admin tokens
+server/compose/federation/generated/
 *.pem
 *.key
 *.p8

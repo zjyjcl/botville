@@ -22,8 +22,16 @@
 #         identity; exclusive-namespace rejections asserted both ways.
 #         continuwuity has no file-based appservice registration yet and is
 #         not covered (see docs/deploy/appservice.md).
-# lint:   compose config for all three profiles, shellcheck, python syntax,
-#         stdlib unit tests for the bootstrap/init scripts (no Docker),
+# federation-e2e (A2.1): the standalone botville-fed compose project boots
+#         two Synapse instances (hs-a/hs-b), each behind its own fedgate
+#         gate + pairing service (server/pairing, python:3.12-slim with the
+#         stdlib-only source bind-mounted). federation_e2e.py proves:
+#         unpaired federation denied, pairing enables invite/join/messages
+#         both ways, and each side severing cuts traffic in both directions.
+#         Certs/configs/tokens are generated at run time (gitignored).
+# lint:   compose config for all three profiles (+ the federation stack),
+#         shellcheck, python syntax, stdlib unit tests for the bootstrap/
+#         init scripts and the pairing package (no Docker),
 #         notify/gateway contract validation, a guard that .env.example
 #         only ever contains placeholders, and a guard that every image
 #         defaults to tag@sha256 digest (no :latest) identically in compose
@@ -237,6 +245,32 @@ jobs:
             --env-file server/compose/.env --profile ${{ matrix.homeserver }} \
             down -v --remove-orphans
 
+  federation-e2e:
+    name: federation-e2e (synapse x2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Paired-federation e2e (pair, chat, sever both ways)
+        run: make federation-e2e
+
+      - name: Dump logs
+        if: failure()
+        run: |
+          if [ -f server/compose/federation/generated/federation.env ]; then
+            docker compose -p botville-fed \
+              -f server/compose/federation/docker-compose.federation.yml \
+              --env-file server/compose/federation/generated/federation.env \
+              logs --no-color
+          else
+            echo "federation.env missing (setup never ran); no logs yet"
+          fi
+
+      - name: Teardown
+        if: always()
+        run: make federation-down
+
   lint:
     name: lint
     runs-on: ubuntu-latest
@@ -247,13 +281,22 @@ jobs:
       - name: shellcheck scripts
         run: |
           shellcheck -x server/scripts/init.sh server/scripts/bootstrap-continuwuity.sh \
-            server/scripts/lib.sh server/scripts/backup-synapse.sh server/scripts/restore-synapse.sh
+            server/scripts/lib.sh server/scripts/backup-synapse.sh server/scripts/restore-synapse.sh \
+            server/scripts/federation-certs.sh
 
       - name: Python syntax
-        run: python3 -m py_compile server/tests/smoke.py server/tests/e2e_synapse.py server/tests/push_e2e.py server/tests/appservice_e2e.py server/scripts/render_push_denylist.py
+        run: |
+          python3 -m py_compile server/tests/smoke.py server/tests/e2e_synapse.py \
+            server/tests/push_e2e.py server/tests/appservice_e2e.py server/tests/federation_e2e.py \
+            server/scripts/render_push_denylist.py server/scripts/federation-setup.py \
+            server/pairing/__init__.py server/pairing/store.py server/pairing/service.py \
+            server/pairing/fedgate.py server/pairing/validate.py
 
       - name: Bootstrap/init script unit tests (stdlib mock, no Docker)
         run: python3 -m unittest discover -s server/tests -p "test_*.py" -v
+
+      - name: Pairing package unit tests (stdlib mock, no Docker)
+        run: python3 -m unittest discover -s server/pairing/tests -v
 
       - name: Notify examples + gateway contract validation
         run: |
@@ -276,6 +319,11 @@ jobs:
             docker compose -f server/compose/docker-compose.yml \
               --env-file server/compose/.env --profile "${hs}" --profile push config --quiet
           done
+          echo "== docker compose config (federation, A2.1)"
+          python3 server/scripts/federation-setup.py
+          docker compose -p botville-fed \
+            -f server/compose/federation/docker-compose.federation.yml \
+            --env-file server/compose/federation/generated/federation.env config --quiet
 
       - name: .env.example contains placeholders only
         run: |
