@@ -672,7 +672,9 @@ def build_server(
     cfg = config or load_config()
     if transport is None:
         transport = build_transport(cfg)
-    store = UsageStore(cfg.max_usage_events, cfg.usage_retention_seconds)
+    store = UsageStore(
+        cfg.max_usage_events, cfg.usage_retention_seconds, secret=cfg.hmac_secret
+    )
     limit_store = LimitStore(cfg)
     svc = GatewayService(cfg, transport, store, limit_store)
     return GatewayServer(cfg, svc, transport)

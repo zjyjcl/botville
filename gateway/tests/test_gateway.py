@@ -515,7 +515,7 @@ class TestConfig(unittest.TestCase):
             "SILENT_HOURS_START": "22:00",
             "SILENT_HOURS_END": "08:00",
             "GATEWAY_PORT": "9000",
-            "GATEWAY_AUTH_TOKEN": "a-strong-random-token",
+            "GATEWAY_HMAC_SECRET": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "GATEWAY_AUTH_TOKEN": "a-strong-random-token",
         }
         cfg = load_config(env)
         self.assertEqual(cfg.rate_limit_messages, 10)
@@ -530,20 +530,20 @@ class TestConfig(unittest.TestCase):
     def test_port_out_of_range_raises(self):
         # 建议 9: GATEWAY_PORT 0–65535 校验
         with self.assertRaises(ConfigError):
-            load_config({"GATEWAY_PORT": "70000", "GATEWAY_AUTH_TOKEN": "t"})
+            load_config({"GATEWAY_PORT": "70000", "GATEWAY_HMAC_SECRET": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "GATEWAY_AUTH_TOKEN": "t"})
         with self.assertRaises(ConfigError):
-            load_config({"GATEWAY_PORT": "0", "GATEWAY_AUTH_TOKEN": "t"})
+            load_config({"GATEWAY_PORT": "0", "GATEWAY_HMAC_SECRET": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "GATEWAY_AUTH_TOKEN": "t"})
 
     def test_unknown_timezone_raises(self):
         with self.assertRaises(Exception):
-            load_config({"SILENT_HOURS_TIMEZONE": "Not/A_Real_Zone", "GATEWAY_AUTH_TOKEN": "t"})
+            load_config({"SILENT_HOURS_TIMEZONE": "Not/A_Real_Zone", "GATEWAY_HMAC_SECRET": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "GATEWAY_AUTH_TOKEN": "t"})
 
     def test_change_me_token_rejected_without_dev_mode(self):
         """建议7: <change-me> 必须拒绝启动，即使显式设置也当未配置。"""
         with self.assertRaises(ConfigError):
-            load_config({"GATEWAY_AUTH_TOKEN": "<change-me>"})
+            load_config({"GATEWAY_HMAC_SECRET": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "GATEWAY_AUTH_TOKEN": "<change-me>"})
         with self.assertRaises(ConfigError):
-            load_config({"GATEWAY_AUTH_TOKEN": ""})
+            load_config({"GATEWAY_HMAC_SECRET": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "GATEWAY_AUTH_TOKEN": ""})
 
     def test_dev_mode_allows_no_token(self):
         """建议7: 显式 dev 模式可免鉴权启动。"""
@@ -553,7 +553,7 @@ class TestConfig(unittest.TestCase):
 
     def test_real_token_overrides_dev_mode(self):
         """设置真实 token 永远优先于 dev 模式。"""
-        cfg = load_config({"GATEWAY_DEV_MODE": "true", "GATEWAY_AUTH_TOKEN": "real-token-xyz"})
+        cfg = load_config({"GATEWAY_DEV_MODE": "true", "GATEWAY_HMAC_SECRET": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "GATEWAY_AUTH_TOKEN": "real-token-xyz"})
         self.assertEqual(cfg.auth_token, "real-token-xyz")
         self.assertTrue(cfg.dev_mode)
 
@@ -573,7 +573,7 @@ class TestConfig(unittest.TestCase):
     def test_non_dev_mode_may_bind_any_host(self):
         """#92: 非 dev 模式（有真实 token）不受 loopback 限制——否则生产无法对外监听。"""
         cfg = load_config(
-            {"GATEWAY_HOST": "0.0.0.0", "GATEWAY_AUTH_TOKEN": "a-strong-random-token"}
+            {"GATEWAY_HOST": "0.0.0.0", "GATEWAY_HMAC_SECRET": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "GATEWAY_AUTH_TOKEN": "a-strong-random-token"}
         )
         self.assertFalse(cfg.dev_mode)
         self.assertEqual(cfg.host, "0.0.0.0")
@@ -704,6 +704,7 @@ class TestHttpServer(unittest.TestCase):
             rate_limit_messages=60,
             silent_hours_enabled=False,  # 让 HTTP 测试不受当前真实时刻影响
             auth_token=None,
+            hmac_secret=b"test-hmac-secret" * 2,
         )
         base.update(overrides)
         return Config(**base)

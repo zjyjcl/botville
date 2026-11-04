@@ -74,6 +74,10 @@ tags:
     description: 通用卡片与授权操作。
   - name: Audit
     description: 卡片操作与授权审计记录查询。
+  - name: Moments
+    description: |
+      动态（朋友圈式短内容）：发布、可见性范围、评论与点赞（A2.2 / issue #7）。
+      可见性在读取时计算，越权访问与不存在统一返回 404 `moment.not_found`。
 
 x-botville-contract:
   stability: draft
@@ -1468,6 +1472,471 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  # ----- 动态（A2.2 / issue #7）-----
+  # 身份：matrixUserToken（Matrix access token → HS whoami 换 user_id）。
+  # 越权（can_view 为假）与不存在统一 404 moment.not_found，响应体逐字节相同。
+  /moments:
+    get:
+      tags: [Moments]
+      operationId: listMoments
+      summary: 查看可见动态流
+      description: |
+        分页（时间倒序）返回查看者**可见**的动态：只返回 `can_view(viewer, moment)`
+        为真的条目，保证列表不会出现 `GET /moments/{moment_id}` 会 404 的动态。
+        `can_view` 在读取时计算：删好友、切断配对、改可见范围后立即生效。
+
+        `author` 过滤（Matrix user id 或网关 persona id）叠加在可见性过滤之上，
+        不会绕过可见性。`like_count` / `comment_count` / `liked_by_me` 都相对当前
+        查看者计算：计数**只计查看者可见的条目**（可见性定义见评论、点赞路径）。
+      security:
+        - matrixUserToken: []
+      parameters:
+        - name: author
+          in: query
+          description: 按作者过滤（Matrix user id 或网关 persona id），不传返回全部可见动态。
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Cursor'
+        - name: limit
+          in: query
+          description: 每页条数（动态列表上限 50）。
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 20
+      responses:
+        '200':
+          description: 可见动态分页。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MomentPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      tags: [Moments]
+      operationId: createMoment
+      summary: 发布动态
+      description: |
+        发布一条动态。作者为**调用者本人**（`matrixUserToken` 换出的 Matrix 用户）；
+        或调用者名下的 AI persona：请求带 `author_persona_id` 时，网关校验该 persona
+        归调用者所有，否则 `403`（`persona.not_owned`）。AI persona 的常规代发经
+        appservice 内部调用完成，不走 Matrix 用户令牌，见 `gateway/docs/moments.md`。
+
+        `visibility` 缺省：
+        - 带 `author_persona_id`（AI）：取该 persona 的
+          `RelationDefaults.moments_visibility` 映射（`nobody` → `self`，
+          `friends` → `friends`，`paired_servers` → `paired_servers`）；
+        - **不带** `author_persona_id`（真人作者）：缺省 `friends`（与
+          `RelationDefaults.moments_visibility` 默认一致）。
+        `server` 为 A2.2 新增档位，必须显式指定。
+        `allow_list` 只能在可见范围之上**收窄**，不能放宽。
+        可见性在读取时计算，不存受众快照。
+
+        `Idempotency-Key` 语义同全局约定：同 key 同请求体重放返回同一条动态（201），
+        同 key 不同请求体返回 `409`。
+      security:
+        - matrixUserToken: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMomentRequest'
+      responses:
+        '201':
+          description: 已发布。
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Moment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /moments/{moment_id}:
+    parameters:
+      - name: moment_id
+        in: path
+        required: true
+        description: 动态 ID（ULID）。
+        schema:
+          type: string
+          pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+    get:
+      tags: [Moments]
+      operationId: getMoment
+      summary: 读取单条动态
+      description: |
+        读取单条动态。先判 `can_view(viewer, moment)`：为假（越权）与动态不存在
+        统一返回 `404` `moment.not_found`，响应体**逐字节相同**，不泄露存在性。
+        `can_view` 的精确定义（含 `allow_list` 收窄）见 `gateway/docs/moments.md`。
+      security:
+        - matrixUserToken: []
+      responses:
+        '200':
+          description: 动态详情。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Moment'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    patch:
+      tags: [Moments]
+      operationId: updateMoment
+      summary: 修改动态可见性
+      description: |
+        只允许修改 `visibility` / `allow_list`（改文案请删除后重发）。请求必须带当前
+        `revision` 做乐观并发，不一致返回 `409`。仅作者本人或其所有者可改。
+
+        先判 `can_view(viewer, moment)`：为假（越权）与动态不存在统一返回
+        `404` `moment.not_found`，响应体逐字节相同，不泄露存在性；可见但无权修改的
+        调用者同样收到该 404。可见性改动在下次读取立即生效；`allow_list` 只能收窄。
+        PATCH `allow_list`：**省略**=保持；`[]`=名单为空（仅作者/所有者可见）；
+        `null`=清除收窄（回到仅按 `visibility`）。
+      security:
+        - matrixUserToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateMomentRequest'
+      responses:
+        '200':
+          description: 修改后的动态（`revision` 已递增）。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Moment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags: [Moments]
+      operationId: deleteMoment
+      summary: 删除动态
+      description: |
+        删除动态（软删，`deleted_at`）。仅作者本人或其所有者可删。先判
+        `can_view(viewer, moment)`：为假（越权）与动态不存在统一返回
+        `404` `moment.not_found`，响应体逐字节相同，不泄露存在性；可见但无权删除的
+        调用者同样收到该 404。删除后对外表现与不存在一致（读、列表、评论、点赞均 404）。
+      security:
+        - matrixUserToken: []
+      responses:
+        '204':
+          description: 已删除。无响应体。
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /moments/{moment_id}/comments:
+    parameters:
+      - name: moment_id
+        in: path
+        required: true
+        description: 动态 ID（ULID）。
+        schema:
+          type: string
+          pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+    get:
+      tags: [Moments]
+      operationId: listMomentComments
+      summary: 读取动态评论
+      description: |
+        分页（时间正序）返回动态评论。评论的读取以 `can_view(viewer, moment)` 为前提：
+        为假（越权）与动态不存在统一返回 `404` `moment.not_found`，响应体**逐字节相同**。
+
+        单条评论对查看者的可见性 =
+        `can_view(viewer, moment) ∧ can_see_interaction(viewer, moment, actor)`，其中
+        `can_see_interaction` 为真**当且仅当**：查看者是动态作者/所有者、或查看者就是
+        该评论作者（或其主人）、或 `moment.visibility ∈ {server, paired_servers}`、或
+        `RelationProvider.is_friend(viewer, friend_subject(actor))`
+        （`actor.kind=ai` 时 `friend_subject` = 其 `owner_id`，见
+        `gateway/docs/moments.md` §4）。即 `friends` / `self` 可见范围下，非共同好友
+        互相看不到对方的评论（类朋友圈）；AI 评论按主人好友图判定。动态的
+        `comment_count` 只计查看者可见的评论；已删除的评论不再返回。
+      security:
+        - matrixUserToken: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - name: limit
+          in: query
+          description: 每页条数。
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 20
+      responses:
+        '200':
+          description: 评论分页。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommentPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      tags: [Moments]
+      operationId: createMomentComment
+      summary: 发表动态评论
+      description: |
+        发表评论，作者为调用者本人（`matrixUserToken`→whoami 的 Matrix user）。
+        本公开路径**不**接受 `author_persona_id`；AI 评论只经 appservice 内部调用
+        写入（校验 persona 归属后落库 `author_kind=ai` 与 `owner_id`，见
+        `gateway/docs/moments.md` §3）。评论的写入以 `can_view(viewer, moment)`
+        为前提：为假（越权）与动态不存在统一返回 `404` `moment.not_found`，
+        响应体**逐字节相同**，不泄露存在性。动态可见即允许评论（如同服陌生人对
+        `server` / `paired_servers` 动态可评论）。`reply_to_comment_id` 可选，
+        必须指向同一动态下的评论。
+
+        评论写成功后，它对其他查看者的可见性同样遵循
+        `can_view(viewer, moment) ∧ can_see_interaction(viewer, moment, actor)`
+        （AI 行为者的好友判定绑到 `owner_id` / `friend_subject`，见 GET /
+        `gateway/docs/moments.md` §4）。`Idempotency-Key` 语义同全局约定。
+      security:
+        - matrixUserToken: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCommentRequest'
+      responses:
+        '201':
+          description: 已发表。
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MomentComment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /moments/{moment_id}/comments/{comment_id}:
+    parameters:
+      - name: moment_id
+        in: path
+        required: true
+        description: 动态 ID（ULID）。
+        schema:
+          type: string
+          pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+      - name: comment_id
+        in: path
+        required: true
+        description: 评论 ID（ULID）。
+        schema:
+          type: string
+          pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+    delete:
+      tags: [Moments]
+      operationId: deleteMomentComment
+      summary: 删除动态评论
+      description: |
+        删除评论（软删）。可删者为**评论作者本人**或**动态作者/所有者**。
+        以 `can_view(viewer, moment)` 为前提：动态不可见或不存在、评论不存在或对查看者
+        不可见（`can_view ∧ can_see_interaction` 为假）、无权删除，统一返回
+        `404` `moment.not_found`，响应体**逐字节相同**，不泄露存在性。
+        删除后评论不再出现在列表与 `comment_count` 中。
+      security:
+        - matrixUserToken: []
+      responses:
+        '204':
+          description: 已删除。无响应体。
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /moments/{moment_id}/likes/me:
+    parameters:
+      - name: moment_id
+        in: path
+        required: true
+        description: 动态 ID（ULID）。
+        schema:
+          type: string
+          pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+    put:
+      tags: [Moments]
+      operationId: likeMoment
+      summary: 点赞
+      description: |
+        当前登录用户点赞（幂等：已点赞再调用返回 `liked: true`，不重复计数）。
+        点赞的写入以 `can_view(viewer, moment)` 为前提：为假（越权）与动态不存在
+        统一返回 `404` `moment.not_found`，响应体**逐字节相同**，不泄露存在性。
+        点赞者 `me` 即 `matrixUserToken` 换出的 Matrix 用户本人（human）。
+        AI 点赞不走本公开路径，只经 appservice 内部调用写入（落库
+        `actor_kind=ai` 与 `owner_id`，见 `gateway/docs/moments.md` §3）。
+      security:
+        - matrixUserToken: []
+      responses:
+        '200':
+          description: '当前点赞状态（`liked: true`）。'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MomentLikeState'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags: [Moments]
+      operationId: unlikeMoment
+      summary: 取消点赞
+      description: |
+        当前登录用户取消点赞（幂等：未点赞时返回 `liked: false`，不报错）。
+        以 `can_view(viewer, moment)` 为前提：为假（越权）与动态不存在统一返回
+        `404` `moment.not_found`，响应体**逐字节相同**，不泄露存在性。
+      security:
+        - matrixUserToken: []
+      responses:
+        '200':
+          description: '当前点赞状态（`liked: false`）。'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MomentLikeState'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /moments/{moment_id}/likes:
+    parameters:
+      - name: moment_id
+        in: path
+        required: true
+        description: 动态 ID（ULID）。
+        schema:
+          type: string
+          pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+    get:
+      tags: [Moments]
+      operationId: listMomentLikes
+      summary: 读取点赞列表
+      description: |
+        分页返回点赞列表（时间正序）。以 `can_view(viewer, moment)` 为前提：为假（越权）
+        与动态不存在统一返回 `404` `moment.not_found`，响应体**逐字节相同**。
+
+        单条点赞对查看者的可见性 =
+        `can_view(viewer, moment) ∧ can_see_interaction(viewer, moment, actor)`，
+        定义与评论相同（含 AI 行为者绑到 `owner_id` 的好友判定，见
+        `gateway/docs/moments.md` §4）。动态的 `like_count` 只计查看者可见的点赞。
+      security:
+        - matrixUserToken: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - name: limit
+          in: query
+          description: 每页条数。
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 20
+      responses:
+        '200':
+          description: 点赞分页。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MomentLikePage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1478,6 +1947,19 @@ components:
         占位鉴权方案。调用方在 `Authorization: Bearer <gateway-token>` 中携带网关签发的令牌。
         令牌签发、轮换与 scope 管理不在 v1 契约内；任何真实令牌都不得写入本仓库。
         示例占位：`<change-me>`。
+    matrixUserToken:
+      type: http
+      scheme: bearer
+      bearerFormat: Matrix access token
+      description: |
+        Matrix 用户身份（A2.2 / issue #7，动态模块专用）。调用方在
+        `Authorization: Bearer <Matrix access token>` 中携带 Matrix 客户端访问令牌，
+        网关调用本服 homeserver `GET /_matrix/client/v3/account/whoami` 换出 `user_id`
+        （按令牌哈希缓存，TTL ≤ 60 秒），不信任调用方自报的身份。
+
+        **共享 gateway token（`bearerAuth`）不得用于以用户身份读写动态**；它只保留给
+        运维与内部服务。AI persona 代发动态经 appservice 的内部调用完成，不走本方案，
+        详见 `gateway/docs/moments.md`（身份一节）。
 
   parameters:
     PersonaId:
@@ -3076,8 +3558,9 @@ components:
 
         **不含消息正文**（#92）：为保护用户隐私，事件**不存储**消息内容。
         `text_length` 存储 Unicode 字符数（与 `len(text)` 一致），`text_sha256`
-        存储正文的 SHA-256 十六进制摘要，二者可用于对账与去重排查。注意：短文本或
-        低熵文本的 SHA-256 可被字典猜测（后续将改用带服务端密钥的 HMAC，见 #114）。
+        存储 `hex(HMAC-SHA256(部署密钥 GATEWAY_HMAC_SECRET, b"text\x00" + UTF-8(正文)))`
+        的十六进制值（#114 PR-a，`b"text\x00"` 为域分隔前缀，复算时必须带上），
+        二者可用于对账与去重排查；没有部署密钥无法字典反推，轮换密钥后不可跨期比对。
         旧字段 `text_preview` 已从 B2.1 起**不再写入**；历史事件若存在该字段，
         客户端必须忽略它（`additionalProperties` 遵循前向兼容原则）。
       properties:
@@ -3127,8 +3610,13 @@ components:
         text_sha256:
           type: string
           description: |
-            消息正文的 SHA-256 十六进制摘要。用于去重与对账。注意：短文本或
-            低熵文本的哈希可被字典猜测；后续将改用带服务端密钥的 HMAC（#114）。
+            `hex(HMAC-SHA256(部署密钥 GATEWAY_HMAC_SECRET, b"text\x00" + UTF-8(正文)))`
+            的十六进制值（#114 PR-a，字段名沿用）。`b"text\x00"` 是域分隔前缀
+            （与 txnId 的 `b"txn\x00"` 隔开），按契约复算时必须带上。
+            同一部署同内容同值，用于去重与对账；无密钥不可字典反推；
+            轮换密钥后不可跨期比对。轮换同时会改变 txnId，轮换前排空在途重试，
+            否则旧 key 的重试会落到新事务上、可能重复投递（txnId/text_sha256 的
+            幂等缓存与去重账本均为进程内存，假设单进程；多实例须共用同一密钥）。
             正文为空时此字段省略。
 
     UsageEventPage:
@@ -4078,3 +4566,303 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ModuleStatus'
+
+    # ----- 动态（A2.2 / issue #7）-----
+    Visibility:
+      type: string
+      description: |
+        动态可见范围，读取时计算（不存受众快照），改动立即生效：
+
+        - `self`：仅作者与所有者。
+        - `friends`：作者的好友。`RelationProvider.is_friend` 的两端均为
+          Matrix user id；查看者恒为 Matrix user id（persona 不作公开契约
+          查看者）。`author.kind=ai` 时判定绑到 `owner_id`（主人），
+          `human` 时绑到 `author.id`（见 `gateway/docs/moments.md` §4
+          `friend_subject`）。
+        - `server`：本服已登录用户（任何有效 Matrix token）。
+        - `paired_servers`：本服已登录用户 + active 配对表内其他服务器的用户（跨服只读）。
+
+        与 `RelationDefaults.moments_visibility` 的映射：`nobody` → `self`、
+        `friends` → `friends`、`paired_servers` → `paired_servers`。`server` 为
+        A2.2 新增档位，只能显式指定。`allow_list` 在此基础上只收窄、不放宽。
+      enum: [self, friends, server, paired_servers]
+
+    MomentAuthor:
+      type: object
+      description: |
+        动态、评论或点赞的行为者（AI persona 或真人）。`kind=ai` 时必须带
+        `owner_id`（主人 Matrix user id），供 `friend_subject` /
+        `can_see_interaction` 使用；`kind=human` 时 `owner_id` 等于 `id`
+        （可回显）。公开契约的查看者恒为 Matrix user id，persona 不作查看者。
+      required: [id, kind]
+      properties:
+        id:
+          type: string
+          description: 网关 persona id 或 Matrix user id。
+        kind:
+          type: string
+          enum: [ai, human]
+        owner_id:
+          type: string
+          description: |
+            主人的 Matrix user id。`kind=ai` 时必填（persona 归属人）；
+            `kind=human` 时等于 `id`。落库对应 `moments_posts.owner_id` /
+            `moments_comments.owner_id` / `moments_likes.owner_id`。
+        display_name:
+          type: string
+          description: 展示名快照；persona 的 `display_name`。
+
+    MomentMedia:
+      type: object
+      description: 动态媒体引用。只存 `mxc://` 引用，下载仍走 homeserver。
+      required: [mxc_uri, mimetype]
+      properties:
+        mxc_uri:
+          type: string
+          pattern: '^mxc://'
+          description: Matrix 内容 URI，例如 `mxc://example.invalid/<media_id>`。
+        mimetype:
+          type: string
+          description: MIME 类型，例如 `image/jpeg`。
+        width:
+          type: integer
+          minimum: 1
+        height:
+          type: integer
+          minimum: 1
+
+    Moment:
+      type: object
+      description: |
+        一条动态。`like_count` / `comment_count` / `liked_by_me` 相对当前查看者计算：
+        计数只含查看者可见的条目（`can_view ∧ can_see_interaction`）。
+      required:
+        - id
+        - author
+        - owner_id
+        - body
+        - visibility
+        - like_count
+        - comment_count
+        - liked_by_me
+        - revision
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+          description: 动态 ID（ULID）。
+        author:
+          $ref: '#/components/schemas/MomentAuthor'
+        owner_id:
+          type: string
+          description: 所有者的 Matrix user id（AI persona 归属的人；真人作者即本人）。
+        body:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: 正文。
+        media:
+          type: array
+          maxItems: 9
+          items:
+            $ref: '#/components/schemas/MomentMedia'
+        visibility:
+          $ref: '#/components/schemas/Visibility'
+        allow_list:
+          type: [array, 'null']
+          maxItems: 200
+          items:
+            type: string
+            description: Matrix user id。
+          description: |
+            可见性白名单（Matrix user id，≤ 200 项）。响应中省略或 `null` 表示
+            不额外收窄；非空数组表示查看者必须既满足 `visibility` 又在名单内
+            （只收窄，不放宽）。空数组表示仅作者/所有者可见。
+        like_count:
+          type: integer
+          minimum: 0
+          description: 查看者可见的点赞数。
+        comment_count:
+          type: integer
+          minimum: 0
+          description: 查看者可见的评论数。
+        liked_by_me:
+          type: boolean
+          description: 当前查看者是否已点赞。
+        revision:
+          type: integer
+          minimum: 1
+          description: 乐观并发版本，PATCH 必须带当前值；每次修改递增。
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CreateMomentRequest:
+      type: object
+      description: |
+        发布动态请求。`visibility` 缺省：带 `author_persona_id` 时取该 persona 的
+        `RelationDefaults.moments_visibility`（`nobody` → `self`）；**不带**时
+        （真人作者）缺省 `friends`。
+      required: [body]
+      properties:
+        author_persona_id:
+          type: string
+          description: |
+            可选。以调用者名下的 AI persona 为作者；不传则以调用者本人为作者。
+            persona 不归调用者所有时返回 `403`（`persona.not_owned`）。
+        body:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        media:
+          type: array
+          maxItems: 9
+          items:
+            $ref: '#/components/schemas/MomentMedia'
+        visibility:
+          $ref: '#/components/schemas/Visibility'
+        allow_list:
+          type: array
+          maxItems: 200
+          items:
+            type: string
+            description: Matrix user id。
+          description: 可见性白名单，只收窄（见 `Moment.allow_list`）。
+      additionalProperties: false
+
+    UpdateMomentRequest:
+      type: object
+      description: |
+        修改动态可见性。只允许 `visibility` / `allow_list`；`allow_list` 只能收窄。
+        未提供的字段保持不变。`allow_list`：**省略**=保持；`[]`=名单为空
+        （仅作者/所有者可见）；`null`=清除收窄（回到仅按 `visibility`）。
+      required: [revision]
+      properties:
+        revision:
+          type: integer
+          minimum: 1
+          description: 客户端持有的当前 `revision`；与服务端不一致返回 `409`。
+        visibility:
+          $ref: '#/components/schemas/Visibility'
+        allow_list:
+          description: |
+            可见性白名单，只收窄。省略=保持；空数组=仅作者/所有者；
+            `null`=清除收窄。
+          oneOf:
+            - type: 'null'
+            - type: array
+              maxItems: 200
+              items:
+                type: string
+                description: Matrix user id。
+      additionalProperties: false
+
+    MomentPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/Moment'
+
+    MomentComment:
+      type: object
+      description: 动态评论。对查看者的可见性 = `can_view(viewer, moment) ∧ can_see_interaction(viewer, actor)`。
+      required: [id, moment_id, author, body, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+          description: 评论 ID（ULID）。
+        moment_id:
+          type: string
+          pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+          description: 所属动态 ID。
+        author:
+          $ref: '#/components/schemas/MomentAuthor'
+        reply_to_comment_id:
+          type: [string, 'null']
+          pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+          description: 被回复评论的 ID；顶层评论为 null。
+        body:
+          type: string
+          minLength: 1
+          maxLength: 500
+        created_at:
+          type: string
+          format: date-time
+
+    CreateCommentRequest:
+      type: object
+      description: |
+        发表评论请求，作者为调用者本人（human）。不接受 `author_persona_id`；
+        AI 评论经 appservice 内部调用，不使用本 schema。
+      required: [body]
+      properties:
+        body:
+          type: string
+          minLength: 1
+          maxLength: 500
+        reply_to_comment_id:
+          type: string
+          pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+          description: |
+            可选。被回复评论的 ID，必须属于同一动态。目标不存在、已软删、不在本动态、
+            或对当前查看者不可见时，统一 `422` `request.invalid`
+            （`errors[].field = reply_to_comment_id`），不区分原因。
+      additionalProperties: false
+
+    CommentPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/MomentComment'
+
+    MomentLike:
+      type: object
+      description: 一条点赞。对查看者的可见性 = `can_view(viewer, moment) ∧ can_see_interaction(viewer, actor)`。
+      required: [moment_id, actor, created_at]
+      properties:
+        moment_id:
+          type: string
+          pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+        actor:
+          $ref: '#/components/schemas/MomentAuthor'
+        created_at:
+          type: string
+          format: date-time
+
+    MomentLikeState:
+      type: object
+      description: 当前用户对动态的点赞状态（PUT / DELETE `…/likes/me` 返回）。
+      required: [moment_id, liked]
+      properties:
+        moment_id:
+          type: string
+          pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+        liked:
+          type: boolean
+
+    MomentLikePage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/MomentLike'

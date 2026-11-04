@@ -11,13 +11,20 @@
   批量裁剪（一次裁到 90% 上限），避免每条事件都触发列表整体移动。
 
 隐私（#92 / 契约 `UsageEvent`）：事件**不保存消息正文**。只保存
-`text_length`（字符数）与 `text_sha256`（正文摘要），既能对账（同内容同 hash），
-又不会把用户内容落进审计日志。
+`text_length`（字符数）与 `text_sha256`（正文摘要），既能对账，又不会把用户
+内容落进审计日志。
+
+**#114 PR-a：`text_sha256` 改为 HMAC-SHA256(部署密钥, 正文)**。裸 SHA-256 的
+短/低熵文本可被字典反推；HMAC 让没有密钥的一方无法离线猜测。字段名保持不变
+（契约兼容），同一部署同内容仍同值可对账；轮换密钥后不可跨期比对。未传密钥
+（直接构造 `UsageEvent` 的测试路径）退回裸 SHA-256，生产路径由 `build_server`
+注入 `Config.hmac_secret`。
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import threading
 import uuid
 from dataclasses import dataclass
@@ -55,11 +62,19 @@ KIND_TO_CONTRACT: Dict[EventKind, str] = {
 }
 
 
-def text_digest(text: str) -> str:
-    """正文摘要（SHA-256 十六进制）。空正文返回空串，避免把空串伪装成可对账 hash。"""
+def text_digest(text: str, secret: Optional[bytes] = None) -> str:
+    """正文摘要：有部署密钥时 `HMAC-SHA256(secret, b"text\\x00" + text)`。
+
+    空正文返回空串，避免把空串伪装成可对账 hash。未传 `secret` 时退回裸
+    SHA-256（仅为直接构造事件的测试路径保留；生产由 `UsageStore` 注入密钥）。
+    `b"text\\x00"` 是与 service 的 txnId（`b"txn\\x00"`）区分的域分隔前缀。
+    """
     if not text:
         return ""
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    payload = text.encode("utf-8")
+    if secret is None:
+        return hashlib.sha256(payload).hexdigest()
+    return hmac.new(secret, b"text\x00" + payload, hashlib.sha256).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -67,7 +82,8 @@ class UsageEvent:
     """单条用量/审计记录。字段名对齐契约 `usage_events` 约定。
 
     **不存正文**：`text_length` + `text_sha256` 足够对账与去重排查，
-    且不会把用户消息内容写进用量账单（#92）。
+    且不会把用户消息内容写进用量账单（#92）。`text_sha256` 自 #114 PR-a 起
+    是 HMAC-SHA256(部署密钥, 正文)（字段名不变，契约兼容）。
     """
 
     id: str
@@ -106,11 +122,14 @@ class UsageEvent:
         tokens_out: int = 0,
         town_tokens: int = 0,
         peer_id: Optional[str] = None,
+        secret: Optional[bytes] = None,
     ) -> "UsageEvent":
         """构造事件。`at` 由调用方传入服务时钟，保证与策略评估用同一个 now。
 
         不要在内部直接读 `datetime.now()`：那样注入的时钟（测试、回放）会与
         事件时间戳脱节，滑动窗口判断随之失真。
+
+        `secret` 是部署密钥（#114 PR-a）：省略时退回裸 SHA-256（测试兼容）。
         """
         return UsageEvent(
             id=f"evt_{uuid.uuid4().hex}",
@@ -119,7 +138,7 @@ class UsageEvent:
             conversation_id=conversation_id,
             reason_code=reason_code,
             text_length=len(text or ""),
-            text_sha256=text_digest(text or ""),
+            text_sha256=text_digest(text or "", secret),
             recorded_at=at or datetime.now(timezone.utc),
             tokens_in=tokens_in,
             tokens_out=tokens_out,
@@ -141,6 +160,7 @@ class UsageStore:
         retention_seconds: int = 0,
         *,
         now_fn=None,
+        secret: Optional[bytes] = None,
     ) -> None:
         if max_events < 0:
             raise ValueError("max_events must be >= 0")
@@ -150,7 +170,13 @@ class UsageStore:
         self._max_events = max_events
         self._retention_seconds = retention_seconds
         self._now = now_fn
+        # #114 PR-a：正文摘要用的部署密钥（Config.hmac_secret）；None 退回裸 SHA-256。
+        self._secret = secret
         self._lock = threading.Lock()
+
+    @property
+    def secret(self) -> Optional[bytes]:
+        return self._secret
 
     @property
     def max_events(self) -> int:

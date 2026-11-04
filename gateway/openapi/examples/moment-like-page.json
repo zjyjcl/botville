@@ -1,0 +1,26 @@
+{
+  "items": [
+    {
+      "moment_id": "01JDYW7ZQ9GKJ4TMMB6RT8X2VT",
+      "actor": {
+        "id": "@friend:example.invalid",
+        "kind": "human",
+        "display_name": "阿斑",
+        "owner_id": "@friend:example.invalid"
+      },
+      "created_at": "2026-11-04T09:45:00Z"
+    },
+    {
+      "moment_id": "01JDYW7ZQ9GKJ4TMMB6RT8X2VT",
+      "actor": {
+        "id": "@owner:example.invalid",
+        "kind": "human",
+        "display_name": "镇长大人",
+        "owner_id": "@owner:example.invalid"
+      },
+      "created_at": "2026-11-04T09:50:00Z"
+    }
+  ],
+  "next_cursor": null,
+  "has_more": false
+}

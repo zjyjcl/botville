@@ -127,12 +127,12 @@ class TestConfigEdge(unittest.TestCase):
 
     def test_env_bool_falsey_values(self):
         for val in ("0", "false", "no", "off"):
-            cfg = load_config({"GATEWAY_DEV_MODE": val, "GATEWAY_AUTH_TOKEN": "t"})
+            cfg = load_config({"GATEWAY_DEV_MODE": val, "GATEWAY_HMAC_SECRET": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "GATEWAY_AUTH_TOKEN": "t"})
             self.assertFalse(cfg.dev_mode, val)
 
     def test_silent_start_bad_format_raises(self):
         with self.assertRaises(ConfigError):
-            load_config({"GATEWAY_AUTH_TOKEN": "t", "SILENT_HOURS_START": "25:99"})
+            load_config({"GATEWAY_HMAC_SECRET": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "GATEWAY_AUTH_TOKEN": "t", "SILENT_HOURS_START": "25:99"})
 
     def test_rate_limit_negative_raises(self):
         with self.assertRaises(ConfigError):
@@ -144,7 +144,7 @@ class TestConfigEdge(unittest.TestCase):
 
     def test_port_zero_rejected_via_env(self):
         with self.assertRaises(ConfigError):
-            load_config({"GATEWAY_AUTH_TOKEN": "t", "GATEWAY_PORT": "0"})
+            load_config({"GATEWAY_HMAC_SECRET": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "GATEWAY_AUTH_TOKEN": "t", "GATEWAY_PORT": "0"})
 
     def test_port_via_constructor_zero_ok(self):
         cfg = Config(dev_mode=True, port=0)
