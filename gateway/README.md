@@ -222,7 +222,9 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 传 transport 时按 config 构建，**不会静默回落内存假后端**。`appservice` 模式
 必须同时给 `GATEWAY_HOMESERVER_URL` / `GATEWAY_MATRIX_SERVER_NAME` /
 `GATEWAY_AS_TOKEN`（非空、≥32 字符、无空白），缺省或占位时**拒绝启动**
-（fail closed），且 as_token 不进 repr/日志；启动时用 AS token 调 whoami
+（fail closed），且 as_token 不进 repr/日志；此外 `GATEWAY_HMAC_SECRET` 在
+**所有**非 dev 模式下都是必填（十六进制、≥64 hex 字符、拒绝全零），
+缺省或占位时同样拒绝启动。启动时用 AS token 调 whoami
 做一次健康校验，失败即退出（fail fast）。
 
 ### 配置项
@@ -232,10 +234,10 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_HOST` | `127.0.0.1` | 监听地址 |
 | `GATEWAY_PORT` | `8080` | 监听端口（1–65535；环境变量给 0 或超范围会启动失败） |
 | `GATEWAY_AUTH_TOKEN` | *(空)* | **必填**：留空或仍为 `<change-me>` 时**拒绝启动**（fail closed）；生产设为随机值，请求需 `Authorization: Bearer <token>`；用 `hmac.compare_digest` 常数时间比较 |
-| `GATEWAY_HMAC_SECRET` | *(空)* | **必填**（#114 PR-a）：≥32 字节随机值（十六进制），用于 txnId 与 `text_sha256` 的 HMAC；非 dev 模式留空或为 `<change-me>` 时拒绝启动，dev 模式未设置则每进程随机生成 |
+| `GATEWAY_HMAC_SECRET` | *(空)* | **必填**（#114 PR-a / N10）：**只接受十六进制**，至少 **64 个 hex 字符**（= 32 字节），拒绝全零；用于 txnId 与 `text_sha256` 的 HMAC。非 dev 模式留空或为 `<change-me>` 时拒绝启动，dev 模式未设置则每进程随机生成。生成：`python3 -c 'import secrets;print(secrets.token_hex(32))'` **（破坏性变更：以前接受任意字符串）** |
 | `GATEWAY_DEV_MODE` | `false` | 仅本地开发：`true` 时允许无 token 启动并免鉴权（启动横幅打 WARNING）；设了真实 token 永远优先 |
 | `RATE_LIMIT_MESSAGES` | `60` | 窗口内每个 persona 最多消息数；`0` = 关闭限速 |
-| `RATE_LIMIT_WINDOW_SECONDS` | `3600` | 滑动窗口长度（秒，≥1） |
+| `RATE_LIMIT_WINDOW_SECONDS` | `3600` | 滑动窗口长度（秒，**≥60**，与 OpenAPI `window_seconds` 的 `minimum: 60` 一致） |
 | `SILENT_HOURS_ENABLED` | `true` | 是否启用深夜静默 |
 | `SILENT_HOURS_START` | `23:00` | 静默开始（`HH:MM`，本地时区） |
 | `SILENT_HOURS_END` | `07:30` | 静默结束（`HH:MM`；`START > END` 表示跨午夜） |

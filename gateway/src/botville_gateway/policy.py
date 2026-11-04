@@ -36,8 +36,8 @@
 
 from __future__ import annotations
 
-import math
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -51,6 +51,11 @@ from .store import EventKind, UsageStore
 from .timeutil import iso_utc, seconds_until, utcnow
 
 SOURCE_PLATFORM = "platform_default"
+
+# 在途预留的自动回收 TTL（秒，#114-7.7）。传输层超时默认 30s、/health 探针
+# 另有 2s 短超时；预留 TTL 取 300s，比任何单次投递的正常耗时都长一个量级，
+# 只回收真正被遗弃的预留（投递线程异常终止）。
+DEFAULT_RESERVATION_TTL_SECONDS = 300.0
 
 # ---- 原因码（对外稳定标识；只增不改） ----
 CODE_RATE_LIMIT = "messages.window.exceeded"
@@ -172,6 +177,8 @@ class Reservation:
     UsageEvent 的 `recorded_at`，所以投递耗时不会被算进窗口起点之前。
     `conversation_id` 用于 ai_loop / anti_spam 按会话计数在途预留（B2.2）；
     `peer_id` 用于 peer 层按 (persona, peer_id) 计数在途预留（§6.4）。
+    `expires_at` 是自动回收时刻（#114-7.7），见 `ReservationBook`；用单调时钟
+    秒数（`time.monotonic()`）计量在途时长，不写进任何时间戳字段。
     """
 
     id: str
@@ -180,6 +187,7 @@ class Reservation:
     at: datetime
     conversation_id: Optional[str] = None
     peer_id: Optional[str] = None
+    expires_at: Optional[float] = None
 
 
 class ReservationBook:
@@ -192,11 +200,37 @@ class ReservationBook:
     - 最小间隔：在途消息的 `at` 也算「最近一次发言」，避免并发击穿间隔限制。
 
     预留条目是内存里的临时状态，不写 UsageEvent、不进账单（投递失败不计费）。
+
+    **TTL 自动回收（#114-7.7）**：预留只在 `send_text` 返回后提交/回滚。若投递
+    线程被异常终止（进程内未捕获的 `BaseException`、线程被杀、或调用方忘记
+    release），名额会永久留在账上——消息数/ token 预算/最小间隔就此被一条
+    幽灵消息卡死。因此每条预留带 `expires_at`，任何一次读写账本时先回收过期
+    条目。TTL 由 `ReservationBook(ttl_seconds=…)` 注入，默认 300s（远大于传输
+    超时 30s 的两倍），保证正常慢投递不会被误回收。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, ttl_seconds: float = DEFAULT_RESERVATION_TTL_SECONDS) -> None:
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be > 0")
+        self._ttl = ttl_seconds
         self._items: Dict[str, Reservation] = {}
         self._lock = threading.Lock()
+
+    def _purge_expired_locked(self) -> None:
+        """回收已过 TTL 的预留（调用方须持锁）。
+
+        用**单调时钟**计量在途时长，不读墙钟：一是预留问的是「这条消息占位
+        多久了」，与日历时间无关；二是测试与回放会注入过去的假时钟（策略评估
+        用），若拿墙钟比对 `at`，所有预留都会瞬间被判过期，去重/限额全线失效。
+        """
+        now = time.monotonic()
+        expired = [
+            rid
+            for rid, item in self._items.items()
+            if item.expires_at is not None and now >= item.expires_at
+        ]
+        for rid in expired:
+            del self._items[rid]
 
     def reserve(
         self,
@@ -212,29 +246,37 @@ class ReservationBook:
             persona_id=persona_id,
             tokens=tokens,
             at=at,
+            expires_at=time.monotonic() + self._ttl,
             conversation_id=conversation_id,
             peer_id=peer_id,
         )
         with self._lock:
+            self._purge_expired_locked()
             self._items[reservation.id] = reservation
         return reservation
 
     def release(self, reservation: Reservation) -> bool:
         """回滚预留；返回该预留是否仍在账上（重复回滚返回 False）。"""
         with self._lock:
+            self._purge_expired_locked()
             return self._items.pop(reservation.id, None) is not None
 
     def for_persona(self, persona_id: str) -> List[Reservation]:
         with self._lock:
+            self._purge_expired_locked()
             return [r for r in self._items.values() if r.persona_id == persona_id]
 
     def for_conversation(self, conversation_id: str) -> List[Reservation]:
         """按会话过滤在途预留（B2.2 ai_loop 计数用）。"""
         with self._lock:
-            return [r for r in self._items.values() if r.conversation_id == conversation_id]
+            self._purge_expired_locked()
+            return [
+                r for r in self._items.values() if r.conversation_id == conversation_id
+            ]
 
     def __len__(self) -> int:
         with self._lock:
+            self._purge_expired_locked()
             return len(self._items)
 
 
@@ -875,6 +917,7 @@ class PolicyEngine:
             start = parse_hhmm(window["start"])
             end = parse_hhmm(window["end"])
             if start == end:
+                # 零长度窗口 = 不静默（`silent_window` 已排除这类层，这里是兜底）。
                 return _SilentView(False, None, LAYER_PLATFORM, SOURCE_PLATFORM)
             tz = ZoneInfo(window["timezone"])
             item = effective.get("silent_hours")

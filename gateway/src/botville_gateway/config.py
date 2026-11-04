@@ -25,9 +25,17 @@ CONTRACT_VERSION = "0.1.0"
 # unless GATEWAY_DEV_MODE=true is explicitly set.
 _INSECURE_TOKENS: frozenset = frozenset({"", "<change-me>"})
 
-# 部署密钥（GATEWAY_HMAC_SECRET）的最低强度：HMAC 的保密性全部押在密钥上，
-# 32 字节（256 bit）与 SHA-256 的输出宽度对齐。
+# 速率窗口的合法下界（#114-7.8d）：OpenAPI `window_seconds` 声明 `minimum: 60`，
+# 部署配置用更小的窗口会造出契约里不存在的速率对。
+MIN_RATE_LIMIT_WINDOW_SECONDS = 60
+
+# 部署密钥（GATEWAY_HMAC_SECRET）的格式与最低强度（#114 N10）：HMAC 的保密性
+# 全部押在密钥上，32 字节（256 bit）与 SHA-256 的输出宽度对齐；只接受 hex，
+# 32 字节恰好是 64 个 hex 字符。全零/全相同字符是明显的低熵占位，拒绝。
 HMAC_SECRET_MIN_LENGTH = 32
+HMAC_SECRET_MIN_HEX_CHARS = HMAC_SECRET_MIN_LENGTH * 2
+_HMAC_SECRET_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+HMAC_SECRET_HINT = "python3 -c 'import secrets;print(secrets.token_hex(32))'"
 # 与 _INSECURE_TOKENS 同语义的字节形态（直接构造 Config 时也按占位处理）。
 _INSECURE_SECRET_BYTES: frozenset = frozenset({b"", b"<change-me>"})
 # dev 模式自动生成密钥只警告一次，避免每次构造 Config（测试）都刷屏。
@@ -274,8 +282,11 @@ class Config:
             raise ConfigError(f"port must be 0–65535, got {self.port}")
         if self.rate_limit_messages < 0:
             raise ConfigError("rate_limit_messages must be >= 0")
-        if self.rate_limit_window_seconds < 1:
-            raise ConfigError("rate_limit_window_seconds must be >= 1")
+        if self.rate_limit_window_seconds < MIN_RATE_LIMIT_WINDOW_SECONDS:
+            raise ConfigError(
+                f"rate_limit_window_seconds must be >= {MIN_RATE_LIMIT_WINDOW_SECONDS} "
+                "(matches the OpenAPI window_seconds minimum)"
+            )
         if self.max_message_chars < 1:
             raise ConfigError("max_message_chars must be >= 1")
         if self.platform_token_budget < 0:
@@ -322,8 +333,8 @@ class Config:
             if not self.dev_mode:
                 raise ConfigError(
                     "GATEWAY_HMAC_SECRET is unset or uses the default placeholder. "
-                    "Set a strong random secret (>= 32 bytes, e.g. "
-                    "`python3 -c \"import secrets; print(secrets.token_hex(32))\"`). "
+                    "Set a random hex secret (>= 64 hex characters, i.e. 32 bytes). "
+                    f"Generate one with: {HMAC_SECRET_HINT}. "
                     "Use GATEWAY_DEV_MODE=true only for local development."
                 )
             # dev 模式：自动生成每进程随机密钥（重启后 txnId/hash 不稳定）。
@@ -335,14 +346,22 @@ class Config:
                 print(
                     "WARNING: GATEWAY_HMAC_SECRET is not set — using a per-process random "
                     "secret. txnId and text_sha256 will change on restart. "
-                    "Set GATEWAY_HMAC_SECRET (>= 32 bytes) for stable values.",
+                    f"Set GATEWAY_HMAC_SECRET (>= 64 hex characters; {HMAC_SECRET_HINT}) "
+                    "for stable values.",
                     file=sys.stderr,
                 )
         elif len(self.hmac_secret) < HMAC_SECRET_MIN_LENGTH:  # type: ignore[arg-type]
             raise ConfigError(
                 f"GATEWAY_HMAC_SECRET must be at least {HMAC_SECRET_MIN_LENGTH} bytes "
-                f"(got {len(self.hmac_secret)}). "  # type: ignore[arg-type]
-                f"Generate with: python3 -c \"import secrets; print(secrets.token_hex(32))\""
+                f"({HMAC_SECRET_MIN_HEX_CHARS} hex characters), got "
+                f"{len(self.hmac_secret)} bytes. "  # type: ignore[arg-type]
+                f"Generate with: {HMAC_SECRET_HINT}"
+            )
+        elif not any(self.hmac_secret):  # type: ignore[arg-type]
+            # 全零密钥（如 64 个 "0"）长度达标但熵为零：等于没有密钥。
+            raise ConfigError(
+                "GATEWAY_HMAC_SECRET must not be all zero bytes (it provides no "
+                f"secrecy). Generate with: {HMAC_SECRET_HINT}"
             )
         # A1.3：transport=appservice 时必须带齐全的三件套（fail closed），
         # 否则启动即失败，而不是回落到内存假后端悄悄"成功"。
@@ -446,18 +465,35 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
     token = _env_str(source, "GATEWAY_AUTH_TOKEN", "")
     dev_mode = _env_bool(source, "GATEWAY_DEV_MODE", False)
     as_token = _env_str(source, "GATEWAY_AS_TOKEN", "")
-    # #114 PR-a: 部署密钥（HMAC）。十六进制串 → bytes；空/<change-me> → None
-    # （由 Config 校验决定 dev 放行还是 fail-closed）。接受任意十六进制长度，强度
-    # 校验在 __post_init__ 统一做（>= HMAC_SECRET_MIN_LENGTH 字节）。
+    # #114 PR-a / N10: 部署密钥（HMAC）。**只接受 hex**（#114 N10）：以前的
+    # 实现把非 hex 串按 UTF-8 兜底，导致「63 个 hex 字符」被当成 63 字节密钥
+    # 静默接受，与文档写的「十六进制、≥64 hex 字符」不一致。空/<change-me> →
+    # None（由 Config 校验决定 dev 放行还是 fail-closed）。
     hmac_secret_raw = _env_str(source, "GATEWAY_HMAC_SECRET", "")
     if hmac_secret_raw in ("", "<change-me>"):
         hmac_secret: Optional[bytes] = None
     else:
-        try:
-            hmac_secret = bytes.fromhex(hmac_secret_raw)
-        except ValueError:
-            # 非 hex（如原始字节串）按 utf-8 编码兜底；长度校验在 __post_init__。
-            hmac_secret = hmac_secret_raw.encode("utf-8")
+        if not _HMAC_SECRET_HEX_RE.fullmatch(hmac_secret_raw):
+            raise ConfigError(
+                "GATEWAY_HMAC_SECRET must be a hexadecimal string "
+                f"(0-9a-f), got {len(hmac_secret_raw)} characters containing "
+                "non-hex input. "
+                f"Generate one with: {HMAC_SECRET_HINT}"
+            )
+        if len(hmac_secret_raw) < HMAC_SECRET_MIN_HEX_CHARS:
+            raise ConfigError(
+                f"GATEWAY_HMAC_SECRET must be at least {HMAC_SECRET_MIN_HEX_CHARS} "
+                f"hex characters (= {HMAC_SECRET_MIN_LENGTH} bytes), got "
+                f"{len(hmac_secret_raw)}. Generate one with: {HMAC_SECRET_HINT}"
+            )
+        if len(hmac_secret_raw) % 2 == 1:
+            # 奇数个 hex 字符无法解成整字节；明确报错，而不是退回 UTF-8。
+            raise ConfigError(
+                "GATEWAY_HMAC_SECRET must contain an even number of hex characters "
+                f"(two per byte), got {len(hmac_secret_raw)}. "
+                f"Generate one with: {HMAC_SECRET_HINT}"
+            )
+        hmac_secret = bytes.fromhex(hmac_secret_raw)
     server_name = _env_str(source, "GATEWAY_MATRIX_SERVER_NAME", "") or None
     if server_name is not None:
         # 统一小写 + 形状校验（大小写漂移会让 @ai_* 命名空间两侧对不上）。
@@ -475,7 +511,10 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         dev_mode=dev_mode,
         rate_limit_messages=_env_int(source, "RATE_LIMIT_MESSAGES", 60),
         rate_limit_window_seconds=_env_int(
-            source, "RATE_LIMIT_WINDOW_SECONDS", 3600, minimum=1
+            source,
+            "RATE_LIMIT_WINDOW_SECONDS",
+            3600,
+            minimum=MIN_RATE_LIMIT_WINDOW_SECONDS,
         ),
         silent_hours_enabled=_env_bool(source, "SILENT_HOURS_ENABLED", True),
         silent_hours_start=_env_str(source, "SILENT_HOURS_START", DEFAULT_SILENT_START),
