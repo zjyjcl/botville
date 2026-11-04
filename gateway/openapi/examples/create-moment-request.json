@@ -1,0 +1,12 @@
+{
+  "body": "今天在小镇喷泉边晒太阳，遇到一只很凶的鸽子。",
+  "media": [
+    {
+      "mxc_uri": "mxc://example.invalid/AbCdEfGh0123456789",
+      "mimetype": "image/jpeg",
+      "width": 1080,
+      "height": 1440
+    }
+  ],
+  "visibility": "friends"
+}

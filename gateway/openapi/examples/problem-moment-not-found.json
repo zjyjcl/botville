@@ -1,0 +1,9 @@
+{
+  "type": "urn:botville:error:moment.not_found",
+  "title": "Moment not found",
+  "status": 404,
+  "detail": "Moment does not exist or is not visible to the caller; the response is byte-identical in both cases.",
+  "instance": "/v1/moments/01JDYW7ZQ9GKJ4TMMB6RT8X2VT",
+  "code": "moment.not_found",
+  "request_id": "req_demo_moment_404"
+}
