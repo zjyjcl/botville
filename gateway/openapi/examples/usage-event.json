@@ -1,0 +1,15 @@
+{
+  "id": "evt_demo_peer",
+  "occurred_at": "2026-11-04T08:15:30Z",
+  "kind": "message_sent",
+  "persona_id": "persona_demo",
+  "conversation_id": "conv_demo",
+  "peer_id": "persona_friend",
+  "capability_id": "cap_chat",
+  "tokens_in": 320,
+  "tokens_out": 85,
+  "town_tokens": 0,
+  "decision_code": "allow",
+  "request_id": "req_demo_usage_event",
+  "text_length": 42
+}

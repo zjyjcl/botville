@@ -8,7 +8,7 @@
   "estimated_tokens": 120,
   "reasons": [
     {
-      "code": "ai_loop.breaker_open",
+      "code": "ai_loop.tripped",
       "message": "AI-to-AI conversation hit the hourly circuit breaker.",
       "layer": "platform"
     }
@@ -22,7 +22,7 @@
       "used": 20,
       "remaining": 0,
       "reset_at": "2026-11-03T13:00:00Z",
-      "code": "ai_loop.breaker_open",
+      "code": "ai_loop.tripped",
       "source_id": "platform_default"
     },
     {
