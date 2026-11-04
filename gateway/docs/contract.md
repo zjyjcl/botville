@@ -240,6 +240,9 @@ App                          网关                        模块网页（WKWebV
 - 卡片操作（`POST /cards/{card_id}/actions/{action_id}`）的 `Idempotency-Key`
   **必填**，其余写接口强烈建议。`POST /messages`、创建类接口必须支持。
 - 本规则取代此前「卡片操作必须用新 key」的说法——那条与重试复用相矛盾，已作废。
+- **例外：`PUT /limits`**。整层替换天然幂等，服务端**不做**幂等缓存；`Idempotency-Key`
+  对该端点**可选**，同一 key 不同请求体**不返回** `409 idempotency.conflict`（每次重放
+  均执行整层替换）。
 
 ### 1.6 版本与乐观并发
 
@@ -792,6 +795,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.1.0 | 2026-11-04 | [B2.2 PR1 审查修订] 补全冷却/peer_id/幂等/码表语义，**只增不删、不改状态码集合**。(1) §6.3 冷却结束时刻即清零该 persona 在该会话的连续计数，被拦（`blocked`）消息不计入连续数；选码时机——触发那条报 `anti_spam.consecutive`、冷却期内后续请求报 `anti_spam.cooldown`（check 口径 limit=`cooldown_seconds`/used=已冷却秒数/remaining=剩余秒数/reset_at=`may_clear_at`）；冷却期内出现经网关人类消息提前解除冷却并清零，首版无人类入站入口故实际只靠冷却到期解除（不会永久静音）；(2) §6.4 当会话成员中存在配置了 peer 层限额的对方 persona、而请求未带 `peer_id` 时返回 `422 request.invalid`（`errors[].field=peer_id`），无 peer 层规则时省略 `peer_id` 与 B2.1 一致，实发与预检 `peer_id` 必须一致；(3) §1.5 把 `PUT /limits` 列为幂等例外（整层替换天然幂等、服务端不缓存、同 key 不同 body 不返回 409）；(4) `PolicyCheck.key` 推荐列表补 `anti_spam.cooldown`，注明 `key` 与 `code` 是两套名字；(5) `PolicyReason.code` 描述注明旧码 `ai_loop.breaker_open` 视为 `ai_loop.tripped` 的别名；(6) 推荐码列表按 B2.1 实际常量写（带后缀 `.exceeded`/`.active`/`.too_soon` 等）；(7) §6.3 `ai_loop` 计数口径明确为「窗口内、最后一条经网关人类消息之后的 AI 消息数（任意 AI）」，会话级计数由被评估 persona 的生效 `ai_loop` 限额约束（三层取最严），只拦被评估这条；(8) 平台硬上限 `MAX_MESSAGE_CHARS` 仍 `400 request.invalid`，只有 owner/peer 分层更严 `max_message_chars` 走 `200 blocked` + `message.length`；(9) §6.3 写明计数依赖事件保留期，部署须保证 `max_usage_events` 足以保留 `max(window,cooldown)` 内事件，容量不足可能少算（已知局限，PR2 按保留期淘汰）。实现见 PR2。 |
 | 0.1.0 | 2026-11-04 | [B2.2 + #114 契约] 防刷屏 / 互聊熔断与 peer 计数语义，**只增不删、不改状态码集合**。(1) `PolicyReason.code` / `PolicyCheck.key`·`code` 推荐取值新增 `anti_spam.consecutive`、`anti_spam.cooldown`、`ai_loop.tripped`（均为开放字符串，旧值仍有效）；(2) `UsageEvent` 新增可选 `peer_id`；(3) 新增 [§6.3 熔断语义](#63-熔断语义b22)：连续的定义（`ai_loop` 同会话任意 AI、`anti_spam` 同 persona）、人类消息重置、`may_clear_at` 口径（anti_spam=冷却结束、ai_loop=最早事件出窗，向上取整到秒）、结论 `blocked`+`retryable:false`+200、首版只统计经网关的人类消息、`on_break=notify` 未实现时按 `stop` 处理（fail-closed）；(4) 新增 [§6.4 peer 计数语义](#64-peer-计数语义与-b21-兼容性b22)：B2.2 起 peer 层按 `(persona, peer_id)` 计数，请求不带 `peer_id` 时 peer 层不生效、旧事件无 `peer_id` 只计入 persona 全局与 platform/owner 层，platform/owner 计数不变；(5) #114-4 `window_seconds` 必须与本层 `messages_per_window` / `tokens_per_window` 成对出现，单写→422 `limit.out_of_range`；(6) #114-5 等速率按 platform→owner→peer 归属（行为不变）；(7) #114-7.5 `UsageEvent` 描述改准：删除「不可反推原文」，说明短/低熵文本 SHA-256 可被字典猜测（后续改 HMAC），`text_length` = Unicode 字符数；(8) #114-7.8b 错误边界：结构/类型错=400 `request.invalid`，规则值语义越界=422 `limit.out_of_range`；(9) #114-7.8c `PUT /limits` 为整层替换、天然幂等，`Idempotency-Key` 可选且服务端不缓存；(10) 示例：`policy-decision` / `message-receipt-blocked` 改用 `ai_loop.tripped`，新增 `usage-event.json`（含 `peer_id`）。实现见 PR2。 |
 | 0.1.0 | 2026-11-04 | 澄清会话加密与 AI 参与：E2EE/`ai_participation=disabled` 下 AI 发言与预检返回 `403 conversation.e2ee`（硬约束，非 §1.4 blocked）；`createConversation` 禁止 `e2ee`+`enabled`（`422 request.invalid`），省略 `ai_participation` 时按 `encryption` 推导；苹果端细节改为外链。属文档澄清，不改字段集合。 |
 | 0.1.0 | 2026-11-04 | `Card.interrupt` 与 `CreateCardRequest.interrupt` 移除 `default: false`，改为三态（省略 / `true` / `false`）：省略时由 `priority` 决定（`urgent`→穿透，其余→顺延），显式 `false` 即使 `urgent` 也不打断。属「改默认值」=准破坏，按 §5.3 minor + 公告处理；同主版本内字段语义未变，仅澄清三态。 |
@@ -850,15 +854,21 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 - 静默时段、防刷屏、互聊熔断也各自参与，`checks[]` 里逐项给出 `allowed`/`limit`/`used`/`remaining`/`reset_at`。
 - `PolicyCheck.key` 推荐取值：`messages.window`、`tokens.window`、`proactive.per_day`、
   `town.tokens_per_day`、`silent_hours`、`min_interval`、`anti_spam.consecutive`、
-  `ai_loop.per_hour`、`message.length`、`relation.chat_allowed`。
-- **B2.1 已实现**的检查项：`messages.window`、`tokens.window`、`min_interval`、
-  `silent_hours`（每项都取三层中最严者，`source_layer` 落在 `PolicyCheck.layer` 上）。
-  `proactive.per_day` / `town.tokens_per_day` 的生效值已在 `GET /limits` 中计算，
+  `anti_spam.cooldown`、`ai_loop.per_hour`、`message.length`、`relation.chat_allowed`。
+  **注意**：`PolicyCheck.key` 与 `PolicyReason.code` 是**两套名字**——前者是检查项标识，
+  后者是未通过原因码；两者同域但取值不同（如 key=`messages.window` 对应 code=
+  `messages.window.exceeded`）。
+- **B2.1 已实现**的检查项：`messages.window`（code: `messages.window.exceeded`）、
+  `tokens.window`（code: `tokens.window.exceeded`）、`min_interval`（code: `min_interval.too_soon`）、
+  `silent_hours`（code: `silent_hours.active`）（每项都取三层中最严者，`source_layer` 落在
+  `PolicyCheck.layer` 上）。`proactive.per_day`（code: `proactive.per_day.exceeded`）/
+  `town.tokens_per_day`（code: `town.tokens_per_day.exceeded`）的生效值已在 `GET /limits` 中计算，
   执行留待 B2.2（主动发言调度）。
 - **B2.2 契约已定、实现见 PR2** 的检查项：`anti_spam.consecutive`（同 persona 连续
-  AI 消息达到 `max_consecutive_ai_messages`）、`anti_spam.cooldown`（防刷屏冷却未结束）、
-  `ai_loop.per_hour`（同会话任意 AI 互聊达到 `max_ai_messages_per_hour`）、
-  `message.length`（正文长度超过 `max_message_chars`）。熔断语义见 [§6.3](#63-熔断语义b22)。
+  AI 消息达到 `max_consecutive_ai_messages`，code: `anti_spam.consecutive`）、`anti_spam.cooldown`
+  （防刷屏冷却未结束，code: `anti_spam.cooldown`）、`ai_loop.per_hour`（同会话任意 AI 互聊
+  达到 `max_ai_messages_per_hour`，code: `ai_loop.tripped`）、`message.length`（正文长度超过
+  owner/peer 分层 `max_message_chars`，code: `message.length`）。熔断语义见 [§6.3](#63-熔断语义b22)。
 - **token 预算**：评估时按 `token_estimate`（缺省按正文长度估算）**预扣**，
   投递成功后实际入账（`usage_delta.tokens_out`）。计量取
   `max(token_estimate, estimate_tokens(content))`（B3）：客户端给的值只是**下限**，
@@ -892,33 +902,51 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 - **「连续」的两种口径**：
   - **`ai_loop`（互聊熔断）按同会话任意 AI 连续计数**：同一 `conversation_id` 内，
-    按时间序累计**任意 AI**（不限 persona）发出的、未被人类消息打断的 AI 消息数。
-    理由：互聊的本质是多个 AI 互相接话，与具体哪个 AI 无关，只看「房间里 AI 一直在
-    自己说」这件事是否超过人类允许的密度。
+    `count` = 滑动窗口内、**最后一条经网关人类消息之后**的 AI 消息数（任意 AI，不限
+    persona）。理由：互聊的本质是多个 AI 互相接话，与具体哪个 AI 无关，只看「房间里
+    AI 一直在自己说」这件事是否超过人类允许的密度。会话级计数由**被评估 persona 的生效
+    `ai_loop` 限额**约束（三层取最严），只拦被评估的这条发言，不影响其他 AI 的独立计数。
   - **`anti_spam`（防刷屏）按同 persona 连续计数**：同一 `conversation_id` 内，按时间序
     累计**同一 `persona_id`** 发出的、未被人类消息打断的 AI 消息数。理由：防刷屏关心
     单个 AI 是否在刷屏，因此绑定到具体 persona。
   - 计数都基于 `UsageStore` 中近期发送方序列（`ai` / `human`），不读消息正文。
+  - **被拦（`blocked`）的消息不计入连续数**：`anti_spam` / `ai_loop` 触发后返回
+    `blocked`，该条消息不写入连续序列，冷却期内多次请求不会进一步累积计数。
 - **人类消息重置连续计数**：一旦该会话出现一条**经网关**的人类消息，`ai_loop` 的「任意
-  AI 连续」与 `anti_spam` 的「同 persona 连续」计数**同时归零**。
+  AI 连续」与 `anti_spam` 的「同 persona 连续」计数**同时归零**；冷却期内出现经网关的
+  人类消息时亦提前解除冷却并将连续计数归零。**首版局限**：当前网关只有 AI 发言入口
+  （`POST /conversations/{id}/messages`），没有人类入站路由；因此冷却实际只靠到期解除，
+  **不会永久静音**。此局限将在后续接入人类消息同步后消除，届时不升主版本（仅扩展行为）。
 - **恢复时间 `may_clear_at`**：
   - `anti_spam` 达 `max_consecutive_ai_messages` 上限后进入 `cooldown_seconds` 冷却，
     `may_clear_at` = **冷却结束时刻**（触发时刻 + `cooldown_seconds`，向上取整到秒，
-    与 B2.1 的 `reset_at` 口径一致）。
+    与 B2.1 的 `reset_at` 口径一致）。**冷却结束时刻即将该 persona 在该会话的连续计数
+    清零**，下次发言重新从 0 起计；与 `same_content_allowed: true` 一致（冷却后同一
+    内容可重发）。
   - `ai_loop` 按小时滑动窗口（`max_ai_messages_per_hour`）：`may_clear_at` = **最早一条
     入账事件滑出窗口的时刻**（向上取整到秒，与 B2.1 一致）。
   - 两者结论均为 `outcome: blocked`、`retryable: false`、HTTP `200`（策略结论不是错误，
     见 §1.4）。`same_content_allowed: true`（额度/窗口恢复后同一内容可重发）。
+- **选码时机**：
+  - 触发那条（第 `max_consecutive_ai_messages + 1` 条）：`reasons[].code = anti_spam.consecutive`。
+  - 冷却期内后续请求：`reasons[].code = anti_spam.cooldown`；对应 `PolicyCheck` 口径：
+    `key = anti_spam.cooldown`、`limit = cooldown_seconds`、`used` = 已冷却秒数、
+    `remaining` = 剩余秒数、`reset_at = may_clear_at`。
+- **`message.length` 与平台硬上限区分**：平台固定的 `MAX_MESSAGE_CHARS` 上限在请求解析时
+  直接拒绝，返回 `400 request.invalid`，**不走策略裁决**。只有 owner / peer 分层中配置的
+  更严 `max_message_chars` 才走策略路径，返回 `200 blocked` + `reasons[].code = message.length`。
+  两者严格区分，不改变状态码集合（§1.3）。
 - **`on_break` 行为**：
   - `stop`（默认）：熔断触发即**拦截**，按上面 `blocked` 结论返回。
   - `notify`：**当前版本未实现通知通道**，按 `stop` 处理（fail-closed，先拦截再谈通知），
     即与 `stop` 行为一致。将来实现通知后，`notify` 仍会拦截，并**额外向所有者推送一条
     通知**（提醒人类介入），不会改成放行。
-- **首版局限**：连续计数只统计**经网关**的人类消息作为「人类消息打断」。当前网关没有
-  Matrix 同步回灌，因此人类**直接在 Matrix 客户端**发的消息（未经网关登记）不会重置
-  计数。此局限会在后续接入同步后消除，契约届时不升主版本（仅扩展行为）。
 - **在途预留**：与 B2.1 的 token 预扣一致，已发出但未入账（`queued` / `deferred`）的
   AI 消息**计入**连续数，避免因排程而绕过熔断；`may_clear_at` 的计算同样把在途计入。
+- **计数依赖事件保留期**：连续计数基于 `UsageStore` 中保留的近期事件；部署须保证
+  `max_usage_events` 足以保留 `max(window_seconds, cooldown_seconds)` 内的所有事件。
+  容量不足时事件可能被淘汰，导致计数偏低（fail-open，提前放行），属已知局限；
+  PR2 将按保留期淘汰旧事件（仅契约说明，不改实现范围）。
 
 ### 6.4 peer 计数语义与 B2.1 兼容性（B2.2）
 
@@ -927,14 +955,18 @@ B2.2 起 peer 层限额按 `(persona, peer_id)` 计数，即对每个对端角�
 - **计数维度**：peer 层的 `messages_per_window` / `tokens_per_window` / `min_interval`
   等窗口类限额，`used` 以 `(persona_id, peer_id)` 为键累加，来源是带 `peer_id` 的
   `UsageEvent`。
-- **兼容条件（与 B2.1 一致）**：
-  - 请求**不带 `peer_id`** 时，peer 层**不生效**，计数仍为 **persona 全局**（与 B2.1 行为
-    完全一致，旧客户端无感）。
+- **`peer_id` 缺失强制**：当会话成员中存在配置了 peer 层限额的对方 persona、而请求（
+  `OutgoingMessageRequest` 或 `PolicyEvaluateRequest`）**未带 `peer_id`** 时，网关返回
+  `422 request.invalid`，`errors[].field = peer_id`（语义组合不合法，peer 层规则无法匹配）。
+  这与 B2.1 的 fail-open 行为不同，是 B2.2 对 peer 层绕过的修正。
+- **兼容条件**：会话成员中**无任何 peer 层规则**时，省略 `peer_id` 的行为与 B2.1 完全
+  相同（peer 层不生效，计数仍为 persona 全局，旧客户端无感）。
   - 旧 `UsageEvent` 无 `peer_id` 字段的记录，只计入 **persona 全局**与 **platform / owner
     层**，**不计入任何 peer 层**计数（历史数据不回填）。
   - **platform / owner 层计数不变**：仍以 persona 全局为键，与 peer_id 无关。
 - **`PolicyEvaluateRequest.peer_id` 与 `OutgoingMessageRequest.peer_id` 必须一致**：
-  否则预检与实发结论可能不同（见 §6.1 与 OpenAPI 字段说明）。
+  否则预检与实发结论可能不同（见 §6.1 与 OpenAPI 字段说明）。实发与预检的 `peer_id`
+  由调用方保证一致；两者不一致不报错，但结论不可信（已在字段描述中标注）。
 
 ---
 
