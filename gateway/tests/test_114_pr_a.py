@@ -4,9 +4,15 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import sys
 import threading
 import time
 import unittest
+
+_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 
 from botville_gateway.config import Config, ConfigError, load_config
 from botville_gateway.limits import LimitStore
