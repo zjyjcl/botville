@@ -27,6 +27,9 @@ make ps              # 容器状态
 make down            # 停止（保留数据卷；手动 down -v 可清空）
 ```
 
+continuwuity 默认关闭上游 announcements 检查（避免 SIGTERM 卡到 SIGKILL）：见 [docs/ops/continuwuity-announcements.md](../docs/ops/continuwuity-announcements.md)。
+
+
 说明：
 
 - 首次 `make up` 会执行 `server/scripts/init.sh`：从 `.env.example` 生成本地

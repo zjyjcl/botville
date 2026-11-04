@@ -66,11 +66,20 @@ jobs:
             --base-url http://127.0.0.1:8008 \
             --registration-token "$token"
 
-      - name: Graceful stop right after traffic (issue #91)
+      - name: Graceful stop right after traffic (issue #91 / #109)
         run: |
           # Stop immediately after smoke: the window in which continuwuity's
           # announcements check used to block shutdown until SIGKILL.
+          # Timing alone can false-green on a fast network (#109): the GET to
+          # continuwuity.org often finishes in <1s, so the interruptible wait
+          # path is already active by the time we stop. Lock the fix itself
+          # with a network-free env assertion on the continuwuity profile.
           cid="$(docker compose -f server/compose/docker-compose.yml --env-file server/compose/.env --profile "${{ matrix.homeserver }}" ps -q "${{ matrix.homeserver }}")"
+          if [[ "${{ matrix.homeserver }}" == "continuwuity" ]]; then
+            env_dump="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$cid")"
+            echo "$env_dump" | grep -Fqx 'CONTINUWUITY_ALLOW_ANNOUNCEMENTS_CHECK=false'
+            echo "continuwuity env asserts CONTINUWUITY_ALLOW_ANNOUNCEMENTS_CHECK=false"
+          fi
           start=$(date +%s)
           docker stop -t 60 "$cid"
           took=$(( $(date +%s) - start ))
