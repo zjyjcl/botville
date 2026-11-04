@@ -7,8 +7,10 @@
   1. 迁移 DDL 可在 sqlite3 内存库上执行两遍（IF NOT EXISTS 幂等），
      且所有 moments_ 表与必要索引存在；
   2. 契约中 Moments 路径齐全，评论/点赞的读写操作 description 均以 can_view
-     为前提（字面包含 "can_view"），安全方案为 matrixUserToken；
-  3. Visibility 枚举与 moment 示例一致。
+     为前提（字面包含 "can_view"），且交互描述含 can_see_interaction /
+     friend_subject 或 owner_id 绑定说明；安全方案为 matrixUserToken；
+  3. Visibility 枚举与 moment 示例一致；UpdateMomentRequest.allow_list 可 null；
+     真人发布缺省 visibility 写明为 friends。
 """
 
 from __future__ import annotations
@@ -131,6 +133,50 @@ class TestMomentsContract(unittest.TestCase):
                 "%s %s description must state the can_view(viewer, moment) precondition"
                 % (method.upper(), path),
             )
+
+
+    def test_interaction_operations_mention_friend_binding(self):
+        """AI 好友判定绑到 owner_id / friend_subject 须写进评论与点赞描述。"""
+        for path, method in INTERACTION_OPERATIONS:
+            if method == "delete" and path.endswith("/likes/me"):
+                continue  # unlike 不列 can_see_interaction 细节也可
+            operation = self.contract["paths"][path][method]
+            description = operation.get("description") or ""
+            if method in ("get",) or (method == "post" and "comments" in path):
+                self.assertTrue(
+                    "can_see_interaction" in description
+                    or "friend_subject" in description
+                    or "owner_id" in description,
+                    "%s %s must document AI friend binding"
+                    % (method.upper(), path),
+                )
+
+    def test_update_moment_allow_list_accepts_null(self):
+        schema = self.contract["components"]["schemas"]["UpdateMomentRequest"]
+        allow = schema["properties"]["allow_list"]
+        variants = allow.get("oneOf") or allow.get("anyOf") or [allow]
+        types = set()
+        for variant in variants:
+            t = variant.get("type")
+            if isinstance(t, list):
+                types.update(t)
+            elif t:
+                types.add(t)
+        self.assertIn("null", types)
+        self.assertIn("array", types)
+
+    def test_create_documents_human_default_visibility(self):
+        post = self.contract["paths"]["/moments"]["post"]["description"]
+        self.assertIn("friends", post)
+        self.assertRegex(post, r"不带.*author_persona_id|真人")
+        create = self.contract["components"]["schemas"]["CreateMomentRequest"][
+            "description"
+        ]
+        self.assertIn("friends", create)
+
+    def test_visibility_friends_documents_ai_owner_binding(self):
+        vis = self.contract["components"]["schemas"]["Visibility"]["description"]
+        self.assertIn("owner_id", vis)
 
     def test_visibility_enum(self):
         enum = self.contract["components"]["schemas"]["Visibility"]["enum"]

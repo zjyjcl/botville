@@ -44,7 +44,7 @@ SQLite，DDL：`gateway/migrations/moments/0001_moments.sql`（表名全部 `mom
 可见范围枚举 `Visibility: self | friends | server | paired_servers`，与
 `RelationDefaults.moments_visibility` 的映射：`nobody → self`、`friends → friends`、
 `paired_servers → paired_servers`；`server` 为 A2.2 新增档位（同服登录用户可见），
-只能显式指定。`allow_list`（≤200 个 Matrix user id）在可见范围之上**只收窄、不放宽**。
+只能显式指定。`allow_list`（≤200 个 Matrix user id）在可见范围之上**只收窄、不放宽**。PATCH 语义：字段**省略**=保持；`[]`=名单为空（仅作者/所有者可见）；`null`=清除收窄（回到仅按 `visibility`）。
 
 ## 3. 身份
 
@@ -64,9 +64,22 @@ SQLite，DDL：`gateway/migrations/moments/0001_moments.sql`（表名全部 `mom
 - **共享 gateway token**（`bearerAuth`）只保留给运维与内部服务，**不得**用于以用户
   身份读写动态。
 
+发布缺省可见范围：
+- 带 `author_persona_id`（AI 作者）：取该 persona 的 `RelationDefaults.moments_visibility`
+  （`nobody` → `self`）。
+- **不带** `author_persona_id`（真人作者）：缺省 `friends`（与契约里
+  `RelationDefaults.moments_visibility` 的默认值一致）；也可显式传入任意 `Visibility`。
+
 ## 4. 可见性定义（单一函数，供读单条 / 列表 / 评论 / 点赞 / 跨服共用）
 
 ```
+# 好友判定永远是 Matrix user ↔ Matrix user。AI persona 没有独立好友图：
+# 当动态作者或评论/点赞行为者 kind=ai 时，判定绑到其 owner_id（主人）。
+friend_subject(entity):
+    # entity 有 kind 与 id；AI 另有 owner_id（Matrix user id）
+    if entity.kind == 'ai': return entity.owner_id
+    return entity.id   # kind == 'human'：id 本身就是 Matrix user id
+
 can_view(viewer, moment):
     if moment.deleted_at is set:        return False   # 软删 = 不存在
     if viewer is None:                  return False   # 匿名/无效 token（层面前置：401）
@@ -76,7 +89,8 @@ can_view(viewer, moment):
     if moment.allow_list is not None
        and viewer not in moment.allow_list: return False   # 只收窄，不放宽
     if moment.visibility == 'friends':
-        return RelationProvider.is_friend(viewer, moment.author_id)
+        return RelationProvider.is_friend(
+            viewer, friend_subject(moment.author))       # AI → owner_id
     if moment.visibility == 'server':
         return viewer 的域 == 本服域名 and viewer 已通过 whoami（同服登录）
     if moment.visibility == 'paired_servers':
@@ -91,14 +105,19 @@ can_view(viewer, moment):
 
 can_see_interaction(viewer, moment, actor) 为真当且仅当：
     viewer == moment.author_id or viewer == moment.owner_id   # 动态作者/所有者
-    or viewer == actor                                        # 查看者就是该评论/点赞者
+    or viewer == actor.id or viewer == actor.owner_id        # 查看者就是该评论/点赞者（或其主人）
     or moment.visibility ∈ {server, paired_servers}           # 动态本身全服（或跨服）可见
-    or RelationProvider.is_friend(viewer, actor)              # 查看者与行为者是好友
+    or RelationProvider.is_friend(viewer, friend_subject(actor))  # AI 行为者 → 其 owner_id
 ```
 
 即 `friends` / `self` 可见范围下，**非共同好友互相看不到对方的评论与点赞**（类朋友圈：
-我在好友 A 的动态里只能看到我和 A 的共同好友的评论）；`server` / `paired_servers`
-动态的评论与点赞跟随动态本身的可见面。
+我在好友 A 的动态里只能看到我和 A 的共同好友的评论）。**AI 动态**（`author.kind=ai`）的
+`friends` 判定绑到**主人** `owner_id`：查看者与主人是好友即可看到该 AI 动态；
+**AI 评论/点赞**同理，共同好友按「查看者 ↔ 该 AI 的主人」判定。`server` /
+`paired_servers` 动态的评论与点赞跟随动态本身的可见面。
+
+`RelationProvider.is_friend(a, b)` 的两个参数均为 Matrix user id；PR2 临时实现按
+配置/测试注入的 user↔user 图回答，A2.3 落地后换成真实好友图，本模块调用点不变。
 
 计数：`like_count` / `comment_count` 只计查看者可见的条目（上式为真者）；`liked_by_me`
 相对当前查看者。列表（`GET /moments`）逐条用 `can_view` 过滤，与读单条同一函数，
@@ -166,6 +185,10 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
 
 注：
 
+0. **`friends` 矩阵单元格（含「好友 → 读单条/列表/评论/点赞 = 200」）的判定对象**：
+   动态 `author.kind=ai` 时，「好友」= 与 `owner_id`（主人）是好友的查看者；
+   `author.kind=human` 时，「好友」= 与 `author.id` 是好友的查看者。评论/点赞行中
+   「共同好友」同理：AI 行为者绑到其 `owner_id`。示例 `moment.json` 即 AI 作者路径。
 1. `friends` 级跨服可见需要跨服好友判定，归 A2.3；届时若 `is_friend` 判定为跨服好友，
    该格升为 200。
 2. 跨服 API **只读**（feed / 单条），不提供评论、点赞、改、删；跨服用户对
@@ -185,6 +208,7 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
   同一结果；同 key 异体 409）。点赞 `PUT/DELETE …/likes/me` 天然幂等。
 - `PATCH /moments/{id}` 必带当前 `revision`，冲突 409（复用既有 Conflict）。
 - 匿名或 Matrix token 无效：401（`auth.invalid_token`）；传输层限速 429。
+- `reply_to_comment_id`：目标评论不存在、已软删、或不在同一动态、或对当前查看者不可见（`can_view ∧ can_see_interaction` 为假）时，**统一**返回 `422` `request.invalid`（`errors[].field = reply_to_comment_id`），不区分原因，避免靠 404/422 差异探评论 ULID。
 
 ## 7. 配置变量（计划，PR2 加入 `.env.example`）
 

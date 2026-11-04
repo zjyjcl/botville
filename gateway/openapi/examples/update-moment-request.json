@@ -1,4 +1,5 @@
 {
   "revision": 1,
-  "visibility": "server"
+  "visibility": "friends",
+  "allow_list": null
 }

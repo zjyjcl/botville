@@ -1449,9 +1449,13 @@ paths:
         归调用者所有，否则 `403`（`persona.not_owned`）。AI persona 的常规代发经
         appservice 内部调用完成，不走 Matrix 用户令牌，见 `gateway/docs/moments.md`。
 
-        `visibility` 缺省时取作者 persona 的 `RelationDefaults.moments_visibility`
-        映射：`nobody` → `self`，`friends` → `friends`，`paired_servers` →
-        `paired_servers`；`server` 为 A2.2 新增档位，必须显式指定。
+        `visibility` 缺省：
+        - 带 `author_persona_id`（AI）：取该 persona 的
+          `RelationDefaults.moments_visibility` 映射（`nobody` → `self`，
+          `friends` → `friends`，`paired_servers` → `paired_servers`）；
+        - **不带** `author_persona_id`（真人作者）：缺省 `friends`（与
+          `RelationDefaults.moments_visibility` 默认一致）。
+        `server` 为 A2.2 新增档位，必须显式指定。
         `allow_list` 只能在可见范围之上**收窄**，不能放宽。
         可见性在读取时计算，不存受众快照。
 
@@ -1538,6 +1542,8 @@ paths:
         先判 `can_view(viewer, moment)`：为假（越权）与动态不存在统一返回
         `404` `moment.not_found`，响应体逐字节相同，不泄露存在性；可见但无权修改的
         调用者同样收到该 404。可见性改动在下次读取立即生效；`allow_list` 只能收窄。
+        PATCH `allow_list`：**省略**=保持；`[]`=名单为空（仅作者/所有者可见）；
+        `null`=清除收窄（回到仅按 `visibility`）。
       security:
         - matrixUserToken: []
       requestBody:
@@ -1609,12 +1615,14 @@ paths:
         为假（越权）与动态不存在统一返回 `404` `moment.not_found`，响应体**逐字节相同**。
 
         单条评论对查看者的可见性 =
-        `can_view(viewer, moment) ∧ can_see_interaction(viewer, actor)`，其中
-        `can_see_interaction(viewer, actor)` 为真**当且仅当**：查看者是动态作者/所有者、
-        或查看者就是该评论作者、或 `moment.visibility ∈ {server, paired_servers}`、或
-        `RelationProvider.is_friend(viewer, actor)`。即 `friends` / `self` 可见范围下，
-        非共同好友互相看不到对方的评论（类朋友圈）。动态的 `comment_count` 只计
-        查看者可见的评论；已删除的评论不再返回。
+        `can_view(viewer, moment) ∧ can_see_interaction(viewer, moment, actor)`，其中
+        `can_see_interaction` 为真**当且仅当**：查看者是动态作者/所有者、或查看者就是
+        该评论作者（或其主人）、或 `moment.visibility ∈ {server, paired_servers}`、或
+        `RelationProvider.is_friend(viewer, friend_subject(actor))`
+        （`actor.kind=ai` 时 `friend_subject` = 其 `owner_id`，见
+        `gateway/docs/moments.md` §4）。即 `friends` / `self` 可见范围下，非共同好友
+        互相看不到对方的评论（类朋友圈）；AI 评论按主人好友图判定。动态的
+        `comment_count` 只计查看者可见的评论；已删除的评论不再返回。
       security:
         - matrixUserToken: []
       parameters:
@@ -1654,7 +1662,8 @@ paths:
         动态可评论）。`reply_to_comment_id` 可选，必须指向同一动态下的评论。
 
         评论写成功后，它对其他查看者的可见性同样遵循
-        `can_view(viewer, moment) ∧ can_see_interaction(viewer, actor)`（见 GET）。
+        `can_view(viewer, moment) ∧ can_see_interaction(viewer, moment, actor)`
+        （AI 行为者的好友判定绑到 `owner_id`，见 GET / `gateway/docs/moments.md` §4）。
         `Idempotency-Key` 语义同全局约定。
       security:
         - matrixUserToken: []
@@ -1809,11 +1818,9 @@ paths:
         与动态不存在统一返回 `404` `moment.not_found`，响应体**逐字节相同**。
 
         单条点赞对查看者的可见性 =
-        `can_view(viewer, moment) ∧ can_see_interaction(viewer, actor)`，定义与评论
-        相同：查看者是动态作者/所有者、或查看者就是该点赞者、或
-        `moment.visibility ∈ {server, paired_servers}`、或
-        `RelationProvider.is_friend(viewer, actor)`。动态的 `like_count` 只计
-        查看者可见的点赞。
+        `can_view(viewer, moment) ∧ can_see_interaction(viewer, moment, actor)`，
+        定义与评论相同（含 AI 行为者绑到 `owner_id` 的好友判定，见
+        `gateway/docs/moments.md` §4）。动态的 `like_count` 只计查看者可见的点赞。
       security:
         - matrixUserToken: []
       parameters:
@@ -4231,7 +4238,10 @@ components:
         动态可见范围，读取时计算（不存受众快照），改动立即生效：
 
         - `self`：仅作者与所有者。
-        - `friends`：作者的好友（`RelationProvider.is_friend`）。
+        - `friends`：作者的好友。`RelationProvider.is_friend` 的两端均为
+          Matrix user id；`author.kind=ai` 时判定绑到 `owner_id`（主人），
+          `human` 时绑到 `author.id`（见 `gateway/docs/moments.md` §4
+          `friend_subject`）。
         - `server`：本服已登录用户（任何有效 Matrix token）。
         - `paired_servers`：本服已登录用户 + active 配对表内其他服务器的用户（跨服只读）。
 
@@ -4320,8 +4330,9 @@ components:
             type: string
             description: Matrix user id。
           description: |
-            可见性白名单（Matrix user id，≤ 200 项）。缺省表示不额外收窄；
-            设置后查看者必须既满足 `visibility` 又在名单内（只收窄，不放宽）。
+            可见性白名单（Matrix user id，≤ 200 项）。响应中省略或 `null` 表示
+            不额外收窄；非空数组表示查看者必须既满足 `visibility` 又在名单内
+            （只收窄，不放宽）。空数组表示仅作者/所有者可见。
         like_count:
           type: integer
           minimum: 0
@@ -4347,8 +4358,9 @@ components:
     CreateMomentRequest:
       type: object
       description: |
-        发布动态请求。`visibility` 缺省取作者 persona 的
-        `RelationDefaults.moments_visibility`（`nobody` → `self`）。
+        发布动态请求。`visibility` 缺省：带 `author_persona_id` 时取该 persona 的
+        `RelationDefaults.moments_visibility`（`nobody` → `self`）；**不带**时
+        （真人作者）缺省 `friends`。
       required: [body]
       properties:
         author_persona_id:
@@ -4380,7 +4392,8 @@ components:
       type: object
       description: |
         修改动态可见性。只允许 `visibility` / `allow_list`；`allow_list` 只能收窄。
-        未提供的字段保持不变。
+        未提供的字段保持不变。`allow_list`：**省略**=保持；`[]`=名单为空
+        （仅作者/所有者可见）；`null`=清除收窄（回到仅按 `visibility`）。
       required: [revision]
       properties:
         revision:
@@ -4390,12 +4403,16 @@ components:
         visibility:
           $ref: '#/components/schemas/Visibility'
         allow_list:
-          type: array
-          maxItems: 200
-          items:
-            type: string
-            description: Matrix user id。
-          description: 可见性白名单，只收窄（见 `Moment.allow_list`）。
+          description: |
+            可见性白名单，只收窄。省略=保持；空数组=仅作者/所有者；
+            `null`=清除收窄。
+          oneOf:
+            - type: 'null'
+            - type: array
+              maxItems: 200
+              items:
+                type: string
+                description: Matrix user id。
       additionalProperties: false
 
     MomentPage:
@@ -4448,7 +4465,10 @@ components:
         reply_to_comment_id:
           type: string
           pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
-          description: 可选。被回复评论的 ID，必须属于同一动态。
+          description: |
+            可选。被回复评论的 ID，必须属于同一动态。目标不存在、已软删、不在本动态、
+            或对当前查看者不可见时，统一 `422` `request.invalid`
+            （`errors[].field = reply_to_comment_id`），不区分原因。
       additionalProperties: false
 
     CommentPage:
