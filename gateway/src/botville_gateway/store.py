@@ -21,7 +21,7 @@ import hashlib
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Dict, List, Optional
 
@@ -32,6 +32,8 @@ class EventKind(str, Enum):
     `SENT` / `BLOCKED` / `DEFERRED` / `PROACTIVE` 对应契约
     `usage_events.kind` 的 `message_sent` / `blocked` / `message_deferred` /
     `proactive_message`；`TOWN_ACTION` 对应 `town_action`。
+    `HUMAN` 是内部辅助事件（人类消息到达），不映射到契约 kind，
+    `list_usage_events` 中过滤掉，聚合计数也不计入。
     """
 
     SENT = "sent"
@@ -39,15 +41,17 @@ class EventKind(str, Enum):
     DEFERRED = "deferred"
     PROACTIVE = "proactive"
     TOWN_ACTION = "town_action"
+    HUMAN = "human"  # B2.2: 人类消息记录，用于 anti_spam / ai_loop 计数重置
 
 
-# 内部 kind → 契约 UsageEvent.kind
+# 内部 kind → 契约 UsageEvent.kind；HUMAN 不在契约 enum 中，list_usage_events 过滤掉。
 KIND_TO_CONTRACT: Dict[EventKind, str] = {
     EventKind.SENT: "message_sent",
     EventKind.BLOCKED: "blocked",
     EventKind.DEFERRED: "message_deferred",
     EventKind.PROACTIVE: "proactive_message",
     EventKind.TOWN_ACTION: "town_action",
+    EventKind.HUMAN: "",  # 哨兵：空串；list_usage_events 按此过滤
 }
 
 
@@ -78,6 +82,9 @@ class UsageEvent:
     tokens_in: int = 0
     tokens_out: int = 0
     town_tokens: int = 0
+    # B2.2：peer_id 对应 OutgoingMessageRequest.peer_id；sent/blocked 事件写入。
+    # 旧事件无此字段（None），不计入任何 peer 层计数（历史数据不回填）。
+    peer_id: Optional[str] = None
 
     @property
     def tokens_total(self) -> int:
@@ -98,6 +105,7 @@ class UsageEvent:
         tokens_in: int = 0,
         tokens_out: int = 0,
         town_tokens: int = 0,
+        peer_id: Optional[str] = None,
     ) -> "UsageEvent":
         """构造事件。`at` 由调用方传入服务时钟，保证与策略评估用同一个 now。
 
@@ -116,6 +124,7 @@ class UsageEvent:
             tokens_in=tokens_in,
             tokens_out=tokens_out,
             town_tokens=town_tokens,
+            peer_id=peer_id,
         )
 
 
@@ -137,15 +146,24 @@ class UsageStore:
     def max_events(self) -> int:
         return self._max_events
 
-    def append(self, event: UsageEvent) -> None:
+    def append(self, event: UsageEvent, retention_seconds: int = 0) -> None:
         with self._lock:
             self._events.append(event)
-            self._evict_locked()
+            self._evict_locked(retention_seconds)
 
-    def _evict_locked(self) -> None:
-        """超限时按最旧优先批量裁剪到 90% 上限（兜底至少留 1 条）。"""
+    def _evict_locked(self, retention_seconds: int = 0) -> None:
+        """超限时优先丢弃早于保留期的事件，容量仍超才按最旧淘汰（B2.2 #114-7 保留期）。
+
+        `retention_seconds > 0` 时先将早于 now-retention_seconds 的事件批量清除，
+        再检查容量；容量仍超时按最旧优先裁剪到 90% 上限（兜底至少留 1 条）。
+        `retention_seconds=0` 时退化为纯容量淘汰，与旧行为一致。
+        """
         if self._max_events <= 0:
             return
+        # 按保留期淘汰（仅当 retention_seconds > 0）
+        if retention_seconds > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(seconds=retention_seconds)
+            self._events = [e for e in self._events if e.recorded_at > cutoff]
         overflow = len(self._events) - self._max_events
         if overflow <= 0:
             return
@@ -160,6 +178,7 @@ class UsageStore:
         since: Optional[datetime] = None,
         until: Optional[datetime] = None,
         conversation_id: Optional[str] = None,
+        peer_id: Optional[str] = None,
     ) -> List[UsageEvent]:
         """返回窗口 `(since, until]` 内的事件；任一过滤条件为 None 表示不过滤。
 
@@ -169,6 +188,9 @@ class UsageStore:
           活锁；开区间让「reset_at 到了 ⇒ 名额真的腾出来」成立。
         - 右端闭：`since == until` 得到空集，但同一秒内已记录的事件不会被漏算。
         不传 `until`（策略评估的默认）表示不设上限，避免时钟回拨把已记用量漏掉。
+
+        `peer_id` 过滤（B2.2）：传入时只返回 event.peer_id == peer_id 的事件；
+        旧事件（peer_id=None）不匹配，符合「旧事件不计入 peer 层」的契约约定。
         """
         with self._lock:
             return [
@@ -179,6 +201,7 @@ class UsageStore:
                 and (conversation_id is None or e.conversation_id == conversation_id)
                 and (since is None or e.recorded_at > since)
                 and (until is None or e.recorded_at <= until)
+                and (peer_id is None or e.peer_id == peer_id)
             ]
 
     def sent_count_since(self, *, persona_id: str, since: datetime) -> int:

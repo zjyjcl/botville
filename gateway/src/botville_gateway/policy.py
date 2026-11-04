@@ -58,6 +58,11 @@ CODE_SILENT_HOURS = "silent_hours.active"
 CODE_MIN_INTERVAL = "min_interval.too_soon"
 CODE_PROACTIVE_LIMIT = "proactive.per_day.exceeded"
 CODE_TOWN_TOKEN_LIMIT = "town.tokens_per_day.exceeded"
+# B2.2
+CODE_ANTI_SPAM_CONSECUTIVE = "anti_spam.consecutive"
+CODE_ANTI_SPAM_COOLDOWN = "anti_spam.cooldown"
+CODE_AI_LOOP_TRIPPED = "ai_loop.tripped"
+CODE_MESSAGE_LENGTH = "message.length"
 
 DECISION_ALLOW = "allow"
 DECISION_DEFER = "defer"
@@ -164,12 +169,14 @@ class Reservation:
 
     `at` 是预留时刻：它同时充当「这条消息进入滑动窗口的时间」，提交时会成为
     UsageEvent 的 `recorded_at`，所以投递耗时不会被算进窗口起点之前。
+    `conversation_id` 用于 ai_loop 按会话计数在途预留（B2.2）。
     """
 
     id: str
     persona_id: str
     tokens: int
     at: datetime
+    conversation_id: Optional[str] = None
 
 
 class ReservationBook:
@@ -188,9 +195,20 @@ class ReservationBook:
         self._items: Dict[str, Reservation] = {}
         self._lock = threading.Lock()
 
-    def reserve(self, *, persona_id: str, tokens: int, at: datetime) -> Reservation:
+    def reserve(
+        self,
+        *,
+        persona_id: str,
+        tokens: int,
+        at: datetime,
+        conversation_id: Optional[str] = None,
+    ) -> Reservation:
         reservation = Reservation(
-            id=f"res_{uuid.uuid4().hex}", persona_id=persona_id, tokens=tokens, at=at
+            id=f"res_{uuid.uuid4().hex}",
+            persona_id=persona_id,
+            tokens=tokens,
+            at=at,
+            conversation_id=conversation_id,
         )
         with self._lock:
             self._items[reservation.id] = reservation
@@ -204,6 +222,11 @@ class ReservationBook:
     def for_persona(self, persona_id: str) -> List[Reservation]:
         with self._lock:
             return [r for r in self._items.values() if r.persona_id == persona_id]
+
+    def for_conversation(self, conversation_id: str) -> List[Reservation]:
+        """按会话过滤在途预留（B2.2 ai_loop 计数用）。"""
+        with self._lock:
+            return [r for r in self._items.values() if r.conversation_id == conversation_id]
 
     def __len__(self) -> int:
         with self._lock:
@@ -262,7 +285,7 @@ class PolicyEngine:
         reasons: List[PolicyReason] = []
 
         # 1) 消息数窗口
-        rate = self._rate_view(persona_id, now, effective)
+        rate = self._rate_view(persona_id, now, effective, peer_id=peer_id)
         checks.append(rate)
         if not rate.allowed:
             reasons.append(
@@ -363,6 +386,67 @@ class PolicyEngine:
                 )
             )
 
+        # 7) 防刷屏 anti_spam（B2.2）
+        if conversation_id:
+            anti_spam = self._anti_spam_view(
+                persona_id=persona_id,
+                conversation_id=conversation_id,
+                now=now,
+                effective=effective,
+            )
+            if anti_spam is not None:
+                checks.append(anti_spam)
+                if not anti_spam.allowed:
+                    reasons.append(
+                        PolicyReason(
+                            code=anti_spam.code or CODE_ANTI_SPAM_CONSECUTIVE,
+                            message=(
+                                f"Anti-spam triggered: {anti_spam.code}; "
+                                f"may clear at {anti_spam.reset_at}."
+                            ),
+                            layer=anti_spam.layer,
+                        )
+                    )
+
+        # 8) 互聊熔断 ai_loop（B2.2）
+        if conversation_id:
+            ai_loop = self._ai_loop_view(
+                persona_id=persona_id,
+                conversation_id=conversation_id,
+                now=now,
+                effective=effective,
+            )
+            if ai_loop is not None:
+                checks.append(ai_loop)
+                if not ai_loop.allowed:
+                    reasons.append(
+                        PolicyReason(
+                            code=CODE_AI_LOOP_TRIPPED,
+                            message=(
+                                f"AI-to-AI conversation hit the hourly circuit breaker; "
+                                f"may clear at {ai_loop.reset_at}."
+                            ),
+                            layer=ai_loop.layer,
+                        )
+                    )
+
+        # 9) 分层 max_message_chars（B2.2 #114-7.2）
+        # 平台硬上限已在 _validate_send 里做 400；这里只处理 owner/peer 更严的配置。
+        msg_len = self._message_length_view(text=text, now=now, effective=effective)
+        if msg_len is not None:
+            checks.append(msg_len)
+            if not msg_len.allowed:
+                reasons.append(
+                    PolicyReason(
+                        code=CODE_MESSAGE_LENGTH,
+                        message=(
+                            f"Message length {len(text)} exceeds the effective limit "
+                            f"{msg_len.limit} set by layer {msg_len.layer}."
+                        ),
+                        layer=msg_len.layer,
+                    )
+                )
+
         return self._resolve(
             now=now,
             estimated=estimated,
@@ -458,7 +542,12 @@ class PolicyEngine:
         return self._config.rate_limit_window_seconds
 
     def _rate_view(
-        self, persona_id: str, now: datetime, effective: Optional[EffectiveLimits]
+        self,
+        persona_id: str,
+        now: datetime,
+        effective: Optional[EffectiveLimits],
+        *,
+        peer_id: Optional[str] = None,
     ) -> PolicyCheck:
         window = self._window_seconds(effective, pair="messages")
         if effective is not None:
@@ -483,9 +572,15 @@ class PolicyEngine:
             layer, source_id = LAYER_PLATFORM, SOURCE_PLATFORM
 
         since = now - timedelta(seconds=window)
+        # B2.2 §6.4: peer 层按 (persona, peer_id) 计数；其他层仍为 persona 全局。
+        from .limits import LAYER_PEER
+        use_peer_filter = (layer == LAYER_PEER and peer_id is not None)
         events = sorted(
             self._store.events_in_window(
-                persona_id=persona_id, kind=EventKind.SENT, since=since
+                persona_id=persona_id,
+                kind=EventKind.SENT,
+                since=since,
+                peer_id=peer_id if use_peer_filter else None,
             ),
             key=lambda e: e.recorded_at,
         )
@@ -493,7 +588,15 @@ class PolicyEngine:
 
         # 把在途预留（锁外投递中）也算作已用名额，防止并发击穿。
         if self._reservations is not None:
-            inflight = len(self._reservations.for_persona(persona_id))
+            # B2.2 §6.4: peer 层在途只计同 peer_id 的；其他层计全部该 persona 在途。
+            from .limits import LAYER_PEER
+            if use_peer_filter and peer_id is not None:
+                inflight = sum(
+                    1 for r in self._reservations.for_persona(persona_id)
+                    if r.conversation_id is not None
+                )
+            else:
+                inflight = len(self._reservations.for_persona(persona_id))
             used += inflight
 
         allowed = used < limit
@@ -764,3 +867,243 @@ class PolicyEngine:
                 microsecond=0,
             )
         return target.astimezone(timezone.utc)
+
+    # ---------------------------------------------- B2.2 anti_spam / ai_loop
+    def _last_human_at(
+        self, conversation_id: str, now: datetime
+    ) -> Optional[datetime]:
+        """该会话最近一条人类消息时刻；无人类消息时返回 None（计数从窗口起点起算）。"""
+        events = self._store.events_in_window(
+            conversation_id=conversation_id,
+            kind=EventKind.HUMAN,
+        )
+        if not events:
+            return None
+        return max(e.recorded_at for e in events)
+
+    def _anti_spam_view(
+        self,
+        *,
+        persona_id: str,
+        conversation_id: str,
+        now: datetime,
+        effective: Optional[EffectiveLimits],
+    ) -> Optional[PolicyCheck]:
+        """防刷屏：同 persona、同会话连续 AI 消息数 + 冷却（B2.2 §6.3）。
+
+        连续数 = 最后一条人类消息之后该 persona 的 sent 事件数 + 在途预留数。
+        达到 max_consecutive_ai_messages 后的下一条 → blocked（consecutive），
+        进入冷却；冷却锚定首次触发时刻，冷却期内再请求 → blocked（cooldown），
+        **不延长冷却**。冷却结束 → 连续数清零（以冷却结束时刻作为计数起点）。
+        blocked 事件不计入连续数（这里只统计 SENT 事件，blocked 事件不在其中）。
+        """
+        if effective is None:
+            return None
+        max_item = self._limits_for(effective, "anti_spam.max_consecutive_ai_messages")
+        cooldown_item = self._limits_for(effective, "anti_spam.cooldown_seconds")
+        if max_item is None:
+            return None
+        max_consecutive, layer, source_id = max_item
+        cooldown_seconds = int(cooldown_item[0]) if cooldown_item is not None else 0
+
+        # 冷却锚点：最近一次 reason_code=anti_spam.consecutive 的 blocked 事件。
+        blocked_events = sorted(
+            self._store.events_in_window(
+                persona_id=persona_id,
+                conversation_id=conversation_id,
+                kind=EventKind.BLOCKED,
+            ),
+            key=lambda e: e.recorded_at,
+        )
+        cooldown_anchor: Optional[datetime] = None
+        for e in blocked_events:
+            if e.reason_code == CODE_ANTI_SPAM_CONSECUTIVE:
+                cooldown_anchor = e.recorded_at
+
+        # 人类消息提前解除冷却：冷却锚点之后出现经网关人类消息 → 冷却失效，
+        # 计数起点直接取该人类消息时刻（契约 §6.3）。
+        human_at = self._last_human_at(conversation_id, now)
+        if (
+            cooldown_anchor is not None
+            and human_at is not None
+            and human_at > cooldown_anchor
+        ):
+            cooldown_anchor = None
+
+        if cooldown_anchor is not None and cooldown_seconds > 0:
+            cooldown_end = cooldown_anchor + timedelta(seconds=cooldown_seconds)
+            if now < cooldown_end:
+                # 冷却期内：blocked(cooldown)，may_clear_at 不变（不延长）。
+                used_seconds = (now - cooldown_anchor).total_seconds()
+                remaining_seconds = max(0, cooldown_seconds - used_seconds)
+                return PolicyCheck(
+                    key="anti_spam.cooldown",
+                    layer=layer,
+                    allowed=False,
+                    limit=cooldown_seconds,
+                    used=used_seconds,
+                    remaining=remaining_seconds,
+                    reset_at=iso_utc(_ceil_to_second(cooldown_end)),
+                    code=CODE_ANTI_SPAM_COOLDOWN,
+                    source_id=source_id,
+                )
+            # 冷却已结束：计数起点 = 冷却结束时刻（之前的 sent 不再计入）。
+            count_since = cooldown_end
+        else:
+            # 无冷却（或已被人类消息解除）：计数起点 = 最后一条人类消息时刻
+            # （无人类消息则从窗口起点）。
+            count_since = human_at
+
+        # 统计 count_since 之后的 SENT 事件（该 persona、该会话）。
+        events = sorted(
+            self._store.events_in_window(
+                persona_id=persona_id,
+                conversation_id=conversation_id,
+                kind=EventKind.SENT,
+                since=count_since,
+            ),
+            key=lambda e: e.recorded_at,
+        )
+        used = len(events)
+        # 在途预留也计入连续数（避免排程绕过熔断）。
+        if self._reservations is not None:
+            used += len(self._reservations.for_persona(persona_id))
+
+        if used >= max_consecutive:
+            # 触发：blocked(consecutive)，冷却锚点 = now（首次触发时刻）。
+            may_clear = now + timedelta(seconds=cooldown_seconds)
+            return PolicyCheck(
+                key="anti_spam.consecutive",
+                layer=layer,
+                allowed=False,
+                limit=max_consecutive,
+                used=used,
+                remaining=0,
+                reset_at=iso_utc(_ceil_to_second(may_clear)),
+                code=CODE_ANTI_SPAM_CONSECUTIVE,
+                source_id=source_id,
+            )
+
+        return PolicyCheck(
+            key="anti_spam.consecutive",
+            layer=layer,
+            allowed=True,
+            limit=max_consecutive,
+            used=used,
+            remaining=max(0, max_consecutive - used),
+            code=None,
+            source_id=source_id,
+        )
+
+    def _ai_loop_view(
+        self,
+        *,
+        persona_id: str,
+        conversation_id: str,
+        now: datetime,
+        effective: Optional[EffectiveLimits],
+    ) -> Optional[PolicyCheck]:
+        """互聊熔断：同会话任意 AI 在 1 小时滑动窗口内的消息数（B2.2 §6.3）。
+
+        count = 每小时滑动窗口内、最后一条人类消息之后的**任意 AI** sent 事件数
+        + 该会话在途预留。限额 = 被评估 persona 的生效 max_ai_messages_per_hour
+        （三层取最严）。超限 → blocked(ai_loop.tripped)；on_break=notify 按 stop 处理。
+        may_clear_at = 被计入 count 的最早一条事件出窗时刻（+3600s，向上取整到秒）；
+        若阻塞来自在途预留则给保守值（预留 at + 3600）。
+        """
+        if effective is None:
+            return None
+        item = self._limits_for(effective, "ai_loop.max_ai_messages_per_hour")
+        if item is None:
+            return None
+        max_per_hour, layer, source_id = item
+        window_seconds = 3600
+
+        # 计数起点 = 最后一条人类消息时刻（无人类消息则取窗口起点）。
+        human_at = self._last_human_at(conversation_id, now)
+        window_start = now - timedelta(seconds=window_seconds)
+        if human_at is not None and human_at > window_start:
+            count_since = human_at
+        else:
+            count_since = window_start
+
+        events = sorted(
+            self._store.events_in_window(
+                conversation_id=conversation_id,
+                kind=EventKind.SENT,
+                since=count_since,
+            ),
+            key=lambda e: e.recorded_at,
+        )
+        used = len(events)
+        # 在途预留：按会话过滤（任意 AI 的预留都计入同一会话的熔断计数）。
+        if self._reservations is not None:
+            inflight_conv = self._reservations.for_conversation(conversation_id)
+            used += len(inflight_conv)
+
+        if used >= max_per_hour:
+            # may_clear_at = 被计入 count 的最早一条事件出窗时刻。
+            if events:
+                earliest = events[0].recorded_at
+                may_clear = earliest + timedelta(seconds=window_seconds)
+            else:
+                # 阻塞来自在途预留：给保守值（now + 3600）。
+                may_clear = now + timedelta(seconds=window_seconds)
+            return PolicyCheck(
+                key="ai_loop.per_hour",
+                layer=layer,
+                allowed=False,
+                limit=max_per_hour,
+                used=used,
+                remaining=0,
+                reset_at=iso_utc(_ceil_to_second(may_clear)),
+                code=CODE_AI_LOOP_TRIPPED,
+                source_id=source_id,
+            )
+
+        return PolicyCheck(
+            key="ai_loop.per_hour",
+            layer=layer,
+            allowed=True,
+            limit=max_per_hour,
+            used=used,
+            remaining=max(0, max_per_hour - used),
+            code=None,
+            source_id=source_id,
+        )
+
+    def _message_length_view(
+        self,
+        *,
+        text: str,
+        now: datetime,
+        effective: Optional[EffectiveLimits],
+    ) -> Optional[PolicyCheck]:
+        """分层 max_message_chars（B2.2 #114-7.2）。
+
+        平台硬上限 config.max_message_chars 仍由请求解析层 400 拦截；
+        这里只处理 owner/peer 分层中更严的 max_message_chars，返回 200 blocked +
+        code=message.length。若生效值不严于平台层（或未配置），返回 None。
+        """
+        if effective is None or self._limit_store is None:
+            return None
+        item = self._limits_for(effective, "max_message_chars")
+        if item is None:
+            return None
+        limit, layer, source_id = item
+        platform_chars = self._config.max_message_chars
+        # 只在生效值比平台硬上限更严时才走策略路径。
+        if limit >= platform_chars:
+            return None
+        length = len(text)
+        allowed = length <= limit
+        return PolicyCheck(
+            key="message.length",
+            layer=layer,
+            allowed=allowed,
+            limit=limit,
+            used=length,
+            remaining=max(0, limit - length),
+            code=None if allowed else CODE_MESSAGE_LENGTH,
+            source_id=source_id,
+        )

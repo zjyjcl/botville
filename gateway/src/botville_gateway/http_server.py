@@ -43,6 +43,7 @@ from .errors import (
     GatewayDeliveryError,
     IdempotencyConflict,
     LimitError,
+    PeerValidationError,
     ValidationError,
 )
 from .limits import LimitStore
@@ -421,8 +422,12 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             errors = None
             if exc.field:
                 errors = [{"field": exc.field, "code": exc.code, "message": exc.detail}]
+            # PeerValidationError 携带 http_status=422（§6.4 peer_id 校验）；
+            # 普通 ValidationError 仍 400。
+            status = getattr(exc, "http_status", 400)
+            title = "Request validation failed" if status == 400 else "Request invalid"
             self._send_problem(
-                400, exc.code, "Request validation failed",
+                status, exc.code, title,
                 detail=exc.detail, errors=errors,
             )
             return
@@ -444,8 +449,12 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             errors = None
             if exc.field:
                 errors = [{"field": exc.field, "code": exc.code, "message": exc.detail}]
+            # PeerValidationError 携带 http_status=422（§6.4 peer_id 校验）；
+            # 普通 ValidationError 仍 400。
+            status = getattr(exc, "http_status", 400)
+            title = "Request validation failed" if status == 400 else "Request invalid"
             self._send_problem(
-                400, exc.code, "Request validation failed",
+                status, exc.code, title,
                 detail=exc.detail, errors=errors,
             )
             return
@@ -575,8 +584,12 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         errors = None
         if exc.field:
             errors = [{"field": exc.field, "code": exc.code, "message": exc.detail}]
+        # PeerValidationError 携带 http_status=422（§6.4 peer_id 校验）；
+        # 普通 ValidationError 仍 400。
+        status = getattr(exc, "http_status", 400)
+        title = "Request validation failed" if status == 400 else "Request invalid"
         self._send_problem(
-            400, exc.code, "Request validation failed",
+            status, exc.code, title,
             detail=exc.detail, errors=errors,
         )
 

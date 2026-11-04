@@ -46,7 +46,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import Config
-from .errors import GatewayDeliveryError, IdempotencyConflict, LimitError, ValidationError
+from .errors import GatewayDeliveryError, IdempotencyConflict, LimitError, PeerValidationError, ValidationError
 from .limits import LAYER_PLATFORM, LimitStore, PLATFORM_SCOPE_ID
 from .matrix import DeliveryError, MatrixTransport, SentEvent
 from .policy import (
@@ -165,6 +165,8 @@ class GatewayService:
         self._idempotency_guards: Dict[str, _KeyGuard] = {}
         self._queue: "OrderedDict[str, _QueueItem]" = OrderedDict()
         self._started_at = now_fn()
+        # B2.2 peer_id 校验：最小内存会话注册表（内部 API，测试用）。
+        self._conversation_registry: Dict[str, List[str]] = {}
 
     # ------------------------------------------------------------- accessors
     @property
@@ -192,6 +194,70 @@ class GatewayService:
     def pending_queue(self) -> List[_QueueItem]:
         with self._lock:
             return list(self._queue.values())
+
+    def register_conversation(self, conversation_id: str, persona_ids: List[str]) -> None:
+        """注册会话成员列表（内部 API，测试用；不加 HTTP 端点）。
+
+        用于 peer_id 校验：evaluate_policy / send_ai_message 时检查
+        peer_id ∈ persona_ids 且 ≠ sender。
+        """
+        with self._lock:
+            self._conversation_registry[conversation_id] = list(persona_ids)
+
+    def record_human_message(
+        self, conversation_id: str, at: Optional[datetime] = None
+    ) -> None:
+        """记录人类消息到达事件（内部 API，不加 HTTP 端点）。
+
+        写 UsageEvent kind=HUMAN，用于 anti_spam / ai_loop 计数重置。
+        同时提前解除该会话 persona 的 anti_spam 冷却（通过 EventKind.HUMAN 事件的存在，
+        policy engine 在 _anti_spam_view 中检查 human_at 来决定计数起点）。
+        """
+        now = at or self._now()
+        self._store.append(
+            UsageEvent.make(
+                EventKind.HUMAN,
+                persona_id="__human__",
+                conversation_id=conversation_id,
+                at=now,
+            )
+        )
+
+    def _check_peer_id(
+        self,
+        *,
+        conversation_id: Optional[str],
+        sender: str,
+        peer_id: Optional[str],
+    ) -> None:
+        """peer_id 校验（B2.2 §6.4）：
+
+        - 会话已注册 + 带 peer_id：peer_id ∈ persona_ids 且 ≠ sender，否则 422。
+        - 会话已注册 + 无 peer_id：若会话成员中有任一 persona 有 peer 层规则 → 422。
+        - 会话未注册 + 带 peer_id：fail-closed → 422（无法校验成员）。
+        - 会话未注册 + 无 peer_id：与 B2.1 相同（pass）。
+        """
+        if conversation_id is None:
+            return
+        registered = self._conversation_registry.get(conversation_id)
+        if registered is not None:
+            if peer_id is not None:
+                if peer_id not in registered or peer_id == sender:
+                    raise PeerValidationError(
+                        f"peer_id {peer_id!r} must be a conversation member and differ from sender {sender!r}"
+                    )
+            else:
+                # 无 peer_id：若会话成员中有 peer 层规则则强制 422。
+                if self._limits.any_peer_rules(registered):
+                    raise PeerValidationError(
+                        "peer_id is required when a conversation member has peer-layer rules configured"
+                    )
+        else:
+            if peer_id is not None:
+                raise PeerValidationError(
+                    f"peer_id {peer_id!r} supplied but conversation {conversation_id!r} is not registered; "
+                    "cannot verify membership (fail-closed)"
+                )
 
     # --------------------------------------------------------------- limits
     def get_limits(
@@ -254,12 +320,16 @@ class GatewayService:
             raise ValidationError("request.invalid", "'to' must not precede 'from'", "to")
         tz = _resolve_timezone(timezone_name)
 
-        events = self._store.events_in_window(
-            persona_id=persona_id,
-            conversation_id=conversation_id,
-            since=start,
-            until=end,
-        )
+        events = [
+            e
+            for e in self._store.events_in_window(
+                persona_id=persona_id,
+                conversation_id=conversation_id,
+                since=start,
+                until=end,
+            )
+            if e.contract_kind  # filter out HUMAN events
+        ]
         counts: Dict[str, int] = {}
         for event in events:
             counts[event.contract_kind] = counts.get(event.contract_kind, 0) + 1
@@ -322,7 +392,8 @@ class GatewayService:
             for e in self._store.events_in_window(
                 persona_id=persona_id, since=start, until=end
             )
-            if wanted_kinds is None or e.contract_kind in wanted_kinds
+            if e.contract_kind  # EventKind.HUMAN has empty contract_kind → filter out
+            and (wanted_kinds is None or e.contract_kind in wanted_kinds)
         ]
         events.sort(key=lambda e: e.recorded_at, reverse=True)
 
@@ -389,6 +460,11 @@ class GatewayService:
                 f"'kind' must be one of {sorted(EVALUATE_KINDS)}, got {kind!r}",
                 "kind",
             )
+        self._check_peer_id(
+            conversation_id=conversation_id,
+            sender=persona_id,
+            peer_id=peer_id,
+        )
         decision = self._engine.evaluate(
             persona_id=persona_id,
             conversation_id=conversation_id,
@@ -472,6 +548,7 @@ class GatewayService:
                     reply_to=validated["reply_to"],
                     mentions=validated["mentions"],
                     metadata=validated["metadata"],
+                    peer_id=validated["peer_id"],
                 )
                 if idempotency_key:
                     self._idempotency_put(idempotency_key, fingerprint, receipt)
@@ -642,6 +719,11 @@ class GatewayService:
         `peer_id` 必须传进 `evaluate()`（B2）：否则 peer 层的 messages/tokens
         限额只在预检里生效，实发会把三层退化成两层。
         """
+        self._check_peer_id(
+            conversation_id=conversation_id,
+            sender=sender,
+            peer_id=peer_id,
+        )
         now = self._now()
         decision = self._engine.evaluate(
             persona_id=sender,
@@ -662,6 +744,7 @@ class GatewayService:
                     reason_code=decision.reasons[0].code if decision.reasons else None,
                     text=text,
                     at=now,
+                    peer_id=peer_id,
                 )
             )
             return _PreparedSend(decision, receipt=self._receipt(decision, outcome="blocked"))
@@ -696,7 +779,10 @@ class GatewayService:
 
         # allow：先预留名额（消息数 / token 预扣 / 最小间隔），投递完成后再提交。
         reservation = self._reservations.reserve(
-            persona_id=sender, tokens=decision.estimated_tokens, at=now
+            persona_id=sender,
+            tokens=decision.estimated_tokens,
+            at=now,
+            conversation_id=conversation_id,
         )
         return _PreparedSend(
             decision, reservation=reservation, tokens_out=decision.estimated_tokens
@@ -720,6 +806,7 @@ class GatewayService:
         reply_to: Optional[str],
         mentions: Optional[List[str]],
         metadata: Optional[Dict[str, str]],
+        peer_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """锁内提交：调用方须持锁，且已释放（或即将释放）该预留。
 
@@ -735,6 +822,7 @@ class GatewayService:
                 text=text,
                 at=reservation.at,
                 tokens_out=tokens_out,
+                peer_id=peer_id,
             )
         )
 
@@ -1039,6 +1127,8 @@ def _usage_event_body(event: UsageEvent) -> Dict[str, Any]:
         body["text_length"] = event.text_length
     if event.text_sha256:
         body["text_sha256"] = event.text_sha256
+    if event.peer_id:
+        body["peer_id"] = event.peer_id
     return body
 
 
