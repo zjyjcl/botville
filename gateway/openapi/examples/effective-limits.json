@@ -10,7 +10,10 @@
     { "key": "proactive_per_day", "value": 3, "unit": "count", "source_layer": "peer", "source_id": "persona_peer" },
     { "key": "max_message_chars", "value": 8000, "unit": "chars", "source_layer": "platform", "source_id": "platform_default" },
     { "key": "min_seconds_between_messages", "value": 5, "unit": "seconds", "source_layer": "platform", "source_id": "platform_default" },
-    { "key": "silent_hours", "value": true, "unit": "boolean", "source_layer": "owner", "source_id": "persona_demo" }
+    { "key": "silent_hours", "value": true, "unit": "boolean", "source_layer": "owner", "source_id": "persona_demo" },
+    { "key": "anti_spam.max_consecutive_ai_messages", "value": 5, "unit": "count", "source_layer": "platform", "source_id": "platform_default" },
+    { "key": "anti_spam.cooldown_seconds", "value": 60, "unit": "seconds", "source_layer": "platform", "source_id": "platform_default" },
+    { "key": "ai_loop.max_ai_messages_per_hour", "value": 20, "unit": "count", "source_layer": "platform", "source_id": "platform_default" }
   ],
   "layers": [
     {
