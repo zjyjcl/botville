@@ -795,7 +795,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
-| 0.1.0 | 2026-11-04 | [B2.2 PR2 实现] 防刷屏与 AI 互聊熔断落地，**只增不删、不改状态码集合**。(1) §1.3 错误码表补 `422 request.invalid`（createConversation 语义不合法 + peer_id 校验，属 §5.3 条件必填，0.x 例外）；(2) §6.3 `ai_loop.may_clear_at` 措辞改为「最早一条**被计入 count 的** AI 事件出窗」（窗口内有早于人类消息的旧事件时不偏早）；(3) §6.3 补「blocked 仍记 `kind=blocked` 不计入连续数；冷却锚定首次触发、重试不延长」；(4) §6.4 补 `peer_id` 须为会话成员且为对方 persona（≠ sender）；(5) §6.4 peer_id 缺失强制声明属 §5.3 条件必填、0.x 例外，无 peer 规则时省略同 B2.1。实现：`store.py` 增 `EventKind.HUMAN` + `UsageEvent.peer_id` + 保留期淘汰；`policy.py` 增 `anti_spam`/`ai_loop`/`message.length` 检查 + peer 层按 (persona, peer_id) 计数；`service.py` 增 `record_human_message`/`register_conversation`/`_check_peer_id`（422）；`limits.py` #114-4 `window_seconds` 单写 → 422；`http_server.py` peer_id 校验 422。测试 `test_b22_anti_spam_ai_loop.py` 42 例。 |
+| 0.1.0 | 2026-11-04 | [B2.2 PR2 实现] 防刷屏与 AI 互聊熔断落地，**只增不删、不改状态码集合**。(1) §1.3 错误码表补 `422 request.invalid`（createConversation 语义不合法 + peer_id 校验，属 §5.3 条件必填，0.x 例外）；(2) §6.3 `ai_loop.may_clear_at` 措辞改为「最早一条**被计入 count 的** AI 事件出窗」（窗口内有早于人类消息的旧事件时不偏早）；(3) §6.3 补「blocked 仍记 `kind=blocked` 不计入连续数；冷却锚定首次触发、重试不延长」；(4) §6.4 补 `peer_id` 须为会话成员且为对方 persona（≠ sender）；(5) §6.4 peer_id 缺失强制声明属 §5.3 条件必填、0.x 例外，无 peer 规则时省略同 B2.1。实现：`store.py` 增 `EventKind.HUMAN` + `UsageEvent.peer_id` + 保留期淘汰；`policy.py` 增 `anti_spam`/`ai_loop`/`message.length` 检查 + peer 层按 (persona, peer_id) 计数；`service.py` 增 `record_human_message`/`register_conversation`/`_check_peer_id`（422）；`limits.py` #114-4 `window_seconds` 单写 → 422；`http_server.py` peer_id 校验 422。测试 `test_b22_anti_spam_ai_loop.py` 42 例。**[B2.2 #117 审查修订]** (6) §6.4 会话成员来源（HTTP 注册/房间成员同步）尚未接入：**未登记会话（或 evaluate 无 `conversation_id`）按 B2.1 采信 `peer_id`、不校验成员**（带 `peer_id` 则 peer 层生效并计数）；仅**已登记**会话做成员校验（∈成员且≠sender，否则 422）与「**对方**（排除 sender）有 peer 规则时缺 `peer_id` → 422」，sender 自身有 peer 规则不触发；空串 `peer_id` → `400 request.invalid`（send 与 evaluate 一致）。(7) §6.3 **冷却状态独立于事件表保存**（进程内存按 `(persona, conversation_id)` 键，不受 blocked 事件容量淘汰影响，不再由事件复算 `may_clear_at`）；冷却期内同键 blocked 事件**只记一条**；`cooldown_seconds=0` 触发后冷却立即结束、计数起点取触发时刻（无 `reset_at == now` 活锁）；`kind=deferred`（静默顺延）**计入**连续数；保留期 `USAGE_RETENTION_SECONDS`（默认 30 天）**按服务时钟**（事件 `recorded_at`）淘汰。(8) §6.3 在途预留按会话计入 `anti_spam`（不跨会话误伤）。 |
 | 0.1.0 | 2026-11-04 | [B2.2 PR1 审查修订] 补全冷却/peer_id/幂等/码表语义，**只增不删、不改状态码集合**。(1) §6.3 冷却结束时刻即清零该 persona 在该会话的连续计数，被拦（`blocked`）消息不计入连续数；选码时机——触发那条报 `anti_spam.consecutive`、冷却期内后续请求报 `anti_spam.cooldown`（check 口径 limit=`cooldown_seconds`/used=已冷却秒数/remaining=剩余秒数/reset_at=`may_clear_at`）；冷却期内出现经网关人类消息提前解除冷却并清零，首版无人类入站入口故实际只靠冷却到期解除（不会永久静音）；(2) §6.4 当会话成员中存在配置了 peer 层限额的对方 persona、而请求未带 `peer_id` 时返回 `422 request.invalid`（`errors[].field=peer_id`），无 peer 层规则时省略 `peer_id` 与 B2.1 一致，实发与预检 `peer_id` 必须一致；(3) §1.5 把 `PUT /limits` 列为幂等例外（整层替换天然幂等、服务端不缓存、同 key 不同 body 不返回 409）；(4) `PolicyCheck.key` 推荐列表补 `anti_spam.cooldown`，注明 `key` 与 `code` 是两套名字；(5) `PolicyReason.code` 描述注明旧码 `ai_loop.breaker_open` 视为 `ai_loop.tripped` 的别名；(6) 推荐码列表按 B2.1 实际常量写（带后缀 `.exceeded`/`.active`/`.too_soon` 等）；(7) §6.3 `ai_loop` 计数口径明确为「窗口内、最后一条经网关人类消息之后的 AI 消息数（任意 AI）」，会话级计数由被评估 persona 的生效 `ai_loop` 限额约束（三层取最严），只拦被评估这条；(8) 平台硬上限 `MAX_MESSAGE_CHARS` 仍 `400 request.invalid`，只有 owner/peer 分层更严 `max_message_chars` 走 `200 blocked` + `message.length`；(9) §6.3 写明计数依赖事件保留期，部署须保证 `max_usage_events` 足以保留 `max(window,cooldown)` 内事件，容量不足可能少算（已知局限，PR2 按保留期淘汰）。实现见 PR2。 |
 | 0.1.0 | 2026-11-04 | [B2.2 + #114 契约] 防刷屏 / 互聊熔断与 peer 计数语义，**只增不删、不改状态码集合**。(1) `PolicyReason.code` / `PolicyCheck.key`·`code` 推荐取值新增 `anti_spam.consecutive`、`anti_spam.cooldown`、`ai_loop.tripped`（均为开放字符串，旧值仍有效）；(2) `UsageEvent` 新增可选 `peer_id`；(3) 新增 [§6.3 熔断语义](#63-熔断语义b22)：连续的定义（`ai_loop` 同会话任意 AI、`anti_spam` 同 persona）、人类消息重置、`may_clear_at` 口径（anti_spam=冷却结束、ai_loop=最早事件出窗，向上取整到秒）、结论 `blocked`+`retryable:false`+200、首版只统计经网关的人类消息、`on_break=notify` 未实现时按 `stop` 处理（fail-closed）；(4) 新增 [§6.4 peer 计数语义](#64-peer-计数语义与-b21-兼容性b22)：B2.2 起 peer 层按 `(persona, peer_id)` 计数，请求不带 `peer_id` 时 peer 层不生效、旧事件无 `peer_id` 只计入 persona 全局与 platform/owner 层，platform/owner 计数不变；(5) #114-4 `window_seconds` 必须与本层 `messages_per_window` / `tokens_per_window` 成对出现，单写→422 `limit.out_of_range`；(6) #114-5 等速率按 platform→owner→peer 归属（行为不变）；(7) #114-7.5 `UsageEvent` 描述改准：删除「不可反推原文」，说明短/低熵文本 SHA-256 可被字典猜测（后续改 HMAC），`text_length` = Unicode 字符数；(8) #114-7.8b 错误边界：结构/类型错=400 `request.invalid`，规则值语义越界=422 `limit.out_of_range`；(9) #114-7.8c `PUT /limits` 为整层替换、天然幂等，`Idempotency-Key` 可选且服务端不缓存；(10) 示例：`policy-decision` / `message-receipt-blocked` 改用 `ai_loop.tripped`，新增 `usage-event.json`（含 `peer_id`）。实现见 PR2。 |
 | 0.1.0 | 2026-11-04 | 澄清会话加密与 AI 参与：E2EE/`ai_participation=disabled` 下 AI 发言与预检返回 `403 conversation.e2ee`（硬约束，非 §1.4 blocked）；`createConversation` 禁止 `e2ee`+`enabled`（`422 request.invalid`），省略 `ai_participation` 时按 `encryption` 推导；苹果端细节改为外链。属文档澄清，不改字段集合。 |
@@ -937,9 +937,21 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
     `key = anti_spam.cooldown`、`limit = cooldown_seconds`、`used` = 已冷却秒数、
     `remaining` = 剩余秒数、`reset_at = may_clear_at`。
 - **blocked 事件持久化与冷却锚点**：被拦消息仍以 `kind=blocked` 写入 `UsageStore`
-  （与 `MessageReceipt` 语义一致），但**不计入连续数**（连续数只统计 `kind=sent`）。
-  冷却锚定**首次触发** `anti_spam.consecutive` 的时刻，冷却期内**重试不延长冷却**；
-  `may_clear_at` 可由 `reason_code=anti_spam.consecutive` 的 blocked 事件复算（实现无状态）。
+  （与 `MessageReceipt` 语义一致），但**不计入连续数**（连续数只统计 `kind=sent` /
+  `kind=deferred`）。
+  - **冷却状态独立于事件表保存（#117 审查修订）**：冷却锚点由网关在**实发路径**单独
+    记录（进程内存，按 `(persona, conversation_id)` 键），**不依赖** `UsageStore` 中的
+    blocked 事件，也**不受**这些事件的容量淘汰影响。因此被拒请求的写放大不会提前解除
+    冷却，`may_clear_at` 也不再由事件复算（先前「实现无状态、可由 blocked 事件复算」的
+    说法已废弃）。
+  - 冷却锚定**首次触发** `anti_spam.consecutive` 的时刻，冷却期内**重试不延长冷却**。
+  - **冷却期内重复 blocked 只记一条事件**：同 `(persona, conversation_id)` 在一次冷却
+    期间，`reason_code=anti_spam.cooldown` 的 blocked 事件只在首次写入一条，后续重试
+    仍返回同样的 `200 blocked` 结论与 `may_clear_at`，但不再写事件，避免被拒请求挤占
+    事件容量。
+  - **`cooldown_seconds = 0`**：触发后冷却**立即结束**，计数起点取触发时刻；下一条请求
+    重新从 0 起计（可再次发满 `max_consecutive_ai_messages` 条），不会出现
+    `reset_at == now` 的活锁。即 0 秒冷却表示「不冷却，只做窗口外的连续计数」。
 - **`message.length` 与平台硬上限区分**：平台固定的 `MAX_MESSAGE_CHARS` 上限在请求解析时
   直接拒绝，返回 `400 request.invalid`，**不走策略裁决**。只有 owner / peer 分层中配置的
   更严 `max_message_chars` 才走策略路径，返回 `200 blocked` + `reasons[].code = message.length`。
@@ -949,12 +961,18 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
   - `notify`：**当前版本未实现通知通道**，按 `stop` 处理（fail-closed，先拦截再谈通知），
     即与 `stop` 行为一致。将来实现通知后，`notify` 仍会拦截，并**额外向所有者推送一条
     通知**（提醒人类介入），不会改成放行。
-- **在途预留**：与 B2.1 的 token 预扣一致，已发出但未入账（`queued` / `deferred`）的
-  AI 消息**计入**连续数，避免因排程而绕过熔断；`may_clear_at` 的计算同样把在途计入。
-- **计数依赖事件保留期**：连续计数基于 `UsageStore` 中保留的近期事件；部署须保证
-  `max_usage_events` 足以保留 `max(window_seconds, cooldown_seconds)` 内的所有事件。
-  容量不足时事件可能被淘汰，导致计数偏低（fail-open，提前放行），属已知局限；
-  PR2 将按保留期淘汰旧事件（仅契约说明，不改实现范围）。
+- **在途预留与 `deferred` 计入连续数**：与 B2.1 的 token 预扣一致，已发出但未入账
+  （`queued` / `deferred`）的 AI 消息**计入**连续数，避免因排程而绕过熔断；
+  `may_clear_at` 的计算同样把在途计入。**`deferred`（静默时段被顺延）的消息也计入
+  `anti_spam` 连续数**：顺延不等于未发，仍算作一次连续 AI 消息（`kind=deferred`
+  写入 `UsageStore`，与 `kind=sent` 同等对待）。
+- **保留期淘汰（`USAGE_RETENTION_SECONDS`，默认 30 天）**：`UsageStore` 在每次
+  `append` 时，**按服务时钟**（事件的 `recorded_at`，不读 `datetime.now()`）优先淘汰
+  早于 `now - USAGE_RETENTION_SECONDS` 的旧事件，超出容量上限才按最旧 LRU 淘汰。
+  因此：超过 30 天的事件不会被滑动窗口计入，行为一致；注入/回放时钟时边界不失真。
+  部署须保证 `max_usage_events` 足以保留 `max(window_seconds, cooldown_seconds)` 内
+  的所有事件；容量不足时事件可能被淘汰，导致计数偏低（fail-open，提前放行），属
+  已知局限（冷却状态独立存储，不受此影响）。
 
 ### 6.4 peer 计数语义与 B2.1 兼容性（B2.2）
 
@@ -963,12 +981,22 @@ B2.2 起 peer 层限额按 `(persona, peer_id)` 计数，即对每个对端角�
 - **计数维度**：peer 层的 `messages_per_window` / `tokens_per_window` / `min_interval`
   等窗口类限额，`used` 以 `(persona_id, peer_id)` 为键累加，来源是带 `peer_id` 的
   `UsageEvent`。
-- **`peer_id` 缺失强制**：当会话成员中存在配置了 peer 层限额的对方 persona、而请求（
-  `OutgoingMessageRequest` 或 `PolicyEvaluateRequest`）**未带 `peer_id`** 时，网关返回
-  `422 request.invalid`，`errors[].field = peer_id`（语义组合不合法，peer 层规则无法匹配）。
-  此为 B2.2 对 peer 层绕过的修正，属 §5.3「收紧约束/条件必填」；0.x 例外。
-  **无 peer 层规则**时省略 `peer_id` 的行为与 B2.1 完全相同（旧客户端无感）。
-  这与 B2.1 的 fail-open 行为不同，是 B2.2 对 peer 层绕过的修正。
+- **会话成员来源与校验范围（#117 审查修订）**：会话成员的真实来源（HTTP 会话注册 /
+  Matrix 房间成员同步）**尚未接入**，当前只有网关内部登记（`register_conversation`，测试用）。
+  因此校验按会话是否已登记分两种：
+  - **未登记（或 `POST /policy/evaluate` 未带 `conversation_id`）**：按 **B2.1 行为**采信
+    `peer_id`，**不校验成员**。带 `peer_id` 时 peer 层生效并按 `(persona, peer_id)` 计数；
+    不带时 peer 层不生效。这样未登记会话的旧客户端与 B2.1 完全一致。
+  - **已登记**：`peer_id` 须 ∈ 会话成员且 ≠ sender（否则 `422 request.invalid`）。
+  - **`peer_id` 缺失强制（仅已登记会话）**：当已登记会话中**对方**（排除 sender 自身）存在
+    配置了 peer 层限额的 persona、而请求（`OutgoingMessageRequest` 或
+    `PolicyEvaluateRequest`）**未带 `peer_id`** 时，网关返回 `422 request.invalid`，
+    `errors[].field = peer_id`（语义组合不合法，peer 层规则无法匹配）。
+    此为 B2.2 对 peer 层绕过的修正，属 §5.3「收紧约束/条件必填」；0.x 例外。
+    只有 sender 自己配置了 peer 层规则、对方没有时，省略 `peer_id` **不报错**。
+    **无 peer 层规则**时省略 `peer_id` 的行为与 B2.1 完全相同（旧客户端无感）。
+  - **空串 `peer_id`**：`""` 不是合法对端标识，实发与预检均返回 **`400 request.invalid`**
+    （`errors[].field = peer_id`），不走策略路径（结构/类型错误，见 §6.6 错误边界）。
 - **兼容条件**：会话成员中**无任何 peer 层规则**时，省略 `peer_id` 的行为与 B2.1 完全
   相同（peer 层不生效，计数仍为 persona 全局，旧客户端无感）。
   - 旧 `UsageEvent` 无 `peer_id` 字段的记录，只计入 **persona 全局**与 **platform / owner

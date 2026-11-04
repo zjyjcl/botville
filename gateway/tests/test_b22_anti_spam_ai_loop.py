@@ -861,5 +861,332 @@ class TestConcurrentAntiSpam(unittest.TestCase):
         self.assertEqual(blocked, 3, f"outcomes: {results}")
 
 
+# ---------------------------------------------------------------------------
+# 11. TestB22ReviewFixes — #117 审查回归
+# ---------------------------------------------------------------------------
+
+def _put_peer_rule(limits: LimitStore, peer_id: str, **rules) -> None:
+    """为 peer 层写入规则（scope_id = peer_id）。"""
+    limits.put(
+        {
+            "layer": "peer",
+            "scope": "peer",
+            "scope_id": peer_id,
+            "rules": rules,
+        },
+        now=datetime.datetime.now(timezone.utc),
+    )
+
+
+class TestB22ReviewFixes(unittest.TestCase):
+    """#117 审查修订回归：未注册会话、冷却独立、在途隔离、deferred 计数等。"""
+
+    def setUp(self):
+        self.svc, _, self.store, self.limits, self.clock = make_service()
+
+    # ------------------------------------------------------------------
+    # T1  未注册会话经 HTTP 带 peer_id → delivered；peer 层生效；usage 有 peer_id
+    # ------------------------------------------------------------------
+    def test_unregistered_conv_with_peer_id_delivered_over_http(self):
+        config = make_config(auth_token=None, dev_mode=True, port=0)
+        transport = InMemoryMatrixTransport()
+        store = UsageStore(max_events=0)
+        limits = LimitStore(config)
+        clock = FixedClock()
+        svc = GatewayService(config, transport, store, limits, now_fn=clock)
+        _put_peer_rule(limits, "bot2", messages_per_window=5, window_seconds=3600)
+        server = build_server(config, transport)
+        server.service = svc
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            body = json.dumps({
+                "sender_persona_id": "bot1",
+                "peer_id": "bot2",
+                "content": {"type": "text", "text": "hello"},
+            }).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_address[1]}/v1/conversations/conv_unreg/messages",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req) as resp:
+                status = resp.status
+                receipt = json.loads(resp.read())
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(status, 200, receipt)
+        self.assertEqual(receipt["outcome"], "delivered", receipt)
+        # peer 层生效：usage 事件带 peer_id
+        sent = [e for e in store.all_events() if e.peer_id == "bot2"]
+        self.assertTrue(len(sent) >= 1, "usage event must carry peer_id")
+
+    # ------------------------------------------------------------------
+    # T2  未注册会话不带 peer_id → delivered（B2.1 行为，peer 层不生效）
+    # ------------------------------------------------------------------
+    def test_unregistered_conv_without_peer_id_not_blocked(self):
+        _put_peer_rule(self.limits, "bot2", messages_per_window=5, window_seconds=3600)
+        r = send(self.svc, "bot1", "conv_unreg")
+        self.assertEqual(r["outcome"], "delivered", r)
+
+    # ------------------------------------------------------------------
+    # T3  convB 有在途预留时 convA 的 anti_spam 不被误伤
+    # ------------------------------------------------------------------
+    def test_inflight_in_other_conv_does_not_block_anti_spam(self):
+        put_anti_spam(self.limits, "bot1", max_consecutive=2, cooldown_seconds=30)
+        # 构造一条 convB 的在途预留
+        self.svc._reservations.reserve(
+            persona_id="bot1",
+            tokens=10,
+            at=self.clock(),
+            conversation_id="conv_b",
+        )
+        # convA 发 2 条（应不被 convB 的在途计入 convA 的连续数）
+        for _ in range(2):
+            r = send(self.svc, "bot1", "conv_a")
+            self.assertEqual(r["outcome"], "delivered", r)
+
+    # ------------------------------------------------------------------
+    # T4  UsageStore(max_events=10)：触发冷却后重试 20 次全 blocked，冷却后放行；
+    #     冷却期 blocked 事件数 ≤ 2
+    # ------------------------------------------------------------------
+    def test_cooldown_independent_of_event_table_capacity(self):
+        config = make_config(rate_limit_messages=100, rate_limit_window_seconds=3600)
+        clock = FixedClock()
+        transport = InMemoryMatrixTransport()
+        store = UsageStore(max_events=10)   # 小容量：事件容易被淘汰
+        limits = LimitStore(config)
+        svc = GatewayService(config, transport, store, limits, now_fn=clock)
+        put_anti_spam(limits, "bot1", max_consecutive=2, cooldown_seconds=60)
+
+        for _ in range(2):
+            r = send(svc, "bot1", "conv1")
+            self.assertEqual(r["outcome"], "delivered", r)
+        # 触发
+        r = send(svc, "bot1", "conv1")
+        self.assertEqual(r["outcome"], "blocked", r)
+        codes = [x["code"] for x in r["decision"]["reasons"]]
+        self.assertIn(CODE_ANTI_SPAM_CONSECUTIVE, codes)
+        # 冷却期内 20 次重试全 blocked
+        for _ in range(20):
+            r = send(svc, "bot1", "conv1")
+            self.assertEqual(r["outcome"], "blocked", r)
+        # blocked 事件数 ≤ 2（冷却期内最多 1 条，加上首次触发 consecutive 1 条）
+        blocked_events = [e for e in store.all_events() if e.kind == EventKind.BLOCKED]
+        self.assertLessEqual(len(blocked_events), 2, blocked_events)
+        # 冷却结束后放行
+        clock.advance(seconds=61)
+        r = send(svc, "bot1", "conv1")
+        self.assertEqual(r["outcome"], "delivered", r)
+
+    # ------------------------------------------------------------------
+    # T5  平台 rate 2/3600 + anti_spam max=2 cooldown=60：
+    #     第3条同时 rate+anti_spam 失败仍建立锚点；冷却结束后 anti_spam allowed
+    # ------------------------------------------------------------------
+    def test_dual_fail_still_anchors_cooldown_and_clears(self):
+        # 平台 rate=2 (via LimitStore)
+        self.limits.put(
+            {
+                "layer": "owner",
+                "scope": "persona",
+                "scope_id": "bot1",
+                "rules": {"messages_per_window": 2, "window_seconds": 3600},
+            },
+            now=self.clock(),
+        )
+        put_anti_spam(self.limits, "bot1", max_consecutive=2, cooldown_seconds=60)
+        for _ in range(2):
+            r = send(self.svc, "bot1", "conv1")
+            self.assertEqual(r["outcome"], "delivered", r)
+        # 第3条：rate 被拦 + anti_spam 同时触发
+        r = send(self.svc, "bot1", "conv1")
+        self.assertEqual(r["outcome"], "blocked", r)
+        codes = [x["code"] for x in r["decision"]["reasons"]]
+        # 至少有一个是 anti_spam.consecutive（锚点应已建立）
+        self.assertIn(CODE_ANTI_SPAM_CONSECUTIVE, codes)
+        # 让时钟跳过 rate 窗口 + 冷却期
+        self.clock.advance(seconds=3661)
+        # anti_spam 冷却结束后 check 应为 allowed
+        decision = self.svc._engine.evaluate(
+            persona_id="bot1",
+            conversation_id="conv1",
+            now=self.clock(),
+        )
+        anti_spam_check = next(
+            (c for c in decision.checks if c.key == "anti_spam.consecutive"), None
+        )
+        self.assertIsNotNone(anti_spam_check, "anti_spam.consecutive check missing")
+        self.assertTrue(anti_spam_check.allowed, "anti_spam should be allowed after cooldown")
+
+    # ------------------------------------------------------------------
+    # T6  cooldown_seconds=0：触发后下一条 anti_spam 放行，且 reset_at ≠ now 活锁
+    # ------------------------------------------------------------------
+    def test_zero_cooldown_no_livelock(self):
+        put_anti_spam(self.limits, "bot1", max_consecutive=1, cooldown_seconds=0)
+        # 触发（第2条）
+        send(self.svc, "bot1", "conv1")
+        r = send(self.svc, "bot1", "conv1")
+        self.assertEqual(r["outcome"], "blocked", r)
+        codes = [x["code"] for x in r["decision"]["reasons"]]
+        self.assertIn(CODE_ANTI_SPAM_CONSECUTIVE, codes)
+        # 下一条（不 advance 时钟）应直接放行，不进入 cooldown 循环
+        r2 = send(self.svc, "bot1", "conv1")
+        self.assertEqual(r2["outcome"], "delivered", r2)
+
+    # ------------------------------------------------------------------
+    # T7  仅在途阻塞时 messages/tokens reset_at 非 None 且 > now
+    # ------------------------------------------------------------------
+    def test_inflight_only_reset_at_is_future(self):
+        svc, _, store, limits, clock = make_service(
+            rate_limit_messages=1, rate_limit_window_seconds=3600
+        )
+        r1 = send(svc, "bot1", "conv1")
+        self.assertEqual(r1["outcome"], "delivered", r1)
+        # 第2条被 rate 拦；在途预留 0（投递已完成），事件已提交
+        r2 = send(svc, "bot1", "conv1")
+        self.assertEqual(r2["outcome"], "blocked", r2)
+        checks = {c["key"]: c for c in r2["decision"]["checks"]}
+        mw = checks.get("messages.window")
+        self.assertIsNotNone(mw)
+        self.assertIsNotNone(mw.get("reset_at"), "reset_at must not be None")
+        reset_dt = datetime.datetime.strptime(
+            mw["reset_at"], "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=timezone.utc)
+        self.assertGreater(reset_dt, clock())
+
+    # ------------------------------------------------------------------
+    # T8  peer 层 tokens_per_window：bot2 用尽不影响 bot3（按 (persona, peer_id)）
+    # ------------------------------------------------------------------
+    def test_peer_token_budget_isolated_by_peer_id(self):
+        _put_peer_rule(self.limits, "bot2", tokens_per_window=4, window_seconds=3600)
+        # 不注册会话，未注册走 B2.1：直接采信 peer_id
+        # 用尽 bot2 peer 层 token 预算（每条文本 "hi" ≈ 1 token）
+        for _ in range(4):
+            r = send(self.svc, "bot1", "conv1", text="hi", peer_id="bot2")
+            self.assertEqual(r["outcome"], "delivered", r)
+        r = send(self.svc, "bot1", "conv1", text="hi", peer_id="bot2")
+        self.assertEqual(r["outcome"], "blocked", r)
+        # bot3 不受影响
+        r3 = send(self.svc, "bot1", "conv1", text="hi", peer_id="bot3")
+        self.assertEqual(r3["outcome"], "delivered", r3)
+
+    def test_peer_min_interval_isolated_by_peer_id(self):
+        """peer 层 min_seconds_between_messages 按 (persona, peer_id) 计：刚给 bot2 发过不影响给 bot3 发。"""
+        _put_peer_rule(self.limits, "bot2", min_seconds_between_messages=600)
+        _put_peer_rule(self.limits, "bot3", min_seconds_between_messages=600)
+        r = send(self.svc, "bot1", "conv1", peer_id="bot2")
+        self.assertEqual(r["outcome"], "delivered", r)
+        r = send(self.svc, "bot1", "conv1", peer_id="bot2")
+        self.assertEqual(r["outcome"], "blocked", r)
+        r3 = send(self.svc, "bot1", "conv1", peer_id="bot3")
+        self.assertEqual(r3["outcome"], "delivered", r3)
+
+    # ------------------------------------------------------------------
+    # T9  静默时段 deferred 计入连续数（anti_spam used 递增）
+    # ------------------------------------------------------------------
+    def test_deferred_counts_toward_anti_spam_consecutive(self):
+        # 本用例单独开启静默时段（Asia/Shanghai 23:00-07:30）
+        self.svc, _, self.store, self.limits, self.clock = make_service(
+            silent_hours_enabled=True,
+            silent_hours_start="23:00",
+            silent_hours_end="07:30",
+            silent_hours_timezone="Asia/Shanghai",
+        )
+        self.clock.set("2026-11-03T16:00:00Z")  # 00:00 Asia/Shanghai，落在默认静默 23:00-07:30
+        put_anti_spam(self.limits, "bot1", max_consecutive=3, cooldown_seconds=60)
+        # 静默时段内发言 → deferred
+        r = send(self.svc, "bot1", "conv1")
+        self.assertEqual(r["outcome"], "deferred", r)
+        # deferred 应写入 UsageStore（kind=DEFERRED）
+        events = self.store.all_events()
+        deferred = [e for e in events if e.kind == EventKind.DEFERRED]
+        self.assertTrue(len(deferred) >= 1, "deferred event must be recorded")
+        # anti_spam 视角里 used 应包含此 deferred
+        self.clock.set("2026-11-04T04:00:00Z")  # 12:00 Asia/Shanghai，白天
+        decision = self.svc._engine.evaluate(
+            persona_id="bot1",
+            conversation_id="conv1",
+            now=self.clock(),
+        )
+        anti_spam_check = next(
+            (c for c in decision.checks if c.key == "anti_spam.consecutive"), None
+        )
+        self.assertIsNotNone(anti_spam_check)
+        self.assertGreater(anti_spam_check.used, 0, "deferred should be counted")
+
+    # ------------------------------------------------------------------
+    # T10 保留期：早于 retention_seconds 的事件在 append 后被淘汰
+    # ------------------------------------------------------------------
+    def test_retention_evicts_old_events(self):
+        base = datetime.datetime(2026, 11, 3, 12, 0, 0, tzinfo=timezone.utc)
+        store = UsageStore(max_events=0, retention_seconds=3600)
+        # 注入 5 条比 retention 更老的事件（2h 前）
+        for i in range(5):
+            store.append(
+                UsageEvent.make(
+                    EventKind.SENT,
+                    persona_id="bot1",
+                    at=base - timedelta(hours=2, seconds=i),
+                )
+            )
+        self.assertEqual(len(store), 5)
+        # append 一条 now 事件 → 旧事件被淘汰
+        store.append(
+            UsageEvent.make(EventKind.SENT, persona_id="bot1", at=base)
+        )
+        remaining = store.all_events()
+        cutoff = base - timedelta(seconds=3600)
+        for e in remaining:
+            self.assertGreater(
+                e.recorded_at, cutoff,
+                f"event at {e.recorded_at} is older than retention cutoff {cutoff}"
+            )
+        self.assertLess(len(remaining), 6, "old events should have been evicted")
+
+    # ------------------------------------------------------------------
+    # T11 已注册会话，仅 sender 有 peer 规则，缺 peer_id → 不 422
+    # ------------------------------------------------------------------
+    def test_registered_conv_only_sender_has_peer_rule_no_422(self):
+        self.svc.register_conversation("conv_reg", ["bot1", "bot2"])
+        # bot1 (sender) 有 peer 规则；bot2 没有
+        _put_peer_rule(self.limits, "bot1", messages_per_window=10, window_seconds=3600)
+        # 发送方=bot1，无 peer_id → 对方 bot2 无规则，不应 422
+        r = send(self.svc, "bot1", "conv_reg")
+        self.assertEqual(r["outcome"], "delivered", r)
+
+    # ------------------------------------------------------------------
+    # T12 evaluate 带 peer_id 无 conversation_id：不 422，peer 层生效
+    # ------------------------------------------------------------------
+    def test_evaluate_with_peer_id_no_conv_id_not_422(self):
+        _put_peer_rule(self.limits, "bot2", messages_per_window=5, window_seconds=3600)
+        result = self.svc.evaluate_policy({
+            "persona_id": "bot1",
+            "peer_id": "bot2",
+            "content": "hello",
+        })
+        # peer 层应生效（有 messages.window check）
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("decision"), "allow")
+
+    # ------------------------------------------------------------------
+    # T13 空串 peer_id → evaluate 与 send 都 400
+    # ------------------------------------------------------------------
+    def test_empty_peer_id_is_400_for_evaluate(self):
+        with self.assertRaises(ValidationError) as ctx:
+            self.svc.evaluate_policy({
+                "persona_id": "bot1",
+                "peer_id": "",
+                "content": "hello",
+            })
+        self.assertEqual(ctx.exception.http_status, 400)
+
+    def test_empty_peer_id_is_400_for_send(self):
+        with self.assertRaises(ValidationError) as ctx:
+            send(self.svc, "bot1", "conv1", peer_id="")
+        self.assertEqual(ctx.exception.http_status, 400)
+
+
 if __name__ == "__main__":
     unittest.main()
