@@ -867,15 +867,6 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
-        '403':
-          description: 身份有效但无权限（如 persona 不属于调用方）。
-          headers:
-            X-Request-Id:
-              $ref: '#/components/headers/XRequestId'
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
         '422':
           $ref: '#/components/responses/UnprocessableEntity'
         '500':
@@ -1971,7 +1962,8 @@ components:
         token ≥32 字节）；服务端先对请求 token 与存储 token 各做 `HMAC-SHA256(进程随机键)`
         统一长度，再 `hmac.compare_digest` 全量比较（不提前返回）。`owner_id` 由 token 推出，
         **只用于 `/context/assemble` 的 persona 区**：推不出或非 owner 时 persona 区为空
-        （正常结果，非错误），该接口**一律 `200`**。`403 persona.not_owned` 只用于
+        （正常结果，非错误），**persona 归属不改变状态码（`200`）**，请求非法时仍按
+        `400` / `401` / `422` 返回。`403 persona.not_owned` 只用于
         **`/context/assemble` 以外**的 persona 写操作（如以 `author_persona_id` 写动态）。
         `GATEWAY_LEGACY_TOKEN_ENABLED` 默认 `true`（兼容站点级 token），**开启调用方 token
         后建议关闭**；配置了 caller token 而旧 token 仍开启时启动打 WARNING。
