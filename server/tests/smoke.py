@@ -33,6 +33,31 @@ SUPPORTED_STAGES = ("m.login.registration_token", "m.login.dummy")
 # Login retries on HTTP 429 (M_LIMIT_EXCEEDED): sleep retry_after_ms from the
 # response body (default 1000) and try again, at most this many times.
 LOGIN_MAX_RETRIES = 5
+# Cap a single 429 sleep so a hostile/broken retry_after_ms cannot hang CI.
+LOGIN_RETRY_AFTER_MS_DEFAULT = 1000
+LOGIN_RETRY_AFTER_MS_MAX = 30000
+
+
+def _login_retry_delay_ms(resp):
+    """Delay in ms from a 429 body; non-finite/negative/non-dict → default.
+
+    Issue #110 / PR #108 nit: only isinstance(int/float) let NaN/Inf/negatives
+    and True through; clamp to [0, LOGIN_RETRY_AFTER_MS_MAX] with a 1s fallback.
+    """
+    if not isinstance(resp, dict):
+        return LOGIN_RETRY_AFTER_MS_DEFAULT
+    delay_ms = resp.get("retry_after_ms")
+    if isinstance(delay_ms, bool) or not isinstance(delay_ms, (int, float)):
+        return LOGIN_RETRY_AFTER_MS_DEFAULT
+    # Reject NaN/Inf (json.loads may produce them with allow_nan defaults).
+    if delay_ms != delay_ms or delay_ms in (float("inf"), float("-inf")):
+        return LOGIN_RETRY_AFTER_MS_DEFAULT
+    if delay_ms < 0:
+        return LOGIN_RETRY_AFTER_MS_DEFAULT
+    if delay_ms > LOGIN_RETRY_AFTER_MS_MAX:
+        return LOGIN_RETRY_AFTER_MS_MAX
+    return int(delay_ms)
+
 
 
 def request_json(method, url, body=None, token=None, timeout=REQUEST_TIMEOUT):
@@ -166,10 +191,7 @@ class Smoke:
             if status != 429 or retries_left <= 0:
                 break
             retries_left -= 1
-            delay_ms = (resp or {}).get("retry_after_ms")
-            if not isinstance(delay_ms, (int, float)):
-                delay_ms = 1000
-            time.sleep(delay_ms / 1000.0)
+            time.sleep(_login_retry_delay_ms(resp) / 1000.0)
         expect(status == 200, "login returned HTTP {}: {!r}".format(status, resp))
         token = (resp or {}).get("access_token")
         expect(token, "login 200 without access_token: {!r}".format(resp))

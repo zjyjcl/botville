@@ -225,6 +225,8 @@ class RestoreSynapseTest(unittest.TestCase):
         backup = self.make_backup()
         proc = self.run_restore(backup, compose="bash {}".format(self.fake_compose))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        # #110: explicit COMPOSE must warn that instance check is .env-scoped only.
+        self.assertIn("COMPOSE is explicitly set", proc.stderr)
         calls = self.compose_log.read_text(encoding="utf-8").splitlines()
         self.assertIn("stop synapse", calls)
         self.assertIn("up -d postgres", calls)
@@ -259,6 +261,38 @@ class RestoreSynapseTest(unittest.TestCase):
         self.assertIn("skipping checksum verification", proc.stderr)
         self.assertNotIn("checksum OK", proc.stdout)
         self.assertTrue(self.docker_calls())
+
+
+
+class EnvValueFromLastWinsTest(unittest.TestCase):
+    """#110: env_value_from must match compose/init last-wins."""
+
+    def test_last_assignment_wins(self):
+        import subprocess
+        import tempfile
+        from pathlib import Path as P
+
+        lib = P(__file__).resolve().parents[1] / "scripts" / "lib.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            env = P(tmp) / "e"
+            env.write_text(
+                "COMPOSE_PROJECT_NAME=first\n"
+                "COMPOSE_PROJECT_NAME=second\n"
+                "BOTVILLE_HTTP_PORT=8008\n"
+                "BOTVILLE_HTTP_PORT=8018\n",
+                encoding="utf-8",
+            )
+            script = (
+                "set -euo pipefail; source {lib}; "
+                'printf "%s\\n%s" '
+                '"$(env_value_from {env} COMPOSE_PROJECT_NAME)" '
+                '"$(env_value_from {env} BOTVILLE_HTTP_PORT)"'
+            ).format(lib=repr(str(lib)), env=repr(str(env)))
+            proc = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=30
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "second\n8018")
 
 
 if __name__ == "__main__":

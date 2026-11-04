@@ -368,6 +368,14 @@ make e2e E2E_PHASE=verify               # ⑥ 用 state 文件重新登录，确
 第 ⑥ 步输出 `E2E VERIFY OK` 即「备份可恢复」验收通过（之后可把注册关回去）。
 CI 的 `backup-restore (synapse)` job 每次提交都跑同样流程。
 
+
+
+> **实例一致性检查的口径（#110）**：恢复前比对的是当前 `server/compose/.env`
+> 与备份里 `env` 的 `COMPOSE_PROJECT_NAME` / `BOTVILLE_HTTP_PORT`（同机
+> project/port 维度；两台主机都用默认 `botville/8008` 时无法区分）。
+> 装回备份 `.env` 后会按新值重算 compose 项目名——**调用方已显式
+> `export COMPOSE=...` 时除外**（脚本会 WARNING，仍使用该 COMPOSE）。
+
 ## 同机多实例 / 多开发线并行
 
 生产、测试或多条开发线要在同一台机器（NAS 或开发机）上各跑一套栈时，**每个实例

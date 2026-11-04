@@ -22,12 +22,16 @@ compose() {
     ${COMPOSE} "$@"
 }
 
-# First value of KEY from an arbitrary env file (empty if unset/no file).
+# Last value of KEY from an arbitrary env file (empty if unset/no file).
+# Last assignment wins — same as docker compose --env-file and init.sh's
+# env_value (issue #110 / PR #108 nit). Duplicate keys in .env must not make
+# restore's instance check disagree with the project compose actually uses.
 env_value_from() { # env_value_from <file> <KEY>
-    sed -n "s/^$2=//p" "$1" | head -n 1
+    sed -n "s/^$2=//p" "$1" | tail -n 1
 }
 
-# First value of KEY from server/compose/.env (empty if unset/no file).
+# Value of KEY from server/compose/.env (empty if unset/no file); last
+# assignment wins (see env_value_from).
 env_value() {
     env_value_from "${BOTVILLE_ENV_FILE}" "$1"
 }
