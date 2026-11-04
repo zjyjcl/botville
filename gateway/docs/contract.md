@@ -126,6 +126,67 @@ App                          网关                        模块网页（WKWebV
 
 `code` 与 cookie 值都不得写入日志、localStorage 或任何脚本可读的位置。
 
+#### 1.2.2 调用方身份（#124）
+
+§1.2 的 `bearerAuth` 是**站点级占位令牌**（`GATEWAY_AUTH_TOKEN`）：持有者可代表任意
+`sender_persona_id` 发言，没有 per-caller 身份，也没有所有权边界。本节定义可选的
+**调用方身份**（caller identity）层，让网关能区分「哪个调用方在以哪个 owner 的 persona
+发言」，用于 `/context/assemble` 的 persona 区鉴权与后续 per-caller 审计。**本节只定义
+契约；实现见 PR-D。**
+
+**配置（环境变量，均为占位符，不得写入真实密钥）**：
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `GATEWAY_CALLER_TOKENS` | *(空)* | 调用方 token 表：每条形如 `caller_id:token:owner_id`，多条用**分号 `;` 或换行**分隔（两种分隔符等价，可混用）；留空 = 不启用调用方身份，行为与现状一致 |
+| `GATEWAY_LEGACY_TOKEN_ENABLED` | `true` | 是否仍接受站点级 `GATEWAY_AUTH_TOKEN`；**开启调用方 token 后建议关闭**（见下） |
+
+- **`GATEWAY_CALLER_TOKENS`**：每个调用方一条，含 `caller_id`（日志标识，不可逆）、
+  `token`（≥32 字节随机值）、`owner_id`（该调用方拥有的 persona 集合的所有者 ID）。
+  **字段约束**：三个字段的值都**不得包含** `:`（字段分隔符）、`;`（条目分隔符）或换行；
+  条目必须恰好含两个 `:`（三段均非空）。**缺字段、空字段、字段数不为 3、或字段内含上述
+  分隔符 → 拒绝启动**（fail closed；dev 模式仅警告的例外只针对 token 强度与重复，见下）。
+  字段按 `:` 切分后再 trim 两端空白。
+  `.env.example` 只放占位符（如 `<caller-token-placeholder>`），**绝不写真实密钥**。
+- **`GATEWAY_LEGACY_TOKEN_ENABLED` 默认 `true`**：兼容现有部署。**文档建议**：一旦配置了
+  `GATEWAY_CALLER_TOKENS`，把 `GATEWAY_LEGACY_TOKEN_ENABLED` 改为 `false`，避免站点级
+  token 绕过 per-caller 所有权。**配置了 `GATEWAY_CALLER_TOKENS` 而 `GATEWAY_LEGACY_TOKEN_ENABLED`
+  仍为 `true` 时，启动打一条 WARNING**（提示旧 token 仍可绕过 per-caller 边界）；该 WARNING 的
+  实现留给后续 PR，契约先行声明。
+- **caller token 与 legacy token 冲突**：某个 caller token **等于** `GATEWAY_AUTH_TOKEN`
+  → **拒绝启动**（否则无法判定该请求的身份边界；两套语义不可重载同一值）。
+- **legacy 关闭且 caller token 为空**：`GATEWAY_LEGACY_TOKEN_ENABLED=false` 而
+  `GATEWAY_CALLER_TOKENS` 为空时，**所有需要鉴权的请求一律 `401 auth.invalid_token`**
+  （部署不提供任何可用凭据），启动打一条 **WARNING**（不拒绝启动：可能是刻意的封闭部署）。
+- **token 强度**：每个 caller token ≥32 字节；**短于 32 字节拒绝启动**，**重复 token 拒绝启动**
+  （dev 模式仅警告，不拒绝）。
+- **比较方式**：服务端先对请求 token 与存储 token 各做 `HMAC-SHA256(进程随机键, token)` 统一
+  长度，再用 `hmac.compare_digest` **全量比较，不提前返回**（常数时间，防时序侧信道）。
+  进程随机键每次启动重新生成、不落盘。
+- **日志**：**只记 `caller_id`，绝不记 token、token 哈希或 owner_id 明文**。鉴权失败的日志
+  同样只记 `caller_id`（未知 caller 时记 `<unknown>`）。
+- **`/context/assemble` 的 owner 推导**：`owner_id` 由调用方 token 推出（HTTP 层鉴权后注入
+  `service.assemble_context(owner_id=…)`）；**推不出（无 caller token / 用站点级 token）
+  或推出的 owner 不拥有该 persona 时，persona 区为空**——这是**正常结果，不是错误**
+  （fail-closed，与 §7.2 一致）。请求体**不接受** `owner_id` 字段
+  （`ContextAssembleRequest` `additionalProperties: false`）。
+- **`/context/assemble` 的 persona 归属不改变状态码（`200`）**：该接口**不因 persona 归属返回
+  `403`**——推不出 owner 或非 owner 都只是让 persona 区为空，`outcome` 仍按 §7.2 正常判定
+  （`allowed` / `blocked`）；请求本身非法时仍按 `400` / `401` / `422` 返回，这些状态码与
+  persona 归属无关。这与 #123 已合的 fail-closed 行为及其测试一致，PR-D 不得改写为 `403`。
+- **`403` 只用于 `/context/assemble` 以外的 persona 写操作**：例如模块以 `author_persona_id`
+  写动态、写 persona 设置等，调用方 token 有效但该 persona 不归其 owner 所有时返回
+  **`403 persona.not_owned`**（错误码统一为 `persona.not_owned`，不使用
+  `auth.insufficient_scope`；见 §1.3 与 OpenAPI 的 `persona.not_owned` 定义）。
+- **不改请求字段、不改 `401` 语义**：本节不向任何请求体新增字段；无有效 token（caller token
+  未配置且 legacy 关闭、或 token 不匹配）仍走 §1.3 的 `401 auth.invalid_token`。本节不新增
+  任何错误码。
+- **v1 的约束范围**：调用方身份**只约束 `/context/assemble` 的 persona 区**（该区内容由
+  token 推出的 owner 决定，非 owner 即为空）。**发送路径的 `sender_persona_id` 所有权校验
+  不在本期**：v1 不校验以某个 persona 发言的调用方是否拥有该 persona——站点级 token（legacy）
+  仍可代表任意 `sender_persona_id` 发言，per-caller token 也不额外做发送侧归属校验。
+  per-caller 的发送隔离属后续版本，接入时不升主版本（仅扩展行为）。
+
 
 ### 1.3 错误模型（RFC 9457）
 
@@ -152,7 +213,7 @@ App                          网关                        模块网页（WKWebV
 |---|---|---|
 | 400 | `request.invalid` / `request.malformed_json` | 语法或参数错误 |
 | 401 | `auth.missing` / `auth.invalid_token` | 缺少或无效令牌（含一次性 code 重复使用） |
-| 403 | `auth.insufficient_scope` / `persona.not_owned` / `relation.chat_denied` / `conversation.e2ee` / `card.step_up_required` / `card.assertion_invalid` | 身份有效但无权限 / 断言无效 |
+| 403 | `persona.not_owned` / `relation.chat_denied` / `conversation.e2ee` / `card.step_up_required` / `card.assertion_invalid` | 身份有效但无权限 / 断言无效 |
 | 404 | `persona.not_found` / `conversation.not_found` / `capability.not_found` / `card.not_found` / `audit.not_found` | 不存在或对调用方不可见 |
 | 409 | `persona.in_use` / `conversation.exists_conflict` / `persona.revision_conflict` / `card.revision_conflict` / `idempotency.conflict` / `card.already_decided` / `card.challenge_invalid` | 状态冲突 |
 | 410 | `card.challenge_expired` | challenge 或一次性 code 已过期 |
@@ -811,6 +872,10 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.1.0 | 2026-11-05 | [#124 契约 r3] 修 r2 审查 B1 与 nit。**(1) B1**：删除 OpenAPI `POST /context/assemble` 的 path 级 `403`（描述「身份有效但无权限（如 persona 不属于调用方）」）——该接口只返回 `200` / `400` / `401` / `422`，persona 归属只体现为 persona 区为空，与 `http_server.py` 及 #123 信任隔离测试一致。**(2) 措辞收敛**：§1.2.2 与 OpenAPI bearerAuth 描述的「`/context/assemble` 一律 `200`」改为「persona 归属不改变状态码（`200`）」，并注明请求本身非法仍按 `400` / `401` / `422` 返回。**(3) nit**：§6.3 「事故排序」→「出窗排序」；预留离场路径由两条补为三条（提交 `sent` / TTL 回收 / 投递失败回滚 `_rollback` → `release`）；`notify` 段改写为「`notify` 目前等价 `stop`，故平台为 `stop` 时 owner / peer 设 `notify` 不报 `422`」；在 N8 处定义 `ceil_to_second` = 按整秒向上取整（非截断）；预留 TTL 出处改为「#114 PR-b（#126）实现、PR-C 消费」。 |
+| 0.1.0 | 2026-11-05 | [#124 契约 r2] §1.2.2 修 B1 矛盾：`/context/assemble` persona 归属不改变状态码（`200`），推不出 owner 或非 owner → persona 区为空（与 §7.2、#123 测试一致）；`403` 只用于 `/context/assemble` 以外的 persona 写操作，错误码统一为 `persona.not_owned`，删除 `auth.insufficient_scope`。补 nit5：多条用分号 `;` 或换行分隔（两种等价），`caller_id` / `token` / `owner_id` 不得含 `:` `;` 换行，缺/空字段拒绝启动，caller token 等于 legacy token 时拒绝启动，legacy 关闭且无 caller token 时所有请求 `401`（启动 WARNING）。补 nit6：v1 只约束 `/context/assemble` 的 persona 区，发送路径 `sender_persona_id` 所有权校验不在本期。`.env.example` 同步分隔符说明。OpenAPI bearerAuth 描述同步。 |
+| 0.1.0 | 2026-11-05 | [N8 契约 r2] §6.3 `ai_loop` 的 `may_clear_at` 补边界：(a) `limit=0` 时 `may_clear_at=null`（永不因滑窗恢复，只能调整限额）；(b) 在途预留明确为已准入、尚未提交为 `sent` 的 `ReservationBook` 条目，预留 TTL 默认 300s（PR-B 实现），超 TTL 先回收不计入 `used`；`deferred` 立即写 `UsageEvent(kind=deferred)` 已被计数，不是在途预留；预留不受人类消息重置；(c) `may_clear_at` 最终取 `max(计算值, ceil(now)+1s)`，永不返回过去或当前时刻，避免活锁。删除「不会偏早」的无条件断言。OpenAPI `AiLoopRules` 描述同步。 |
+| 0.1.0 | 2026-11-05 | [N7 契约 r2] §6.3 补 `PLATFORM_AI_LOOP_ON_BREAK` 单独说明：默认 `stop` 是平台底线值，不适用「0=不设」；枚举严格序定义为 `stop` 严于 `notify`（`notify` 按 `stop` 执行）；明确区分平台 env 的 `0=不设` 与 API 的 `max_ai_messages_per_hour=0=一条都不允许` 两种语义。`.env.example` 补 4 个 `PLATFORM_*` 占位符（数值项默认 `0`=平台不设，枚举项默认 `stop`）。OpenAPI `AiLoopRules` 描述同步。 |
 | 0.1.0 | 2026-11-04 | [B2.3 PR1 r3] 闭环审查阻断 B1–B5，**只增字段/接口、不改既有成功路径状态码集合**（描述可修订；`/context/assemble` 为新接口，其 4xx 属新路径）。**(1) B1 选型 b**：删除「运行时自行拼装失败经 `/policy/evaluate` 上报」的不可达路径；`trust.isolation_failed` **只能**由 `POST /context/assemble`（`outcome=blocked`）产生；自行拼装失败时**本地放弃本轮、不调模型**，不经 evaluate 上报；evaluate 描述删除该段，`PolicyEvaluateRequest` **不新增** isolation 字段。**(2) B2 提权面**：§7.1/§7.2 明文写死「调用方声明只能降级（≤ `untrusted`），不得提升；`system` **只能由网关内部**按规则 1 赋予」；`ContextAssembleRequest.system_text` / `persona_text` 标 `deprecated` 并**禁用**（出现即 `400 request.invalid`）；`system` 区只含固定声明、`persona` 区只由网关按 owner 鉴权从存储读取（非 owner/读不到 → persona 区为空）；请求示例去掉两者、结果示例 `system` 区只含固定声明；`GET messages` 的 `trust=system` 筛选器**保留**并注明「仅为筛选、非 trust 声明，筛选实现可后置」。**(3) B3 洗白**：`source_id` 存在时**以本地存储正文为准**，请求 `text` 与之不一致 → `422 request.invalid`（`errors[].field=items[].text`），不进入分区；`ContextItemVerdict.trust` 注明条目文本永不进 `system`，判定为 `system` 的条目文本丢弃；`boundary_forgery` 补「可信 source_id + 恶意 text」样例，§7.3 增验收点 (e)。**(4) B4 口径统一**：`/context/assemble` 出现 `trust`/`external`/`provenance` 等未知或禁用字段 → `400 request.invalid`（契约删「一律忽略」）；`kind` 枚举对齐 OpenAPI（`comment`→`moments_comment`，补 `moments_post`/`other`）。**(5) B5 nonce**：`<untrusted id="{nonce}">` 的 **id 必须等于 nonce**，`ContextNonce.segment_id` **必须等于** `nonce`；结果示例把 `seg_1/seg_2` 换成真实 nonce，`segment_id` 与之相同；`validate_openapi.py` 增加交叉校验（标签 id 集合 == `nonces[].nonce` 集合，且 `segment_id == nonce`）。**(6) 非阻断**：§5.1「只增不删」改为「只增字段/接口、不改既有成功路径状态码集合，描述可修订」；§7.2 写明 `items` 单次上限 **200**；`send-message-request.json` 补 `provenance.forwarded_from`（与 changelog 一致）。实现见 PR2。 |
 | 0.1.0 | 2026-11-04 | [B2.3 PR1 审查修订] 修 DeepSeek 阻断 1/2 与非阻断项，**只增不删、不改状态码集合**；OpenAPI 仅新增可选接口/字段与描述。**(1) 阻断 1——隔离执行主体与失败路径**：§7.2 明确**四区拼装与 nonce 边界由 AI 运行时执行**（网关不调模型，见 §0/§2.1），并新增**可选**接口 `POST /context/assemble`（只增）：请求 `persona_id`/`conversation_id`/`system_text`/`persona_text`/`items[]`，网关按 §7.1 判定每条 `trust`（忽略调用方传入值），`outcome=allowed` 返回 `zones` 四分区 + `nonces`（每段数据区一个）+ `items[]` 判定，`outcome=blocked` 返回 `reason.code=trust.isolation_failed`；写全 blocked 取值：`retryable=false`、`retry_after_seconds=null`、`same_content_allowed=false`、`may_clear_at=null`、`queue_id=null`、记一条 `usage_events kind=blocked`（`decision_code=trust.isolation_failed`）且**不计** token/消息配额、不调模型、不投递；坏请求 `400 request.invalid`（结构/类型）、`422 request.invalid`（语义不合法，如 `items[].kind` 未知、`conversation_id` 不属该 persona、`items` 超上限）。运行时自行拼装失败时经 `POST /policy/evaluate` 同码上报：`decision=block`、`allowed=false`、`reasons[].code=trust.isolation_failed`，不计配额、不产生 `message_sent`、日志/审计不含原文。**(2) 阻断 2——`forwarded_from` 可追溯**：§7.1 定义 `provenance.forwarded_from` 取值为**原始消息 Matrix `event_id`**（`^\$` 格式）或 `null`；网关按**本地消息存储**查原始 trust，不实时回查对端；**逐跳追溯、跳数上限 8**、链上取最低；超限/查不到/已过期或被 redact/联邦来源不可知 → `untrusted`（fail-closed）；`OutgoingMessageRequest` 新增可选 `provenance.forwarded_from`（含 `OutgoingProvenance` schema），非法值 `422 request.invalid`（`errors[].field=provenance.forwarded_from`）；写明保证**仅覆盖网关可识别的转发**——复制粘贴/截图/手改写等无 `forwarded_from` 的转发只能按发送者判定。判定表由「命中即停」改为「**所有命中规则取最低值**」（偏序 `untrusted < trusted`；`system` 仅由规则 1 在 2–8 全不命中时产生，任何 `untrusted` 命中覆盖之），与文末「只降不升」一致；规则 7 补显式 `origin=ai` + `external=false`。**(3) 非阻断**：坏链改 `../../docs/deploy/paired-federation.md`；规则 5 字段名 `personality`→`personality_template_id`；规则 4/5 注明描述的是**入上下文时**的判定（动态/评论/人设卡不是 `Message`，无自身 `trust` 字段）；nonce 规则补「每段独立、CSPRNG ≥128 bit、不跨请求/轮次复用、**先归一化后检测**、模型输出回流同样转义、截断只在数据区内且按 Unicode 码点并保留闭合边界、多段 role 等价方案不得让 untrusted 进高优先级 role」；`boundary_forgery` 用例支持 `{{nonce}}` 占位（harness 注入真实 nonce，断言 (c) 在替换后执行），§7.3 同步说明并补类别归属（他人动态正文归 `moments_comment`、外部插件归 `bridge`、`town` 归 `role_hijack`）与 PR2 JSONL 自检要求；`GET /conversations/{id}/messages` 的 `trust` 查询参数 enum 补 `system`，与 §7.1 三值对齐。示例：新增 `context-assemble-request.json` / `context-assemble-result.json`，`send-message-request.json` 补 `provenance.forwarded_from`。实现见 PR2。 |
 | 0.1.0 | 2026-11-04 | [B2.3 PR1 契约] 不可信内容标记与隔离定义、注入测试集约定，**只增不删、不改状态码集合**。(1) 新增 [§7.1 trust 判定规则](#71-trust-判定规则b23)：8 条按序判定（命中即停），`system`→网关自身生成、`external=true`→`untrusted`、`origin=bridge/town`→`untrusted`、动态评论/正文→`untrusted`、人设卡字段→`untrusted`（仅本 persona 所有者在服内写入且经网关校验的自身人设为 `trusted`，且只能进人设区）、本服人类与本服 AI→`trusted`、来源不明→`untrusted` fail-closed；配对只决定可达性不提升可信度，切断后 backfill 事件同样 `untrusted`；`friend_subject` 只影响可见性不影响 trust；trust 由服务端判定，客户端传入值忽略；只能降级（`forwarded_from` 取原始来源与转发者较低者），`system` 不参与取低；枚举沿用 `trusted`/`untrusted`/`system` 不新增。(2) 新增 [§7.2 隔离的可验收定义](#72-隔离的可验收定义交给模型前)：四分区 `system`→`persona`→`conversation`→`untrusted_data`，untrusted 只进数据区；每请求随机 nonce（≥128 bit）包裹边界、撞 nonce/边界标记先转义、仿造 role/边界标签视为纯文本（或独立 role 等价方案）；system 区固定声明数据区非指令；隔离失败/边界生成失败/trust 不可判定 → **不调模型**、`200 blocked` + `trust.isolation_failed`（开放字符串，不新增 HTTP 状态码）；`PolicyReason.message`/日志/审计不得含 untrusted 原文（补「含数据区」）；隔离是必要条件非充分条件，高风险操作仍走 D2.1 签名回调。(3) 新增 [§7.3 注入测试集约定](#73-注入测试集约定b23)：`gateway/tests/injection/<category>.jsonl` 格式与 6 个必备类别（`moments_comment`/`federation`/`persona_card`/`bridge`/`boundary_forgery`/`role_hijack`），验收断言 (a)–(d)，PR1 每类 2 条样例、PR2 补全至每类 ≥5 条。(4) OpenAPI 仅改 description：`Message.trust` 补判定摘要与「服务端判定、客户端值被忽略」，`MessageProvenance.external` 补配对联邦语义，`PolicyReason.code` 推荐列表追加 `trust.isolation_failed`。实现见 PR2。 |
@@ -935,8 +1000,37 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 ### 6.3 熔断语义（B2.2）
 
-本节描述防刷屏（`anti_spam`）与互聊熔断（`ai_loop`）的语义，契约已定，实现见 PR2。
+本节描述防刷屏（`anti_spam`）与互聊熔断（`ai_loop`）的语义。
 
+- **平台层可配置（N7）**：`anti_spam` / `ai_loop` 与 §6.1 的其它限额一样参与
+  **三层取最严**，平台层的值由部署配置给出：
+
+  | 环境变量 | 对应规则 | 默认 | 0 的语义 |
+  |---|---|---|---|
+  | `PLATFORM_MAX_CONSECUTIVE_AI_MESSAGES` | `anti_spam.max_consecutive_ai_messages`（越小越严） | `0` | `0` = 平台不设该项 |
+  | `PLATFORM_ANTI_SPAM_COOLDOWN_SECONDS` | `anti_spam.cooldown_seconds`（越大越严） | `0` | `0` = 平台不设该项 |
+  | `PLATFORM_MAX_AI_MESSAGES_PER_HOUR` | `ai_loop.max_ai_messages_per_hour`（越小越严） | `0` | `0` = 平台不设该项 |
+  | `PLATFORM_AI_LOOP_ON_BREAK` | `ai_loop.on_break` | `stop` | 枚举，**无**「不设」语义（见下） |
+
+  **前三个数值项：平台层默认 `0` = 平台不设该项**（与 §6.1「`RATE_LIMIT_MESSAGES=0` /
+  `PLATFORM_TOKEN_BUDGET=0` 表示平台关闭该项」的既有语义一致）：平台层**省略**该键，
+  生效值只由 owner / peer 层决定，现有部署行为不变。平台层给非 0 值时，`owner` / `peer`
+  任何一项比平台更宽松 → **`422 limit.out_of_range`**（与 §6.1 的平台底线校验一致）。
+
+  **`PLATFORM_AI_LOOP_ON_BREAK` 单独说明（不适用「0 = 不设」）**：它是枚举项，没有
+  「不设」取值，**默认 `stop` 就是平台底线值**——即「平台要求熔断必须拦截」；它与上面
+  三个数值项的语义不同，不能把「默认 `0` = 平台不设」的规则套到它头上。
+  **枚举严格序：`stop` 严于 `notify`**（`stop` ⊐ `notify`）；「取最严」在该项上即取
+  更靠 `stop` 的值。**`notify` 目前等价 `stop`，故平台为 `stop` 时 owner / peer 设
+  `notify` 不报 `422`**（见下文 `on_break` 行为）；也正因二者当前执行行为相同，该项
+  目前对拦截与否没有影响。
+
+  **两种 `0` 的语义必须分开**：
+  - **平台 env 的 `0`**（`PLATFORM_*`）= **不设该项**（平台层省略键）；
+  - **API 的 `0`**（`max_ai_messages_per_hour: 0` 等写进 `PUT /limits` 或出现在生效值中）
+    = **有效限额，一条都不允许**（§6.1）。此时 `may_clear_at` 为 `null`（见下 N8）。
+  两者不可混用：把 API 的 `0` 读成「不设」会放行本应全拦的配置，反之会让平台默认值
+  意外变成全封禁。
 - **「连续」的两种口径**：
   - **`ai_loop`（互聊熔断）按同会话任意 AI 连续计数**：同一 `conversation_id` 内，
     `count` = 滑动窗口内、**最后一条经网关人类消息之后**的 AI 消息数（任意 AI，不限
@@ -965,6 +1059,35 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
     count 已定义为「窗口内、最后一条人类消息之后的 AI 消息数」，因此「被计入 count
     的最早一条」指该窗口内、人类消息之后最早的那条；窗口内有早于人类消息的旧事件时
     不偏早（那些旧事件不在 count 中）。
+    - **`used ≥ limit` 时的取值（N8）**：窗口内已计入的事件数为 `used`。`used == limit`
+      时「最早一条出窗」就是第 1 早的事件；`used > limit` 时（例如 `limit=3`、窗口内有 5 条，
+      只会由 limit 被下调后出现），取**第 `used − limit + 1` 早**的计入事件出窗时刻——
+      保证到 `may_clear_at` 时恰好腾出足够名额，而不是等到最早那条出窗仍超额。
+      设第 `used − limit + 1` 早的事件在 `t` 时刻入窗，则
+      `may_clear_at = ceil_to_second(t + 3600)`。此处 **`ceil_to_second(x)` 定义为
+      把 `x` 向上取整到整秒**（`ceil`，不是截断）。
+    - **`limit = 0` 的取值（N8）**：`max_ai_messages_per_hour = 0` 是**合法限额**（一条都
+      不允许，见 §6.1），此时上方公式无定义（`used − limit + 1 = used + 1` 超出窗口内事件数）。
+      规定 **`may_clear_at = null`**：滑窗内**永远不会**因为事件出窗而恢复名额，任何时刻都是
+      `blocked`。客户端不得因 `may_clear_at` 安排重试（`null` = 没有「额度恢复时间」，
+      与 §1.4 的 blocked 语义一致）；恢复只能来自部署/owner 调整该限额。
+    - **在途预留的计入（N8）**：**在途预留指已准入、尚未提交为 `sent` 的
+      `ReservationBook` 条目**——即策略已放行、正文已通过校验但投递尚未落库为
+      `kind=sent` 的那部分名额（这是 B2.1 token 预扣的会话侧对应物）。注意
+      `deferred`（静默时段顺延）**不是**在途预留：它立即写入
+      `UsageEvent(kind=deferred)` 并已被事件计数包含。
+      - 在途预留计入 `used`，并按「预留时刻 `at` + 3600 秒」作为其出窗时刻
+        **计入同一排序**（窗口起点取 `at`）。
+      - **预留 TTL 默认 300 秒**（#114 PR-b（#126）实现、PR-C 消费）：`ReservationBook`
+        条目超过 TTL 仍未提交为 `sent` 时**先回收**，回收后的条目**不计入 `used`**，
+        也不参与上面的出窗排序。因此卡住的投递不会把名额永久占死。
+      - **预留不受人类消息重置**：人类消息只重置连续计数（`anti_spam` / `ai_loop` 的
+        `count`），不回收、不清空 `ReservationBook` 条目；预留只由「提交为 `sent`」、
+        「TTL 到期回收」或「投递失败回滚（`_rollback` → `release`）」三条路径离场。
+    - **取值下界（N8）**：`may_clear_at` 最终取
+      **`max(按上述规则算出的值, ceil_to_second(now) + 1s)`**——**永不返回过去或当前时刻**。
+      这样客户端拿到的恢复时间一定是未来（严格大于当前秒），避免「到点重试仍被拦」的活锁；
+      计算值本身已晚于 `now` 时不变。`limit = 0` 的 `null` 例外，不参与该下界。
   - 两者结论均为 `outcome: blocked`、`retryable: false`、HTTP `200`（策略结论不是错误，
     见 §1.4）。`same_content_allowed: true`（额度/窗口恢复后同一内容可重发）。
 - **选码时机**：
@@ -997,11 +1120,13 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
   - `notify`：**当前版本未实现通知通道**，按 `stop` 处理（fail-closed，先拦截再谈通知），
     即与 `stop` 行为一致。将来实现通知后，`notify` 仍会拦截，并**额外向所有者推送一条
     通知**（提醒人类介入），不会改成放行。
-- **在途预留与 `deferred` 计入连续数**：与 B2.1 的 token 预扣一致，已发出但未入账
-  （`queued` / `deferred`）的 AI 消息**计入**连续数，避免因排程而绕过熔断；
-  `may_clear_at` 的计算同样把在途计入。**`deferred`（静默时段被顺延）的消息也计入
-  `anti_spam` 连续数**：顺延不等于未发，仍算作一次连续 AI 消息（`kind=deferred`
-  写入 `UsageStore`，与 `kind=sent` 同等对待）。
+- **在途预留与 `deferred` 计入连续数**：**在途预留**指已准入、尚未提交为 `sent` 的
+  `ReservationBook` 条目（不是 `queued`/`deferred` 回执），它们与 B2.1 的 token 预扣
+  同源，**计入**连续数以避免因投递未落库而绕过熔断；`may_clear_at` 的计算同样把
+  未超 TTL 的在途预留计入（超 TTL 先回收、不计入 `used`，见上文 N8）。
+  **`deferred`（静默时段被顺延）不是在途预留**：它立即写入 `UsageEvent(kind=deferred)`，
+  已被事件计数包含，因此**也计入** `anti_spam` 连续数——顺延不等于未发，仍算作一次
+  连续 AI 消息（与 `kind=sent` 同等对待）。
 - **保留期淘汰（`USAGE_RETENTION_SECONDS`，默认 30 天）**：`UsageStore` 在每次
   `append` 时，**按服务时钟**（事件的 `recorded_at`，不读 `datetime.now()`）优先淘汰
   早于 `now - USAGE_RETENTION_SECONDS` 的旧事件，超出容量上限才按最旧 LRU 淘汰。
