@@ -4,7 +4,9 @@
   "generated_at": "2026-11-03T12:00:00Z",
   "effective": [
     { "key": "messages_per_window", "value": 60, "unit": "count", "source_layer": "owner", "source_id": "persona_demo" },
+    { "key": "messages.window_seconds", "value": 86400, "unit": "seconds", "source_layer": "owner", "source_id": "persona_demo" },
     { "key": "tokens_per_window", "value": 200000, "unit": "tokens", "source_layer": "platform", "source_id": "platform_default" },
+    { "key": "tokens.window_seconds", "value": 86400, "unit": "seconds", "source_layer": "platform", "source_id": "platform_default" },
     { "key": "proactive_per_day", "value": 3, "unit": "count", "source_layer": "peer", "source_id": "persona_peer" },
     { "key": "max_message_chars", "value": 8000, "unit": "chars", "source_layer": "platform", "source_id": "platform_default" },
     { "key": "min_seconds_between_messages", "value": 5, "unit": "seconds", "source_layer": "platform", "source_id": "platform_default" },

@@ -58,9 +58,10 @@ CODE_OUT_OF_RANGE = "limit.out_of_range"
 # `window_seconds` **不在**这里：它不与任何计数独立比较，而是作为速率对的
 # 一部分（见 `RATE_PAIRS`）。单独取 min 会让「2 条/3600s」被一个
 # `window_seconds: 60` 放大成「2 条/60s」（评审 B1）。
+# messages_per_window / tokens_per_window **不在** SCALAR_RULES：它们只走
+# RATE_PAIRS（校验与 effective[]），否则会出现重复 key、source_layer 自相矛盾，
+# 且 {count↑, window↑} 合法更严速率会被旧标量规则误 422（复审 B1-残）。
 SCALAR_RULES: Tuple[Tuple[str, str, str], ...] = (
-    ("messages_per_window", "count", "min"),
-    ("tokens_per_window", "tokens", "min"),
     ("proactive_per_day", "count", "min"),
     ("town_tokens_per_day", "tokens", "min"),
     ("max_message_chars", "chars", "min"),
@@ -97,6 +98,7 @@ _AI_LOOP_ON_BREAK = frozenset({"stop", "notify"})
 
 _RULES_FIELDS = frozenset(
     {name for name, _, _ in SCALAR_RULES}
+    | {count_key for count_key, _, _ in RATE_PAIRS}
     | {_WINDOW_KEY, "silent_hours", "anti_spam", "ai_loop"}
 )
 _SILENT_FIELDS = frozenset({"enabled", "start", "end", "timezone"})
@@ -187,6 +189,13 @@ def validate_rules(raw: Any) -> Dict[str, Any]:
         if name in raw:
             minimum, maximum = _SCALAR_RANGES[name]
             out[name] = _check_int(f"rules.{name}", raw[name], minimum, maximum)
+    # 速率对计数项：校验范围，但不进 SCALAR_RULES 的独立取严。
+    for count_key, _, _ in RATE_PAIRS:
+        if count_key in raw:
+            minimum, maximum = _SCALAR_RANGES[count_key]
+            out[count_key] = _check_int(
+                f"rules.{count_key}", raw[count_key], minimum, maximum
+            )
     if _WINDOW_KEY in raw:
         # 仍然接受该字段（契约声明了它），只是不再独立参与「取最严」。
         minimum, maximum = _SCALAR_RANGES[_WINDOW_KEY]

@@ -176,6 +176,45 @@ class TestB1RatePair(unittest.TestCase):
         # 相同速率
         self.assertFalse(rate_is_looser(2, 3600, 2, 3600))
 
+    def test_effective_keys_are_unique(self):
+        """复审 B1-残：effective[] 每个 key 只出现一次，source_layer 不自相矛盾。
+
+        平台 2@3600 + owner {messages:2, window:7200}（速率更严）时，
+        旧实现会写出两条 messages_per_window（owner 与 platform 各一）。
+        """
+        self.put({"messages_per_window": 2, "window_seconds": 7200})
+        eff = self.store.effective(persona_id="p", now=self.now)
+        body = eff.to_dict()
+        keys = [item["key"] for item in body["effective"]]
+        self.assertEqual(len(keys), len(set(keys)), f"duplicate keys: {keys}")
+        # get() / dict 取值 / 列表三者一致（都指向 owner 速率对）
+        by_key = {item["key"]: item for item in body["effective"]}
+        msg = by_key["messages_per_window"]
+        win = by_key["messages.window_seconds"]
+        self.assertEqual(msg["value"], 2)
+        self.assertEqual(msg["source_layer"], "owner")
+        self.assertEqual(win["value"], 7200)
+        self.assertEqual(win["source_layer"], "owner")
+        self.assertEqual(eff.get("messages_per_window").source_layer, "owner")
+        self.assertEqual(eff.get("messages.window_seconds").value, 7200)
+
+    def test_higher_count_with_longer_window_accepted_when_rate_stricter(self):
+        """复审 B1-残：{count↑, window↑} 且 rate 不放宽时应被接受（不被标量规则 422）。
+
+        平台 2/3600；owner {messages:3, window:7200} → 3/7200 < 2/3600 → 更严。
+        """
+        layer = self.put({"messages_per_window": 3, "window_seconds": 7200})
+        self.assertEqual(layer.rules["messages_per_window"], 3)
+        self.assertEqual(layer.rules["window_seconds"], 7200)
+        eff = self.store.effective(persona_id="p", now=self.now)
+        self.assertEqual(eff.get("messages_per_window").value, 3)
+        self.assertEqual(eff.get("messages_per_window").source_layer, "owner")
+        self.assertEqual(eff.get("messages.window_seconds").value, 7200)
+        # dict 取值与 get() 一致（无重复 key 覆盖）
+        by_key = {i["key"]: i for i in eff.to_dict()["effective"]}
+        self.assertEqual(by_key["messages_per_window"]["source_layer"], "owner")
+        self.assertEqual(by_key["messages_per_window"]["value"], 3)
+
 
 # ============================================================
 # B2: peer 层进实发
