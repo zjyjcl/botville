@@ -392,6 +392,9 @@ class AppServiceMatrixTransport:
         """
         # #114 PR-a：single-flight。缓存过期瞬间只有一个线程（领头者）打 whoami，
         # 其余线程等同一结果，防止免鉴权的 /health 被并发探针放大成 N 次 HS 请求。
+        # #114 N12：领头者标记与 `inflight` 的发布必须和「清理」在同一个
+        # try/finally 里——否则置位与进 try 之间被 BaseException 打断时 Event
+        # 永不 set、`_health_inflight` 永不清空，之后所有探针都会等满超时。
         now = time.monotonic()
         with self._lock:
             if (
@@ -411,23 +414,31 @@ class AppServiceMatrixTransport:
                 return bool(self._health_result)
         ok = False
         try:
-            self._request(
-                "GET",
-                "/_matrix/client/v3/account/whoami",
-                timeout=self._health_timeout,
-            )
-            ok = True
-        except DeliveryError:
-            ok = False
-        except OSError:
-            # _request 已尽量归一为 DeliveryError；这里兜底，/health 不因
-            # 传输层异常变成 500。
-            ok = False
+            with self._lock:
+                # 双检：置位到进 try 之间若有并发者已抢到领头权（不可能，但
+                # 防御未来改动），确认自己仍是 owner，避免误清新领头者的事件。
+                still_leader = self._health_inflight is inflight
+            if not still_leader:  # pragma: no cover - 防御性分支
+                return bool(inflight.wait(self._health_timeout + 1) and ok)
+            try:
+                self._request(
+                    "GET",
+                    "/_matrix/client/v3/account/whoami",
+                    timeout=self._health_timeout,
+                )
+                ok = True
+            except DeliveryError:
+                ok = False
+            except OSError:
+                # _request 已尽量归一为 DeliveryError；这里兜底，/health 不因
+                # 传输层异常变成 500。
+                ok = False
         finally:
             with self._lock:
                 self._health_cached = ok
                 self._health_result = ok
                 self._health_checked_at = time.monotonic()
-                self._health_inflight = None
+                if self._health_inflight is inflight:
+                    self._health_inflight = None
             inflight.set()
         return ok

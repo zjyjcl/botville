@@ -189,8 +189,10 @@ class TestLedgerKeyedByServiceTxn(unittest.TestCase):
             r1["delivery"]["matrix_event_id"], r2["delivery"]["matrix_event_id"]
         )
         self.assertEqual(len(transport.sent), 12)
+        # #121 N3：账本键改为 (conversation_id, sender, txnId)。
         self.assertEqual(sorted(svc._txn_events), sorted([
-            svc._txn_id_for("K"), svc._txn_id_for("L"),
+            ("conv", "p", svc._txn_id_for("K")),
+            ("conv", "p", svc._txn_id_for("L")),
         ]))
 
     def test_ledger_survives_transport_not_echoing_txn_id(self):

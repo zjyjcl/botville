@@ -114,7 +114,7 @@ class TestConfigEdge(unittest.TestCase):
     def test_env_int_below_min_raises(self):
         with self.assertRaises(ConfigError):
             load_config({"GATEWAY_DEV_MODE": "true",
-                         "RATE_LIMIT_WINDOW_SECONDS": "0"})
+                         "RATE_LIMIT_WINDOW_SECONDS": "59"})
 
     def test_env_bool_bad_raises(self):
         with self.assertRaises(ConfigError):

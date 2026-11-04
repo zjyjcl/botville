@@ -174,6 +174,24 @@ class GatewayService:
             config.usage_retention_seconds,
             secret=config.hmac_secret,
         )
+        # #114 N8：调用方注入了未带 secret 的 store 时，生产路径会静默退回裸
+        # SHA-256（无告警的 fail-open）。这里统一从 config 兜底注入：测试里
+        # `UsageStore(max_events=0)` 期望无摘要（默认 secret=None）属合理，
+        # 但当 config 持有真实 secret 时，外部 store 必须用同一 secret，否则
+        # `text_sha256` 跨实例不可对账。若调用方有意传 secret=None（无摘要需求）
+        # 又想用 config.hmac_secret，需显式构造 store。
+        if (
+            self._store.secret is None
+            and config.hmac_secret is not None
+            and not config.dev_mode
+        ):
+            # 直接 mutate 注入的 store 不优雅，但 store 在构造期就固定 secret，
+            # 重新构造会丢掉调用方可能设置的状态（容量/时钟）。这里 fail-closed：
+            # 抛错比静默降级好；测试路径（dev_mode 或显式 None）不受影响。
+            raise RuntimeError(
+                "UsageStore was constructed without a secret while config has one; "
+                "pass secret=config.hmac_secret to UsageStore"
+            )
         self._limits = (
             limit_store if limit_store is not None else LimitStore(config)
         )
@@ -190,13 +208,15 @@ class GatewayService:
         self._now = now_fn
         self._lock = threading.RLock()
         self._idempotency: "OrderedDict[str, _IdempotencyEntry]" = OrderedDict()
-        # #114 PR-a：txnId → event_id 的去重账本。幂等缓存被容量/TTL 淘汰后同 key
+        # #114 PR-a：账本 → event_id 的去重账本。幂等缓存被容量/TTL 淘汰后同 key
         # 重试会重新投递，HS 按 txnId 返回**同一个** event_id；据此不再重复记
         # SENT 用量（淘汰后重复计费）。容量取 max_idempotency_entries 的 2 倍，TTL 取
         # idempotency_ttl_seconds 的 2 倍（必须比幂等缓存活得久，否则淘汰后重试
-        # 恰好落在账本过期窗口里仍会重复计费）。键是 service 自己算出的 txnId；
-        # 仅无 `Idempotency-Key`（随机 txnId、没有重试语义）时不写入、照常计费。
-        self._txn_events: "OrderedDict[str, Tuple[str, datetime]]" = OrderedDict()
+        # 恰好落在账本过期窗口里仍会重复计费）。
+        # #121 N3：键是 `(conversation_id, sender, txnId)`，与 HS 的
+        # `(room, sender, txnId)` 去重粒度对齐；仅无 `Idempotency-Key`
+        # （随机 txnId、没有重试语义）时不写入、照常计费。
+        self._txn_events: "OrderedDict[Tuple[str, str, str], Tuple[str, datetime]]" = OrderedDict()
         self._idempotency_guards: Dict[str, _KeyGuard] = {}
         self._queue: "OrderedDict[str, _QueueItem]" = OrderedDict()
         self._started_at = now_fn()
@@ -787,7 +807,9 @@ class GatewayService:
 
             # ---- 第三段：重新进锁提交（写 usage、计费、清预留） ----------
             with self._lock:
-                self._reservations.release(reservation)
+                # #114-7.7：先写 SENT 事件、再释放预留（顺序在 _commit_send 内）。
+                # 反过来会有一个「事件还没写、名额已释放」的瞬间；虽然此刻持锁，
+                # 但把顺序固定成 append→release 能让不变量更容易验证。
                 receipt = self._commit_send(
                     decision=decision,
                     reservation=reservation,
@@ -1138,10 +1160,21 @@ class GatewayService:
         以预留时刻 `reservation.at` 作为 `recorded_at`：策略判断发生在那一刻，
         投递耗时不应改变这条消息落在哪个滑动窗口里。
 
+        **提交顺序（#114-7.7）**：先 `store.append`（写 SENT 事件），再
+        `reservations.release`（释放预留）。虽然整段在锁内执行，固定顺序能让
+        「名额被占 ⟺ 事件已入账」成为稳定不变量，避免 release 后 append 前
+        被 TTL 回收错误地把本条当幽灵释放。调用方应在本函数返回后再 release；
+        目前的 `send_ai_message` 第三段在调用 `_commit_send` **之前**已经调用了
+        `reservations.release`，因此这里不重复 release。
+
         #114 PR-a 淘汰后去重计费：幂等缓存被淘汰后同 key 重试，HS 按 txnId 返回
         同一个 event_id。此处按 `ledger_txn` 记账，若本次 event_id 与已记录的一致，
         说明是同一次投递的重放——不再 append SENT 事件、不重复扣 token，回执照常
         返回（`delivery.matrix_event_id` 即上次的同一事件；不新增字段）。
+
+        **账本键（#121 N3）**：`(conversation_id, sender, txnId)` 三元组与 HS 的
+        去重粒度对齐；裸 txnId 在跨会话复用同一幂等键（缓存淘汰后）时可把账本覆盖
+        成另一房间的 event_id，导致下次重试 event 不匹配、多计一次 SENT。
 
         `ledger_txn` 必须是 **service 自己算出的** txnId（有 `Idempotency-Key` 时
         是 `_txn_id_for(key)`，无 key 时显式传 `None`），不能用 `event.txn_id`
@@ -1150,14 +1183,15 @@ class GatewayService:
         `None` 表示本次请求没有幂等键：**不写账本**，但照常计费。
         """
         tokens_out = decision.estimated_tokens
-        txn_key = ledger_txn
+        # N3：账本键改为 (conversation_id, sender, txnId)，与 HS 去重粒度对齐。
+        ledger_key = (conversation_id, sender, ledger_txn) if ledger_txn else None
         deduped = False
-        if txn_key:
-            recorded = self._txn_events_get(txn_key)
+        if ledger_key:
+            recorded = self._txn_events_get(ledger_key)
             if recorded is not None and recorded == event.event_id:
                 deduped = True
             else:
-                self._txn_events_put(txn_key, event.event_id)
+                self._txn_events_put(ledger_key, event.event_id)
 
         if not deduped:
             self._store.append(
@@ -1172,6 +1206,8 @@ class GatewayService:
                     secret=self._store.secret,
                 )
             )
+        # 释放预留（在 append 之后，保持「占名额 ⟺ 事件入账」不变量，见上方注释）。
+        self._reservations.release(reservation)
         # B6 (#117)：delivered 后清 blocked 去重记录，下次进入 blocked 状态可重新写一条。
         self._engine.clear_blocked_records(sender, conversation_id)
 
@@ -1421,15 +1457,17 @@ class GatewayService:
         assert secret is not None, "Config guarantees hmac_secret is set"
         return hmac.new(secret, b"txn\x00" + idempotency_key.encode("utf-8"), hashlib.sha256).hexdigest()[:64]
 
-    # ------------------------------------------- txnId → event_id dedupe book
-    def _txn_events_get(self, txn_id: str) -> Optional[str]:
-        """查该 txnId 上次投递的 event_id；过 TTL 即失效。调用方须持锁。
+    # ------------------------------------------- (conv, sender, txn) dedupe book
+    def _txn_events_get(self, key: Tuple[str, str, str]) -> Optional[str]:
+        """查该 `(conversation_id, sender, txnId)` 上次投递的 event_id；过 TTL 即失效。
+        调用方须持锁。
 
-        N1：命中时刷新时间戳，与 `_idempotency_get` 命中后 `_idempotency_put`
-        续期缓存对齐。否则会出现「重试命中去重 → 缓存 TTL 续期、账本仍按首次
-        写入起算」，账本反而先于幂等缓存过期，2× TTL 的论断不成立。
+        N1：命中时刷新时间戳，与「提交时账本与幂等缓存同刻刷新」对齐
+        （缓存命中路径直接 return、不会重写缓存，真正的对齐点是投递提交；
+        r2 审查指出旧注释归因有误，此处修正）。否则会出现「重试命中去重 →
+        缓存已续期、账本仍按首次写入起算」，账本反而先于幂等缓存过期。
         """
-        entry = self._txn_events.get(txn_id)
+        entry = self._txn_events.get(key)
         if entry is None:
             return None
         event_id, created_at = entry
@@ -1438,16 +1476,17 @@ class GatewayService:
         ttl = self._config.idempotency_ttl_seconds * 2
         now = self._now()
         if ttl > 0 and (now - created_at).total_seconds() > ttl:
-            self._txn_events.pop(txn_id, None)
+            self._txn_events.pop(key, None)
             return None
-        self._txn_events[txn_id] = (event_id, now)
-        self._txn_events.move_to_end(txn_id)
+        self._txn_events[key] = (event_id, now)
+        self._txn_events.move_to_end(key)
         return event_id
 
-    def _txn_events_put(self, txn_id: str, event_id: str) -> None:
-        """记录 txnId → event_id（容量复用幂等缓存上限，LRU 淘汰）。调用方须持锁。"""
-        self._txn_events[txn_id] = (event_id, self._now())
-        self._txn_events.move_to_end(txn_id)
+    def _txn_events_put(self, key: Tuple[str, str, str], event_id: str) -> None:
+        """记录 `(conversation_id, sender, txnId)` → event_id（容量复用幂等缓存
+        上限，LRU 淘汰）。调用方须持锁。"""
+        self._txn_events[key] = (event_id, self._now())
+        self._txn_events.move_to_end(key)
         # 容量取幂等缓存上限的 2 倍：账本必须比缓存保留更多 key，否则缓存淘汰的
         # 那个 key 往往也已被账本淘汰，去重形同虚设。
         while len(self._txn_events) > 2 * max(1, self._config.max_idempotency_entries):

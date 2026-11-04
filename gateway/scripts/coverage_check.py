@@ -8,10 +8,10 @@
 
 用法：
     python3 gateway/scripts/coverage_check.py
-    python3 gateway/scripts/coverage_check.py --module <module> [--args ...]
 
 默认对 `gateway/tests` 运行 `unittest discover`，统计 `gateway/src`
-下所有 `.py` 的行覆盖率。退出码 0 当总覆盖率 ≥ 阈值（默认 80），否则 1。
+下所有 `.py` 的行覆盖率。退出码 0 当总覆盖率 ≥ 阈值（默认 80）且测试全部
+通过，否则 1。
 
 实现要点：
 - 「可执行行」指非空、非纯注释行；docstring 起止行算一行（与 coverage.py
@@ -212,8 +212,14 @@ def main(argv=None) -> int:
     parser.add_argument("--show-missing", action="store_true", default=False,
                         help="print uncovered line numbers per file")
     args = parser.parse_args(argv)
-    files, _ok = run_tests()
-    return report(files, args.threshold, show_missing=args.show_missing)
+    files, tests_ok = run_tests()
+    coverage_ok = report(files, args.threshold, show_missing=args.show_missing) == 0
+    # 测试失败时覆盖率数字没有意义（import 期崩溃会让分母虚高），
+    # 必须让退出码反映测试结果，否则 CI 会把红跑成绿（#114-7.6）。
+    if not tests_ok:
+        print("  FAIL: unittest reported failures/errors")
+        return 1
+    return 0 if coverage_ok else 1
 
 
 if __name__ == "__main__":
