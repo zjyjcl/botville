@@ -518,7 +518,7 @@ class TestPeerIdValidationHTTP(unittest.TestCase):
     """HTTP 端点对 peer_id 校验返回 422。"""
 
     def setUp(self):
-        config = make_config(auth_token=None, dev_mode=True)
+        config = make_config(auth_token=None, dev_mode=True, port=0)
         transport = InMemoryMatrixTransport()
         store = UsageStore(max_events=0)
         limits = LimitStore(config)
@@ -543,6 +543,7 @@ class TestPeerIdValidationHTTP(unittest.TestCase):
 
     def tearDown(self):
         self.server.shutdown()
+        self.server.server_close()
 
     def _post(self, path: str, body: dict) -> tuple:
         data = json.dumps(body).encode()
