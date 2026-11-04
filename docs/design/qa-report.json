@@ -1,0 +1,121 @@
+{
+  "generated_at": "2026-11-04T17:33:57.515Z",
+  "network_policy": {
+    "blocked_url_patterns": [
+      "*http://*",
+      "*https://*"
+    ],
+    "local_protocol": "file:"
+  },
+  "pages": [
+    {
+      "html": "01-chat-list.html",
+      "png": "png/01-chat-list.png",
+      "width": 454,
+      "height": 1281,
+      "frames": 1,
+      "issues": [],
+      "passed": true
+    },
+    {
+      "html": "02-chat.html",
+      "png": "png/02-chat.png",
+      "width": 1282,
+      "height": 1241,
+      "frames": 3,
+      "issues": [],
+      "passed": true
+    },
+    {
+      "html": "03-moments-feed.html",
+      "png": "png/03-moments-feed.png",
+      "width": 868,
+      "height": 1259,
+      "frames": 2,
+      "issues": [],
+      "passed": true
+    },
+    {
+      "html": "04-compose.html",
+      "png": "png/04-compose.png",
+      "width": 868,
+      "height": 1222,
+      "frames": 2,
+      "issues": [],
+      "passed": true
+    },
+    {
+      "html": "05-notifications-cards.html",
+      "png": "png/05-notifications-cards.png",
+      "width": 1282,
+      "height": 1241,
+      "frames": 3,
+      "issues": [],
+      "passed": true
+    },
+    {
+      "html": "06-profile.html",
+      "png": "png/06-profile.png",
+      "width": 454,
+      "height": 1263,
+      "frames": 1,
+      "issues": [],
+      "passed": true
+    },
+    {
+      "html": "07-ai-profile.html",
+      "png": "png/07-ai-profile.png",
+      "width": 454,
+      "height": 1281,
+      "frames": 1,
+      "issues": [],
+      "passed": true
+    },
+    {
+      "html": "08-dynamic-entries.html",
+      "png": "png/08-dynamic-entries.png",
+      "width": 1282,
+      "height": 1241,
+      "frames": 3,
+      "issues": [],
+      "passed": true
+    },
+    {
+      "html": "flow-1-moment-ai-comment.html",
+      "png": "png/flow-1-moment-ai-comment.png",
+      "width": 1696,
+      "height": 1222,
+      "frames": 4,
+      "issues": [],
+      "passed": true
+    },
+    {
+      "html": "flow-2-low-risk-approve.html",
+      "png": "png/flow-2-low-risk-approve.png",
+      "width": 1282,
+      "height": 1241,
+      "frames": 3,
+      "issues": [],
+      "passed": true
+    },
+    {
+      "html": "flow-3-high-risk-faceid.html",
+      "png": "png/flow-3-high-risk-faceid.png",
+      "width": 1696,
+      "height": 1241,
+      "frames": 4,
+      "issues": [],
+      "passed": true
+    },
+    {
+      "html": "palette-final.html",
+      "png": "png/palette-final.png",
+      "width": 868,
+      "height": 1222,
+      "frames": 2,
+      "issues": [],
+      "passed": true
+    }
+  ],
+  "passed": true
+}

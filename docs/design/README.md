@@ -1,17 +1,78 @@
 # 小镇界面设计交付
 
-本目录交付 13 份可独立打开的静态 HTML、对应 PNG 和截图脚本。每个手机画框为 **390 × 844**，多状态并排比较。HTML 内联 CSS、无脚本、无外部字体或图片依赖；按钮仅为视觉示意，不执行接口或真实操作。所有人物、内容、编号均为假数据。
+本目录交付 12 份可独立打开的静态 HTML、对应 PNG 和截图脚本。每个手机画框为 **390 × 844**，多状态并排比较。HTML 内联 CSS、无脚本、无外部字体或图片依赖；按钮仅为视觉示意，不执行接口或真实操作。所有人物、内容、编号均为假数据。
 
 设计只依据本次读取的仓库契约；没有修改 App，也不代表接口已经部署、功能已经实现或设备认证已经通过。英文仅用于原样保留的契约标识、接口、枚举及必要专名，用户文案使用简体中文。
 
-## 风格选择
+## 最终风格（v2）
 
-| 方案 | 强调色 | 特征 | 使用建议 |
-|---|---|---|---|
-| [清爽微信系](palette-fresh.html) | `#237d68` | 灰阶表面、低饱和绿色、轻量列表 | **推荐默认**。适合以聊天为主的高频操作，AI 身份由文字角标标识 |
-| [温暖小镇系](palette-warm.html) | `#a45b3d` | 相同灰阶与布局，陶土色强调 | 可选。偏陪伴感的小镇表达；不改变风险等级与导航含义 |
+采用**主流即时通讯 App 布局**：浅灰背景、白色列表单元格与 1 px 细分隔线；顶部标题居中；底部固定「消息 / 通讯录 / 发现 / 我」。聊天对方为左侧白色气泡，自己为右侧主色气泡，双方均带方形头像；发现页以分组白色列表承载按 manifest 筛选后的入口。
 
-两份配色稿使用完全相同的示例界面、文本、内容顺序、字号与间距，只替换强调色及其浅色状态。其他设计稿沿用默认清爽系。风险用「低风险 / 高风险」文字、边框与确认步骤区分，不增加红绿交通灯配色。灰色头像和照片块都是占位，不加载真实照片。
+唯一主色为 **`#1AAD8E`**，统一用于己方气泡、主要按钮、AI 角标、选中图标和卡片强调线。AI 好友、心情/签名、授权卡片与好友互动隔离构成小镇的增量。小字号强调文案使用深青绿，主色上的正文使用深色文字。风险仍以「低风险 / 高风险」、说明和确认步骤区分。
+
+[最终设计规范](palette-final.html) 包含色板、字号和组件尺寸。所有长度单位均为 px；手机画框始终为 390 × 844。
+
+| 色值 | 用途 |
+|---|---|
+| `#1AAD8E` | 唯一主色：己方气泡、主要按钮、AI 角标、选中图标 |
+| `#E4F5F0` | 提示与心情的浅色背景 |
+| `#087763` | 浅底上的强调文字、辅助图标 |
+| `#EDEDED` | 手机内容与画板背景 |
+| `#FFFFFF` | 列表行、卡片、对方气泡、搜索框 |
+| `#1F2523` | 主文字、主色上的文字、底部手势条 |
+| `#6C7471` | 次要文字、时间、未选中导航 |
+| `#DDE2DF` | 1 px 分隔线与普通边框 |
+| `#F7F8F7` | 底部导航、输入栏、互动列表浅底 |
+| `#DCE9E4` | 假头像、照片占位、浅色标签边线 |
+| `#B6C0BA` | 手机画框边线 |
+| `#A1AAA5` | 未选中单选控件边线 |
+
+| 组件 | 尺寸、圆角与间距 |
+|---|---|
+| 画框 / 导航 | 390 × 844；状态栏高 28；顶部导航高 60；Tab 栏高 62；底部安全区高 22 |
+| 字号 | 画板标题 28；导航标题/姓名 17；聊天正文 15；按钮/正文 14；摘要 13；提示 12；辅助文案/Tab 11；标签 10；AI 角标 9 |
+| 行高 | 正文 1.55；气泡 1.5；辅助文案 1.6–1.7 |
+| 气泡 | 最大宽 264；内边距上下 10、左右 12；圆角 6；头像间距 10；消息纵向间距 14 |
+| 头像 / 图标 | 聊天头像 40 × 40；列表头像 44 × 44，圆角 6；资料头像 64 × 64，圆角 8；Tab 图标 24，普通图标 20 |
+| 列表 | 普通行最小高 56，消息行最小高 82；左右内边距 16；分隔线 1；分组间距 14 |
+| 卡片 / 按钮 | 卡片内边距 16，圆角 12；按钮最小高 44，圆角 8，双按钮间距 10 |
+| 通用间距 | 页面内边距 16；常规纵向间距 14；紧凑流程间距 10；并排画框间距 24 |
+
+规范页为容纳色板采用紧凑示例：卡片内边距 12，气泡正文 14；其余页面使用标准规格。灰色/浅青绿照片和文字头像均为假素材。
+
+## 开源非侵权原则
+
+- 仅借鉴通用的主流即时通讯 App 布局与交互习惯；使用小镇自己的名称、主色、文案与增量功能，不使用第三方品牌名、标识、专有图案或界面截图。
+- 所有图标均由本目录的简单几何 SVG 自绘，无外部图标、图片或字体下载。文字头像和照片占位不涉及真实身份或照片。
+- 下表的 SF Symbols 名称只说明图标语义对应关系。本稿未复制、提取、打包或分发 SF Symbols 字体或图形；`.fill` 名称也不表示本稿使用该资源。未来原生实现如选用平台资源，须遵循相应平台的许可与使用条件。
+- 主色与组件细节独立定义；开源交付只含静态假数据示意，不包含任何密钥、个人资料或真实服务连接。
+
+| 图标位置 / 语义 | 对应 SF Symbols 名称 |
+|---|---|
+| 底部「消息」、评论输入 | `message.fill` |
+| 底部「通讯录」、好友与群组 | `person.2.fill` |
+| 底部「发现」、发现空态 | `safari` |
+| 底部「我」、资料入口 | `person.crop.circle` |
+| 高风险生物认证 | `faceid` |
+| 授权卡片、完成回执 | `checkmark.seal` |
+| 完成或选中 | `checkmark` |
+| 加密会话、隐私说明 | `lock.fill` |
+| 通知与提醒 | `bell` |
+| 列表行末导航 | `chevron.right` |
+| 顶部返回 | `arrow.left` |
+| 顶部更多 | `ellipsis` |
+| 新建会话、增加内容 | `plus` |
+| 图片占位、照片入口 | `photo` |
+| 搜索框、记忆检索 | `magnifyingglass` |
+| 模块入口 | `square.grid.2x2` |
+| 桥接入口 | `link` |
+| 设置入口 | `gearshape` |
+| 动态点赞 | `heart` |
+| 聊天输入语音 | `waveform` |
+| 聊天表情、心情 | `face.smiling` |
+| 状态栏信号 | `antenna.radiowaves.left.and.right` |
+| 状态栏无线网络 | `wifi` |
+| 状态栏电量 | `battery.100` |
 
 ## 导航结构
 
@@ -51,8 +112,7 @@
 | [流程一：动态与 AI 评论](flow-1-moment-ai-comment.html) | 4；发帖、AI 接收、内部评论、通知 | `POST /v1/moments` → `Moment`；`MomentComment.author.kind=ai / author.owner_id / body`；`Card.type=notification / title / blocks / source` | AI 触发/接收、内部评论接口、评论与通知关联、通知跳转待定；公开评论不能指定 AI 作者 |
 | [流程二：低风险同意](flow-2-low-risk-approve.html) | 3；卡片、提交、回执 | `CardAction.risk` 覆盖 `Card.risk`；`POST /v1/cards/{card_id}/actions/{action_id}`；`CardActionRequest.revision`；请求头 `Idempotency-Key`；`CardActionReceipt.status / auth_method / audit_id / revision_before / revision_after / card` | 低风险不需要 challenge；approval 仍必带版本。业务 `payload` 结构待定 |
 | [流程三：高风险认证](flow-3-high-risk-faceid.html) | 4；卡片、确认、Face ID 与本地签名、提交回执 | `CardAction.confirmation`；`CardActionChallengeRequest.algorithm / revision`；`CardActionChallenge.challenge / expires_at / card_id / action_id / revision / algorithm`；`CardActionRequest.revision / challenge / assertion`；`CardActionReceipt` | 二次确认 → Face ID → challenge → 本地签名 → submit；没有 `/sign` API。设备密钥注册、签名字节编码待定 |
-| [清爽配色](palette-fresh.html) | 1；默认配色 | 与会话列表、消息摘要、通知卡片相同的展示字段 | 配色是设计选择，不向网关增加字段；未读与搜索仍待定 |
-| [温暖配色](palette-warm.html) | 1；同界面换色 | 与清爽配色完全相同 | 不增加第二种语义或不同假数据 |
+| [最终配色与组件规范](palette-final.html) | 2；最终色板、字号与组件规格 | 与会话列表、消息摘要、通知卡片相同的展示字段 | 配色是设计选择，不向网关增加字段；未读与搜索仍待定 |
 
 ### A2.2 动态隐私
 
@@ -131,28 +191,38 @@ bash docs/design/export.sh
 
 也可从任意目录执行本脚本的绝对路径。脚本先找 `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`，没有时查找系统/用户应用目录的 Chromium，再查找命令 `chromium` / `chromium-browser`；不自动安装软件。
 
-每个 HTML 都用 `mktemp -d` 创建新的 `--user-data-dir`，临时根目录通过 `TMPDIR` 限定在 `docs/design/` 下，结束自动清理。使用 headless、`--hide-scrollbars`、1 倍像素密度；按每页画框数设窗口宽度：`64 + 390 × 画框数 + 24 × (画框数 − 1)`。窗口高度 1500，包含标题、画框和契约注释。页面元信息记录尺寸，脚本无需依赖 Node 或第三方 Python 包。重复执行会覆盖 `png/` 中的同名截图。
+导出需要 Node.js 22+（使用内建 WebSocket），不安装依赖。每个 HTML 使用独立的临时 Chrome 配置，临时目录及 `TMPDIR` 均限制在 `docs/design/`，结束自动清理。导出只读取本地静态页面，禁用外部 HTTP/HTTPS 资源请求，不复用日常浏览器配置。
+
+脚本按画框数设定精确窗口宽度：`64 + 390 × 画框数 + 24 × (画框数 − 1)`，测量完整页面内容高度后调整窗口高度并截图；像素密度为 1。标题、所有画框、画框外注释及页尾均纳入 PNG，不再使用固定 1500 高度。导出同时检查画框尺寸、内容溢出、标题居中、四个 Tab 和 SVG，结果写入 [qa-report.json](qa-report.json)。重复执行覆盖同名 PNG；检查失败不覆盖该页既有截图。
+
+### 文件清单
+
+- 页面：`01-chat-list.html`、`02-chat.html`、`03-moments-feed.html`、`04-compose.html`、`05-notifications-cards.html`、`06-profile.html`、`07-ai-profile.html`、`08-dynamic-entries.html`。
+- 流程：`flow-1-moment-ai-comment.html`、`flow-2-low-risk-approve.html`、`flow-3-high-risk-faceid.html`。
+- 最终规范：[palette-final.html](palette-final.html)。两份旧配色稿及对应 PNG 已移除。
+- 维护与导出：[design-system.css](design-system.css)、[apply-theme.py](apply-theme.py)、[export.sh](export.sh)、[export.mjs](export.mjs)、[qa-report.json](qa-report.json)、本 README。
+
+`python3 docs/design/apply-theme.py` 将统一样式和自绘 SVG 内联进所有 HTML，随后再运行导出。交付 HTML 可独立打开，无脚本、外部字体、外部图片或联网依赖。
 
 ### png/ 文件清单
 
 | 文件 | 尺寸 |
 |---|---|
-| [01-chat-list.png](png/01-chat-list.png) | 454 × 1500 |
-| [02-chat.png](png/02-chat.png) | 1282 × 1500 |
-| [03-moments-feed.png](png/03-moments-feed.png) | 868 × 1500 |
-| [04-compose.png](png/04-compose.png) | 868 × 1500 |
-| [05-notifications-cards.png](png/05-notifications-cards.png) | 1282 × 1500 |
-| [06-profile.png](png/06-profile.png) | 454 × 1500 |
-| [07-ai-profile.png](png/07-ai-profile.png) | 454 × 1500 |
-| [08-dynamic-entries.png](png/08-dynamic-entries.png) | 1282 × 1500 |
-| [flow-1-moment-ai-comment.png](png/flow-1-moment-ai-comment.png) | 1696 × 1500 |
-| [flow-2-low-risk-approve.png](png/flow-2-low-risk-approve.png) | 1282 × 1500 |
-| [flow-3-high-risk-faceid.png](png/flow-3-high-risk-faceid.png) | 1696 × 1500 |
-| [palette-fresh.png](png/palette-fresh.png) | 454 × 1500 |
-| [palette-warm.png](png/palette-warm.png) | 454 × 1500 |
+| [01-chat-list.png](png/01-chat-list.png) | 454 × 1281 |
+| [02-chat.png](png/02-chat.png) | 1282 × 1241 |
+| [03-moments-feed.png](png/03-moments-feed.png) | 868 × 1259 |
+| [04-compose.png](png/04-compose.png) | 868 × 1222 |
+| [05-notifications-cards.png](png/05-notifications-cards.png) | 1282 × 1241 |
+| [06-profile.png](png/06-profile.png) | 454 × 1263 |
+| [07-ai-profile.png](png/07-ai-profile.png) | 454 × 1281 |
+| [08-dynamic-entries.png](png/08-dynamic-entries.png) | 1282 × 1241 |
+| [flow-1-moment-ai-comment.png](png/flow-1-moment-ai-comment.png) | 1696 × 1222 |
+| [flow-2-low-risk-approve.png](png/flow-2-low-risk-approve.png) | 1282 × 1241 |
+| [flow-3-high-risk-faceid.png](png/flow-3-high-risk-faceid.png) | 1696 × 1241 |
+| [palette-final.png](png/palette-final.png) | 868 × 1222 |
 
 ## 验证范围
 
 本次验收针对静态交付：HTML 独立性、画框尺寸与溢出、PNG 覆盖及尺寸、字段对应和截图视觉抽查。真实网络、通知投递、Face ID 及后端联调不在本次文档任务中。此说明不将静态演示视为线上验收。
 
-本次静态验证已完成：13 个 HTML、29 个 390 × 844 画框无横向/纵向溢出；13 张 PNG 均由最终 HTML 导出且尺寸正确。A/B 画框未泄露对方姓名或互动，配色稿的手机示例内容完全一致，README 相对链接均可解析。已视觉抽查聊天、朋友圈、授权、动态入口、AI 资料和配色稿。未运行 git 命令。
+本次静态验证已完成：12 个 HTML、29 个 390 × 844 画框通过尺寸、横纵向溢出、子元素边界、标题居中、四个 Tab 与 SVG 检查；12 张 PNG 的实际尺寸与上表一致，页尾和画框外说明完整。已逐张查看全部 PNG。A/B 画框未泄露对方姓名或互动；所有色值和 24 种 SVG 语义均已记录，未引用外部资源。待定项清单与既有页面/流程契约映射逐字保留，仅将旧配色文件记录更新为最终规范。只修改 docs/design/，未运行 git 命令；真实功能与接口未在本轮执行。
