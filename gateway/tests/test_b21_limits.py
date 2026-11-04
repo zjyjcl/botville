@@ -1002,10 +1002,12 @@ class TestServiceLimitsAndUsage(unittest.TestCase):
         cfg = make_config(rate_limit_messages=100, idempotency_ttl_seconds=10)
         svc, transport, store, limits, clock = make_service(cfg)
         payload = {"sender_persona_id": "p", "content": {"type": "text", "text": "a"}}
-        svc.send_ai_message("c", payload, idempotency_key="key-expire")
+        r1 = svc.send_ai_message("c", payload, idempotency_key="key-expire")
         clock.advance(seconds=11)
-        svc.send_ai_message("c", payload, idempotency_key="key-expire")
-        self.assertEqual(len(transport.sent), 2)
+        r2 = svc.send_ai_message("c", payload, idempotency_key="key-expire")
+        # 缓存过期后会重新投递；HS（内存传输同语义）按 txnId 返回同一事件（#114 PR-a）。
+        self.assertEqual(len(transport.sent), 1)
+        self.assertEqual(r1["delivery"]["matrix_event_id"], r2["delivery"]["matrix_event_id"])
 
     def test_queue_is_bounded(self):
         cfg = make_config(max_queue_entries=2, silent_hours_enabled=True,
@@ -1064,6 +1066,7 @@ def http_config(**overrides):
     base = dict(
         host="127.0.0.1", port=0, dev_mode=True, rate_limit_messages=60,
         silent_hours_enabled=False, auth_token=None,
+        hmac_secret=b"test-hmac-secret" * 2,
     )
     base.update(overrides)
     return Config(**base)

@@ -39,7 +39,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Set, Tuple
 
@@ -114,6 +113,8 @@ class AppServiceMatrixTransport:
         self._health_cache_seconds = health_cache_seconds
         self._health_cached: Optional[bool] = None
         self._health_checked_at = 0.0
+        self._health_inflight: Optional[threading.Event] = None
+        self._health_result: bool = False
         self._ensured: Set[str] = set()
         # conversation_id -> (room_id, 过期时刻 monotonic 秒)；TTL=0 时不写入。
         self._rooms: Dict[str, Tuple[str, float]] = {}
@@ -376,6 +377,7 @@ class AppServiceMatrixTransport:
             sent_at=datetime.now(timezone.utc),
             reply_to=reply_to,
             content_type=content_type,
+            txn_id=txn,
         )
 
     def healthy(self) -> bool:
@@ -388,6 +390,8 @@ class AppServiceMatrixTransport:
         探针请求排队等满 30 秒。结果缓存 `health_cache_seconds`（默认 5s）：
         缓存期内直接返回上次结论，不重复打 HS。
         """
+        # #114 PR-a：single-flight。缓存过期瞬间只有一个线程（领头者）打 whoami，
+        # 其余线程等同一结果，防止免鉴权的 /health 被并发探针放大成 N 次 HS 请求。
         now = time.monotonic()
         with self._lock:
             if (
@@ -395,6 +399,16 @@ class AppServiceMatrixTransport:
                 and now - self._health_checked_at < self._health_cache_seconds
             ):
                 return self._health_cached
+            inflight = self._health_inflight
+            leader = inflight is None
+            if leader:
+                inflight = threading.Event()
+                self._health_inflight = inflight
+        if not leader:
+            if not inflight.wait(self._health_timeout + 1):
+                return False
+            with self._lock:
+                return bool(self._health_result)
         ok = False
         try:
             self._request(
@@ -409,7 +423,11 @@ class AppServiceMatrixTransport:
             # _request 已尽量归一为 DeliveryError；这里兜底，/health 不因
             # 传输层异常变成 500。
             ok = False
-        with self._lock:
-            self._health_cached = ok
-            self._health_checked_at = time.monotonic()
+        finally:
+            with self._lock:
+                self._health_cached = ok
+                self._health_result = ok
+                self._health_checked_at = time.monotonic()
+                self._health_inflight = None
+            inflight.set()
         return ok

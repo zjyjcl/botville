@@ -19,7 +19,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List, Optional, Protocol, runtime_checkable
+from typing import Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 # Matrix 事务 ID 允许的字符（spec: `[A-Za-z0-9._=-]`）。
 _TXN_ID_RE = re.compile(r"^[A-Za-z0-9._=-]{1,255}$")
@@ -86,7 +86,7 @@ class MatrixTransport(Protocol):
 def resolve_txn_id(txn_id: Optional[str]) -> str:
     """统一 txnId 规整：省略时给随机值；显式值只允许 Matrix txnId 安全字符。
 
-    调用方（service）给的是 `sha256(idempotency_key).hexdigest()[:64]`，但
+    调用方（service）给的是 `HMAC-SHA256(部署密钥, key).hexdigest()[:64]`（#114 PR-a），但
     传输实现不该盲信外部输入——非法字符会让 PUT 路径断裂或需要转义。
     """
     if txn_id is None:
@@ -109,6 +109,8 @@ class InMemoryMatrixTransport:
     _counter: itertools.count = field(default_factory=lambda: itertools.count(1))
     sent: List[SentEvent] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # 与真实 HS 一致：同 (room, sender, txnId) 重放返回同一事件、不再追加（#114 PR-a）。
+    _by_txn: Dict[Tuple[str, str, str], SentEvent] = field(default_factory=dict, repr=False)
     fail: bool = False
 
     def send_text(
@@ -125,6 +127,9 @@ class InMemoryMatrixTransport:
             raise DeliveryError("matrix.unavailable", "in-memory transport is set to fail")
         txn = resolve_txn_id(txn_id)  # 与真实传输一致的 txnId 校验
         with self._lock:
+            prior = self._by_txn.get((room_id, sender_id, txn))
+            if prior is not None:
+                return prior
             event = SentEvent(
                 event_id=f"$inmem_{next(self._counter)}_{uuid.uuid4().hex[:8]}",
                 room_id=room_id,
@@ -136,6 +141,7 @@ class InMemoryMatrixTransport:
                 txn_id=txn,
             )
             self.sent.append(event)
+            self._by_txn[(room_id, sender_id, txn)] = event
             return event
 
     def healthy(self) -> bool:
