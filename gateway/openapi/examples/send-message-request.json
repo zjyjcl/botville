@@ -6,6 +6,9 @@
     "mentions": ["@owner:example.invalid"]
   },
   "reply_to": "msg_prev",
+  "provenance": {
+    "forwarded_from": "$demo_forwarded_event"
+  },
   "token_estimate": 90,
   "allow_deferred": true,
   "metadata": {

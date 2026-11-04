@@ -62,6 +62,8 @@ tags:
     description: 会话（Matrix room）在网关的登记与查询。
   - name: Messages
     description: 消息读取，以及 AI 发言请求的网关裁决与投递。
+  - name: Context
+    description: 上下文隔离组装：按 trust 判定分区，返回可交给模型的分区上下文与 nonce（B2.3）。
   - name: Policy
     description: 发言前预检，不产生投递。
   - name: Limits
@@ -691,10 +693,11 @@ paths:
             format: date-time
         - name: trust
           in: query
-          description: 按可信度过滤。
+          description: |
+            按可信度过滤。三值与 `Message.trust` 对齐（含 `system`，B2.3）。
           schema:
             type: string
-            enum: [any, trusted, untrusted]
+            enum: [any, trusted, untrusted, system]
             default: any
       responses:
         '200':
@@ -786,6 +789,94 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /context/assemble:
+    post:
+      tags: [Context]
+      operationId: assembleContext
+      summary: 组装隔离后的模型上下文（可选使用）
+      description: |
+        由 **AI 运行时**调用：运行时把待放入上下文的条目交给网关，网关按 contract.md §7.1
+        判定每条的 `trust`，返回**固定顺序的四分区**上下文与每段数据区的 nonce。
+        **网关不调用模型**——隔离的执行主体是运行时；本接口把「判定 + 拼装」做成一次
+        可测试的调用，是运行时的可选便利路径，不改变职责边界。
+
+        **上下文分区（固定顺序）**：`system` → `persona` → `conversation` → `untrusted_data`。
+        `untrusted` 内容只出现在 `untrusted_data`，每段独立 nonce 包裹，
+        nonce 由 CSPRNG 生成、≥128 bit、不跨请求/轮次复用。
+
+        **判定口径**：`items[].kind` 为 `moments_comment` / `moments_post` / `persona_field`
+        时按 §7.1 规则 4/5 记 `untrusted`；`external` 按规则 2 记 `untrusted`；
+        `other` 按规则 8 fail-closed；`message` 按 `source_id` 查**本地消息存储**取原始 trust
+        与转发链（规则 6/7 及 `forwarded_from` 逐跳取低），查不到或已过期按规则 8
+        fail-closed 记 `untrusted`。
+
+        **调用方声明只能降级**：任何调用方提供的 `trust` / `external` / 来源声明**只能使结果
+        降为 `untrusted`（或更低），不得提升**；`system` **只能由网关内部**按规则 1 赋予。
+        本请求**不接受**调用方声明：`trust` / `external` / `provenance` 等字段不属于本请求，
+        出现即按未知属性返回 `400 request.invalid`。
+
+        **`system` / `persona` 区不可由调用方注入**：
+        - `system` 区**只**含网关的固定声明，不含任何调用方或外部原文；
+        - `persona` 区**只**由网关从 persona 存储按 owner 鉴权读取，请求只传 `persona_id`；
+          非 owner 或读不到 → persona 区为空，不得用请求体内容顶替；
+        - 因此 **`system_text` / `persona_text` 已被禁用**：请求里出现这两个字段一律按未知属性
+          返回 `400 request.invalid`（`additionalProperties: false`）。
+
+        **`source_id` 与正文绑定**：条目带 `source_id` 时，网关**以本地存储正文为准**；
+        请求 `text` 与存储正文不一致 → `422 request.invalid`
+        （`errors[].field=items[].text`），该条不进入任何分区。无 `source_id` 的内联条目
+        按 kind 判定（通常为 `untrusted`），`text` 进 `untrusted_data`。
+
+        **200 的两种结论**（均不新增 HTTP 状态码）：
+        - `outcome=allowed`：返回 `zones` 与 `nonces`，运行时可据此拼装并调用模型；
+        - `outcome=blocked`：`reason.code=trust.isolation_failed`，`zones` / `nonces`
+          为 `null`；`retryable=false`、`retry_after_seconds=null`、
+          `same_content_allowed=false`、`may_clear_at=null`、`queue_id=null`；
+          记一条 `usage_events kind=blocked`（`decision_code=trust.isolation_failed`），
+          **不计** token / 消息配额、不产生 `message_sent`、不调用模型、不投递。
+
+        本接口不扣限额、不做幂等缓存（结果只取决于请求内容与当前存储）。
+        结构或类型错误（缺 `persona_id` / `items`、未知属性、类型不符）→ `400 request.invalid`；
+        语义不合法（`items[].kind` 未知、`conversation_id` 不属于该 persona、
+        `items` 超过单次上限）→ `422 request.invalid`（`errors[].field` 指出字段）。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ContextAssembleRequest'
+      responses:
+        '200':
+          description: |
+            组装结论：`allowed` 返回四分区上下文与 nonce；`blocked` 返回
+            `reason.code=trust.isolation_failed`。
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContextAssembleResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: 身份有效但无权限（如 persona 不属于调用方）。
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /policy/evaluate:
     post:
       tags: [Policy]
@@ -798,6 +889,11 @@ paths:
 
         目标会话 `encryption=e2ee` 或 `ai_participation=disabled` 时返回 `403` `conversation.e2ee`
         （与 sendMessage 同一硬约束；不返回 200 blocked）。
+
+        本接口**不识别隔离信号**：`trust.isolation_failed` 只能由 `POST /context/assemble`
+        产生（`outcome=blocked`）。AI 运行时若不经该接口、自行拼装上下文而隔离失败，应**本地
+        放弃本轮、不调用模型**，不通过本接口上报该码；本接口不带也不识别 `isolation_failed`
+        字段。
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -2618,9 +2714,29 @@ components:
           enum: [human, ai, system, bridge, town]
         external:
           type: boolean
-          description: 是否来自本服之外（联邦、桥接、外部插件）。
+          description: |
+            是否来自本服之外（联邦、桥接、外部插件）。
+
+            **配对不提升可信度**：按 A2.1 仅配对联邦（`docs/deploy/paired-federation.md`），
+            active 配对表只决定消息「能不能通」。配对服务器来的内容 `external=true`，
+            据此判定为 `untrusted`；配对切断后经 backfill 补回的事件同样 `external=true`
+            且 `untrusted`。判定规则见 contract.md §7.1。
         forwarded_from:
           type: [string, 'null']
+          pattern: '^\$'
+          description: |
+            转发来源：**原始消息的 Matrix `event_id`**（以 `$` 开头），或 `null`。
+
+            网关按**本地消息存储**（按 `matrix_event_id` 查找）取原始消息的 trust，
+            取本消息与原始来源中较低者（**只降不升**）。原始消息本身可能也是转发，
+            网关**逐跳追溯**直到 `null` 或达到跳数上限（**8 跳**），链上各级取最低；
+            超过上限、查不到本地副本、原始消息已过期 / 被 redact、或原始来源是联邦但
+            来源不可知时，一律 `untrusted`（fail-closed）。`system` 不参与取低，
+            也不能由转发产生。判定规则见 contract.md §7.1「转发的降级与来源追溯」。
+
+            **保证范围**：只覆盖网关可识别的转发——即带合法 `forwarded_from` 且原始消息
+            在本服可追溯。客户端复制粘贴、截图、手改写等不带该字段的转发没有可追溯线索，
+            只能按发送者判定（本服人类即 `trusted`）。
 
     Message:
       type: object
@@ -2641,6 +2757,22 @@ components:
         trust:
           type: string
           enum: [trusted, untrusted, system]
+          description: |
+            内容可信度。**由服务端（网关）判定，客户端/调用方随消息提供的值一律忽略。**
+            判定按 contract.md §7.1 的规则逐条**独立**评估，**所有命中规则取最低值**
+            （偏序 `untrusted < trusted`；`system` 仅由规则 1 在其余规则全不命中时产生，
+            任何 `untrusted` 命中覆盖之）：
+            网关自身生成的系统通知/策略回执 → `system`；
+            `provenance.external=true`（联邦/桥接/外部插件，含 A2.1 配对服务器）→ `untrusted`；
+            `origin` 为 `bridge`/`town` → `untrusted`；
+            动态评论/点赞附言与他人动态正文 → `untrusted`；
+            人设卡字段 → `untrusted`（仅本 persona 所有者在服内写入且经网关校验的自身人设可 `trusted`）；
+            本服经鉴权的人类消息与本服 AI 消息 → `trusted`；
+            来源不明/字段缺失/解析失败 → `untrusted`（fail-closed）。
+            好友关系（A2.2 `friend_subject`）只影响可见性，不影响 trust。
+            只能降级不能升级：`forwarded_from` 非空时按本地存储逐跳追溯（上限 8）、
+            取本消息与链上各级的最低者，查不到/已过期 → `untrusted`；
+            `system` 不参与取低。交给模型前按 §7.2 隔离。
         provenance:
           $ref: '#/components/schemas/MessageProvenance'
         reply_to:
@@ -2675,6 +2807,20 @@ components:
               items:
                 $ref: '#/components/schemas/Message'
 
+    OutgoingProvenance:
+      type: object
+      description: 发送消息时调用方声明的来源信息。
+      properties:
+        forwarded_from:
+          type: [string, 'null']
+          pattern: '^\$'
+          description: |
+            转发来源：**原始消息的 Matrix `event_id`**（以 `$` 开头），或 `null`。
+            网关按本地消息存储查原始 trust 并逐跳取低（上限 8 跳），详见 contract.md §7.1。
+            非法格式（非 `null` 且不以 `$` 开头）→ `422 request.invalid`
+            （`errors[].field=provenance.forwarded_from`）。
+      additionalProperties: false
+
     OutgoingContent:
       type: object
       required: [type, text]
@@ -2703,6 +2849,8 @@ components:
         reply_to:
           type: string
           description: 被回复消息的 `id` 或 `matrix_event_id`。
+        provenance:
+          $ref: '#/components/schemas/OutgoingProvenance'
         token_estimate:
           type: integer
           minimum: 0
@@ -2754,6 +2902,194 @@ components:
           minimum: 0
           default: 0
 
+    ContextAssembleRequest:
+      type: object
+      required: [persona_id, items]
+      properties:
+        persona_id:
+          type: string
+          description: 请求方 persona；`conversation_id` 必须属于该 persona 的可见范围。
+        conversation_id:
+          type: string
+          description: 可选。带上时按会话成员与归档状态校验；`message` 类条目从该会话的消息存储取 trust。
+        system_text:
+          type: string
+          deprecated: true
+          description: |
+            **已废弃 / 禁用**：`system` 区**只**含网关固定声明，调用方不得注入任何文本。
+            本字段仅为兼容期占位保留；请求中出现 `system_text` 一律按禁用字段处理，
+            返回 `400 request.invalid`（`errors[].field=system_text`），**不会**进入任何分区。
+        persona_text:
+          type: string
+          deprecated: true
+          description: |
+            **已废弃 / 禁用**：`persona` 区内容**必须**由网关从 persona 存储按 owner 鉴权读取，
+            调用方不得用请求体顶替。请求只需 `persona_id`；非 owner 或读不到 → persona 区为空
+            （不组装该区内容），**不得**用请求体内容替代。
+            请求中出现 `persona_text` 一律按禁用字段处理，返回 `400 request.invalid`
+            （`errors[].field=persona_text`）。
+        items:
+          type: array
+          minItems: 1
+          maxItems: 200
+          description: |
+            待放入上下文的消息 / 外部内容列表，按给定顺序拼装。单次上限 **200 条**（同 `maxItems`）。
+            每项**不接受** `trust` / `external` / `provenance` 等字段（`ContextItem`
+            `additionalProperties: false`）：出现即 `400 request.invalid`。
+          items:
+            $ref: '#/components/schemas/ContextItem'
+      additionalProperties: false
+
+    ContextItem:
+      type: object
+      required: [kind, text]
+      properties:
+        kind:
+          type: string
+          enum: [message, moments_comment, moments_post, persona_field, external, other]
+          description: |
+            条目类别，决定 §7.1 的判定规则：
+            `message` → 规则 6/7/8，并按 `source_id` 追溯转发链；
+            `moments_comment` / `moments_post` → 规则 4（`untrusted`）；
+            `persona_field` → 规则 5（`untrusted`，除非为本 persona 所有者的自身人设）；
+            `external` → 规则 2（`untrusted`）；
+            `other` → 规则 8 fail-closed（`untrusted`）。
+        source_id:
+          type: string
+          description: |
+            来源标识。`message` 类填 `message.id` 或 `matrix_event_id`
+            （`$` 开头），用于查本地存储取原始 trust 与转发链；查不到按规则 8。
+            **存在 `source_id` 时以本地存储正文为准**：请求 `text` 与存储正文不一致 →
+            `422 request.invalid`（`errors[].field=items[].text`），该条不进入任何分区。
+        text:
+          type: string
+          maxLength: 8000
+          description: |
+            原文。带 `source_id` 时**只**作占位 / 客户端缓存，必须与本地存储正文一致（不一致 → `422`）；
+            无 `source_id` 的内联条目按 kind 判定（通常 `untrusted`）。
+            文本只进 `untrusted_data` 区或 `conversation` 区，**永不进 `system`**。
+        label:
+          type: string
+          maxLength: 120
+          description: 供数据区标签使用的简短来源描述（如发送者显示名），仅作展示。
+      additionalProperties: false
+
+    ContextAssembleResult:
+      type: object
+      description: |
+        组装结论。`outcome=allowed` 时 `zones` 与 `nonces` 非空、`reason` 为 `null`；
+        `outcome=blocked` 时两者为 `null`、`reason.code=trust.isolation_failed`，
+        且 `retryable=false`、`retry_after_seconds=null`、`same_content_allowed=false`、
+        `may_clear_at=null`、`queue_id=null`；记一条 `usage_events kind=blocked`，
+        **不计** token / 消息配额。
+      required: [outcome, retryable, zones, nonces, reason]
+      properties:
+        outcome:
+          type: string
+          enum: [allowed, blocked]
+        retryable:
+          type: boolean
+          description: |
+            `allowed` → `false`（已成功，无需重试）；`blocked` → **始终** `false`。
+        retry_after_seconds:
+          type: [integer, 'null']
+          minimum: 0
+          description: '`blocked` 时始终 `null`。'
+        same_content_allowed:
+          type: boolean
+          description: '`blocked`（`trust.isolation_failed`）时始终 `false`：构造失败的上下文不因等待而变得可用。'
+        may_clear_at:
+          type: [string, 'null']
+          format: date-time
+          description: '`blocked` 时始终 `null`：隔离失败没有「额度恢复时间」。'
+        queue_id:
+          type: [string, 'null']
+          description: '始终 `null`：本接口不产生排程。'
+        zones:
+          anyOf:
+            - $ref: '#/components/schemas/ContextZones'
+            - type: 'null'
+        nonces:
+          anyOf:
+            - type: array
+              items:
+                $ref: '#/components/schemas/ContextNonce'
+            - type: 'null'
+          description: |
+            每个 `untrusted_data` 段一个 nonce，与 `zones.untrusted_data` 中的
+            开闭标签一一对应。每段独立生成、CSPRNG、≥128 bit、不跨请求/轮次复用。
+        items:
+          type: array
+          description: 每条输入的判定结果，供运行时核对（顺序与请求 `items` 一致）。
+          items:
+            $ref: '#/components/schemas/ContextItemVerdict'
+        reason:
+          anyOf:
+            - $ref: '#/components/schemas/PolicyReason'
+            - type: 'null'
+
+    ContextZones:
+      type: object
+      description: |
+        固定顺序的四分区文本。`untrusted` 内容只出现在 `untrusted_data`；
+        `system` 区含网关固定声明，不含任何外部原文；`persona` 区仅本 persona 所有者
+        的自身人设。`untrusted_data` 每段由 nonce 标签包裹，
+        原文中出现相同 nonce 或边界标记字面量时已先转义（先归一化后检测、按码点截断并保留闭合边界）。
+      required: [system, persona, conversation, untrusted_data]
+      properties:
+        system:
+          type: string
+          description: 网关策略与固定声明。
+        persona:
+          type: string
+          description: 本 persona 所有者本人的人设。
+        conversation:
+          type: string
+          description: '`trusted` 的对话内容。'
+        untrusted_data:
+          type: string
+          description: '`untrusted` 数据区，每段用独立 nonce 包裹。'
+
+    ContextNonce:
+      type: object
+      required: [segment_id, nonce, bits]
+      properties:
+        segment_id:
+          type: string
+          description: |
+            数据区该段的标识，**必须等于** `nonce` 字面量，也就是 `zones.untrusted_data`
+            中该段开闭标签 `id="..."` 的值（不接受可预测的 `seg_N`）。
+        nonce:
+          type: string
+          description: |
+            该段使用的 nonce 字面量（hex 或 base64url）。它就是标签 `id` 的值——
+            `<untrusted id="{nonce}">…</untrusted id="{nonce}">`，每段独立、不可预测。
+        bits:
+          type: integer
+          minimum: 128
+          description: nonce 熵下界，固定 ≥128。
+
+    ContextItemVerdict:
+      type: object
+      required: [index, trust]
+      properties:
+        index:
+          type: integer
+          minimum: 0
+          description: 对应请求 `items` 中的下标。
+        source_id:
+          type: string
+        trust:
+          type: string
+          enum: [trusted, untrusted, system]
+          description: |
+            网关按 §7.1 判定的结果（调用方传入的 `trust` 不被采纳）。`items[]` 的文本
+            **永不进 `system` 区**：若某条被判定为 `system`（不应由 `items` 产生），
+            该条文本按丢弃处理、不进入任何分区，仅在结果里回传判定供核对。
+        rule:
+          type: string
+          description: 命中的判定规则标识（如 `rule1`…`rule8`、`forwarded_from`，供核对）。
+
     PolicyReason:
       type: object
       required: [code, message]
@@ -2770,6 +3106,9 @@ components:
             `anti_spam.consecutive`（同 persona 连续 AI 消息达到上限，触发那条）、
             `anti_spam.cooldown`（防刷屏冷却未结束，冷却期内后续请求）、
             `ai_loop.tripped`（同会话任意 AI 互聊达到每小时上限）。
+            以及 B2.3 隔离相关：
+            `trust.isolation_failed`（隔离器报错、边界生成失败或 trust 无法判定时
+            fail-closed 不调用模型，仍为 `200` + `outcome: blocked`）。
             旧码 `ai_loop.breaker_open` 视为 `ai_loop.tripped` 的别名（仅曾出现在
             示例，src 从未输出；照旧码实现的客户端仍可正常工作）。
             **注意**：`PolicyReason.code` 与 `PolicyCheck.key` 是两套名字——

@@ -1,0 +1,15 @@
+{
+  "outcome": "blocked",
+  "retryable": false,
+  "retry_after_seconds": null,
+  "same_content_allowed": false,
+  "may_clear_at": null,
+  "queue_id": null,
+  "zones": null,
+  "nonces": null,
+  "reason": {
+    "code": "trust.isolation_failed",
+    "message": "Context isolation could not be built; the model was not called.",
+    "layer": "system"
+  }
+}
