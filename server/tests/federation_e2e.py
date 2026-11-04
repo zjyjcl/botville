@@ -228,12 +228,21 @@ def main():
     # --- phase 1: unpaired -> federation is denied -------------------------
 
     def step_unpaired():
-        room = create_room(alice, invite=["@{}:hs-b".format(bob.username)])
+        # Synapse sends the invite synchronously over federation; when the
+        # remote fedgate answers 403 the invite call itself fails. Create
+        # the room first, then the invite must be refused AND never arrive.
+        room = create_room(alice)
+        status, resp = request_json(
+            "POST", alice.url("/_matrix/client/v3/rooms/{}/invite".format(quote_room(room))),
+            body={"user_id": "@{}:hs-b".format(bob.username)},
+            token=alice.access_token)
+        expect(status >= 400,
+               "unpaired invite unexpectedly accepted: HTTP {} {!r}".format(status, resp))
         assert_never(
             "an invite into {} on hs-b".format(room),
             lambda: room in sync_invited_rooms(bob))
         globals()["stale_room"] = room
-        return "invite never reached hs-b (kept room {} aside)".format(room)
+        return "invite refused (HTTP {}) and never reached hs-b".format(status)
 
     # --- phase 2: pair A -> B, then talk over federation -------------------
 
