@@ -130,6 +130,21 @@ def _check_int(
     return value
 
 
+def _silent_is_effective(silent: Any) -> bool:
+    """该层的 silent_hours 是否真的会静默（#114-7.3）。
+
+    `enabled: true` 但 `start == end` 是**零长度窗口**，语义上等于「不静默」。
+    平台层这样配置时不能把更严格的 owner 层窗口一起挡掉：否则平台一个
+    `23:00–23:00` 的配置事故会悄悄关掉所有 owner 的静默设置。
+    """
+    if not isinstance(silent, dict) or not silent.get("enabled"):
+        return False
+    try:
+        return parse_hhmm(silent["start"]) != parse_hhmm(silent["end"])
+    except Exception:  # ConfigError / KeyError / TypeError：视为不可生效
+        return False
+
+
 def validate_silent_hours(value: Any, field_path: str = "rules.silent_hours") -> Dict[str, Any]:
     """校验并规范化 `SilentHours`。省略 enabled 时按契约默认 true。"""
     if not isinstance(value, dict):
@@ -158,12 +173,14 @@ def validate_silent_hours(value: Any, field_path: str = "rules.silent_hours") ->
                 "request.invalid", f"{field_path}.{name} must be a string", field_path
             )
         out[name] = raw
-    # HH:MM 格式在 parse_hhmm 里校验（抛 ConfigError，转成 422 更贴切）
-    try:
-        parse_hhmm(out["start"])
-        parse_hhmm(out["end"])
-    except Exception as exc:  # ConfigError
-        raise _range_error(f"{field_path}.start", str(exc)) from exc
+    # HH:MM 格式在 parse_hhmm 里校验（抛 ConfigError，转成 422 更贴切）。
+    # 逐字段校验：错误必须指向真正出错的那个字段（#114-7.8a），否则调用方
+    # 按 errors[].field 定位时会去改没问题的 start。
+    for name in ("start", "end"):
+        try:
+            parse_hhmm(out[name])
+        except Exception as exc:  # ConfigError
+            raise _range_error(f"{field_path}.{name}", str(exc)) from exc
     try:
         ZoneInfo(out["timezone"])
     except (ZoneInfoNotFoundError, ValueError) as exc:
@@ -572,7 +589,7 @@ class LimitStore:
         if (
             isinstance(silent, dict)
             and silent.get("enabled") is False
-            and platform_silent.get("enabled")
+            and _silent_is_effective(platform_silent)
         ):
             errors.append(
                 {
@@ -671,11 +688,12 @@ class LimitStore:
             if winner is not None:
                 values.append(winner)
 
-        # 静默：任一层开启即生效；生效窗口取第一个开启层。
+        # 静默：任一层开启即生效；生效窗口取第一个**真正生效**的开启层
+        # （enabled 但 start == end 的零长度窗口不算，见 `_silent_is_effective`）。
         silent_winner: Optional[EffectiveValue] = None
         for layer in layers:
             silent = layer.rules.get("silent_hours")
-            if isinstance(silent, dict) and silent.get("enabled"):
+            if _silent_is_effective(silent):
                 silent_winner = EffectiveValue(
                     "silent_hours", True, "boolean", layer.layer, layer.scope_id
                 )
@@ -727,7 +745,7 @@ class LimitStore:
         winner_layer, winner_scope = None, None
         for layer in effective.layers:
             silent = layer.rules.get("silent_hours")
-            if isinstance(silent, dict) and silent.get("enabled"):
+            if _silent_is_effective(silent):
                 winner_layer, winner_scope = layer, silent
                 break
         if winner_layer is None:

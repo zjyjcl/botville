@@ -153,5 +153,12 @@ class InMemoryMatrixTransport:
             return [e for e in self.sent if e.room_id == room_id]
 
     def clear(self) -> None:
+        """清空整个假后端状态（#114 N11）。
+
+        `_by_txn` 必须一起清：否则 `clear()` 后 `sent` 为空、同 txnId 却仍返回
+        旧事件，测试里「清空后重放」会假通过。`_counter` 不回退（事件 ID 唯一性
+        比连续性重要）。
+        """
         with self._lock:
             self.sent.clear()
+            self._by_txn.clear()
