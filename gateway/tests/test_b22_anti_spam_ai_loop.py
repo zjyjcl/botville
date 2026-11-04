@@ -479,10 +479,10 @@ class TestPeerIdValidation(unittest.TestCase):
         r = send(self.svc, "bot1", "conv_peer", peer_id="bot2")
         self.assertEqual(r["outcome"], "delivered")
 
-    def test_unregistered_conv_with_peer_id_raises_422(self):
-        """会话未注册 + 带 peer_id → 422（fail-closed）。"""
-        with self.assertRaises(PeerValidationError):
-            send(self.svc, "bot1", "conv_unregistered", peer_id="bot2")
+    def test_unregistered_conv_with_peer_id_ok(self):
+        """会话未注册 + 带 peer_id → B2.1 行为，原样采信（#117 B1 退回 B2.1）。"""
+        r = send(self.svc, "bot1", "conv_unregistered", peer_id="bot2")
+        self.assertEqual(r["outcome"], "delivered")
 
     def test_unregistered_conv_no_peer_id_ok(self):
         """会话未注册 + 无 peer_id → 与 B2.1 相同，pass。"""

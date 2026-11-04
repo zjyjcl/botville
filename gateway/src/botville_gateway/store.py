@@ -135,35 +135,66 @@ class UsageStore:
     `Config.max_usage_events`，由 `build_server()` 注入。
     """
 
-    def __init__(self, max_events: int = 10_000) -> None:
+    def __init__(
+        self,
+        max_events: int = 10_000,
+        retention_seconds: int = 0,
+        *,
+        now_fn=None,
+    ) -> None:
         if max_events < 0:
             raise ValueError("max_events must be >= 0")
+        if retention_seconds < 0:
+            raise ValueError("retention_seconds must be >= 0")
         self._events: List[UsageEvent] = []
         self._max_events = max_events
+        self._retention_seconds = retention_seconds
+        self._now = now_fn
         self._lock = threading.Lock()
 
     @property
     def max_events(self) -> int:
         return self._max_events
 
-    def append(self, event: UsageEvent, retention_seconds: int = 0) -> None:
+    @property
+    def retention_seconds(self) -> int:
+        return self._retention_seconds
+
+    def append(self, event: UsageEvent, retention_seconds: Optional[int] = None) -> None:
+        """追加事件；按保留期 + 容量淘汰旧事件（B2.2 #114-7 / #117 B4）。
+
+        `retention_seconds` 省略时用构造时注入的保留期（`Config.usage_retention_seconds`）；
+        显式传 `0` 表示本次不做保留期淘汰（纯容量）。
+        """
         with self._lock:
             self._events.append(event)
-            self._evict_locked(retention_seconds)
+            self._evict_locked(
+                self._retention_seconds if retention_seconds is None else retention_seconds,
+                now=event.recorded_at,
+            )
 
-    def _evict_locked(self, retention_seconds: int = 0) -> None:
+    def _evict_locked(
+        self, retention_seconds: int = 0, *, now: Optional[datetime] = None
+    ) -> None:
         """超限时优先丢弃早于保留期的事件，容量仍超才按最旧淘汰（B2.2 #114-7 保留期）。
 
-        `retention_seconds > 0` 时先将早于 now-retention_seconds 的事件批量清除，
+        `retention_seconds > 0` 时先将早于 `now - retention_seconds` 的事件批量清除，
         再检查容量；容量仍超时按最旧优先裁剪到 90% 上限（兜底至少留 1 条）。
         `retention_seconds=0` 时退化为纯容量淘汰，与旧行为一致。
+
+        `now` 取**被 append 事件的时间**（service 注入的时钟），不读 `datetime.now()`：
+        注入/回放时钟下淘汰边界才不会失真（#117 B4）。
         """
-        if self._max_events <= 0:
+        if self._max_events <= 0 and retention_seconds <= 0:
             return
         # 按保留期淘汰（仅当 retention_seconds > 0）
         if retention_seconds > 0:
-            cutoff = datetime.now(timezone.utc) - timedelta(seconds=retention_seconds)
+            if now is None:
+                now = self._now() if self._now is not None else datetime.now(timezone.utc)
+            cutoff = now - timedelta(seconds=retention_seconds)
             self._events = [e for e in self._events if e.recorded_at > cutoff]
+        if self._max_events <= 0:
+            return
         overflow = len(self._events) - self._max_events
         if overflow <= 0:
             return

@@ -39,13 +39,14 @@ from __future__ import annotations
 import math
 import threading
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from .config import Config, parse_hhmm
-from .limits import EffectiveLimits, LimitStore, LAYER_PLATFORM
+from .limits import EffectiveLimits, LAYER_PEER, LimitStore, LAYER_PLATFORM
 from .store import EventKind, UsageStore
 from .timeutil import iso_utc, seconds_until, utcnow
 
@@ -169,7 +170,8 @@ class Reservation:
 
     `at` 是预留时刻：它同时充当「这条消息进入滑动窗口的时间」，提交时会成为
     UsageEvent 的 `recorded_at`，所以投递耗时不会被算进窗口起点之前。
-    `conversation_id` 用于 ai_loop 按会话计数在途预留（B2.2）。
+    `conversation_id` 用于 ai_loop / anti_spam 按会话计数在途预留（B2.2）；
+    `peer_id` 用于 peer 层按 (persona, peer_id) 计数在途预留（§6.4）。
     """
 
     id: str
@@ -177,6 +179,7 @@ class Reservation:
     tokens: int
     at: datetime
     conversation_id: Optional[str] = None
+    peer_id: Optional[str] = None
 
 
 class ReservationBook:
@@ -202,6 +205,7 @@ class ReservationBook:
         tokens: int,
         at: datetime,
         conversation_id: Optional[str] = None,
+        peer_id: Optional[str] = None,
     ) -> Reservation:
         reservation = Reservation(
             id=f"res_{uuid.uuid4().hex}",
@@ -209,6 +213,7 @@ class ReservationBook:
             tokens=tokens,
             at=at,
             conversation_id=conversation_id,
+            peer_id=peer_id,
         )
         with self._lock:
             self._items[reservation.id] = reservation
@@ -249,6 +254,14 @@ class PolicyEngine:
         self._now = now_fn
         # 锁外投递时的在途预留；None 时走旧路径（不把在途算进已用额度）。
         self._reservations = reservations
+        # B2.2 §6.3 冷却状态：与容量有界的事件表解耦（#117 B3/B5）。
+        # - `_cooldowns[(persona, conv)]` = 首次触发 anti_spam.consecutive 的时刻；
+        # - `_count_since[(persona, conv)]` = 冷却结束/人类消息之后的连续计数起点；
+        # - `_cooldown_notified` = 本次冷却是否已写过一条 blocked 事件（去重，防洪泛）。
+        self._state_lock = threading.Lock()
+        self._cooldowns: "OrderedDict[Tuple[str, str], datetime]" = OrderedDict()
+        self._count_since: "OrderedDict[Tuple[str, str], datetime]" = OrderedDict()
+        self._cooldown_notified: Dict[Tuple[str, str], bool] = {}
 
     # ------------------------------------------------------------------ API
     def evaluate(
@@ -300,7 +313,7 @@ class PolicyEngine:
             )
 
         # 2) token 窗口（预扣本次估算）
-        token = self._token_view(persona_id, now, estimated, effective)
+        token = self._token_view(persona_id, now, estimated, effective, peer_id=peer_id)
         if token is not None:
             checks.append(token)
             if not token.allowed:
@@ -316,7 +329,7 @@ class PolicyEngine:
                 )
 
         # 3) 最小发言间隔
-        interval = self._interval_view(persona_id, now, effective)
+        interval = self._interval_view(persona_id, now, effective, peer_id=peer_id)
         if interval is not None:
             checks.append(interval)
             if not interval.allowed:
@@ -573,7 +586,6 @@ class PolicyEngine:
 
         since = now - timedelta(seconds=window)
         # B2.2 §6.4: peer 层按 (persona, peer_id) 计数；其他层仍为 persona 全局。
-        from .limits import LAYER_PEER
         use_peer_filter = (layer == LAYER_PEER and peer_id is not None)
         events = sorted(
             self._store.events_in_window(
@@ -587,23 +599,25 @@ class PolicyEngine:
         used = len(events)
 
         # 把在途预留（锁外投递中）也算作已用名额，防止并发击穿。
+        inflight_ats: List[datetime] = []
         if self._reservations is not None:
             # B2.2 §6.4: peer 层在途只计同 peer_id 的；其他层计全部该 persona 在途。
-            from .limits import LAYER_PEER
-            if use_peer_filter and peer_id is not None:
-                inflight = sum(
-                    1 for r in self._reservations.for_persona(persona_id)
-                    if r.conversation_id is not None
-                )
-            else:
-                inflight = len(self._reservations.for_persona(persona_id))
-            used += inflight
+            inflight = [
+                r
+                for r in self._reservations.for_persona(persona_id)
+                if not use_peer_filter or r.peer_id == peer_id
+            ]
+            used += len(inflight)
+            inflight_ats = [r.at for r in inflight]
 
         allowed = used < limit
         remaining = max(0, limit - used)
         if events:
             release_index = min(len(events) - 1, max(0, used - limit))
             release_at = events[release_index].recorded_at + timedelta(seconds=window)
+        elif inflight_ats:
+            # 仅由在途预留阻塞：reset_at = 最早预留 at + window（不得为 now/None，#114-7.1）。
+            release_at = min(inflight_ats) + timedelta(seconds=window)
         else:
             release_at = since + timedelta(seconds=window)
         return PolicyCheck(
@@ -625,6 +639,8 @@ class PolicyEngine:
         now: datetime,
         estimated: int,
         effective: Optional[EffectiveLimits],
+        *,
+        peer_id: Optional[str] = None,
     ) -> Optional[PolicyCheck]:
         window = self._window_seconds(effective, pair="tokens")
         if effective is not None:
@@ -642,16 +658,28 @@ class PolicyEngine:
             )
 
         since = now - timedelta(seconds=window)
+        use_peer_filter = (layer == LAYER_PEER and peer_id is not None)
         events = sorted(
             self._store.events_in_window(
-                persona_id=persona_id, kind=EventKind.SENT, since=since
+                persona_id=persona_id,
+                kind=EventKind.SENT,
+                since=since,
+                peer_id=peer_id if use_peer_filter else None,
             ),
             key=lambda e: e.recorded_at,
         )
         used = sum(e.tokens_in + e.tokens_out for e in events)
         # 在途预留先占预算：并发请求不能各自看到同一份剩余额度。
+        # peer 层只计同 peer_id 的在途（§6.4）。
+        inflight_ats: List[datetime] = []
         if self._reservations is not None:
-            used += sum(r.tokens for r in self._reservations.for_persona(persona_id))
+            inflight = [
+                r
+                for r in self._reservations.for_persona(persona_id)
+                if not use_peer_filter or r.peer_id == peer_id
+            ]
+            used += sum(r.tokens for r in inflight)
+            inflight_ats = [r.at for r in inflight]
         allowed = used + estimated <= budget
         remaining = max(0, budget - used)
 
@@ -675,6 +703,13 @@ class PolicyEngine:
                     )
                     break
             # 单次请求就超过总预算：等多久都不会恢复，reset_at 省略。
+            if reset_at is None and not events and inflight_ats:
+                # 仅由在途预留阻塞：最早预留释放时刻（不得为 None，#114-7.1）。
+                reset_at = iso_utc(
+                    _ceil_to_second(
+                        min(inflight_ats) + timedelta(seconds=window)
+                    )
+                )
 
         return PolicyCheck(
             key="tokens.window",
@@ -690,7 +725,12 @@ class PolicyEngine:
 
     # --------------------------------------------------------- interval view
     def _interval_view(
-        self, persona_id: str, now: datetime, effective: Optional[EffectiveLimits]
+        self,
+        persona_id: str,
+        now: datetime,
+        effective: Optional[EffectiveLimits],
+        *,
+        peer_id: Optional[str] = None,
     ) -> Optional[PolicyCheck]:
         if effective is None:
             return None
@@ -707,10 +747,12 @@ class PolicyEngine:
                 source_id=source_id,
             )
         since = now - timedelta(seconds=min_seconds)
+        use_peer_filter = (layer == LAYER_PEER and peer_id is not None)
         events = self._store.events_in_window(
             persona_id=persona_id,
             kind=EventKind.SENT,
             since=since,
+            peer_id=peer_id if use_peer_filter else None,
         )
         # 在途预留同样算「最近一次发言」：并发请求不能在间隔窗口内同时放行。
         latest_at: Optional[datetime] = None
@@ -718,6 +760,8 @@ class PolicyEngine:
             latest_at = max(e.recorded_at for e in events)
         if self._reservations is not None:
             for reservation in self._reservations.for_persona(persona_id):
+                if use_peer_filter and reservation.peer_id != peer_id:
+                    continue
                 if reservation.at > since and (
                     latest_at is None or reservation.at > latest_at
                 ):
@@ -869,13 +913,62 @@ class PolicyEngine:
         return target.astimezone(timezone.utc)
 
     # ---------------------------------------------- B2.2 anti_spam / ai_loop
+    def _anti_spam_key(self, persona_id: str, conversation_id: str) -> Tuple[str, str]:
+        return (persona_id, conversation_id)
+
+    def _trim_state_locked(self) -> None:
+        """冷却/计数起点表按 max_usage_events 设上限（最旧优先淘汰）。"""
+        limit = self._config.max_usage_events
+        if limit <= 0:
+            return
+        for book in (self._cooldowns, self._count_since):
+            while len(book) > limit:
+                book.popitem(last=False)
+
+    def note_anti_spam_trip(
+        self, persona_id: str, conversation_id: str, at: datetime
+    ) -> None:
+        """记录 anti_spam 冷却锚点（#117 B3/B5）。
+
+        只由 service 在**实发路径**、且 decision 的 checks 中出现
+        `anti_spam.consecutive` + `allowed=False` 时调用；预检（evaluate）不落锚点。
+        冷却状态存在 engine 内，独立于容量有界的事件表：blocked 事件被淘汰不会提前
+        解除冷却（否则客户端可用被拒请求洪泛绕过冷却）。
+        """
+        key = self._anti_spam_key(persona_id, conversation_id)
+        with self._state_lock:
+            self._cooldowns[key] = at
+            self._cooldowns.move_to_end(key)
+            # 冷却结束后的计数起点由冷却结束时决定，旧起点作废。
+            self._count_since.pop(key, None)
+            self._cooldown_notified[key] = False
+            self._trim_state_locked()
+
+    def should_record_cooldown_block(
+        self, persona_id: str, conversation_id: str
+    ) -> bool:
+        """冷却期内同 (persona, conversation) 的 blocked 事件只在首次写一条。
+
+        返回 True 表示应写 UsageEvent；之后的重试返回 False（不写），
+        避免被拒请求的写放大把计数事件挤出容量上限。
+        """
+        key = self._anti_spam_key(persona_id, conversation_id)
+        with self._state_lock:
+            if key not in self._cooldowns:
+                return True
+            if self._cooldown_notified.get(key):
+                return False
+            self._cooldown_notified[key] = True
+            return True
+
     def _last_human_at(
         self, conversation_id: str, now: datetime
     ) -> Optional[datetime]:
-        """该会话最近一条人类消息时刻；无人类消息时返回 None（计数从窗口起点起算）。"""
+        """该会话最近一条人类消息时刻（不晚于 now）；无人类消息时返回 None。"""
         events = self._store.events_in_window(
             conversation_id=conversation_id,
             kind=EventKind.HUMAN,
+            until=now,
         )
         if not events:
             return None
@@ -891,11 +984,12 @@ class PolicyEngine:
     ) -> Optional[PolicyCheck]:
         """防刷屏：同 persona、同会话连续 AI 消息数 + 冷却（B2.2 §6.3）。
 
-        连续数 = 最后一条人类消息之后该 persona 的 sent 事件数 + 在途预留数。
+        连续数 = 最后一条人类消息（或冷却结束）之后该 persona 的 sent/deferred
+        事件数 + 同会话在途预留数。
         达到 max_consecutive_ai_messages 后的下一条 → blocked（consecutive），
         进入冷却；冷却锚定首次触发时刻，冷却期内再请求 → blocked（cooldown），
         **不延长冷却**。冷却结束 → 连续数清零（以冷却结束时刻作为计数起点）。
-        blocked 事件不计入连续数（这里只统计 SENT 事件，blocked 事件不在其中）。
+        blocked 事件不计入连续数。
         """
         if effective is None:
             return None
@@ -906,35 +1000,26 @@ class PolicyEngine:
         max_consecutive, layer, source_id = max_item
         cooldown_seconds = int(cooldown_item[0]) if cooldown_item is not None else 0
 
-        # 冷却锚点：最近一次 reason_code=anti_spam.consecutive 的 blocked 事件。
-        blocked_events = sorted(
-            self._store.events_in_window(
-                persona_id=persona_id,
-                conversation_id=conversation_id,
-                kind=EventKind.BLOCKED,
-            ),
-            key=lambda e: e.recorded_at,
-        )
-        cooldown_anchor: Optional[datetime] = None
-        for e in blocked_events:
-            if e.reason_code == CODE_ANTI_SPAM_CONSECUTIVE:
-                cooldown_anchor = e.recorded_at
+        key = self._anti_spam_key(persona_id, conversation_id)
+        with self._state_lock:
+            anchor = self._cooldowns.get(key)
+            stored_since = self._count_since.get(key)
 
-        # 人类消息提前解除冷却：冷却锚点之后出现经网关人类消息 → 冷却失效，
+        # 人类消息提前解除冷却：锚点之后出现经网关人类消息 → 冷却失效，
         # 计数起点直接取该人类消息时刻（契约 §6.3）。
         human_at = self._last_human_at(conversation_id, now)
-        if (
-            cooldown_anchor is not None
-            and human_at is not None
-            and human_at > cooldown_anchor
-        ):
-            cooldown_anchor = None
+        if anchor is not None and human_at is not None and human_at > anchor:
+            anchor = None
+            with self._state_lock:
+                self._cooldowns.pop(key, None)
+                self._cooldown_notified.pop(key, None)
+            stored_since = human_at
 
-        if cooldown_anchor is not None and cooldown_seconds > 0:
-            cooldown_end = cooldown_anchor + timedelta(seconds=cooldown_seconds)
-            if now < cooldown_end:
+        if anchor is not None:
+            cooldown_end = anchor + timedelta(seconds=cooldown_seconds)
+            if cooldown_seconds > 0 and now < cooldown_end:
                 # 冷却期内：blocked(cooldown)，may_clear_at 不变（不延长）。
-                used_seconds = (now - cooldown_anchor).total_seconds()
+                used_seconds = (now - anchor).total_seconds()
                 remaining_seconds = max(0, cooldown_seconds - used_seconds)
                 return PolicyCheck(
                     key="anti_spam.cooldown",
@@ -947,27 +1032,43 @@ class PolicyEngine:
                     code=CODE_ANTI_SPAM_COOLDOWN,
                     source_id=source_id,
                 )
-            # 冷却已结束：计数起点 = 冷却结束时刻（之前的 sent 不再计入）。
-            count_since = cooldown_end
-        else:
-            # 无冷却（或已被人类消息解除）：计数起点 = 最后一条人类消息时刻
-            # （无人类消息则从窗口起点）。
+            # 冷却已结束（cooldown_seconds=0 时触发即结束）：计数起点 = 冷却结束
+            # 时刻。0 秒冷却取 now：触发那条之后的请求立刻重新从 0 起计，不活锁。
+            stored_since = now if cooldown_seconds <= 0 else cooldown_end
+            with self._state_lock:
+                self._cooldowns.pop(key, None)
+                self._cooldown_notified.pop(key, None)
+                self._count_since[key] = stored_since
+                self._count_since.move_to_end(key)
+                self._trim_state_locked()
+
+        count_since = stored_since
+        if human_at is not None and (
+            count_since is None or human_at > count_since
+        ):
             count_since = human_at
 
-        # 统计 count_since 之后的 SENT 事件（该 persona、该会话）。
+        # 统计 count_since 之后的 SENT / DEFERRED 事件（该 persona、该会话）。
         events = sorted(
-            self._store.events_in_window(
-                persona_id=persona_id,
-                conversation_id=conversation_id,
-                kind=EventKind.SENT,
-                since=count_since,
+            (
+                e
+                for e in self._store.events_in_window(
+                    persona_id=persona_id,
+                    conversation_id=conversation_id,
+                    since=count_since,
+                )
+                if e.kind in (EventKind.SENT, EventKind.DEFERRED)
             ),
             key=lambda e: e.recorded_at,
         )
         used = len(events)
-        # 在途预留也计入连续数（避免排程绕过熔断）。
+        # 在途预留也计入连续数，但只计**同会话**的（#117 B2）。
         if self._reservations is not None:
-            used += len(self._reservations.for_persona(persona_id))
+            used += sum(
+                1
+                for r in self._reservations.for_persona(persona_id)
+                if r.conversation_id == conversation_id
+            )
 
         if used >= max_consecutive:
             # 触发：blocked(consecutive)，冷却锚点 = now（首次触发时刻）。
@@ -1028,10 +1129,13 @@ class PolicyEngine:
             count_since = window_start
 
         events = sorted(
-            self._store.events_in_window(
-                conversation_id=conversation_id,
-                kind=EventKind.SENT,
-                since=count_since,
+            (
+                e
+                for e in self._store.events_in_window(
+                    conversation_id=conversation_id,
+                    since=count_since,
+                )
+                if e.kind in (EventKind.SENT, EventKind.DEFERRED)
             ),
             key=lambda e: e.recorded_at,
         )

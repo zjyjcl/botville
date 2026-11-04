@@ -230,8 +230,7 @@ class TestB2PeerInSend(unittest.TestCase):
              "rules": {"tokens_per_window": 10}},
             now=clock(),
         )
-        # B2.2: 会话需注册才能带 peer_id 发送（fail-closed）。
-        svc.register_conversation("conv", ["p", "peer_x"])
+        # 未注册会话按 B2.1 采信 peer_id（#117 B1：不做成员校验）。
         result = send(svc, "hello world", peer_id="peer_x", token_estimate=20)
         self.assertEqual(result["outcome"], "blocked")
         codes = [r["code"] for r in result["decision"]["reasons"]]
@@ -249,8 +248,7 @@ class TestB2PeerInSend(unittest.TestCase):
              "rules": {"messages_per_window": 1}},
             now=clock(),
         )
-        # B2.2: register conversation so peer_id is valid
-        svc.register_conversation("conv", ["p", "peer_x"])
+        # 未注册会话按 B2.1 采信 peer_id（#117 B1：不做成员校验）。
         r1 = send(svc, "first", peer_id="peer_x")
         r2 = send(svc, "second", peer_id="peer_x")
         self.assertEqual(r1["outcome"], "delivered")
@@ -280,8 +278,7 @@ class TestB2PeerInSend(unittest.TestCase):
              "rules": {"messages_per_window": 1}},
             now=clock(),
         )
-        # B2.2: register conversation so peer_id is valid
-        svc.register_conversation("conv", ["p", "peer_x"])
+        # 未注册会话按 B2.1 采信 peer_id（#117 B1：不做成员校验）。
         # 第 1 条 evaluate → allow
         ev1 = svc.evaluate_policy({
             "persona_id": "p", "peer_id": "peer_x", "content": "x",
