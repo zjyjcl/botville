@@ -173,7 +173,8 @@ class GatewayService:
         # 重试会重新投递，HS 按 txnId 返回**同一个** event_id；据此不再重复记
         # SENT 用量（淘汰后重复计费）。容量取 max_idempotency_entries 的 2 倍，TTL 取
         # idempotency_ttl_seconds 的 2 倍（必须比幂等缓存活得久，否则淘汰后重试
-        # 恰好落在账本过期窗口里仍会重复计费）。仅无 key（随机 txnId）时不写入。
+        # 恰好落在账本过期窗口里仍会重复计费）。键是 service 自己算出的 txnId；
+        # 仅无 `Idempotency-Key`（随机 txnId、没有重试语义）时不写入、照常计费。
         self._txn_events: "OrderedDict[str, Tuple[str, datetime]]" = OrderedDict()
         self._idempotency_guards: Dict[str, _KeyGuard] = {}
         self._queue: "OrderedDict[str, _QueueItem]" = OrderedDict()
@@ -537,6 +538,10 @@ class GatewayService:
                 decision = prepared.decision
 
             # ---- 第二段：锁外投递（慢的 Matrix 调用不阻塞其它请求） ------
+            # txnId 在这里算一次并同时用于投递与账本：账本键只看「有没有 key」，
+            # 无 key 的随机 txnId 不写账本（B1），也不依赖传输的回填值（N2）。
+            txn_id = self._txn_id_for(idempotency_key)
+            ledger_txn = txn_id if idempotency_key else None
             try:
                 event = self._transport.send_text(
                     room_id=conversation_id,
@@ -544,7 +549,7 @@ class GatewayService:
                     text=validated["text"],
                     reply_to=validated["reply_to"],
                     content_type=validated["content_type"],
-                    txn_id=self._txn_id_for(idempotency_key),
+                    txn_id=txn_id,
                 )
             except DeliveryError as exc:
                 # 投递失败：回滚预留，不记账、不占名额；再映射为 5xx 传输错误。
@@ -570,6 +575,7 @@ class GatewayService:
                     mentions=validated["mentions"],
                     metadata=validated["metadata"],
                     peer_id=validated["peer_id"],
+                    ledger_txn=ledger_txn,
                 )
                 if idempotency_key:
                     self._idempotency_put(idempotency_key, fingerprint, receipt)
@@ -854,6 +860,7 @@ class GatewayService:
         mentions: Optional[List[str]],
         metadata: Optional[Dict[str, str]],
         peer_id: Optional[str] = None,
+        ledger_txn: Optional[str] = None,
     ) -> Dict[str, Any]:
         """锁内提交：调用方须持锁，且已释放（或即将释放）该预留。
 
@@ -861,12 +868,18 @@ class GatewayService:
         投递耗时不应改变这条消息落在哪个滑动窗口里。
 
         #114 PR-a 淘汰后去重计费：幂等缓存被淘汰后同 key 重试，HS 按 txnId 返回
-        同一个 event_id。此处按 txn_id 记账，若本次 event_id 与已记录的一致，
+        同一个 event_id。此处按 `ledger_txn` 记账，若本次 event_id 与已记录的一致，
         说明是同一次投递的重放——不再 append SENT 事件、不重复扣 token，回执照常
         返回（`delivery.matrix_event_id` 即上次的同一事件；不新增字段）。
+
+        `ledger_txn` 必须是 **service 自己算出的** txnId（有 `Idempotency-Key` 时
+        是 `_txn_id_for(key)`，无 key 时显式传 `None`），不能用 `event.txn_id`
+        回填值——传输实现可以不回填该字段（N2），而回填值在无 key 时是随机
+        uuid4，写进账本只会产生永远命中不了的噪声并挤掉有效条目（B1）。
+        `None` 表示本次请求没有幂等键：**不写账本**，但照常计费。
         """
         tokens_out = decision.estimated_tokens
-        txn_key = event.txn_id
+        txn_key = ledger_txn
         deduped = False
         if txn_key:
             recorded = self._txn_events_get(txn_key)
@@ -1094,7 +1107,12 @@ class GatewayService:
 
     # ------------------------------------------- txnId → event_id dedupe book
     def _txn_events_get(self, txn_id: str) -> Optional[str]:
-        """查该 txnId 上次投递的 event_id；过 TTL 即失效。调用方须持锁。"""
+        """查该 txnId 上次投递的 event_id；过 TTL 即失效。调用方须持锁。
+
+        N1：命中时刷新时间戳，与 `_idempotency_get` 命中后 `_idempotency_put`
+        续期缓存对齐。否则会出现「重试命中去重 → 缓存 TTL 续期、账本仍按首次
+        写入起算」，账本反而先于幂等缓存过期，2× TTL 的论断不成立。
+        """
         entry = self._txn_events.get(txn_id)
         if entry is None:
             return None
@@ -1102,9 +1120,11 @@ class GatewayService:
         # TTL 取幂等缓存的两倍：账本必须比缓存活得久，否则缓存淘汰后的重试
         # 会落在账本过期窗口里、重复计费。
         ttl = self._config.idempotency_ttl_seconds * 2
-        if ttl > 0 and (self._now() - created_at).total_seconds() > ttl:
+        now = self._now()
+        if ttl > 0 and (now - created_at).total_seconds() > ttl:
             self._txn_events.pop(txn_id, None)
             return None
+        self._txn_events[txn_id] = (event_id, now)
         self._txn_events.move_to_end(txn_id)
         return event_id
 

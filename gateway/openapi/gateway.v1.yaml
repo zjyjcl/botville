@@ -2768,8 +2768,9 @@ components:
 
         **不含消息正文**（#92）：为保护用户隐私，事件**不存储**消息内容。
         `text_length` 存储 Unicode 字符数（与 `len(text)` 一致），`text_sha256`
-        存储 HMAC-SHA256(部署密钥, 正文) 的十六进制值（#114 PR-a），二者可用于对账与
-        去重排查；没有部署密钥无法字典反推，轮换密钥后不可跨期比对。
+        存储 `hex(HMAC-SHA256(部署密钥 GATEWAY_HMAC_SECRET, b"text\x00" + UTF-8(正文)))`
+        的十六进制值（#114 PR-a，`b"text\x00"` 为域分隔前缀，复算时必须带上），
+        二者可用于对账与去重排查；没有部署密钥无法字典反推，轮换密钥后不可跨期比对。
         旧字段 `text_preview` 已从 B2.1 起**不再写入**；历史事件若存在该字段，
         客户端必须忽略它（`additionalProperties` 遵循前向兼容原则）。
       properties:
@@ -2819,9 +2820,13 @@ components:
         text_sha256:
           type: string
           description: |
-            HMAC-SHA256(部署密钥 `GATEWAY_HMAC_SECRET`, 正文) 的十六进制值（#114 PR-a，
-            字段名沿用）。同一部署同内容同值，用于去重与对账；无密钥不可字典反推；
-            轮换密钥后不可跨期比对。
+            `hex(HMAC-SHA256(部署密钥 GATEWAY_HMAC_SECRET, b"text\x00" + UTF-8(正文)))`
+            的十六进制值（#114 PR-a，字段名沿用）。`b"text\x00"` 是域分隔前缀
+            （与 txnId 的 `b"txn\x00"` 隔开），按契约复算时必须带上。
+            同一部署同内容同值，用于去重与对账；无密钥不可字典反推；
+            轮换密钥后不可跨期比对。轮换同时会改变 txnId，轮换前排空在途重试，
+            否则旧 key 的重试会落到新事务上、可能重复投递（txnId/text_sha256 的
+            幂等缓存与去重账本均为进程内存，假设单进程；多实例须共用同一密钥）。
             正文为空时此字段省略。
 
     UsageEventPage:

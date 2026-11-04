@@ -244,11 +244,15 @@ App                          网关                        模块网页（WKWebV
   对该端点**可选**，同一 key 不同请求体**不返回** `409 idempotency.conflict`（每次重放
   均执行整层替换）。
 - **Matrix 事务 ID（#114 PR-a）**：网关把 `Idempotency-Key` 推导为
-  `txnId = HMAC-SHA256(部署密钥, key)` 的前 64 个十六进制字符。txnId 出现在
-  homeserver / 反代日志的 URL 中，但没有部署密钥无法反推 key，也无法跨部署关联。
+  `txnId = hex(HMAC-SHA256(部署密钥 GATEWAY_HMAC_SECRET, b"txn\x00" + UTF-8(key)))[:64]`
+  ——取前 64 个十六进制字符。`b"txn\x00"` 是**域分隔前缀**，与 `text_sha256` 的
+  `b"text\x00"` 隔开，两者不存在构造上的交叉（第三方按契约复算时必须带上该前缀，
+  否则算出的值与网关不同）。txnId 出现在 homeserver / 反代日志的 URL 中，但没有
+  部署密钥无法反推 key，也无法跨部署关联。
 - **缓存淘汰后不重复计费**：幂等缓存因容量或 TTL 被淘汰后，同 key 重试会再次投递；
   homeserver 按 `(room, sender, txnId)` 去重并返回**同一 `event_id`**。网关另保留
-  `txnId → event_id` 账本（容量与 TTL 均为幂等缓存的 2 倍），命中同一 `event_id` 时
+  `txnId → event_id` 账本（容量与 TTL 均为幂等缓存的 2 倍；账本键是网关自己算出的
+  txnId，**不带** `Idempotency-Key` 的请求不写账本、照常计费），命中同一 `event_id` 时
   **不再记 SENT 用量、不重复扣 token**，回执照常返回该 `event_id`。账本也被淘汰后的
   极端重试仍可能重复计费，属已知边界。
 
@@ -893,10 +897,21 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
   小镇行为、图像生成。
 - **消息正文不落入账单**（B2.1 / #92）：`UsageEvent` **不存储**消息正文，只存
   `text_length`（Unicode 字符数，与 `len(text)` 一致）与 `text_sha256` 用于对账。
-  自 #114 PR-a 起 `text_sha256` = **HMAC-SHA256(部署密钥 `GATEWAY_HMAC_SECRET`, 正文)**
-  （字段名不变）：同一部署同内容同值，可对账；没有密钥无法字典反推；轮换密钥后
-  新旧事件不可跨期比对。旧字段 `text_preview` 从 B2.1 起**不再写入**，
+  自 #114 PR-a 起 `text_sha256` =
+  **`hex(HMAC-SHA256(部署密钥 GATEWAY_HMAC_SECRET, b"text\x00" + UTF-8(正文)))`**
+  （字段名不变）；`b"text\x00"` 是域分隔前缀，与 txnId 的 `b"txn\x00"` 隔开，
+  第三方复算时必须带上。同一部署同内容同值，可对账；没有密钥无法字典反推；
+  轮换密钥后新旧事件不可跨期比对。旧字段 `text_preview` 从 B2.1 起**不再写入**，
   客户端必须忽略历史事件中该字段（前向兼容）。
+- **密钥轮换的影响（#114 PR-a）**：`GATEWAY_HMAC_SECRET` 同时决定 `text_sha256`
+  **和 txnId**，因此轮换不止“新旧摘要不可比对”：
+  - 轮换后同一 `Idempotency-Key` 推导出**新的 txnId**，homeserver 不再认为是同一
+    事务。轮换前已投递、轮换后重试的请求会落到新事务上，可能产生**重复消息**。
+    建议轮换前先排空在途重试（等客户端重试窗口过去再切换）。
+  - 幂等缓存与 `txnId → event_id` 账本均为**进程内存**，不做持久化，重启即清空；
+    其“淘汰后不重复计费”的语义**假设网关单进程**。多实例部署必须让所有实例使用
+    同一 `GATEWAY_HMAC_SECRET`（否则 txnId 互不相同，HS 侧去重失效），但各实例的
+    内存账本不共享，跨实例的重复投递仍可能各记一次 SENT。
 - **限速窗口开区间 + 释放时刻向上取整**（#92）：窗口过滤使用左开右闭区间
   `(now - window_seconds, now]`，保证「过期」的名额在 `reset_at` 之后**严格**
   可用；`reset_at` 向上取整到秒，避免差一秒的活锁。`used > limit` 时

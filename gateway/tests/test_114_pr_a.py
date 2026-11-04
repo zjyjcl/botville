@@ -9,6 +9,8 @@ import sys
 import threading
 import time
 import unittest
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 _SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 if _SRC not in sys.path:
@@ -33,10 +35,11 @@ def make_cfg(**kw) -> Config:
     return Config(**base)
 
 
-def make_svc(cfg: Config):
+def make_svc(cfg: Config, clock=None):
     transport = InMemoryMatrixTransport()
     store = UsageStore(1000, secret=cfg.hmac_secret)
-    svc = GatewayService(cfg, transport, store, LimitStore(cfg))
+    kw = {"now_fn": clock} if clock is not None else {}
+    svc = GatewayService(cfg, transport, store, LimitStore(cfg), **kw)
     return svc, transport, store
 
 
@@ -45,6 +48,31 @@ def send(svc, key, text="hi"):
         "conv",
         {"sender_persona_id": "p", "content": {"type": "text", "text": text}},
         idempotency_key=key,
+    )
+
+
+class FixedClock:
+    """可控时钟（N1 需要跨过账本 TTL 才会暴露问题）。"""
+
+    def __init__(self, start: str = "2026-11-03T12:00:00Z") -> None:
+        self._now = datetime.strptime(start, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+
+    def __call__(self) -> datetime:
+        return self._now
+
+    def advance(self, seconds: int) -> None:
+        self._now += timedelta(seconds=seconds)
+
+
+def sent_count(store, text: str) -> int:
+    """只统计某个正文对应的 SENT 条数（`text_sha256` 可区分不同正文）。"""
+    digest = text_digest(text, SECRET_A)
+    return sum(
+        1
+        for ev in store.events_in_window(persona_id="p", kind=EventKind.SENT)
+        if ev.text_sha256 == digest
     )
 
 
@@ -110,6 +138,94 @@ class TestDedupeBillingAfterEviction(unittest.TestCase):
         self.assertEqual(e1.event_id, e2.event_id)
         self.assertNotEqual(e1.event_id, e3.event_id)
         self.assertEqual(len(t.sent), 2)
+
+
+class _NoEchoTransport:
+    """HS 语义但**不回填** `SentEvent.txn_id` 的传输（N2 的隐式契约探针）。"""
+
+    def __init__(self) -> None:
+        self._inner = InMemoryMatrixTransport()
+
+    @property
+    def sent(self):
+        return self._inner.sent
+
+    def send_text(self, **kw):
+        event = self._inner.send_text(**kw)
+        return replace(event, txn_id=None)
+
+    def healthy(self) -> bool:
+        return True
+
+
+class TestLedgerKeyedByServiceTxn(unittest.TestCase):
+    """B1 / N2：账本键取 service 自己算出的 txnId，且无 key 时不写账本。"""
+
+    def test_no_key_sends_do_not_grow_ledger(self):
+        svc, transport, store = make_svc(make_cfg())
+        for i in range(50):
+            r = svc.send_ai_message("conv", {
+                "sender_persona_id": "p",
+                "content": {"type": "text", "text": f"n{i}"},
+            })
+            self.assertEqual(r["outcome"], "delivered")
+        # 无 key → 随机 txnId，没有重试语义，不该污染账本（B1）。
+        self.assertEqual(len(svc._txn_events), 0)
+        # 计费照常：每个无 key 发送都是一条 SENT。
+        self.assertEqual(len(transport.sent), 50)
+        self.assertEqual(
+            len(store.events_in_window(persona_id="p", kind=EventKind.SENT)), 50
+        )
+
+    def test_no_key_noise_does_not_evict_ledger_entry(self):
+        svc, transport, store = make_svc(make_cfg(max_idempotency_entries=1))
+        r1 = send(svc, "K", text="keep")
+        send(svc, "L", text="other")  # 挤掉 K 的幂等缓存，账本容量 2 仍持有 K
+        for i in range(10):  # 大量无 key 噪声：不写账本，也就挤不掉 K
+            send(svc, None, text=f"noise{i}")
+        r2 = send(svc, "K", text="keep")  # 重新投递，HS 返回同一事件
+        self.assertEqual(sent_count(store, "keep"), 1)
+        self.assertEqual(
+            r1["delivery"]["matrix_event_id"], r2["delivery"]["matrix_event_id"]
+        )
+        self.assertEqual(len(transport.sent), 12)
+        self.assertEqual(sorted(svc._txn_events), sorted([
+            svc._txn_id_for("K"), svc._txn_id_for("L"),
+        ]))
+
+    def test_ledger_survives_transport_not_echoing_txn_id(self):
+        """N2：传输不回填 `SentEvent.txn_id` 时去重仍生效。"""
+        svc, transport, store = make_svc(make_cfg(max_idempotency_entries=1))
+        svc._transport = transport = _NoEchoTransport()
+        r1 = send(svc, "A", text="alpha")
+        send(svc, "B", text="beta")
+        r3 = send(svc, "A", text="alpha")
+        self.assertEqual(sent_count(store, "alpha"), 1)
+        self.assertEqual(
+            r1["delivery"]["matrix_event_id"], r3["delivery"]["matrix_event_id"]
+        )
+        self.assertEqual(len(transport.sent), 2)
+
+
+class TestLedgerTtlRefresh(unittest.TestCase):
+    """N1：去重命中也刷新账本时间戳，账本不会先于幂等缓存过期。"""
+
+    def test_dedupe_hit_refreshes_ledger_timestamp(self):
+        clock = FixedClock()
+        cfg = make_cfg(idempotency_ttl_seconds=100, max_idempotency_entries=1)
+        svc, transport, store = make_svc(cfg, clock=clock)
+        send(svc, "A", text="alpha")            # t=0   账本 A@0，TTL 200
+        send(svc, "B", text="beta")             # 挤出 A 的幂等缓存
+        clock.advance(150)
+        r3 = send(svc, "A", text="alpha")       # t=150 去重命中，账本续到 350
+        self.assertEqual(sent_count(store, "alpha"), 1)
+        clock.advance(110)
+        # t=260：幂等缓存（TTL 100，150 起算）已过期，账本若未续期（200）也已过期。
+        r4 = send(svc, "A", text="alpha")
+        self.assertEqual(sent_count(store, "alpha"), 1)
+        self.assertEqual(r3["delivery"]["matrix_event_id"],
+                         r4["delivery"]["matrix_event_id"])
+        self.assertEqual(len(transport.sent), 2)
 
 
 class _StubAS(AppServiceMatrixTransport):
