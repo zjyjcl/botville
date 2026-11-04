@@ -2136,7 +2136,13 @@ components:
           enum: [human, ai, system, bridge, town]
         external:
           type: boolean
-          description: 是否来自本服之外（联邦、桥接、外部插件）。
+          description: |
+            是否来自本服之外（联邦、桥接、外部插件）。
+
+            **配对不提升可信度**：按 A2.1 仅配对联邦（`docs/deploy/paired-federation.md`），
+            active 配对表只决定消息「能不能通」。配对服务器来的内容 `external=true`，
+            据此判定为 `untrusted`；配对切断后经 backfill 补回的事件同样 `external=true`
+            且 `untrusted`。判定规则见 contract.md §7.1。
         forwarded_from:
           type: [string, 'null']
 
@@ -2159,6 +2165,19 @@ components:
         trust:
           type: string
           enum: [trusted, untrusted, system]
+          description: |
+            内容可信度。**由服务端（网关）判定，客户端/调用方随消息提供的值一律忽略。**
+            判定按 contract.md §7.1 的顺序逐条匹配、命中即停：
+            网关自身生成的系统通知/策略回执 → `system`；
+            `provenance.external=true`（联邦/桥接/外部插件，含 A2.1 配对服务器）→ `untrusted`；
+            `origin` 为 `bridge`/`town` → `untrusted`；
+            动态评论/点赞附言与他人动态正文 → `untrusted`；
+            人设卡字段 → `untrusted`（仅本 persona 所有者在服内写入且经网关校验的自身人设可 `trusted`）；
+            本服经鉴权的人类消息与本服 AI 消息 → `trusted`；
+            来源不明/字段缺失/解析失败 → `untrusted`（fail-closed）。
+            好友关系（A2.2 `friend_subject`）只影响可见性，不影响 trust。
+            只能降级不能升级：`forwarded_from` 非空时取原始来源与转发者中较低者；
+            `system` 仅由网关自身生成，不参与取低。交给模型前按 §7.2 隔离。
         provenance:
           $ref: '#/components/schemas/MessageProvenance'
         reply_to:
@@ -2288,6 +2307,9 @@ components:
             `anti_spam.consecutive`（同 persona 连续 AI 消息达到上限，触发那条）、
             `anti_spam.cooldown`（防刷屏冷却未结束，冷却期内后续请求）、
             `ai_loop.tripped`（同会话任意 AI 互聊达到每小时上限）。
+            以及 B2.3 隔离相关：
+            `trust.isolation_failed`（隔离器报错、边界生成失败或 trust 无法判定时
+            fail-closed 不调用模型，仍为 `200` + `outcome: blocked`）。
             旧码 `ai_loop.breaker_open` 视为 `ai_loop.tripped` 的别名（仅曾出现在
             示例，src 从未输出；照旧码实现的客户端仍可正常工作）。
             **注意**：`PolicyReason.code` 与 `PolicyCheck.key` 是两套名字——

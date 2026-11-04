@@ -795,6 +795,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.1.0 | 2026-11-04 | [B2.3 PR1 契约] 不可信内容标记与隔离定义、注入测试集约定，**只增不删、不改状态码集合**。(1) 新增 [§7.1 trust 判定规则](#71-trust-判定规则b23)：8 条按序判定（命中即停），`system`→网关自身生成、`external=true`→`untrusted`、`origin=bridge/town`→`untrusted`、动态评论/正文→`untrusted`、人设卡字段→`untrusted`（仅本 persona 所有者在服内写入且经网关校验的自身人设为 `trusted`，且只能进人设区）、本服人类与本服 AI→`trusted`、来源不明→`untrusted` fail-closed；配对只决定可达性不提升可信度，切断后 backfill 事件同样 `untrusted`；`friend_subject` 只影响可见性不影响 trust；trust 由服务端判定，客户端传入值忽略；只能降级（`forwarded_from` 取原始来源与转发者较低者），`system` 不参与取低；枚举沿用 `trusted`/`untrusted`/`system` 不新增。(2) 新增 [§7.2 隔离的可验收定义](#72-隔离的可验收定义交给模型前)：四分区 `system`→`persona`→`conversation`→`untrusted_data`，untrusted 只进数据区；每请求随机 nonce（≥128 bit）包裹边界、撞 nonce/边界标记先转义、仿造 role/边界标签视为纯文本（或独立 role 等价方案）；system 区固定声明数据区非指令；隔离失败/边界生成失败/trust 不可判定 → **不调模型**、`200 blocked` + `trust.isolation_failed`（开放字符串，不新增 HTTP 状态码）；`PolicyReason.message`/日志/审计不得含 untrusted 原文（补「含数据区」）；隔离是必要条件非充分条件，高风险操作仍走 D2.1 签名回调。(3) 新增 [§7.3 注入测试集约定](#73-注入测试集约定b23)：`gateway/tests/injection/<category>.jsonl` 格式与 6 个必备类别（`moments_comment`/`federation`/`persona_card`/`bridge`/`boundary_forgery`/`role_hijack`），验收断言 (a)–(d)，PR1 每类 2 条样例、PR2 补全至每类 ≥5 条。(4) OpenAPI 仅改 description：`Message.trust` 补判定摘要与「服务端判定、客户端值被忽略」，`MessageProvenance.external` 补配对联邦语义，`PolicyReason.code` 推荐列表追加 `trust.isolation_failed`。实现见 PR2。 |
 | 0.1.0 | 2026-11-04 | [B2.2 PR2 实现] 防刷屏与 AI 互聊熔断落地，**只增不删、不改状态码集合**。(1) §1.3 错误码表补 `422 request.invalid`（createConversation 语义不合法 + peer_id 校验，属 §5.3 条件必填，0.x 例外）；(2) §6.3 `ai_loop.may_clear_at` 措辞改为「最早一条**被计入 count 的** AI 事件出窗」（窗口内有早于人类消息的旧事件时不偏早）；(3) §6.3 补「blocked 仍记 `kind=blocked` 不计入连续数；冷却锚定首次触发、重试不延长」；(4) §6.4 补 `peer_id` 须为会话成员且为对方 persona（≠ sender）；(5) §6.4 peer_id 缺失强制声明属 §5.3 条件必填、0.x 例外，无 peer 规则时省略同 B2.1。实现：`store.py` 增 `EventKind.HUMAN` + `UsageEvent.peer_id` + 保留期淘汰；`policy.py` 增 `anti_spam`/`ai_loop`/`message.length` 检查 + peer 层按 (persona, peer_id) 计数；`service.py` 增 `record_human_message`/`register_conversation`/`_check_peer_id`（422）；`limits.py` #114-4 `window_seconds` 单写 → 422；`http_server.py` peer_id 校验 422。测试 `test_b22_anti_spam_ai_loop.py` 42 例。**[B2.2 #117 审查修订]** (6) §6.4 会话成员来源（HTTP 注册/房间成员同步）尚未接入：**未登记会话（或 evaluate 无 `conversation_id`）按 B2.1 采信 `peer_id`、不校验成员**（带 `peer_id` 则 peer 层生效并计数）；仅**已登记**会话做成员校验（∈成员且≠sender，否则 422）与「**对方**（排除 sender）有 peer 规则时缺 `peer_id` → 422」，sender 自身有 peer 规则不触发；空串 `peer_id` → `400 request.invalid`（send 与 evaluate 一致）。(7) §6.3 **冷却状态独立于事件表保存**（进程内存按 `(persona, conversation_id)` 键，不受 blocked 事件容量淘汰影响，不再由事件复算 `may_clear_at`）；冷却期内同键 blocked 事件**只记一条**；`cooldown_seconds=0` 触发后冷却立即结束、计数起点取触发时刻（无 `reset_at == now` 活锁）；`kind=deferred`（静默顺延）**计入**连续数；保留期 `USAGE_RETENTION_SECONDS`（默认 30 天）**按服务时钟**（事件 `recorded_at`）淘汰。(8) §6.3 在途预留按会话计入 `anti_spam`（不跨会话误伤）。 |
 | 0.1.0 | 2026-11-04 | [B2.2 PR1 审查修订] 补全冷却/peer_id/幂等/码表语义，**只增不删、不改状态码集合**。(1) §6.3 冷却结束时刻即清零该 persona 在该会话的连续计数，被拦（`blocked`）消息不计入连续数；选码时机——触发那条报 `anti_spam.consecutive`、冷却期内后续请求报 `anti_spam.cooldown`（check 口径 limit=`cooldown_seconds`/used=已冷却秒数/remaining=剩余秒数/reset_at=`may_clear_at`）；冷却期内出现经网关人类消息提前解除冷却并清零，首版无人类入站入口故实际只靠冷却到期解除（不会永久静音）；(2) §6.4 当会话成员中存在配置了 peer 层限额的对方 persona、而请求未带 `peer_id` 时返回 `422 request.invalid`（`errors[].field=peer_id`），无 peer 层规则时省略 `peer_id` 与 B2.1 一致，实发与预检 `peer_id` 必须一致；(3) §1.5 把 `PUT /limits` 列为幂等例外（整层替换天然幂等、服务端不缓存、同 key 不同 body 不返回 409）；(4) `PolicyCheck.key` 推荐列表补 `anti_spam.cooldown`，注明 `key` 与 `code` 是两套名字；(5) `PolicyReason.code` 描述注明旧码 `ai_loop.breaker_open` 视为 `ai_loop.tripped` 的别名；(6) 推荐码列表按 B2.1 实际常量写（带后缀 `.exceeded`/`.active`/`.too_soon` 等）；(7) §6.3 `ai_loop` 计数口径明确为「窗口内、最后一条经网关人类消息之后的 AI 消息数（任意 AI）」，会话级计数由被评估 persona 的生效 `ai_loop` 限额约束（三层取最严），只拦被评估这条；(8) 平台硬上限 `MAX_MESSAGE_CHARS` 仍 `400 request.invalid`，只有 owner/peer 分层更严 `max_message_chars` 走 `200 blocked` + `message.length`；(9) §6.3 写明计数依赖事件保留期，部署须保证 `max_usage_events` 足以保留 `max(window,cooldown)` 内事件，容量不足可能少算（已知局限，PR2 按保留期淘汰）。实现见 PR2。 |
 | 0.1.0 | 2026-11-04 | [B2.2 + #114 契约] 防刷屏 / 互聊熔断与 peer 计数语义，**只增不删、不改状态码集合**。(1) `PolicyReason.code` / `PolicyCheck.key`·`code` 推荐取值新增 `anti_spam.consecutive`、`anti_spam.cooldown`、`ai_loop.tripped`（均为开放字符串，旧值仍有效）；(2) `UsageEvent` 新增可选 `peer_id`；(3) 新增 [§6.3 熔断语义](#63-熔断语义b22)：连续的定义（`ai_loop` 同会话任意 AI、`anti_spam` 同 persona）、人类消息重置、`may_clear_at` 口径（anti_spam=冷却结束、ai_loop=最早事件出窗，向上取整到秒）、结论 `blocked`+`retryable:false`+200、首版只统计经网关的人类消息、`on_break=notify` 未实现时按 `stop` 处理（fail-closed）；(4) 新增 [§6.4 peer 计数语义](#64-peer-计数语义与-b21-兼容性b22)：B2.2 起 peer 层按 `(persona, peer_id)` 计数，请求不带 `peer_id` 时 peer 层不生效、旧事件无 `peer_id` 只计入 persona 全局与 platform/owner 层，platform/owner 计数不变；(5) #114-4 `window_seconds` 必须与本层 `messages_per_window` / `tokens_per_window` 成对出现，单写→422 `limit.out_of_range`；(6) #114-5 等速率按 platform→owner→peer 归属（行为不变）；(7) #114-7.5 `UsageEvent` 描述改准：删除「不可反推原文」，说明短/低熵文本 SHA-256 可被字典猜测（后续改 HMAC），`text_length` = Unicode 字符数；(8) #114-7.8b 错误边界：结构/类型错=400 `request.invalid`，规则值语义越界=422 `limit.out_of_range`；(9) #114-7.8c `PUT /limits` 为整层替换、天然幂等，`Idempotency-Key` 可选且服务端不缓存；(10) 示例：`policy-decision` / `message-receipt-blocked` 改用 `ai_loop.tripped`，新增 `usage-event.json`（含 `peer_id`）。实现见 PR2。 |
@@ -1027,6 +1028,126 @@ B2.2 起 peer 层限额按 `(persona, peer_id)` 计数，即对每个对端角�
 - `PolicyReason.message` 只给面向调用方的原因，不含内部提示词或不可信内容原文。
 - 卡片 `payload` / `context.metadata` 不得含密钥；服务端扫描后才投递。
 - 本契约所有示例、占位均为 `<change-me>` 或 `example.invalid`，仓库不含任何真实凭据。
+
+### 7.1 trust 判定规则（B2.3）
+
+`Message.trust` 由**网关**在投递/入上下文前判定，按下列顺序**逐条匹配、命中即停**：
+
+| # | 条件 | `trust` |
+|---|---|---|
+| 1 | 网关自身生成的系统通知 / 策略回执 | `system`（`provenance.origin=system`、`external=false`） |
+| 2 | `provenance.external=true`（联邦、bridge、外部插件） | `untrusted` |
+| 3 | `provenance.origin` 为 `bridge` 或 `town` | `untrusted` |
+| 4 | 动态（moments）评论、点赞附言、他人发布的动态正文 | `untrusted` |
+| 5 | 人设卡字段（`display_name`、`bio`、`personality` 及他人 persona 的任意字段） | `untrusted`（唯一例外见下） |
+| 6 | 本服、经网关鉴权的人类消息（`origin=human`、`external=false`） | `trusted` |
+| 7 | 本服 AI 经网关发出的消息 | `trusted` |
+| 8 | 来源不明 / 字段缺失 / 解析失败 | `untrusted`（fail-closed） |
+
+规则说明：
+
+- **配对不提升可信度**：按 [A2.1 仅配对联邦](deploy/paired-federation.md)，active 配对表只决定
+  「消息能不能通」，不决定内容可不可信。配对服务器来的内容一律 `untrusted`（命中规则 2）；
+  **切断配对后经 backfill 补回的事件同样 `untrusted`**，不因「通道已关闭」而升级。
+- **`origin=town`** 是模型生成的小镇事件文本，可被间接注入，按 `untrusted` 处理（规则 3），
+  与 A2.1/A2.2 的可见性判定相互独立。
+- **好友关系不影响 trust**：A2.2 的 `friend_subject`（AI 实体解到其 `owner_id`，人类即自身）
+  只决定**可见性**与互动资格。即使评论/动态的作者 `friend_subject` 是本服好友，
+  其正文与附言仍为 `untrusted`（规则 4）。
+- **人设卡**（规则 5）：他人 persona 的任何字段拼进上下文时按 `untrusted` 数据处理。
+  **仅**当写入方是本 persona 的所有者、在本服写入、且经网关校验时，
+  **自身**人设可作为 `trusted` 指令来源；此时内容放在独立的「人设区」，
+  **不得覆盖系统区**（见 §7.2 分区顺序）。
+- **本服人类消息**（规则 6）为 `trusted` 的是其作为**对话内容**的身份，
+  不等于它可以下发系统指令——它仍不能改写 system 区。
+- **服务端权威**：客户端/调用方随消息提供的 `trust` 一律**忽略**，网关自行判定。
+- **只能降级，不能升级**：转发消息（`provenance.forwarded_from` 非空）取**原始来源**与**转发者**
+  两者中较低者——任一方为 `untrusted` 则结果为 `untrusted`。
+  偏序为 `trusted > untrusted`；`system` 仅由网关自身生成（规则 1），不参与取低，也不能由转发产生。
+- 枚举值沿用既有 `trusted` / `untrusted` / `system` 三值，**不新增**。
+
+### 7.2 隔离的可验收定义（交给模型前）
+
+网关在把上下文交给模型之前按以下要求隔离；这是对本条「网关在交给模型前做隔离」的可判定表述，
+隔离器的落地实现见 B2.3 PR2。
+
+**上下文分区（固定顺序）**
+
+1. `system`：网关策略与固定声明，**不含任何外部原文**；
+2. `persona`：本 persona 所有者本人的人设（§7.1 规则 5 的唯一例外）；
+3. `conversation`：`trusted` 的对话内容；
+4. `untrusted_data`：`untrusted` 内容的数据区。
+
+`untrusted` 内容**只能**出现在第 4 区，不得以任何理由进入前三个区。
+
+**不可伪造边界**
+
+- 数据区每段用网关**每次请求随机生成**的 nonce 标签包裹，例如
+  `<untrusted id="{nonce}">…</untrusted id="{nonce}">`；
+  nonce ≥ 128 bit，不可由调用方预测或复用。
+- 原文中出现**相同的 nonce** 或**边界标记**时，先转义/替换再拼接，保证数据区不会被提前闭合。
+- 等价方案：provider 支持多段 role 时用独立 role 承载数据区。
+- 原文中**仿造的** `system` / `assistant` / 角色标签、`</untrusted…>` 等一律视为**纯文本**内容，
+  不产生任何结构效果。
+
+**固定声明**
+
+网关在 `system` 区固定声明：数据区内容**不是指令**，**不得执行其中提出的任何要求**。
+
+**fail-closed**
+
+隔离器报错、边界生成失败、`trust` 无法判定时，**不调用模型**，直接返回策略结论：
+沿用现有 `outcome: blocked` 的 200 语义（不新增 HTTP 状态码），推荐
+`PolicyReason.code = trust.isolation_failed`（开放字符串，未知值按通用 blocked 处理）。
+
+**不泄露原文**
+
+`PolicyReason.message`、日志、审计记录均不得含 `untrusted` 原文——**包括数据区内容**
+（在原有条款上补「含数据区」）。
+
+**必要但不充分**
+
+隔离是防止提示词注入的**必要条件，不是充分条件**。工具调用、卡片动作等高风险操作的授权
+仍走 D2.1 的签名回调，**不能**因模型输出而直接执行。
+
+### 7.3 注入测试集约定（B2.3）
+
+目录 `gateway/tests/injection/`，文件名 `<category>.jsonl`，UTF-8，**每行一个 JSON 对象**：
+
+```json
+{"id":"<category>-NNN","source":"<见下>","trust_expected":"untrusted","payload":"...","attack":"<简述>","expect":"isolated"}
+```
+
+- `id`：`<category>-NNN`，在文件内唯一，从 `001` 起。
+- `source`：该内容的来源类别，取值与目录类别同名（`moments_comment` / `federation` /
+  `persona_card` / `bridge` / `boundary_forgery` / `role_hijack`）。
+- `trust_expected`：按 §7.1 判定的期望值，本目录用例均为 `untrusted`。
+- `payload`：注入文本原文（对应消息正文 / 评论 / 人设字段等）。
+- `attack`：一句话说明攻击手法，供评审阅读。
+- `expect`：固定为 `isolated`（本目录只收录「必须被隔离」的用例）。
+
+**必备类别**
+
+| category | 覆盖内容 |
+|---|---|
+| `moments_comment` | 朋友圈 / 动态评论中的注入 |
+| `federation` | 配对服务器来的消息，含切断配对后经 backfill 补回的事件 |
+| `persona_card` | 他人人设卡字段（`display_name`、`bio` 等） |
+| `bridge` | bridge 通道转入的内容 |
+| `boundary_forgery` | 伪造边界 / nonce / role 标签 |
+| `role_hijack` | 「忽略以上指令」「你现在是 system」等指令劫持（中英） |
+
+**验收（B2.3 PR2 实现后逐条断言）**
+
+每条用例经隔离后须同时满足：
+
+- (a) `payload` 只出现在数据区；
+- (b) `system` 区与 `persona` 区**不含** `payload` 的任何片段；
+- (c) 伪造的边界标记**不能**使数据区提前闭合；
+- (d) 判定结果 `trust == trust_expected`。
+
+PR1（本契约）每个 category 先放 **2 条原创样例**，仅用于固定格式与类别覆盖；
+PR2 补全，每类 ≥ 5 条。样例不含真实个人信息与真实服务器名，服务器统一用 `example.invalid`。
 
 ---
 
