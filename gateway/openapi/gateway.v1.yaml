@@ -895,6 +895,11 @@ paths:
         写入所有者层（`layer: owner`，scope 为 `persona` 或 `conversation`）或对方层
         （`layer: peer`，scope 为 `peer`）。平台底线层只能由部署配置设置，不可经 API 修改。
         返回重新计算后的生效限额。
+
+        **整层替换**：请求体 `rules` 完整替换该层原有规则，未出现的字段即被清除
+        （不是局部合并）。因此本接口**天然幂等**——同一请求体重复提交得到同一结果；
+        `Idempotency-Key` 对本端点**可选**，服务端**不做**幂等缓存，重放按一次新的
+        整层替换处理（#114-7.8c）。
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -2258,7 +2263,15 @@ components:
       properties:
         code:
           type: string
-          example: anti_spam.consecutive
+          description: |
+            原因码。开放字符串（未知值按通用 blocked 处理），推荐取值：
+            `messages.window`、`tokens.window`、`min_interval`、`silent_hours`、
+            `proactive.per_day`、`town.tokens_per_day`、`message.length`、
+            `relation.chat_denied`、`conversation.e2ee`，以及 B2.2 熔断相关：
+            `anti_spam.consecutive`（同 persona 连续 AI 消息达到上限）、
+            `anti_spam.cooldown`（防刷屏冷却未结束）、
+            `ai_loop.tripped`（同会话任意 AI 互聊达到每小时上限）。
+          example: ai_loop.tripped
         message:
           type: string
           description: 面向调用方的简短原因（不含内部提示词或不可信内容原文）。
@@ -2268,12 +2281,21 @@ components:
 
     PolicyCheck:
       type: object
-      description: 单项策略检查。`key` 推荐取值见 contract.md 限额一节。
+      description: |
+        单项策略检查。`key` 推荐取值见 contract.md 限额一节：
+        `messages.window`、`tokens.window`、`proactive.per_day`、`town.tokens_per_day`、
+        `silent_hours`、`min_interval`、`anti_spam.consecutive`、`ai_loop.per_hour`、
+        `message.length`、`relation.chat_allowed`。`code` 与 `PolicyReason.code` 同域，
+        B2.2 取值为 `anti_spam.consecutive` / `anti_spam.cooldown` / `ai_loop.tripped`。
       required: [key, layer, allowed]
       properties:
         key:
           type: string
-          example: tokens.window
+          description: |
+            检查项标识，推荐值：`messages.window`、`tokens.window`、`proactive.per_day`、
+            `town.tokens_per_day`、`silent_hours`、`min_interval`、`anti_spam.consecutive`、
+            `ai_loop.per_hour`、`message.length`、`relation.chat_allowed`。
+          example: ai_loop.per_hour
         layer:
           type: string
           enum: [platform, owner, peer, system]
@@ -2482,6 +2504,15 @@ components:
         越小越严；`min_seconds_between_messages` 与 `silent_hours.enabled: true`
         越大/越严。
         owner / peer 层任何一项比平台层宽松 → `422 limit.out_of_range`。
+
+        **`window_seconds` 必须成对出现**（#114-4）：本层写了 `window_seconds`，
+        就必须同时写 `messages_per_window` 或 `tokens_per_window` 中的至少一个；
+        只写 `window_seconds` 不产生任何效果，按 **422 `limit.out_of_range`** 拒绝。
+
+        **错误边界**（#114-7.8b，状态码不变）：结构或类型错误（缺字段、类型不符、
+        非 JSON、未知属性）→ **400 `request.invalid`**；值进入 schema 合法范围但语义
+        不合法（比平台层宽松、只写 `window_seconds`、枚举值未知如 `on_break`、
+        时区不合法）→ **422 `limit.out_of_range`**。
       properties:
         window_seconds:
           type: integer
@@ -2704,8 +2735,9 @@ components:
         一条用量审计记录。
 
         **不含消息正文**（#92）：为保护用户隐私，事件**不存储**消息内容。
-        `text_length` 存储原始字节数（字符数），`text_sha256` 存储正文的
-        SHA-256 十六进制摘要，二者可用于对账与去重排查，但无法反推原文。
+        `text_length` 存储 Unicode 字符数（与 `len(text)` 一致），`text_sha256`
+        存储正文的 SHA-256 十六进制摘要，二者可用于对账与去重排查。注意：短文本或
+        低熵文本的 SHA-256 可被字典猜测（后续将改用带服务端密钥的 HMAC，见 #114）。
         旧字段 `text_preview` 已从 B2.1 起**不再写入**；历史事件若存在该字段，
         客户端必须忽略它（`additionalProperties` 遵循前向兼容原则）。
       properties:
@@ -2724,6 +2756,12 @@ components:
           type: string
         conversation_id:
           type: string
+        peer_id:
+          type: string
+          description: |
+            发送时的会话对端（persona）标识，取自请求的 `peer_id`（B2.2 起可选写入）。
+            用于按 `(persona, peer_id)` 统计 peer 层限额；旧事件无此字段时只计入
+            persona 全局与 platform/owner 层，不计入任何 peer 层。
         capability_id:
           type: string
         tokens_in:
@@ -2749,7 +2787,8 @@ components:
         text_sha256:
           type: string
           description: |
-            消息正文的 SHA-256 十六进制摘要。用于去重与对账，不可反推原文。
+            消息正文的 SHA-256 十六进制摘要。用于去重与对账。注意：短文本或
+            低熵文本的哈希可被字典猜测；后续将改用带服务端密钥的 HMAC（#114）。
             正文为空时此字段省略。
 
     UsageEventPage:

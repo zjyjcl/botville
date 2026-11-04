@@ -72,6 +72,7 @@ EXAMPLE_TARGETS = {
     "policy-decision.json": "#/paths/~1policy~1evaluate/post/responses/200/content/application~1json/schema",
     "effective-limits.json": "#/paths/~1limits/get/responses/200/content/application~1json/schema",
     "usage-summary.json": "#/paths/~1usage/get/responses/200/content/application~1json/schema",
+    "usage-event.json": "#/components/schemas/UsageEvent",
     "card.json": "#/paths/~1cards~1{card_id}/get/responses/200/content/application~1json/schema",
     "create-card-request.json": "#/paths/~1cards/post/requestBody/content/application~1json/schema",
     "card-action-receipt.json": "#/paths/~1cards~1{card_id}~1actions~1{action_id}/post/responses/200/content/application~1json/schema",
