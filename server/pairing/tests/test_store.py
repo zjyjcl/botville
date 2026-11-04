@@ -34,6 +34,37 @@ class StoreTest(unittest.TestCase):
         self.assertIsNone(peer["severed_by"])
         self.assertEqual(self.db.active_server_names(), ["hs-b"])
 
+    def test_sever_between_check_and_redeem_is_enforced(self):
+        # r3 TOCTOU: check_invite passes, then a local sever lands before
+        # the (slow, key-fetching) redeem commits -> redeem must fail.
+        self.db.upsert_peer_active("hs-b", "https://hs-b/x")
+        self.db.create_invite("inv-t", "s3cret", ttl=600, now=1000.0)
+        self.assertEqual(self.db.check_invite("inv-t", "s3cret", now=1001.0,
+                                              server_name="hs-b"), (True, None))
+        self.db.sever_peer("hs-b", "local", now=1002.0)
+        ok, reason = self.db.redeem_invite("inv-t", "s3cret", "hs-b",
+                                           "https://hs-b/x", now=1003.0)
+        self.assertFalse(ok)
+        self.assertEqual(reason, store.REDEEM_PREDATES_SEVER)
+
+    def test_pre_sever_invite_stays_dead_after_repair(self):
+        self.db.upsert_peer_active("hs-b", "https://hs-b/x")
+        self.db.create_invite("old", "s1", ttl=600, now=1000.0)
+        self.db.sever_peer("hs-b", "local", now=1001.0)
+        self.db.create_invite("new", "s2", ttl=600, now=1002.0)
+        ok, _ = self.db.redeem_invite("new", "s2", "hs-b", "https://hs-b/x",
+                                      now=1003.0)
+        self.assertTrue(ok)  # re-paired with a post-sever invite
+        ok, reason = self.db.redeem_invite("old", "s1", "hs-b",
+                                           "https://hs-b/x", now=1004.0)
+        self.assertFalse(ok)  # watermark survives the re-pair
+        self.assertEqual(reason, store.REDEEM_PREDATES_SEVER)
+        # ...while another server may still use an untouched invite.
+        self.db.create_invite("other", "s3", ttl=600, now=1000.5)
+        ok, _ = self.db.redeem_invite("other", "s3", "hs-c", "https://hs-c/x",
+                                      now=1005.0)
+        self.assertTrue(ok)
+
     def test_redeem_unknown_invite(self):
         ok, reason = self.db.redeem_invite("nope", "sec", "hs-b", "https://x")
         self.assertEqual((ok, reason), (False, store.REDEEM_UNKNOWN))

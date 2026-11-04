@@ -79,7 +79,7 @@ pairing 服务（错误统一 `{"errcode","error"}`；`/_matrix/pairing/<x>` 是
 | `POST /v1/pairing/redeem` | 对端（限速） | `{invite_id, secret, server_name, api_url}`：先只读校验 invite（通过前不出站），再（可选）校验对端 key，事务内原子消费并写 `peers[server_name]=active`；响应含 per-peer `shared_secret`（仅 TLS 传输）。限速：每有效 IP 10/min + 每 invite 5/min |
 | `POST /v1/pairing/accept` | admin | `{qr_payload}`：本端调用对端 redeem，成功后本地也写 active（存下 `shared_secret`）；对端错误原样透传 |
 | `GET /v1/pairing/peers` | admin | 配对状态列表（含 `severed_by`、`peer_api_url`；不含 shared_secret） |
-| `DELETE /v1/pairing/peers/{name}` | admin | 单方切断：本地立即 severed（`severed_by=local`）；此前签发的 invite 不能再用于该对端（`invite predates the sever`，其他待配对方的 invite 不受影响），随后 best-effort 以 shared_secret 签名 POST 对端 `/notify-severed`，失败忽略（响应 `notified` 标明） |
+| `DELETE /v1/pairing/peers/{name}` | admin | 单方切断：本地立即 severed（`severed_by=local`）；此前签发的 invite 永远不能再用于该对端（`invite predates the sever`；按 `last_local_sever_at` 水位判断，重新配对后也不清除；在 redeem 的 `BEGIN IMMEDIATE` 事务内复核，无 TOCTOU；其他待配对方的 invite 不受影响），随后 best-effort 以 shared_secret 签名 POST 对端 `/notify-severed`，失败忽略（响应 `notified` 标明） |
 | `POST /v1/pairing/notify-severed` | 对端（HMAC） | `{server_name}` + `X-Botville-Origin/-Ts/-Nonce/-Sig`：把该对端标 `severed_by=remote`（仅 active→severed，不覆盖 `severed_by=local`）。签名 = `HMAC-SHA256(shared_secret, "origin\nts\nnonce\nsha256hex(body)")`；`\|now-ts\|≤300s`、nonce ≥16 字节 hex 且防重放、30/min/IP；一切失败 → 401 且不写 events（仅日志计数） |
 | `GET /v1/pairing/allowed` | admin | active 名单（调试用；fedgate 直接读 SQLite） |
 | `GET /health` | 无 | 存活探针 |
@@ -102,7 +102,7 @@ fedgate 路由规则：
 `peers(server_name, state, paired_at, severed_at, severed_by, peer_api_url, shared_secret)`：
 
 - `active` ⇄（redeem/accept/upsert）→ 初始态，fedgate 放行；
-- `severed`（`severed_by=local`）：本端管理员 DELETE，即刻生效——本端 fedgate 拒绝该 origin 的联邦请求（对方发不进来、也拉不走）；切断前签发的 invite 对该对端失效（切断不可被遗留邀请码撤销，只能用切断后新签发的 invite 重新配对），其他待配对方不受影响；
+- `severed`（`severed_by=local`）：本端管理员 DELETE，即刻生效——本端 fedgate 拒绝该 origin 的联邦请求（对方发不进来、也拉不走）；在最近一次本端切断之前签发的 invite 对该对端永久失效（水位 `last_local_sever_at` 不随重新配对清除），因此重新配对只能用该次切断之后新签发的 invite；其他待配对方不受影响；
 - `severed`（`severed_by=remote`）：收到对端**验签通过**的 `/notify-severed`（只作用于 active 态，绝不覆盖 `severed_by=local`）；
 - **重新配对**：任一方再走一遍 invite→accept 即恢复 `active`（`severed_*` 清空、shared_secret 换新；即使此前是 `severed_by=local` 也允许，需新 invite）；
 - 无记录 = 拒绝（默认拒绝不需要显式黑名单）。
@@ -115,7 +115,7 @@ fedgate 路由规则：
 - **server_name 严格校验**：全链路小写（config/QR/redeem/store/fedgate origin）；仅接受 DNS 名（label ≤63、总长 ≤253、无前后连字符），拒绝 IP 字面量、`localhost`/`*.localhost`、端口、`@?#/` 等；key 校验 URL 只能由模板 + 合法 server_name 构成。
 - **notify-severed 鉴权**：配对时由被核销方生成 per-peer 32 字节 shared_secret，经 redeem 响应（仅 TLS）交予对端，双方 peers 表各存一份（明文，64 hex）；通知与校验共用 `HMAC-SHA256(secret, "origin\nts\nnonce\nsha256hex(body)")`，±300s 时间窗 + nonce 防重放（内存 LRU，窗口 600s）+ 30/min/IP 限速 + `compare_digest`；未知 origin/错签/过期/重放一律 401 且不写 events。旧库自动迁移加列；迁移前的旧配对没有 secret，通知会被对端拒收——重新配对一次即恢复。
 - **反代与限速**：fedgate 转发 `/_matrix/pairing/*` 时剥掉客户端自带的 `X-Forwarded-For`/`X-Real-IP`/`Forwarded`，写入直连客户端 IP；pairing 仅当直连地址 ∈ `PAIRING_TRUSTED_PROXIES`（逗号分隔 CIDR，默认空=不信任）才采信 XFF 最后一个值，否则用直连 IP——伪造 XFF 无法稀释限速桶。
-- **闸门与 HS 解析一致性（B1）**：fedgate 遍历全部 Authorization 头，X-Matrix 头数量 ≠1 或任一参数名重复 → 403；参数切分/去引号/反斜杠转义与 Synapse v1.164.1 `_parse_auth_header` 一致；签名真伪由 HS 验签兜底。**HTTP 层**：Python 标准库与 Twisted 对折行（obs-fold）头的归一化不同（前者保留 `\r\n`+缩进，后者折成一个空格），任何跨解析器的归一化差异都是绕过面，所以闸门**不模拟**对方的归一化，而是在路由前拒绝任何折行头或含控制字符（HTAB 除外）的头名/头值（400），也顺带杜绝 CRLF 注入上游。「闸门放行的 origin == HS 认证的 origin」只在这一前提下成立，并由差分单测（Twisted 折行语义 + Synapse last-wins 参考解析器对照上游实际收到的头）守护。
+- **闸门与 HS 解析一致性（B1）**：fedgate 遍历全部 Authorization 头，X-Matrix 头数量 ≠1 或任一参数名重复 → 403；参数切分/去引号/反斜杠转义与 Synapse v1.164.1 `_parse_auth_header` 一致；签名真伪由 HS 验签兜底。**HTTP 层**：Python 标准库与 Twisted 对折行（obs-fold）头的归一化不同（前者保留 `\r\n`+缩进，后者折成一个空格），任何跨解析器的归一化差异都是绕过面，所以闸门**不模拟**对方的归一化，而是在路由前拒绝任何折行头或含控制字符（HTAB 除外）的头名/头值（400），也顺带杜绝 CRLF 注入上游。**重复 Authorization**：在原始字节层面（不依赖 http.server/email 的合并结果）计数，`Authorization` 出现超过一次（不论是否 X-Matrix、不论大小写）、头名与冒号间有空白、或单个值内出现第二个凭证（第二个 `X-Matrix`/非法参数名）→ 400；转发时只转发那唯一一个已校验的值，绝不合并。不变量是「闸门解析的表示 == 转发给 HS 的表示」，任何偏离即绕过；「闸门放行的 origin == HS 认证的 origin」只在以上全部请求级检查成立时才成立（`parse_x_matrix_origin` 单独并不保证），由 raw socket 用例与差分单测（Twisted 折行语义 + 逐字照抄的 Synapse `_parse_auth_header` 参考实现，对照上游实际收到的头）守护。
 - **媒体访问的硬边界**：Synapse 对 `/_matrix/media/*`（联邦媒体下载）**不验联邦签名**，闸门也不验签（容器仅标准库，无 ed25519）；因此能伪造某 active 对端 origin 的请求方，只要知道 `media_id` 就能下载。**媒体访问的唯一保护是 media_id 的保密性**（Synapse media_id 约 24 位 62 进制，≈143 bit，不可猜）。A2.1 单配对部署下接受；**多配对或生产化前必须补令牌/签名（闸门验签）**。
 - **sink 的代价**：未配对 `/send` 回 `200 {"pdus":{}}` 并丢弃（读 body 上限 1 MiB，超限直接断开；日志按 origin 节流）。**切断期间的 EDU（to-device、E2EE 密钥包）永久丢失**（DAG 补不回、发送方收到 200 不再重试）；PDU 在重新配对后经 `get_missing_events`/`backfill` 补回——因此 sever 是"断流"而非"内容栅栏"，**重新配对后切断窗口内产生的事件会一并补回**；若需要"切断期内容永不再入"需后续做窗口栅栏。
 - **管理面**：`Authorization: Bearer $PAIRING_ADMIN_TOKEN`，常量时间比对；token 缺失时服务**拒绝启动**；pairing 服务只应绑定内网/loopback（compose 只把 admin 端口映射到 `127.0.0.1`；fedgate 只转发 redeem/notify-severed，admin 端点不暴露公网口）。

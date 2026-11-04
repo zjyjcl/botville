@@ -168,13 +168,15 @@ def parse_x_matrix_origin(auth_headers):
         case mismatch can never be an accidental allow);
       - any parse anomaly -> None.
 
-    Returns the origin string, or None (deny). The gate guarantees that
-    whenever it accepts an origin (and headers_are_clean() has already
-    refused folded / CTL-bearing headers, without which the claim is
-    false across parsers), Synapse parses the *same* origin from
-    the same bytes; whether the signature is genuine is then the
-    homeserver's job (it is not checked on /_matrix/media/* — see the
-    module docstring).
+    Returns the origin string, or None (deny). This function alone does
+    NOT guarantee that Synapse authenticates the same origin: that only
+    holds together with the request-level checks in FedgateHandler._handle
+    (raw-wire header validation, Authorization present at most once, no
+    folded / CTL-bearing headers) and with _proxy forwarding exactly the
+    one validated Authorization value unmerged. Parsed representation ==
+    forwarded representation is the invariant; any divergence is a bypass.
+    Signature validity is the homeserver's job (not checked on
+    /_matrix/media/* — see the module docstring).
     """
     matrix_headers = [value for value in (auth_headers or [])
                       if value[:8].lower() == "x-matrix"]
@@ -182,6 +184,8 @@ def parse_x_matrix_origin(auth_headers):
         return None
     if _CTL_RE.search(matrix_headers[0]):
         return None  # folded / CR / LF / other CTL: parsers disagree
+    if matrix_headers[0].lower().count("x-matrix") != 1:
+        return None  # a second credential smuggled into one value
     parts = re.split(r"^X-Matrix +", matrix_headers[0], maxsplit=1)
     if len(parts) != 2:
         return None  # no space-separated parameter section
@@ -192,6 +196,8 @@ def parse_x_matrix_origin(auth_headers):
             if not eq or not key:
                 return None  # parameter without '=' (Synapse: parse error)
             name = key.lower()
+            if not re.fullmatch(r"[a-z0-9_-]+", name):
+                return None  # not a plain auth-param name: ambiguous
             if name in params:
                 return None  # ambiguous: Synapse would let the last one win
             params[name] = raw
@@ -355,6 +361,51 @@ def _should_log_sink(origin, now=None, interval=SINK_LOG_INTERVAL):
 
 # --- HTTP handler ----------------------------------------------------------------
 
+_HEADER_LINE_RE = re.compile(rb"^[!#$%&'*+.^_`|~0-9A-Za-z-]+:")
+
+
+class _HeaderTap:
+    """rfile wrapper recording the raw request line + header lines of the
+    current request (readline() calls up to the blank line). Lets the gate
+    count/validate headers on the exact bytes, independent of how
+    http.server / email.parser represent them (review r3)."""
+
+    def __init__(self, raw):
+        self._raw = raw
+        self.lines = []
+        self._recording = False
+
+    def start(self):
+        self.lines = []
+        self._recording = True
+
+    def readline(self, *args):
+        line = self._raw.readline(*args)
+        if self._recording:
+            self.lines.append(line)
+            if len(self.lines) > 1 and line in (b"\r\n", b"\n", b""):
+                self._recording = False
+        return line
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
+def raw_headers_ok(lines):
+    """Raw-byte header checks: every header line is `token:` (no
+    whitespace before the colon, no folds), and Authorization occurs at
+    most once — counted on the wire, not on the parsed representation."""
+    auth = 0
+    for line in lines[1:]:
+        if line in (b"\r\n", b"\n", b""):
+            break
+        if not _HEADER_LINE_RE.match(line):
+            return False
+        if line.split(b":", 1)[0].lower() == b"authorization":
+            auth += 1
+    return auth <= 1
+
+
 class FedgateHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "botville-fedgate/1.0"
@@ -367,6 +418,12 @@ class FedgateHandler(BaseHTTPRequestHandler):
             self.request.settimeout(30)
             self.request.do_handshake()
         super().setup()
+        self._tap = _HeaderTap(self.rfile)
+        self.rfile = self._tap
+
+    def handle_one_request(self):
+        self._tap.start()
+        super().handle_one_request()
 
     @property
     def config(self):
@@ -411,7 +468,13 @@ class FedgateHandler(BaseHTTPRequestHandler):
         # Twisted: a folded header or any control character (other than
         # HTAB) in any header name/value is refused outright, before any
         # routing. This also closes CRLF injection into the upstream request.
-        if not headers_are_clean(self.headers):
+        # Authorization must appear at most once ON THE WIRE (any scheme):
+        # repeated headers are merged by intermediaries / upstream parsers
+        # and Synapse's last-wins parsing of the merged value would
+        # authenticate a different origin than the one gated (review r3).
+        if not raw_headers_ok(self._tap.lines) or \
+                len(self.headers.get_all("Authorization") or []) > 1 or \
+                not headers_are_clean(self.headers):
             self._reject(400, {"errcode": "M_UNKNOWN",
                                "error": "malformed request headers"})
             return
@@ -563,6 +626,8 @@ class FedgateHandler(BaseHTTPRequestHandler):
                 continue
             if overwrite_forwarded and lowered in FORWARDED_HINTS:
                 continue  # client-supplied forwarding hints are spoofable
+            if key in headers and lowered == "authorization":
+                continue  # never merge credentials (rejected earlier anyway)
             if key in headers:
                 headers[key] += ", " + value
             else:

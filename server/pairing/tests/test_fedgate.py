@@ -338,9 +338,8 @@ def synapse_origin(auth_values):
         parsed = {}
         for item in re.split(r"[ \t]*,[ \t]*", params):
             key, _, raw = item.partition("=")
-            raw = raw.strip()
-            if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
-                raw = raw[1:-1].replace('\\\\', '\\').replace('\\"', '"')
+            if raw.startswith('"'):  # Synapse strip_quotes, verbatim
+                raw = re.sub(r"\\(.)", lambda m: m.group(1), raw[1:-1])
             parsed[key.lower()] = raw
         origin = parsed.get("origin")
     return origin
@@ -414,6 +413,30 @@ class FedgateMatrixTest(unittest.TestCase):
                b"Content-Length: 2\r\n" + header_lines + b"\r\n{}")
         return raw_socket_request(self.port, req)
 
+    MERGE_CASES = [
+        # r3 PoC: X-Matrix + a non-X-Matrix Authorization that a merging
+        # proxy/parser joins with ", " -> Synapse last-wins origin=hs-evil.
+        b'Authorization: X-Matrix origin="hs-a",key="ed25519:a",sig="S"\r\nAuthorization: origin="hs-evil",key="ed25519:evil",sig="E"\r\n',
+        b'Authorization: Bearer abc\r\nAuthorization: X-Matrix origin="hs-a",sig="S"\r\n',
+        b'authorization: X-Matrix origin="hs-a",sig="S"\r\nAUTHORIZATION: X-Matrix origin="hs-evil",sig="E"\r\n',
+        # Whitespace before the colon (parsers disagree on the name).
+        b'Authorization : X-Matrix origin="hs-evil",sig="E"\r\nAuthorization: X-Matrix origin="hs-a",sig="S"\r\n',
+        # Two credentials folded into ONE value.
+        b'Authorization: X-Matrix origin="hs-a",sig="S", X-Matrix origin="hs-evil"\r\n',
+        b'Authorization: X-Matrix origin="hs-a",sig="S", Bearer origin="hs-evil"\r\n',
+    ]
+
+    def test_duplicate_authorization_rejected_raw_socket(self):
+        self.paired("hs-a")
+        for case in self.MERGE_CASES:
+            for path in ("/_matrix/federation/v1/state/r1",
+                         "/_matrix/federation/v1/send/t1"):
+                before = len(self.hs_cls.received)
+                status = self._send_raw(case, path=path)
+                self.assertIn(status, (400, 403), (case, path))
+                self.assertEqual(len(self.hs_cls.received), before,
+                                 "reached upstream: {!r}".format(case))
+
     def test_folded_headers_rejected_raw_socket(self):
         self.paired("hs-a")
         for case in self.FOLDED_CASES:
@@ -454,7 +477,7 @@ class FedgateMatrixTest(unittest.TestCase):
             b'Authorization: X-Matrix  origin="hs-a" , sig="S"\r\n',
             b'Authorization: X-Matrix origin="hs-a",sig="S"\r\nAuthorization: X-Matrix origin="hs-evil",sig="T"\r\n',
             b'Authorization: X-Matrix origin="hs-a",origin="hs-evil",sig="S"\r\n',
-        ] + self.FOLDED_CASES
+        ] + self.FOLDED_CASES + self.MERGE_CASES
         forwarded = 0
         for case in variants:
             before = len(self.hs_cls.received)
@@ -472,7 +495,8 @@ class FedgateMatrixTest(unittest.TestCase):
                 [v for n, v in twisted_unfold(
                     b"".join(b"Authorization: " + v.encode("latin-1") + b"\r\n"
                              for v in seen))])
-            self.assertEqual(upstream_origin, "hs-a", case)
+            self.assertEqual(len(seen), 1, case)  # never merged/duplicated
+            self.assertEqual(upstream_origin, gate_origin, case)
             self.assertEqual(gate_origin, "hs-a", case)
         self.assertEqual(forwarded, 3)
 
@@ -753,8 +777,8 @@ class FedgateMatrixTest(unittest.TestCase):
              ("Authorization", 'X-Matrix origin="hs-evil",key="k",sig="s"'),
              ("Content-Type", "application/json")],
             body=b'{"pdus":[]}')
-        self.assertEqual(status, 403)
-        self.assertIn("not paired", json.loads(body)["error"])
+        # Rejected before routing (Authorization on the wire > 1).
+        self.assertEqual(status, 400)
         self.assertEqual(len(self.hs_cls.received), before)
 
     def test_send_with_duplicate_origin_param_403(self):

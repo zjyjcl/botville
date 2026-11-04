@@ -50,7 +50,10 @@ CREATE TABLE IF NOT EXISTS peers (
     severed_at  REAL,
     severed_by  TEXT CHECK (severed_by IN ('local', 'remote') OR severed_by IS NULL),
     peer_api_url TEXT NOT NULL,
-    shared_secret TEXT
+    shared_secret TEXT,
+    -- Watermark of the latest *local* sever; never cleared by a re-pair,
+    -- so invites issued before any local sever can never pair this peer.
+    last_local_sever_at REAL
 );
 CREATE TABLE IF NOT EXISTS events (
     id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,6 +77,14 @@ REDEEM_PREDATES_SEVER = "invite_predates_sever"
 def hash_secret(secret):
     """sha256 hex digest of a secret string (what gets persisted)."""
     return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def _predates_local_sever(invite_row, peer_row):
+    """True when the invite was created at/before the peer's latest local
+    sever (watermark survives re-pairs)."""
+    if peer_row is None or peer_row["last_local_sever_at"] is None:
+        return False
+    return invite_row["created_at"] <= peer_row["last_local_sever_at"]
 
 
 class PairingStore:
@@ -105,6 +116,12 @@ class PairingStore:
                    self._conn.execute("PRAGMA table_info(peers)").fetchall()}
         if "shared_secret" not in columns:
             self._conn.execute("ALTER TABLE peers ADD COLUMN shared_secret TEXT")
+        if "last_local_sever_at" not in columns:
+            self._conn.execute(
+                "ALTER TABLE peers ADD COLUMN last_local_sever_at REAL")
+            self._conn.execute(
+                "UPDATE peers SET last_local_sever_at = severed_at"
+                " WHERE severed_by = 'local'")
         # OR IGNORE + DELETE: when both spellings of a name existed, the
         # already-lower-case row (if any) wins and the leftover is dropped.
         self._conn.execute(
@@ -164,8 +181,8 @@ class PairingStore:
             peer = None
             if server_name is not None:
                 peer = self._conn.execute(
-                    "SELECT state, severed_at, severed_by FROM peers"
-                    " WHERE server_name = ?", (server_name,)).fetchone()
+                    "SELECT last_local_sever_at FROM peers"
+                    " WHERE server_name = ?", (server_name.lower(),)).fetchone()
         if row is None:
             return False, REDEEM_UNKNOWN
         if row["used_at"] is not None:
@@ -177,9 +194,7 @@ class PairingStore:
         # An invite issued before we severed this peer must not revive it
         # (only a fresh invite can); other parties' invites are unaffected
         # (review r2 #4: no global invite burn on sever).
-        if peer is not None and peer["state"] == "severed" and \
-                peer["severed_by"] == "local" and peer["severed_at"] is not None \
-                and row["created_at"] <= peer["severed_at"]:
+        if _predates_local_sever(row, peer):
             return False, REDEEM_PREDATES_SEVER
         return True, None
 
@@ -204,9 +219,16 @@ class PairingStore:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 row = self._conn.execute(
-                    "SELECT secret_hash, expires_at, used_at FROM invites WHERE id = ?",
+                    "SELECT secret_hash, created_at, expires_at, used_at"
+                    " FROM invites WHERE id = ?",
                     (invite_id,),
                 ).fetchone()
+                # Re-checked inside BEGIN IMMEDIATE (review r3: TOCTOU
+                # between check_invite() / peer-key fetch and a concurrent
+                # local sever).
+                peer = self._conn.execute(
+                    "SELECT last_local_sever_at FROM peers WHERE server_name = ?",
+                    (server_name,)).fetchone()
                 reason = None
                 if row is None:
                     reason = REDEEM_UNKNOWN
@@ -216,6 +238,8 @@ class PairingStore:
                     reason = REDEEM_EXPIRED
                 elif not hmac.compare_digest(row["secret_hash"], hash_secret(secret)):
                     reason = REDEEM_BAD_SECRET
+                elif _predates_local_sever(row, peer):
+                    reason = REDEEM_PREDATES_SEVER
                 if reason is None:
                     cur = self._conn.execute(
                         "UPDATE invites SET used_at = ?"
@@ -343,8 +367,13 @@ class PairingStore:
         now = time.time() if now is None else now
         server_name = server_name.lower()
         query = ("UPDATE peers SET state = 'severed', severed_at = ?,"
-                 " severed_by = ? WHERE server_name = ?")
-        params = [now, by, server_name]
+                 " severed_by = ?")
+        params = [now, by]
+        if by == "local":
+            query += ", last_local_sever_at = ?"
+            params.append(now)
+        query += " WHERE server_name = ?"
+        params.append(server_name)
         if only_if_active:
             query += " AND state = 'active'"
         with self._lock:
