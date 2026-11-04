@@ -1056,6 +1056,18 @@ class TestBuildServerTransportFactory(unittest.TestCase):
         finally:
             server.server_close()
 
+    def test_appservice_transport_gets_room_cache_ttl(self):
+        """#107：GATEWAY_ROOM_ALIAS_CACHE_TTL 经 build_transport 写入传输。"""
+        server = build_server(
+            self._appservice_cfg(room_alias_cache_ttl_seconds=7)
+        )
+        try:
+            transport = server.transport
+            self.assertIsInstance(transport, AppServiceMatrixTransport)
+            self.assertEqual(transport._room_cache_ttl, 7)
+        finally:
+            server.server_close()
+
     def test_memory_config_keeps_in_memory_transport(self):
         server = build_server(_cfg())
         try:

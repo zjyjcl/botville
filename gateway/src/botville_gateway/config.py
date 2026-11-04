@@ -35,12 +35,24 @@ DEFAULT_ROOM_ALIAS_PREFIX = "botville_conv_"
 # 别名 localpart 的安全字符集（与 persona/conversation id 一致）。
 _ROOM_ALIAS_PREFIX_RE = re.compile(r"^[a-z0-9._=-]{1,64}$")
 
+# 别名 → room_id 进程内缓存的默认 TTL 秒数（GATEWAY_ROOM_ALIAS_CACHE_TTL
+# 可覆盖；0 = 不缓存）。与 matrix_appservice.DEFAULT_ROOM_CACHE_TTL_SECONDS
+# 保持一致（各自定义避免 config 反向依赖传输模块）。
+DEFAULT_ROOM_ALIAS_CACHE_TTL = 60
+
 # appservice 模式下 as_token 的最低强度（长度下限；且不得含任何空白）。
 AS_TOKEN_MIN_LENGTH = 32
 
-# 明文 http:// 的 homeserver 只允许这些主机（或无点的单标签容器名，如
-# compose 网络里的 synapse/tuwunel）；其余必须 https 或显式放开。
+# 明文 http:// 的 homeserver 只允许这些 loopback 主机，加上无点的单标签
+# 主机名（compose 网络里的服务名，如 synapse/tuwunel，见下方正则）；其余
+# （带点域名、非 ::1 的 IPv6、链路本地/ULA 等）必须 https 或显式放开。
+# urlparse 对 http://[::1]/ 的 hostname 就是 ::1（已去掉方括号）。
 _LOCAL_HOMESERVER_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+# 单标签主机名形状（#107）：字母数字开头结尾，中间可含连字符；字符集不含
+# "." 与 ":"，天然排除带点域名和一切 IPv6 字面量。
+_PLAINTEXT_HS_SINGLE_LABEL_RE = re.compile(
+    r"^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$"
+)
 
 DEFAULT_SILENT_START = "23:00"
 DEFAULT_SILENT_END = "07:30"
@@ -134,6 +146,25 @@ def normalize_matrix_server_name(name: str) -> str:
     return lowered
 
 
+def _plaintext_homeserver_host(url: str) -> Optional[str]:
+    """明文 homeserver URL → 白名单判断用的 host（小写）；解析不出 → None。
+
+    覆盖 #107 的两类畸形输入：解析不出非空 host（仅 scheme / 空 host），以及
+    未加方括号的 IPv6（如 `http://fe80::1`，urlparse 会把它截成 host='fe80'、
+    端口段 ':1'）——后者按 netloc 复核主机段没有残留冒号，避免 IPv6 字面量
+    被误当成单标签服务名放行。
+    """
+    parsed = urllib.parse.urlparse(url)
+    netloc = parsed.netloc.rpartition("@")[2]
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return None
+    if not netloc.startswith("[") and ":" in netloc.rpartition(":")[0]:
+        # 主机段里还有冒号：未加方括号的 IPv6 / 畸形端口，不是单标签主机名。
+        return None
+    return host
+
+
 def _env_int_range(env: Mapping[str, str], name: str, default: int, *, minimum: int, maximum: int) -> int:
     value = _env_int(env, name, default, minimum=minimum)
     if value > maximum:
@@ -181,6 +212,8 @@ class Config:
     as_token: Optional[str] = field(default=None, repr=False)
     # conversation → 房间别名 localpart 的前缀（#<prefix><conversation_id>:<server>）。
     room_alias_prefix: str = DEFAULT_ROOM_ALIAS_PREFIX
+    # 别名 → room_id 缓存 TTL 秒数（GATEWAY_ROOM_ALIAS_CACHE_TTL；0 = 不缓存）。
+    room_alias_cache_ttl_seconds: int = DEFAULT_ROOM_ALIAS_CACHE_TTL
     # 显式放行明文 http:// 的非本机 homeserver（跨主机部署应使用 https）。
     allow_insecure_homeserver: bool = False
 
@@ -236,18 +269,26 @@ class Config:
                 )
             # as_token 会以 Authorization 头明文发出去：明文 http:// 只允许
             # loopback / 单标签容器名（compose 网络内），跨主机必须 https，
-            # 或显式 GATEWAY_ALLOW_INSECURE_HS=true 自担风险。
+            # 或显式 GATEWAY_ALLOW_INSECURE_HS=true 自担风险。#107 收紧：
+            # 空 host 与未加方括号的 IPv6 不再被误放行，允许集合之外的
+            # 一律拒绝（含非 ::1 的 IPv6、带点域名、链路本地/ULA）。
             if (
                 not self.allow_insecure_homeserver
                 and not self.homeserver_url.startswith("https://")
             ):
-                host = (urllib.parse.urlparse(self.homeserver_url).hostname or "").lower()
-                if host not in _LOCAL_HOMESERVER_HOSTS and "." in host:
+                host = _plaintext_homeserver_host(self.homeserver_url)
+                if host is None or (
+                    host not in _LOCAL_HOMESERVER_HOSTS
+                    and not _PLAINTEXT_HS_SINGLE_LABEL_RE.fullmatch(host)
+                ):
                     raise ConfigError(
-                        f"GATEWAY_HOMESERVER_URL {self.homeserver_url!r} sends the "
-                        "appservice token over plaintext http:// to a non-local host; "
-                        "use https://, point at a loopback/compose-internal host, or "
-                        "set GATEWAY_ALLOW_INSECURE_HS=true to accept the risk"
+                        f"GATEWAY_HOMESERVER_URL {self.homeserver_url!r} would send "
+                        "the appservice token over plaintext http:// to a host outside "
+                        "the allowlist (loopback localhost/127.0.0.1/::1 or a dotless "
+                        "single-label compose service name; the URL must carry a "
+                        "non-empty host); use https://, point at a loopback or "
+                        "compose-internal host, or set GATEWAY_ALLOW_INSECURE_HS=true "
+                        "to accept the risk"
                     )
             if self.as_token is None:
                 raise ConfigError(
@@ -289,6 +330,14 @@ class Config:
                     "GATEWAY_ROOM_ALIAS_PREFIX must be 1-64 characters of "
                     f"[a-z0-9._=-], got {self.room_alias_prefix!r}"
                 )
+        # 别名缓存 TTL 只在 appservice 模式生效，但负值任何模式下都是配置
+        # 错误，直接在构造时拒绝（load_config 的 >=0 校验之外的兜底）。
+        if self.room_alias_cache_ttl_seconds < 0:
+            raise ConfigError(
+                "GATEWAY_ROOM_ALIAS_CACHE_TTL must be >= 0 seconds "
+                "(0 disables the alias->room cache), got "
+                f"{self.room_alias_cache_ttl_seconds}"
+            )
 
     @property
     def silent_start_minute(self) -> int:
@@ -341,6 +390,9 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         room_alias_prefix=(
             _env_str(source, "GATEWAY_ROOM_ALIAS_PREFIX", DEFAULT_ROOM_ALIAS_PREFIX)
             or DEFAULT_ROOM_ALIAS_PREFIX
+        ),
+        room_alias_cache_ttl_seconds=_env_int(
+            source, "GATEWAY_ROOM_ALIAS_CACHE_TTL", DEFAULT_ROOM_ALIAS_CACHE_TTL
         ),
         allow_insecure_homeserver=_env_bool(source, "GATEWAY_ALLOW_INSECURE_HS", False),
     )

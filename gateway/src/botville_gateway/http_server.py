@@ -475,6 +475,7 @@ def build_transport(config: Config) -> MatrixTransport:
             as_token=config.as_token,
             server_name=config.matrix_server_name,
             room_alias_prefix=config.room_alias_prefix,
+            room_cache_ttl_seconds=config.room_alias_cache_ttl_seconds,
         )
     return InMemoryMatrixTransport()
 

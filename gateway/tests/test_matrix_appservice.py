@@ -10,15 +10,16 @@
 - M_USER_IN_USE 视为已存在（幂等）；
 - M_FORBIDDEN（未加入房间）→ 自动 join 后重试一次；
 - 身份/房间映射（PR #99 阻塞项 1）：persona_id → @ai_<persona>:<server>；
-  conversation_id → 房间别名 directory/room 解析 + 缓存；别名不存在 →
-  conversation.not_found；非法字符集 → 客户端侧拒绝（零请求）；
+  conversation_id → 房间别名 directory/room 解析 + TTL 缓存（命中/过期/0=不缓存，
+  #107）；别名不存在 → conversation.not_found；非法字符集 → 客户端侧拒绝（零请求）；
 - 命名空间外 sender 客户端侧拒绝（send_text/ensure_user/join 全部校验）；
 - HTTP 错误映射 DeliveryError(code=errcode / http.<status>)；非 JSON 2xx →
   appservice.response；重定向不跟随；
 - masquerade 参数（?user_id=）与 markdown / reply 内容字段；
 - healthy()（带 AS token 的 whoami）；
 - config：GATEWAY_MATRIX_TRANSPORT 的默认/校验/fail-closed、as_token 强度、
-  server_name 归一化、明文 http 主机白名单、别名前缀校验、token 不进 repr。
+  server_name 归一化、明文 http 主机白名单（#107 收紧：loopback + 无点单标签，
+  空 host / 未加方括号的 IPv6 拒绝）、别名前缀与缓存 TTL 校验、token 不进 repr。
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ import unittest
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List, Tuple
+from unittest import mock
 
 GATEWAY_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -346,6 +348,64 @@ class AppServiceTransportTest(unittest.TestCase):
         lookup = self.hs.matching("GET", "/_matrix/client/v3/directory/room/")[0]
         self.assertIn(urllib.parse.quote("#conv_demo:" + SERVER_NAME, safe=""), lookup["path"])
 
+    # ------------------------------------- alias cache TTL (#107)
+    def test_room_alias_cache_hit_and_expiry(self):
+        """mock _request：未过期沿用旧值（零请求），到期后重新 lookup 拿新值。"""
+        transport = self.make_transport()  # 默认 TTL 60s
+        responses = iter(
+            [{"room_id": "!old:" + SERVER_NAME}, {"room_id": "!new:" + SERVER_NAME}]
+        )
+        calls = []
+
+        def fake_request(method, path, **kwargs):
+            calls.append((method, path))
+            return next(responses)
+
+        transport._request = fake_request
+        with mock.patch("botville_gateway.matrix_appservice._monotonic") as clock:
+            clock.return_value = 100.0
+            self.assertEqual(
+                transport.resolve_room("conv_ttl"), "!old:" + SERVER_NAME
+            )
+            clock.return_value = 159.9  # 未过期：仍旧值、零请求
+            self.assertEqual(
+                transport.resolve_room("conv_ttl"), "!old:" + SERVER_NAME
+            )
+            self.assertEqual(len(calls), 1)
+            clock.return_value = 160.0  # 到期即过期：重新 lookup 并刷新
+            self.assertEqual(
+                transport.resolve_room("conv_ttl"), "!new:" + SERVER_NAME
+            )
+            self.assertEqual(len(calls), 2)
+            clock.return_value = 219.9  # 刷新后的新条目同样只在 TTL 内命中
+            self.assertEqual(
+                transport.resolve_room("conv_ttl"), "!new:" + SERVER_NAME
+            )
+            self.assertEqual(len(calls), 2)
+
+    def test_room_alias_cache_zero_ttl_looks_up_every_time(self):
+        """TTL=0 = 不缓存：连续两次解析发出两次 directory 请求。"""
+        transport = self.make_transport(room_cache_ttl_seconds=0)
+        responses = iter(
+            [{"room_id": "!a:" + SERVER_NAME}, {"room_id": "!b:" + SERVER_NAME}]
+        )
+        calls = []
+
+        def fake_request(method, path, **kwargs):
+            calls.append((method, path))
+            return next(responses)
+
+        transport._request = fake_request
+        self.assertEqual(transport.resolve_room("conv"), "!a:" + SERVER_NAME)
+        self.assertEqual(transport.resolve_room("conv"), "!b:" + SERVER_NAME)
+        self.assertEqual(len(calls), 2)
+        # 0 = 不缓存：连缓存条目都不写。
+        self.assertEqual(transport._rooms, {})
+
+    def test_room_alias_cache_negative_ttl_rejected(self):
+        with self.assertRaises(ValueError):
+            self.make_transport(room_cache_ttl_seconds=-1)
+
     # --------------------------------------- defense in depth (PR #99 建议)
     def test_ensure_user_validates_namespace(self):
         transport = self.make_transport()
@@ -530,8 +590,11 @@ class AppServiceTransportConfigTest(unittest.TestCase):
             with self.assertRaises(ConfigError, msg=bad):
                 load_config(env)
 
-    # --------------------------- plaintext homeserver URL (PR #99 建议)
+    # --------------------------- plaintext homeserver URL (PR #99 建议, #107 收紧)
     def test_plain_http_homeserver_restricted_to_local_hosts(self):
+        """#107：允许集合 = loopback（localhost/127.0.0.1/::1）+ 无点单标签
+        服务名；空 host、未加方括号的 IPv6（urlparse 会截成假单标签）、任意
+        非 ::1 的 IPv6、带点域名一律拒绝；https 与 allow_insecure 不受限。"""
         def load_with(url, **extra):
             env = dict(self.BASE_ENV, GATEWAY_MATRIX_TRANSPORT="appservice", **extra)
             env["GATEWAY_HOMESERVER_URL"] = url
@@ -541,19 +604,56 @@ class AppServiceTransportConfigTest(unittest.TestCase):
             "http://127.0.0.1:8008",
             "http://localhost:8008",
             "http://[::1]:8008",
-            "http://synapse:8008",  # 无点单标签 = compose 网络容器名
-            "https://hs.example.invalid",  # https 不受限
+            "http://[::1]/",
+            "http://synapse:8008",            # 无点单标签 = compose 网络容器名
+            "http://botville-synapse:8008",   # 单标签可含连字符
+            "https://hs.example.invalid",     # https 不受限
+            "https://[2001:db8::1]/",         # https 下任意主机不受限
         ):
             cfg = load_with(ok)
             self.assertEqual(cfg.homeserver_url, ok)
-        for bad in ("http://192.168.1.5:8008", "http://hs.example.invalid:8008"):
+        for bad in (
+            "http://",                        # 空 host / 仅 scheme
+            "http://192.168.1.5:8008",        # 带点 IPv4（非 loopback）
+            "http://hs.example.invalid:8008",  # 带点域名
+            "http://example.com",             # 公网域名
+            "http://[2001:db8::1]/",          # 非 ::1 的 IPv6
+            "http://[fe80::1]/",              # 链路本地
+            "http://fe80::1",                 # 未加方括号的 IPv6（截成 fe80 也不放行）
+        ):
             with self.assertRaises(ConfigError, msg=bad):
                 load_with(bad)
-        # 显式放行明文跨主机。
-        cfg = load_with(
-            "http://hs.example.invalid:8008", GATEWAY_ALLOW_INSECURE_HS="true"
+        # 显式放行明文跨主机（含非本地 IPv6 与域名）。
+        for insecure in ("http://hs.example.invalid:8008", "http://[2001:db8::1]/"):
+            cfg = load_with(insecure, GATEWAY_ALLOW_INSECURE_HS="true")
+            self.assertTrue(cfg.allow_insecure_homeserver)
+
+    # ------------------------------------- alias cache TTL (#107)
+    def test_room_alias_cache_ttl_default_60(self):
+        env = dict(self.BASE_ENV, GATEWAY_MATRIX_TRANSPORT="appservice")
+        self.assertEqual(load_config(env).room_alias_cache_ttl_seconds, 60)
+
+    def test_room_alias_cache_ttl_env_override(self):
+        env = dict(
+            self.BASE_ENV, GATEWAY_MATRIX_TRANSPORT="appservice",
+            GATEWAY_ROOM_ALIAS_CACHE_TTL="5",
         )
-        self.assertTrue(cfg.allow_insecure_homeserver)
+        self.assertEqual(load_config(env).room_alias_cache_ttl_seconds, 5)
+
+    def test_room_alias_cache_ttl_zero_allowed(self):
+        env = dict(
+            self.BASE_ENV, GATEWAY_MATRIX_TRANSPORT="appservice",
+            GATEWAY_ROOM_ALIAS_CACHE_TTL="0",
+        )
+        self.assertEqual(load_config(env).room_alias_cache_ttl_seconds, 0)
+
+    def test_room_alias_cache_ttl_negative_rejected(self):
+        env = dict(
+            self.BASE_ENV, GATEWAY_MATRIX_TRANSPORT="appservice",
+            GATEWAY_ROOM_ALIAS_CACHE_TTL="-1",
+        )
+        with self.assertRaises(ConfigError):
+            load_config(env)
 
     # ------------------------------------- room alias prefix (PR #99 阻塞项 1)
     def test_room_alias_prefix_validated(self):

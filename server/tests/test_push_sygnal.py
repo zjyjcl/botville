@@ -269,7 +269,10 @@ class SygnalInitScriptTest(unittest.TestCase):
             "namespaces:\n"
             "  users:\n"
             "    - exclusive: true\n"
-            "      regex: '^@ai_.*:${BOTVILLE_SERVER_NAME_REGEX}$'\n",
+            "      regex: '^@ai_.*:${BOTVILLE_SERVER_NAME_REGEX}$'\n"
+            "  aliases:\n"
+            "    - exclusive: true\n"
+            "      regex: '^#botville_conv_.*:${BOTVILLE_SERVER_NAME_REGEX}$'\n",
             encoding="utf-8",
         )
 
