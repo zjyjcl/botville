@@ -29,6 +29,29 @@ def limit_body(retry_after_ms=None):
     return body
 
 
+
+class LoginRetryDelayHelperTest(unittest.TestCase):
+    """#110: _login_retry_delay_ms clamps / rejects hostile values."""
+
+    def test_negative_nan_inf_bool_non_dict_fallback(self):
+        d = smoke._login_retry_delay_ms
+        self.assertEqual(d({"retry_after_ms": -1}), smoke.LOGIN_RETRY_AFTER_MS_DEFAULT)
+        self.assertEqual(d({"retry_after_ms": float("nan")}), smoke.LOGIN_RETRY_AFTER_MS_DEFAULT)
+        self.assertEqual(d({"retry_after_ms": float("inf")}), smoke.LOGIN_RETRY_AFTER_MS_DEFAULT)
+        self.assertEqual(d({"retry_after_ms": True}), smoke.LOGIN_RETRY_AFTER_MS_DEFAULT)
+        self.assertEqual(d("not-a-dict"), smoke.LOGIN_RETRY_AFTER_MS_DEFAULT)
+        self.assertEqual(d(None), smoke.LOGIN_RETRY_AFTER_MS_DEFAULT)
+
+    def test_huge_value_clamped_to_max(self):
+        self.assertEqual(
+            smoke._login_retry_delay_ms({"retry_after_ms": 86_400_000}),
+            smoke.LOGIN_RETRY_AFTER_MS_MAX,
+        )
+
+    def test_valid_int_preserved(self):
+        self.assertEqual(smoke._login_retry_delay_ms({"retry_after_ms": 250}), 250)
+
+
 class LoginRetryMockTest(unittest.TestCase):
     def login(self):
         client = smoke.Smoke("http://127.0.0.1:1", None)

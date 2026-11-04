@@ -160,6 +160,14 @@ current_port="${current_port:-8008}"
 backup_port="$(env_value_from "${backup_dir}/env" BOTVILLE_HTTP_PORT)"
 backup_port="${backup_port:-8008}"
 
+# Instance check reads .env (and the backup's env copy) only. An explicit
+# COMPOSE / COMPOSE_OVERRIDE can point compose at a different -p project than
+# .env describes (#110): warn so operators do not confuse "env matches" with
+# "compose target matches". The check itself stays .env-scoped by design.
+if [[ -n "${COMPOSE_OVERRIDE}" ]]; then
+    echo "restore-synapse.sh: WARNING: COMPOSE is explicitly set; instance consistency still compares .env project/port only (compose may target a different -p). Confirm COMPOSE matches the instance you intend to restore into." >&2
+fi
+
 mismatch=0
 if [[ "${current_project}" != "${backup_project}" ]]; then
     echo "restore-synapse.sh: COMPOSE_PROJECT_NAME mismatch: current '${current_project}', backup '${backup_project}'" >&2
