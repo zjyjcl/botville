@@ -1,8 +1,6 @@
 {
   "persona_id": "persona_demo",
   "conversation_id": "conv_demo",
-  "system_text": "你是 persona_demo，用简短中文回答。",
-  "persona_text": "沉稳、好奇，回答不超过三句。",
   "items": [
     {
       "kind": "message",

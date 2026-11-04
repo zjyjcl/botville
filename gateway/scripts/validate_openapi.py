@@ -643,6 +643,91 @@ def check_examples(document, report):
     else:
         report.ok("all examples validate (%d files)" % (len(EXAMPLE_TARGETS),))
 
+    check_assemble_nonce_binding(report)
+
+
+# `id="<nonce>"` on both the opening (`<untrusted id=...>`) and closing
+# (`</untrusted id=...>`) of every untrusted-data segment.
+UNTRUSTED_TAG_ID = re.compile(r"</?untrusted\s+id=\"([^\"]*)\"")
+
+
+def check_assemble_nonce_binding(report):
+    """Cross-check nonce tag ids against ``nonces[]`` (B2.3 B5).
+
+    contract.md §7.2 requires every ``<untrusted id="{nonce}">…</untrusted id="{nonce}">``
+    segment to carry the segment's real nonce as its ``id``, and ``ContextNonce.segment_id``
+    must equal that nonce. The allowed-context example therefore has to satisfy:
+
+      * the set of ``id`` values found in ``zones.untrusted_data`` equals the set of
+        ``nonces[].nonce`` values (one-to-one, no extras on either side), and
+      * each ``nonces[].segment_id`` equals its ``nonce``.
+    """
+    print("\n[2b/3] Context assemble nonce binding")
+    name = "context-assemble-result.json"
+    path = os.path.join(EXAMPLES_DIR, name)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError) as exc:
+        report.fail("%s is readable for nonce checks" % name, exc)
+        return
+
+    if not isinstance(payload, dict) or payload.get("outcome") != "allowed":
+        report.fail("%s has outcome=allowed" % name, "outcome = %r" % (payload.get("outcome"),))
+        return
+
+    zones = payload.get("zones") or {}
+    nonces = payload.get("nonces") or []
+    if not isinstance(zones, dict) or not isinstance(nonces, list) or not nonces:
+        report.fail("%s has zones and nonces" % name, "zones/nonces missing or empty")
+        return
+
+    untrusted = zones.get("untrusted_data") or ""
+    tag_ids = UNTRUSTED_TAG_ID.findall(untrusted) if isinstance(untrusted, str) else []
+    listed = [
+        entry.get("nonce") for entry in nonces if isinstance(entry, dict)
+    ]
+
+    problems = []
+    if not tag_ids:
+        problems.append("no `<untrusted id=\"...\">` tags found in zones.untrusted_data")
+    if any(not isinstance(n, str) or not n for n in listed):
+        problems.append("every nonces[] entry needs a non-string-empty `nonce`")
+    for entry in nonces:
+        if not isinstance(entry, dict):
+            problems.append("nonces[] entry is not an object: %r" % (entry,))
+            continue
+        if entry.get("segment_id") != entry.get("nonce"):
+            problems.append(
+                "segment_id %r != nonce %r (contract §7.2 requires equality)"
+                % (entry.get("segment_id"), entry.get("nonce"))
+            )
+    # Opening and closing tags both repeat the id: an odd count means a dangling tag.
+    if tag_ids and len(tag_ids) % 2 != 0:
+        problems.append("odd number of `<untrusted id=...>` tags (%d): unclosed segment" % len(tag_ids))
+    unique_tags = set(tag_ids)
+    unique_nonces = {n for n in listed if isinstance(n, str) and n}
+    if tag_ids and unique_tags != unique_nonces:
+        missing = unique_nonces - unique_tags
+        extra = unique_tags - unique_nonces
+        if missing:
+            problems.append("nonces missing from untrusted_data tag ids: %s" % ", ".join(sorted(missing)))
+        if extra:
+            problems.append("tag ids with no matching nonce: %s" % ", ".join(sorted(extra)))
+    # Each nonce must appear exactly twice: once opening, once closing.
+    for nonce in sorted(unique_nonces):
+        count = tag_ids.count(nonce)
+        if count != 2:
+            problems.append("nonce %r appears %d times as a tag id (expected 2: open + close)" % (nonce, count))
+
+    if problems:
+        report.fail("%s nonce ids bind to nonces[]" % name, "\n".join(problems[:10]))
+    else:
+        report.ok(
+            "%s nonce ids bind to nonces[] (%d segments, segment_id == nonce)"
+            % (name, len(unique_nonces))
+        )
+
 
 def _short_pointer(pointer):
     """Human readable label for a pointer, e.g. GET /personas/{persona_id} 200."""

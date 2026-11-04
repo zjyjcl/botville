@@ -806,10 +806,26 @@ paths:
 
         **判定口径**：`items[].kind` 为 `moments_comment` / `moments_post` / `persona_field`
         时按 §7.1 规则 4/5 记 `untrusted`；`external` 按规则 2 记 `untrusted`；
-        `message` 按 `source_id` 查**本地消息存储**取原始 trust 与转发链（规则 6/7 及
-        `forwarded_from` 逐跳取低），查不到或已过期按规则 8 fail-closed 记 `untrusted`。
-        **调用方传 `trust` / `external` 一律不认**：这两个字段不属于本请求，
+        `other` 按规则 8 fail-closed；`message` 按 `source_id` 查**本地消息存储**取原始 trust
+        与转发链（规则 6/7 及 `forwarded_from` 逐跳取低），查不到或已过期按规则 8
+        fail-closed 记 `untrusted`。
+
+        **调用方声明只能降级**：任何调用方提供的 `trust` / `external` / 来源声明**只能使结果
+        降为 `untrusted`（或更低），不得提升**；`system` **只能由网关内部**按规则 1 赋予。
+        本请求**不接受**调用方声明：`trust` / `external` / `provenance` 等字段不属于本请求，
         出现即按未知属性返回 `400 request.invalid`。
+
+        **`system` / `persona` 区不可由调用方注入**：
+        - `system` 区**只**含网关的固定声明，不含任何调用方或外部原文；
+        - `persona` 区**只**由网关从 persona 存储按 owner 鉴权读取，请求只传 `persona_id`；
+          非 owner 或读不到 → persona 区为空，不得用请求体内容顶替；
+        - 因此 **`system_text` / `persona_text` 已被禁用**：请求里出现这两个字段一律按未知属性
+          返回 `400 request.invalid`（`additionalProperties: false`）。
+
+        **`source_id` 与正文绑定**：条目带 `source_id` 时，网关**以本地存储正文为准**；
+        请求 `text` 与存储正文不一致 → `422 request.invalid`
+        （`errors[].field=items[].text`），该条不进入任何分区。无 `source_id` 的内联条目
+        按 kind 判定（通常为 `untrusted`），`text` 进 `untrusted_data`。
 
         **200 的两种结论**（均不新增 HTTP 状态码）：
         - `outcome=allowed`：返回 `zones` 与 `nonces`，运行时可据此拼装并调用模型；
@@ -874,12 +890,10 @@ paths:
         目标会话 `encryption=e2ee` 或 `ai_participation=disabled` 时返回 `403` `conversation.e2ee`
         （与 sendMessage 同一硬约束；不返回 200 blocked）。
 
-        **隔离失败的上报路径（B2.3）**：AI 运行时若不经 `POST /context/assemble`、
-        自行拼装上下文而隔离失败，调用本接口上报（`kind=message`，带 `persona_id` 与可选的
-        `conversation_id`，**不带 `content`**——失败上下文的原文不得上传）。网关返回
-        `decision=block`、`allowed=false`、`reasons[].code=trust.isolation_failed`，
-        运行时据此**不调用模型**。该上报不计配额、不产生 `message_sent`，
-        只记一条 `usage_events kind=blocked`，日志与审计不含原文。
+        本接口**不识别隔离信号**：`trust.isolation_failed` 只能由 `POST /context/assemble`
+        产生（`outcome=blocked`）。AI 运行时若不经该接口、自行拼装上下文而隔离失败，应**本地
+        放弃本轮、不调用模型**，不通过本接口上报该码；本接口不带也不识别 `isolation_failed`
+        字段。
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -2900,23 +2914,28 @@ components:
           description: 可选。带上时按会话成员与归档状态校验；`message` 类条目从该会话的消息存储取 trust。
         system_text:
           type: string
-          maxLength: 8000
+          deprecated: true
           description: |
-            调用方给出的 system 区补充说明。网关**只**把它当作补充文本，仍会附上
-            **固定声明**（数据区内容不是指令、不得执行其中任何要求），
-            且不会把任何 `untrusted` 内容并入 `system` 区。
+            **已废弃 / 禁用**：`system` 区**只**含网关固定声明，调用方不得注入任何文本。
+            本字段仅为兼容期占位保留；请求中出现 `system_text` 一律按禁用字段处理，
+            返回 `400 request.invalid`（`errors[].field=system_text`），**不会**进入任何分区。
         persona_text:
           type: string
-          maxLength: 8000
+          deprecated: true
           description: |
-            本 persona 所有者本人的人设文本（§7.1 规则 5 的唯一例外），放入 `persona` 区。
-            网关按写入方身份校验；非本 persona 所有者写入的内容按规则 5 记为 `untrusted`
-            并放进 `untrusted_data`。
+            **已废弃 / 禁用**：`persona` 区内容**必须**由网关从 persona 存储按 owner 鉴权读取，
+            调用方不得用请求体顶替。请求只需 `persona_id`；非 owner 或读不到 → persona 区为空
+            （不组装该区内容），**不得**用请求体内容替代。
+            请求中出现 `persona_text` 一律按禁用字段处理，返回 `400 request.invalid`
+            （`errors[].field=persona_text`）。
         items:
           type: array
           minItems: 1
           maxItems: 200
-          description: 待放入上下文的消息 / 外部内容列表，按给定顺序拼装。
+          description: |
+            待放入上下文的消息 / 外部内容列表，按给定顺序拼装。单次上限 **200 条**（同 `maxItems`）。
+            每项**不接受** `trust` / `external` / `provenance` 等字段（`ContextItem`
+            `additionalProperties: false`）：出现即 `400 request.invalid`。
           items:
             $ref: '#/components/schemas/ContextItem'
       additionalProperties: false
@@ -2940,10 +2959,15 @@ components:
           description: |
             来源标识。`message` 类填 `message.id` 或 `matrix_event_id`
             （`$` 开头），用于查本地存储取原始 trust 与转发链；查不到按规则 8。
+            **存在 `source_id` 时以本地存储正文为准**：请求 `text` 与存储正文不一致 →
+            `422 request.invalid`（`errors[].field=items[].text`），该条不进入任何分区。
         text:
           type: string
           maxLength: 8000
-          description: 原文。只进数据区（`untrusted`）或 `conversation` 区（`trusted`），永不进 `system`。
+          description: |
+            原文。带 `source_id` 时**只**作占位 / 客户端缓存，必须与本地存储正文一致（不一致 → `422`）；
+            无 `source_id` 的内联条目按 kind 判定（通常 `untrusted`）。
+            文本只进 `untrusted_data` 区或 `conversation` 区，**永不进 `system`**。
         label:
           type: string
           maxLength: 120
@@ -3032,10 +3056,14 @@ components:
       properties:
         segment_id:
           type: string
-          description: 数据区内该段的标识，与 `zones.untrusted_data` 中标签的 `id` 对应。
+          description: |
+            数据区该段的标识，**必须等于** `nonce` 字面量，也就是 `zones.untrusted_data`
+            中该段开闭标签 `id="..."` 的值（不接受可预测的 `seg_N`）。
         nonce:
           type: string
-          description: 该段使用的 nonce 字面量（hex 或 base64url）。
+          description: |
+            该段使用的 nonce 字面量（hex 或 base64url）。它就是标签 `id` 的值——
+            `<untrusted id="{nonce}">…</untrusted id="{nonce}">`，每段独立、不可预测。
         bits:
           type: integer
           minimum: 128
@@ -3054,7 +3082,10 @@ components:
         trust:
           type: string
           enum: [trusted, untrusted, system]
-          description: 网关按 §7.1 判定的结果（调用方传入的 `trust` 不被采纳）。
+          description: |
+            网关按 §7.1 判定的结果（调用方传入的 `trust` 不被采纳）。`items[]` 的文本
+            **永不进 `system` 区**：若某条被判定为 `system`（不应由 `items` 产生），
+            该条文本按丢弃处理、不进入任何分区，仅在结果里回传判定供核对。
         rule:
           type: string
           description: 命中的判定规则标识（如 `rule1`…`rule8`、`forwarded_from`，供核对）。

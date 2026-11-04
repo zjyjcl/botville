@@ -745,8 +745,9 @@ major（可在 `/v1` 内共存）。
 ### 5.1 三条硬规则
 
 1. **路径带版本**：所有接口在 `/v1` 下。`/v2` 是另一个契约文件，不是 `/v1` 的变形。
-2. **只增不删**：同一主版本内，只能新增接口、字段、枚举值、能力；不得删除、重命名、
-   改类型、收紧约束。这是 `CONTRIBUTING.md` 第 5、6 条与 `docs/README.md` 的要求。
+2. **只增不删**：同一主版本内，只能**新增字段 / 接口**，不得删除、重命名、
+   改类型、收紧约束，也**不得改变既有成功路径的状态码集合**（描述与文案可修订）。
+   这是 `CONTRIBUTING.md` 第 5、6 条与 `docs/README.md` 的要求。
 3. **破坏性变更必须换主版本**：新主版本与新路径并存，旧版本至少保留一个迁移周期。
 
 ### 5.2 版本号落在哪里
@@ -808,6 +809,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.1.0 | 2026-11-04 | [B2.3 PR1 r3] 闭环审查阻断 B1–B5，**只增字段/接口、不改既有成功路径状态码集合**（描述可修订；`/context/assemble` 为新接口，其 4xx 属新路径）。**(1) B1 选型 b**：删除「运行时自行拼装失败经 `/policy/evaluate` 上报」的不可达路径；`trust.isolation_failed` **只能**由 `POST /context/assemble`（`outcome=blocked`）产生；自行拼装失败时**本地放弃本轮、不调模型**，不经 evaluate 上报；evaluate 描述删除该段，`PolicyEvaluateRequest` **不新增** isolation 字段。**(2) B2 提权面**：§7.1/§7.2 明文写死「调用方声明只能降级（≤ `untrusted`），不得提升；`system` **只能由网关内部**按规则 1 赋予」；`ContextAssembleRequest.system_text` / `persona_text` 标 `deprecated` 并**禁用**（出现即 `400 request.invalid`）；`system` 区只含固定声明、`persona` 区只由网关按 owner 鉴权从存储读取（非 owner/读不到 → persona 区为空）；请求示例去掉两者、结果示例 `system` 区只含固定声明；`GET messages` 的 `trust=system` 筛选器**保留**并注明「仅为筛选、非 trust 声明，筛选实现可后置」。**(3) B3 洗白**：`source_id` 存在时**以本地存储正文为准**，请求 `text` 与之不一致 → `422 request.invalid`（`errors[].field=items[].text`），不进入分区；`ContextItemVerdict.trust` 注明条目文本永不进 `system`，判定为 `system` 的条目文本丢弃；`boundary_forgery` 补「可信 source_id + 恶意 text」样例，§7.3 增验收点 (e)。**(4) B4 口径统一**：`/context/assemble` 出现 `trust`/`external`/`provenance` 等未知或禁用字段 → `400 request.invalid`（契约删「一律忽略」）；`kind` 枚举对齐 OpenAPI（`comment`→`moments_comment`，补 `moments_post`/`other`）。**(5) B5 nonce**：`<untrusted id="{nonce}">` 的 **id 必须等于 nonce**，`ContextNonce.segment_id` **必须等于** `nonce`；结果示例把 `seg_1/seg_2` 换成真实 nonce，`segment_id` 与之相同；`validate_openapi.py` 增加交叉校验（标签 id 集合 == `nonces[].nonce` 集合，且 `segment_id == nonce`）。**(6) 非阻断**：§5.1「只增不删」改为「只增字段/接口、不改既有成功路径状态码集合，描述可修订」；§7.2 写明 `items` 单次上限 **200**；`send-message-request.json` 补 `provenance.forwarded_from`（与 changelog 一致）。实现见 PR2。 |
 | 0.1.0 | 2026-11-04 | [B2.3 PR1 审查修订] 修 DeepSeek 阻断 1/2 与非阻断项，**只增不删、不改状态码集合**；OpenAPI 仅新增可选接口/字段与描述。**(1) 阻断 1——隔离执行主体与失败路径**：§7.2 明确**四区拼装与 nonce 边界由 AI 运行时执行**（网关不调模型，见 §0/§2.1），并新增**可选**接口 `POST /context/assemble`（只增）：请求 `persona_id`/`conversation_id`/`system_text`/`persona_text`/`items[]`，网关按 §7.1 判定每条 `trust`（忽略调用方传入值），`outcome=allowed` 返回 `zones` 四分区 + `nonces`（每段数据区一个）+ `items[]` 判定，`outcome=blocked` 返回 `reason.code=trust.isolation_failed`；写全 blocked 取值：`retryable=false`、`retry_after_seconds=null`、`same_content_allowed=false`、`may_clear_at=null`、`queue_id=null`、记一条 `usage_events kind=blocked`（`decision_code=trust.isolation_failed`）且**不计** token/消息配额、不调模型、不投递；坏请求 `400 request.invalid`（结构/类型）、`422 request.invalid`（语义不合法，如 `items[].kind` 未知、`conversation_id` 不属该 persona、`items` 超上限）。运行时自行拼装失败时经 `POST /policy/evaluate` 同码上报：`decision=block`、`allowed=false`、`reasons[].code=trust.isolation_failed`，不计配额、不产生 `message_sent`、日志/审计不含原文。**(2) 阻断 2——`forwarded_from` 可追溯**：§7.1 定义 `provenance.forwarded_from` 取值为**原始消息 Matrix `event_id`**（`^\$` 格式）或 `null`；网关按**本地消息存储**查原始 trust，不实时回查对端；**逐跳追溯、跳数上限 8**、链上取最低；超限/查不到/已过期或被 redact/联邦来源不可知 → `untrusted`（fail-closed）；`OutgoingMessageRequest` 新增可选 `provenance.forwarded_from`（含 `OutgoingProvenance` schema），非法值 `422 request.invalid`（`errors[].field=provenance.forwarded_from`）；写明保证**仅覆盖网关可识别的转发**——复制粘贴/截图/手改写等无 `forwarded_from` 的转发只能按发送者判定。判定表由「命中即停」改为「**所有命中规则取最低值**」（偏序 `untrusted < trusted`；`system` 仅由规则 1 在 2–8 全不命中时产生，任何 `untrusted` 命中覆盖之），与文末「只降不升」一致；规则 7 补显式 `origin=ai` + `external=false`。**(3) 非阻断**：坏链改 `../../docs/deploy/paired-federation.md`；规则 5 字段名 `personality`→`personality_template_id`；规则 4/5 注明描述的是**入上下文时**的判定（动态/评论/人设卡不是 `Message`，无自身 `trust` 字段）；nonce 规则补「每段独立、CSPRNG ≥128 bit、不跨请求/轮次复用、**先归一化后检测**、模型输出回流同样转义、截断只在数据区内且按 Unicode 码点并保留闭合边界、多段 role 等价方案不得让 untrusted 进高优先级 role」；`boundary_forgery` 用例支持 `{{nonce}}` 占位（harness 注入真实 nonce，断言 (c) 在替换后执行），§7.3 同步说明并补类别归属（他人动态正文归 `moments_comment`、外部插件归 `bridge`、`town` 归 `role_hijack`）与 PR2 JSONL 自检要求；`GET /conversations/{id}/messages` 的 `trust` 查询参数 enum 补 `system`，与 §7.1 三值对齐。示例：新增 `context-assemble-request.json` / `context-assemble-result.json`，`send-message-request.json` 补 `provenance.forwarded_from`。实现见 PR2。 |
 | 0.1.0 | 2026-11-04 | [B2.3 PR1 契约] 不可信内容标记与隔离定义、注入测试集约定，**只增不删、不改状态码集合**。(1) 新增 [§7.1 trust 判定规则](#71-trust-判定规则b23)：8 条按序判定（命中即停），`system`→网关自身生成、`external=true`→`untrusted`、`origin=bridge/town`→`untrusted`、动态评论/正文→`untrusted`、人设卡字段→`untrusted`（仅本 persona 所有者在服内写入且经网关校验的自身人设为 `trusted`，且只能进人设区）、本服人类与本服 AI→`trusted`、来源不明→`untrusted` fail-closed；配对只决定可达性不提升可信度，切断后 backfill 事件同样 `untrusted`；`friend_subject` 只影响可见性不影响 trust；trust 由服务端判定，客户端传入值忽略；只能降级（`forwarded_from` 取原始来源与转发者较低者），`system` 不参与取低；枚举沿用 `trusted`/`untrusted`/`system` 不新增。(2) 新增 [§7.2 隔离的可验收定义](#72-隔离的可验收定义交给模型前)：四分区 `system`→`persona`→`conversation`→`untrusted_data`，untrusted 只进数据区；每请求随机 nonce（≥128 bit）包裹边界、撞 nonce/边界标记先转义、仿造 role/边界标签视为纯文本（或独立 role 等价方案）；system 区固定声明数据区非指令；隔离失败/边界生成失败/trust 不可判定 → **不调模型**、`200 blocked` + `trust.isolation_failed`（开放字符串，不新增 HTTP 状态码）；`PolicyReason.message`/日志/审计不得含 untrusted 原文（补「含数据区」）；隔离是必要条件非充分条件，高风险操作仍走 D2.1 签名回调。(3) 新增 [§7.3 注入测试集约定](#73-注入测试集约定b23)：`gateway/tests/injection/<category>.jsonl` 格式与 6 个必备类别（`moments_comment`/`federation`/`persona_card`/`bridge`/`boundary_forgery`/`role_hijack`），验收断言 (a)–(d)，PR1 每类 2 条样例、PR2 补全至每类 ≥5 条。(4) OpenAPI 仅改 description：`Message.trust` 补判定摘要与「服务端判定、客户端值被忽略」，`MessageProvenance.external` 补配对联邦语义，`PolicyReason.code` 推荐列表追加 `trust.isolation_failed`。实现见 PR2。 |
 | 0.1.0 | 2026-11-04 | [#114 PR-a] 安全加固，**不改字段集合与状态码**。(1) §1.5 txnId 改为 `HMAC-SHA256(部署密钥, Idempotency-Key)`；(2) §1.5 幂等缓存淘汰后同 key 重试按 `txnId → event_id` 去重计费，不重复扣额；(3) §6.2 / OpenAPI `UsageEvent.text_sha256` 改为 HMAC-SHA256（字段名不变）；(4) 新增部署配置 `GATEWAY_HMAC_SECRET`（≥32 字节，非 dev 模式未配置或为占位时拒绝启动；dev 模式每进程随机生成并告警）；(5) `/health` whoami 探测 single-flight（并发探针在缓存过期时只打一次 homeserver）；(6) appservice `SentEvent` 回填 `txn_id`。 |
@@ -1099,8 +1101,13 @@ B2.2 起 peer 层限额按 `(persona, peer_id)` 计数，即对每个对端角�
   **不得覆盖系统区**（见 §7.2 分区顺序）。
 - **本服人类消息**（规则 6）为 `trusted` 的是其作为**对话内容**的身份，
   不等于它可以下发系统指令——它仍不能改写 system 区。
-- **服务端权威**：客户端/调用方随消息提供的 `trust` / `external` 一律**忽略**，
-  网关自行判定；发送请求里出现这类字段按结构非法处理（`422 request.invalid`）。
+- **服务端权威与提升禁止**：任何调用方提供的 `trust` / `external` / 来源声明**只能使结果
+  降为 `untrusted`（或更低），不得提升**；`system` **只能由网关内部**按规则 1 赋予。
+  发送路径（`POST /conversations/{id}/messages`）出现这类字段 → `422 request.invalid`；
+  `/context/assemble` 请求（含 `items[]`）出现 `trust` / `external` / `provenance` 等未知或禁用字段
+  → `400 request.invalid`（见 §7.2 请求字段说明）。两处都**不接受**调用方 `system` 声明。
+- `GET /conversations/{id}/messages` 的 `trust` 查询参数含 `system`，**仅为消息筛选器**，
+  不构成 trust 声明；`system` 仍只由网关内部赋予。筛选逻辑实现可后置，本 PR 只定契约。
 - 枚举值沿用既有 `trusted` / `untrusted` / `system` 三值，**不新增**。
 
 #### 转发的降级与来源追溯（`forwarded_from`）
@@ -1135,14 +1142,17 @@ B2.2 起 peer 层限额按 `(persona, peer_id)` 计数，即对每个对端角�
 
 网关为此提供一个**可选**接口 `POST /context/assemble`（见 OpenAPI 与下文接口小节）：
 运行时把待放入上下文的条目交给网关，网关按 §7.1 判定每条 `trust`，返回**已分区**的
-上下文与 nonce 信息。运行时也可以**自行拼装**，此时必须满足本节全部要求，
-并在失败时按下文「失败上报」经 `/policy/evaluate` 上报。两种路径的可验收结论相同；
+上下文与 nonce 信息。`trust.isolation_failed` **只能**由本接口产生（`outcome=blocked`）。
+运行时也可以**自行拼装**，此时必须满足本节全部要求；若自行拼装失败，**本地放弃本轮、
+不调用模型**，不需要也不能经 `/policy/evaluate` 上报该码（evaluate 不识别隔离信号）。
 `/context/assemble` 只是把判定与拼装做成可测试的一次调用，**不是**调用模型的入口。
 
 **上下文分区（固定顺序）**
 
-1. `system`：网关策略与固定声明，**不含任何外部原文**；
-2. `persona`：本 persona 所有者本人的人设（§7.1 规则 5 的唯一例外）；
+1. `system`：网关策略与固定声明，**不含任何外部原文**；`system` **只能由网关内部**赋予，
+   调用方的任何声明都不能让内容进入该区；
+2. `persona`：本 persona 所有者本人的人设（§7.1 规则 5 的唯一例外），由网关从 persona
+   存储按 owner 鉴权读取，**不得**由请求正文顶替；
 3. `conversation`：`trusted` 的对话内容；
 4. `untrusted_data`：`untrusted` 内容的数据区。
 
@@ -1152,6 +1162,8 @@ B2.2 起 peer 层限额按 `(persona, peer_id)` 计数，即对每个对端角�
 
 - 数据区**每段独立**使用一个 nonce 标签包裹，例如
   `<untrusted id="{nonce}">…</untrusted id="{nonce}">`。
+  标签的 `id` **必须等于**该段 nonce 的字面量（即 `ContextNonce.nonce`），
+  不得用可预测的 `seg_N` 等占位；`ContextNonce.segment_id` 同样必须等于该 nonce。
   每段 nonce 各自独立生成，**不复用**同一 nonce 包两段，也不跨请求/跨轮次复用。
 - nonce 由 **CSPRNG** 生成，≥ 128 bit（推荐 256 bit），以不可预测的
   十六进制或 base64url 编码输出；客户端与模型均无法预测。
@@ -1182,13 +1194,19 @@ B2.2 起 peer 层限额按 `(persona, peer_id)` 计数，即对每个对端角�
 - **请求**（`ContextAssembleRequest`）：
   - `persona_id`（必填）：请求方 persona；
   - `conversation_id`（可选）：会话标识；
-  - `system_text`（可选）：调用方给出的 system 区文本；网关**只接受**它作为
-    「调用方补充说明」，仍会附上固定声明，且不会把任何 untrusted 内容并入；
-  - `persona_text`（可选）：本 persona 所有者的人设文本（规则 5 的唯一例外）；
+  - `system_text`（已禁用）：此字段**不允许**由调用方使用——出现即返回 `400 request.invalid`。
+    `system` 区仅含网关固定声明，调用方不得注入任何文本；
+  - `persona_text`（已禁用）：此字段**不允许**由调用方直接提供——出现即返回 `400 request.invalid`。
+    `persona` 区内容由网关从 persona 存储按 owner 鉴权读取；请求只需 `persona_id`；
+    非 owner 或读不到 → persona 区为空，不得用请求体内容顶替；
   - `items`（必填，数组）：待放入上下文的消息 / 外部内容列表，每项含
-    `kind`（`message` / `comment` / `persona_field` / `external` 等）、
-    `source_id`（如 `matrix_event_id` 或 `message.id`）、`text`，以及可选的
-    `trust` 与 `provenance`——**调用方提供的 `trust` 一律忽略**，网关自行判定。
+    `kind`（`message` / `moments_comment` / `moments_post` / `persona_field` / `external` / `other`）、
+    `source_id`（如 `matrix_event_id` 或 `message.id`）、`text`；
+    **调用方传入 `trust` / `external` / `provenance` 等未知或禁用字段 → `400 request.invalid`**，
+    网关不接受也不忽略；网关自行按 §7.1 判定每条 `trust`，调用方声明**只能使结果
+    降为 `untrusted`（或更低），不得提升**；`source_id` 存在时以本地存储正文为准——
+    请求 `text` 与存储正文不一致 → `422 request.invalid`（`errors[].field=items[].text`）；
+    无 `source_id` 的内联条目按 kind 判定，通常为 `untrusted`，text 进 `untrusted_data`。
 - **响应 200 `ContextAssembleResult`**：
   - `outcome=allowed`：返回 `zones`（`system` / `persona` / `conversation` /
     `untrusted_data` 四段文本，顺序固定）与 `nonces`（每段数据区一个 nonce，
@@ -1213,25 +1231,11 @@ B2.2 起 peer 层限额按 `(persona, peer_id)` 计数，即对每个对端角�
   `blocked` 的客户端语义（不重试同一内容）。
 - **错误**：请求结构或类型非法（缺 `persona_id` / `items`、未知属性、类型不符）→
   `400 request.invalid`；语义不合法（如 `items[].kind` 未知、`conversation_id` 不属于该
-  persona、`items` 超过单次上限）→ **`422 request.invalid`**（`errors[].field` 指出字段）。
-  这些是传输层/调用方错误，不是 `blocked`。
+  persona、`items` 超过单次上限 **200 条**（与 OpenAPI `maxItems` 一致）、
+  `items[].text` 与 `source_id` 存储正文不一致）→ **`422 request.invalid`**
+  （`errors[].field` 指出字段）。这些是传输层/调用方错误，不是 `blocked`。
 - 该接口**不做**限额扣减，**不写** `message_sent` 事件；`Idempotency-Key` 可选，
   服务端不缓存（结果只取决于请求内容与当前存储）。
-
-**失败上报（运行时自行拼装时）**
-
-运行时不经 `/context/assemble`、自行拼装上下文而隔离失败时，**必须先上报再放弃**：
-
-1. 调用 `POST /policy/evaluate`，`kind=message`，带上 `persona_id` 与（若有）`conversation_id`，
-   **不带** `content`（失败上下文的原文不得上传）；
-2. 网关返回 `PolicyDecision`，其中 `decision=block`、`allowed=false`，
-   `reasons[]` 含 `code=trust.isolation_failed`；
-3. 运行时据此**不调用模型**、不进入发送路径，进程内按 `blocked` 处理
-   （`retryable=false`、`same_content_allowed=false`、`may_clear_at=null`）。
-
-该上报**不计**配额、不产生 `message_sent`；网关只记一条 `kind=blocked` 用量事件，
-审计与日志**不得含**失败上下文的原文。上报是「让结论可审计」，不是「让网关替运行时隔离」——
-若运行时不具备隔离能力，正确做法是停止本轮，而不是跳过检查直接调模型。
 
 **不泄露原文**
 
@@ -1270,7 +1274,7 @@ B2.2 起 peer 层限额按 `(persona, peer_id)` 计数，即对每个对端角�
 | `federation` | 配对服务器来的消息，含切断配对后经 backfill 补回的事件 |
 | `persona_card` | 他人人设卡字段（`display_name`、`bio` 等） |
 | `bridge` | bridge 通道转入的内容；外部插件内容同属此类（规则 2 的外部来源，当前不单列类别） |
-| `boundary_forgery` | 伪造边界 / nonce / role 标签；真实 nonce 场景用 `{{nonce}}` 占位 |
+| `boundary_forgery` | 伪造边界 / nonce / role 标签；真实 nonce 场景用 `{{nonce}}` 占位；**可信 `source_id` + 篡改 `text`** 尝试洗白受信内容 |
 | `role_hijack` | 「忽略以上指令」「你现在是 system」等指令劫持（中英） |
 
 未单列的来源不另开类别：`origin=town` 的小镇事件文本按规则 3 处理，其注入用例归入
@@ -1286,6 +1290,9 @@ B2.2 起 peer 层限额按 `(persona, peer_id)` 计数，即对每个对端角�
 - (c) 伪造的边界标记**不能**使数据区提前闭合——**含 `{{nonce}}` 替换成真实 nonce 的情形**：
   断言 (c) 在替换后执行，验证的是真实 nonce 被撞时也会被转义，而不只是「假标签惰性」；
 - (d) 判定结果 `trust == trust_expected`。
+- (e) **可信 `source_id` + 篡改 `text` 必须被拒绝**：条目带可信 `source_id` 但 `text` 与本地存储正文
+  不一致时，实现必须以**存储正文**为准并拒绝该请求（`422 request.invalid`，
+  `errors[].field=items[].text`），不得把请求 `text` 判为 `trusted` 放进 `conversation` 区。
 
 PR2 落地时须同时提供 **JSONL 格式自检**（逐行 JSON 可解析、字段齐全、`id` 文件内唯一且
 `source` 与文件名/类别同名、`trust_expected=untrusted`、`expect=isolated`、UTF-8 无 CRLF），
