@@ -47,7 +47,23 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import Config
-from .errors import GatewayDeliveryError, IdempotencyConflict, LimitError, PeerValidationError, ValidationError
+from .errors import (
+    GatewayDeliveryError,
+    IdempotencyConflict,
+    LimitError,
+    PeerValidationError,
+    UnprocessableError,
+    ValidationError,
+)
+from .isolation import (
+    IsolationResult,
+    MessageStore,
+    PersonaStore,
+    _InvalidKind,
+    _TextMismatch,
+    assemble_context,
+)
+from .trust import MessageRecord, determine_message_trust
 from .limits import LAYER_PLATFORM, LimitStore, PLATFORM_SCOPE_ID
 from .matrix import DeliveryError, MatrixTransport, SentEvent
 from .policy import (
@@ -77,9 +93,14 @@ _SEND_FIELDS = frozenset(
         "allow_deferred",
         "metadata",
         "peer_id",
+        "provenance",
     }
 )
 _CONTENT_FIELDS = frozenset({"type", "text", "mentions"})
+# §7.1：发送路径**不接受**调用方 trust / external 声明（422）。`provenance` 只接受
+# `forwarded_from`（可追溯的网关识别转发）；其余属性一律拒绝。
+_SEND_BANNED_TRUST_FIELDS = frozenset({"trust", "external"})
+_PROVENANCE_FIELDS = frozenset({"forwarded_from"})
 _EVALUATE_FIELDS = frozenset(
     {"persona_id", "conversation_id", "kind", "content", "token_estimate", "peer_id"}
 )
@@ -181,6 +202,18 @@ class GatewayService:
         self._started_at = now_fn()
         # B2.2 peer_id 校验：最小内存会话注册表（内部 API，测试用）。
         self._conversation_registry: Dict[str, List[str]] = {}
+        # B2.3：本地消息存储 / 人设存储（context/assemble 用；内部 API 注入）。
+        self._message_store = MessageStore()
+        self._persona_store = PersonaStore()
+
+    # ------------------------------------------------------------- B2.3 accessors
+    @property
+    def message_store(self) -> MessageStore:
+        return self._message_store
+
+    @property
+    def persona_store(self) -> PersonaStore:
+        return self._persona_store
 
     # ------------------------------------------------------------- accessors
     @property
@@ -442,6 +475,198 @@ class GatewayService:
             )
         )
 
+    # ------------------------------------------------------------- B2.3 context/assemble
+    def assemble_context(
+        self,
+        payload: Dict[str, Any],
+        *,
+        owner_id: Optional[str] = None,
+        nonce_factory=None,
+    ) -> Dict[str, Any]:
+        """POST /context/assemble 实现（§7.2）。
+
+        owner_id 是调用方 persona 的所有者（用于 persona 区鉴权）；由 HTTP 层在
+        鉴权后注入。当前 HTTP 层只有站点级 bearer token、没有 per-caller 身份，因此
+        HTTP 路径不会注入 owner_id —— 即无法证明 owner，persona 区 fail-closed 为空。
+        测试或内部调用方需要 persona 区时，显式传 `owner_id=` 即可。
+        """
+        # ---- 1. 结构校验（400 request.invalid）----
+        # additionalProperties: false（ContextAssembleRequest）
+        _ASSEMBLE_KNOWN = frozenset(
+            {"persona_id", "conversation_id", "system_text", "persona_text", "items"}
+        )
+        # 禁止调用方声明 trust/external/provenance（出现即 400，与 OpenAPI 描述一致）
+        _ASSEMBLE_BANNED = frozenset({"trust", "external", "provenance"})
+
+        banned = set(payload.keys()) & _ASSEMBLE_BANNED
+        if banned:
+            field_name = next(iter(sorted(banned)))
+            raise ValidationError(
+                "request.invalid",
+                f"field '{field_name}' is not accepted by this endpoint; "
+                "caller-supplied trust/external/provenance are rejected",
+                field_name,
+            )
+        unknown = set(payload.keys()) - _ASSEMBLE_KNOWN
+        if unknown:
+            raise ValidationError(
+                "request.invalid",
+                f"unexpected fields: {', '.join(sorted(unknown))}",
+            )
+
+        # system_text / persona_text: deprecated, 出现即 400
+        if "system_text" in payload:
+            raise ValidationError(
+                "request.invalid",
+                "field 'system_text' is disabled; system zone is set by the gateway only",
+                "system_text",
+            )
+        if "persona_text" in payload:
+            raise ValidationError(
+                "request.invalid",
+                "field 'persona_text' is disabled; persona zone is read from persona store by the gateway",
+                "persona_text",
+            )
+
+        persona_id = payload.get("persona_id")
+        if not isinstance(persona_id, str) or not persona_id:
+            raise ValidationError("request.invalid", "'persona_id' is required", "persona_id")
+
+        conversation_id = payload.get("conversation_id")
+        if conversation_id is not None and not isinstance(conversation_id, str):
+            raise ValidationError(
+                "request.invalid", "'conversation_id' must be a string", "conversation_id"
+            )
+
+        # §7.2：conversation_id 不属于该 persona → 422 request.invalid
+        # （契约 ~1233-1235）。会话已注册时校验 persona ∈ 成员列表；未注册同样
+        # 视为「不属于」fail-closed。省略 conversation_id 时不校验（与契约一致）。
+        if conversation_id is not None:
+            members = self._conversation_registry.get(conversation_id)
+            if members is None or persona_id not in members:
+                raise UnprocessableError(
+                    f"conversation_id {conversation_id!r} is not registered for "
+                    f"persona {persona_id!r}",
+                    "conversation_id",
+                )
+
+        items = payload.get("items")
+        if not isinstance(items, list) or len(items) == 0:
+            raise ValidationError("request.invalid", "'items' is required and must be a non-empty array", "items")
+        if len(items) > 200:
+            raise UnprocessableError(
+                f"'items' must not exceed 200 entries, got {len(items)}", "items"
+            )
+
+        # ---- 2. 每个 item 的结构校验（400 request.invalid）----
+        _ITEM_KNOWN = frozenset({"kind", "source_id", "text", "label"})
+        _ITEM_BANNED = frozenset({"trust", "external", "provenance"})
+        _ITEM_KINDS = frozenset(
+            {"message", "moments_comment", "moments_post", "persona_field", "external", "other"}
+        )
+
+        for i, item in enumerate(items):
+            if not isinstance(item, dict):
+                raise ValidationError(
+                    "request.invalid", f"items[{i}] must be an object", f"items[{i}]"
+                )
+            banned_item = set(item.keys()) & _ITEM_BANNED
+            if banned_item:
+                fn = next(iter(sorted(banned_item)))
+                raise ValidationError(
+                    "request.invalid",
+                    f"items[{i}]: field '{fn}' is not accepted; "
+                    "caller-supplied trust/external/provenance are rejected",
+                    f"items[{i}].{fn}",
+                )
+            unknown_item = set(item.keys()) - _ITEM_KNOWN
+            if unknown_item:
+                raise ValidationError(
+                    "request.invalid",
+                    f"items[{i}]: unexpected fields: {', '.join(sorted(unknown_item))}",
+                    f"items[{i}]",
+                )
+            kind = item.get("kind")
+            if kind not in _ITEM_KINDS:
+                # kind 未知 → 422 request.invalid（语义不合法）
+                raise UnprocessableError(
+                    f"items[{i}].kind {kind!r} is not a valid kind", f"items[{i}].kind"
+                )
+            text = item.get("text")
+            if not isinstance(text, str):
+                raise ValidationError(
+                    "request.invalid", f"items[{i}].text is required and must be a string",
+                    f"items[{i}].text"
+                )
+            if len(text) > 8000:
+                raise UnprocessableError(
+                    f"items[{i}].text exceeds 8000 characters", f"items[{i}].text"
+                )
+
+        # ---- 3. 调用 isolation 模块组装 ----
+        # B2：owner_id 不再缺省为 persona_id —— 那会让「自己是自己 owner」的
+        # 自有人设绕过鉴权。未提供/未证明 owner 时传 None，persona 区 fail-closed 为空
+        # （§7.2：非 owner 或读不到 → persona 区为空）。
+        now = self._now()
+
+        try:
+            result = assemble_context(
+                persona_id=persona_id,
+                items=items,
+                message_store=self._message_store,
+                persona_store=self._persona_store,
+                owner_persona_id=owner_id,
+                conversation_id=conversation_id,
+                nonce_factory=nonce_factory,
+            )
+        except _TextMismatch as exc:
+            raise UnprocessableError(
+                f"items[{exc.index}].text does not match the stored text for source_id",
+                f"items[{exc.index}].text",
+            ) from exc
+        except _InvalidKind as exc:
+            raise UnprocessableError(
+                f"items[{exc.index}].kind {exc.kind!r} is not valid",
+                f"items[{exc.index}].kind",
+            ) from exc
+        except Exception:
+            # isolation 内部意外错误 → fail-closed blocked
+            self._record_isolation_blocked(persona_id, conversation_id, now)
+            return _blocked_result()
+
+        # ---- 4. 返回 allowed ----
+        body: Dict[str, Any] = {
+            "outcome": "allowed",
+            "retryable": False,
+            "retry_after_seconds": None,
+            "same_content_allowed": True,
+            "may_clear_at": None,
+            "queue_id": None,
+            "zones": result.zones,
+            "nonces": result.nonces,
+            "items": result.items,
+            "reason": None,
+        }
+        return body
+
+    def _record_isolation_blocked(
+        self,
+        persona_id: str,
+        conversation_id: Optional[str],
+        now,
+    ) -> None:
+        """记一条 kind=blocked decision_code=trust.isolation_failed 用量事件（不计配额）。"""
+        self._store.append(
+            UsageEvent.make(
+                EventKind.BLOCKED,
+                persona_id=persona_id,
+                conversation_id=conversation_id,
+                reason_code="trust.isolation_failed",
+                at=now,
+                secret=self._store.secret,
+            )
+        )
+
     # ----------------------------------------------------------- policy only
     def evaluate_policy(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         # B5: 拒绝未知字段（additionalProperties: false）
@@ -576,6 +801,7 @@ class GatewayService:
                     metadata=validated["metadata"],
                     peer_id=validated["peer_id"],
                     ledger_txn=ledger_txn,
+                    forwarded_from=validated["forwarded_from"],
                 )
                 if idempotency_key:
                     self._idempotency_put(idempotency_key, fingerprint, receipt)
@@ -621,6 +847,14 @@ class GatewayService:
 
     # ------------------------------------------------------------ internals
     def _validate_send(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        # §7.1：发送路径不接受调用方 trust / external / system 声明 → 422 request.invalid。
+        # 放在未知字段检查之前，保证「自报 trust」得到的是 422 而不是笼统的 400。
+        for banned in sorted(_SEND_BANNED_TRUST_FIELDS & set(payload.keys())):
+            raise UnprocessableError(
+                f"'{banned}' is decided by the gateway; caller declarations are not accepted",
+                banned,
+            )
+
         # B5: additionalProperties: false —— 未知字段直接拒绝
         unknown = set(payload.keys()) - _SEND_FIELDS
         if unknown:
@@ -714,6 +948,40 @@ class GatewayService:
                 "request.invalid", "'token_estimate' must be a non-negative integer", "token_estimate"
             )
 
+        # §7.1：发送路径不接受调用方 trust / external / system 声明 → 422 request.invalid。
+        #（`sender_persona_id` 之外的 trust 声明都不得提升结果；system 只由网关赋予。）
+        for banned in sorted(_SEND_BANNED_TRUST_FIELDS & set(payload.keys())):
+            raise UnprocessableError(
+                f"'{banned}' is decided by the gateway; caller declarations are not accepted",
+                banned,
+            )
+
+        # §7.1 转发：`provenance` 只接受 `forwarded_from`（$ 开头或 null）。
+        forwarded_from: Optional[str] = None
+        provenance = payload.get("provenance")
+        if provenance is not None:
+            if not isinstance(provenance, dict):
+                raise ValidationError(
+                    "request.invalid", "'provenance' must be an object", "provenance"
+                )
+            unknown_prov = set(provenance.keys()) - _PROVENANCE_FIELDS
+            if unknown_prov:
+                # trust / external 等声明一律 422（与顶层同口径）
+                field_name = sorted(unknown_prov)[0]
+                raise UnprocessableError(
+                    f"'provenance.{field_name}' is decided by the gateway and not accepted",
+                    f"provenance.{field_name}",
+                )
+            if "forwarded_from" in provenance:
+                raw = provenance["forwarded_from"]
+                if raw is not None:
+                    if not isinstance(raw, str) or not raw.startswith("$"):
+                        raise UnprocessableError(
+                            "'provenance.forwarded_from' must be null or a matrix event id starting with '$'",
+                            "provenance.forwarded_from",
+                        )
+                    forwarded_from = raw
+
         return {
             "sender": sender,
             "text": text,
@@ -724,6 +992,7 @@ class GatewayService:
             "token_estimate": token_estimate,
             "allow_deferred": allow_deferred,
             "peer_id": peer_id,
+            "forwarded_from": forwarded_from,
         }
 
     def _prepare_send(
@@ -739,6 +1008,7 @@ class GatewayService:
         token_estimate: Optional[int],
         allow_deferred: bool,
         peer_id: Optional[str] = None,
+        forwarded_from: Optional[str] = None,
     ) -> _PreparedSend:
         """锁内阶段：策略判断 + 预留名额。调用方必须已持有 `self._lock`。
 
@@ -861,6 +1131,7 @@ class GatewayService:
         metadata: Optional[Dict[str, str]],
         peer_id: Optional[str] = None,
         ledger_txn: Optional[str] = None,
+        forwarded_from: Optional[str] = None,
     ) -> Dict[str, Any]:
         """锁内提交：调用方须持锁，且已释放（或即将释放）该预留。
 
@@ -904,20 +1175,57 @@ class GatewayService:
         # B6 (#117)：delivered 后清 blocked 去重记录，下次进入 blocked 状态可重新写一条。
         self._engine.clear_blocked_records(sender, conversation_id)
 
+        # B2.3：把已投递消息写入本地消息存储（message.id + matrix_event_id 双键），
+        # 供 /context/assemble 按 source_id 取原始 trust 与正文（§7.1 规则 6/7）。
+        # 回执 Message.trust / provenance 必须与 assemble 走同一判定路径（§7.1 只降
+        # 不升）：先注册 MessageRecord，再用 determine_message_trust 沿 forwarded_from
+        # 链取低，以此作为回执 trust；provenance 写入 forwarded_from（与存储一致）。
+        message_id = f"msg_{uuid.uuid4().hex}"
+        if not deduped:
+            with self._lock:
+                self._message_store.register(
+                    MessageRecord(
+                        source_id=event.event_id,
+                        text=text,
+                        origin="ai",
+                        external=False,
+                        forwarded_from=forwarded_from,
+                    )
+                )
+                self._message_store.register(
+                    MessageRecord(
+                        source_id=message_id,
+                        text=text,
+                        origin="ai",
+                        external=False,
+                        forwarded_from=forwarded_from,
+                    )
+                )
+
+        # 按 §7.1 沿 forwarded_from 链取低：与 /context/assemble 走同一路径，保证
+        # 回执 trust 与后续 assemble(source_id=event_id) 一致。deduped 时记录已在
+        # 首次提交时注册，判定结果不变。fail-closed：查不到/超限/非法 → untrusted。
+        receipt_trust, _ = determine_message_trust(event.event_id, self._message_store)
+
+        message = self._message_payload(
+            conversation_id=conversation_id,
+            sender=sender,
+            text=text,
+            content_type=content_type,
+            reply_to=reply_to,
+            mentions=mentions,
+            metadata=metadata,
+            event_id=event.event_id,
+            created_at=event.sent_at,
+            message_id=message_id,
+            trust=receipt_trust,
+            forwarded_from=forwarded_from,
+        )
+
         return self._receipt(
             decision,
             outcome="delivered",
-            message=self._message_payload(
-                conversation_id=conversation_id,
-                sender=sender,
-                text=text,
-                content_type=content_type,
-                reply_to=reply_to,
-                mentions=mentions,
-                metadata=metadata,
-                event_id=event.event_id,
-                created_at=event.sent_at,
-            ),
+            message=message,
             delivery={
                 # 淘汰后同 key 重试时这里就是 HS 上次返回的同一个 event_id（不重复计费），
                 # 契约字段集合不变。
@@ -969,13 +1277,19 @@ class GatewayService:
         metadata: Optional[Dict[str, str]] = None,
         event_id: str,
         created_at: datetime,
+        message_id: str,
+        trust: str,
+        forwarded_from: Optional[str] = None,
     ) -> Dict[str, Any]:
         # 原样保留请求的 content.type：markdown 不得降级为 text（#92）。
         content: Dict[str, Any] = {"type": content_type, "text": text}
         if mentions:
             content["mentions"] = list(mentions)
+        provenance: Dict[str, Any] = {"origin": "ai", "external": False}
+        if forwarded_from is not None:
+            provenance["forwarded_from"] = forwarded_from
         msg: Dict[str, Any] = {
-            "id": f"msg_{uuid.uuid4().hex}",
+            "id": message_id,
             "matrix_event_id": event_id,
             "conversation_id": conversation_id,
             "sender": {
@@ -985,8 +1299,10 @@ class GatewayService:
                 "persona_id": sender,
             },
             "content": content,
-            "trust": "trusted",
-            "provenance": {"origin": "ai", "external": False},
+            # §7.1：trust 由网关判定（只降不升）。出站 AI 消息按规则 7 为 trusted，
+            # 但 forwarded_from 链上出现 untrusted 时取低 → untrusted，不硬编码。
+            "trust": trust,
+            "provenance": provenance,
             "created_at": iso_utc(created_at),
             "redacted": False,
         }
@@ -1172,6 +1488,26 @@ class GatewayService:
 # --------------------------------------------------------------------------- #
 # usage helpers
 # --------------------------------------------------------------------------- #
+def _blocked_result() -> Dict[str, Any]:
+    """`trust.isolation_failed` 的 200 blocked 取值（§7.2，逐项照契约）。"""
+    return {
+        "outcome": "blocked",
+        "retryable": False,
+        "retry_after_seconds": None,
+        "same_content_allowed": False,
+        "may_clear_at": None,
+        "queue_id": None,
+        "zones": None,
+        "nonces": None,
+        "items": [],
+        "reason": {
+            "code": "trust.isolation_failed",
+            "message": "Context isolation could not be built; the model was not called.",
+            "layer": "system",
+        },
+    }
+
+
 def _resolve_timezone(name: Optional[str]) -> ZoneInfoLite:
     return ZoneInfoLite(name or "UTC")
 

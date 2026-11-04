@@ -44,6 +44,7 @@ from .errors import (
     IdempotencyConflict,
     LimitError,
     PeerValidationError,
+    UnprocessableError,
     ValidationError,
 )
 from .limits import LimitStore
@@ -328,6 +329,8 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 return
             if path == "/v1/policy/evaluate":
                 self._handle_policy_evaluate()
+            elif path == "/v1/context/assemble":
+                self._handle_context_assemble()
             elif m := _ROUTE_MESSAGES.match(path):
                 self._handle_send_message(m.group(1))
             else:
@@ -408,6 +411,29 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         }
         # OpenAPI /health 描述：`status` 非 `ok` 时返回 503（结构相同）。
         self._send_json(200 if status == "ok" else 503, body)
+
+    def _handle_context_assemble(self) -> None:
+        svc: GatewayService = self.server.service  # type: ignore[attr-defined]
+        body, err = self._read_json()
+        if err:
+            self._send_json(400, err, problem=True)
+            return
+        assert body is not None
+        try:
+            idempotency_key = self._idempotency_key()
+            result = svc.assemble_context(body)
+        except ValidationError as exc:
+            errors = None
+            if exc.field:
+                errors = [{"field": exc.field, "code": exc.code, "message": exc.detail}]
+            status = getattr(exc, "http_status", 400)
+            title = "Request validation failed" if status == 400 else "Request invalid"
+            self._send_problem(
+                status, exc.code, title,
+                detail=exc.detail, errors=errors,
+            )
+            return
+        self._send_json(200, result)
 
     def _handle_policy_evaluate(self) -> None:
         svc: GatewayService = self.server.service  # type: ignore[attr-defined]
