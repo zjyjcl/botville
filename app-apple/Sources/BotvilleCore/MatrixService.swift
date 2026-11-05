@@ -207,7 +207,7 @@ public final class MatrixService: ObservableObject {
         }
         isAuthenticating = true
         sessionError = nil
-        let pairingTransport = pairingAuthentication.configuredForPairing(fingerprint: qrCode.fingerprint, host: qrCode.homeserver.host)
+        let pairingTransport = pairingAuthentication.configuredForPairing(fingerprint: qrCode.fingerprint, host: qrCode.homeserver.host, port: qrCode.homeserver.port)
         let attempt = AuthenticationAttempt()
         authenticationAttempt = attempt
         do {

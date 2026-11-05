@@ -155,9 +155,10 @@ botville://pair?v=1&hs=<https-url>[&gw=<https-url>][&fp=<spki-hash>]&code=<b64ur
 签发配对码并重新配对（会话侧提示由 App 实现）。服务端换证时**建议保留同一密钥**
 （只换证不换钥），以降低已配对客户端的断连面；密钥轮换则必须重新配对。
 
-**与 #130 文档/实现的关系**：合入本契约前，`app-apple/docs/pairing-qr.md` 与
-`PairingTLS.swift` 仍为「先系统信任再比 fp」的**旧语义**，将在 C 线 #132-PR2
-对齐本节；在此之前以**本文件**为契约真源，旧 App 文档不得覆盖本节。
+**与 #130 文档/实现的关系**：合入本契约时，`PairingTLS.swift` / `app-apple/docs/pairing-qr.md`
+仍可能短暂落后。C 线 **#132-PR1**（PR #141）将 App 自管 URLSession 的 PairingTLS
+对齐本节（有 `fp`：SPKI pin 替代系统根 + 叶证自锚）。**#132-PR2** 专指 SDK 信任锚 /
+描述文件引导（§3.3.3），不以本文件被 App 文档覆盖。
 
 ### 3.3.3 SDK 同步与 pin 边界（已知限制）
 
@@ -184,7 +185,7 @@ matrix-rust-sdk（当前绑定如 `matrix-rust-components-swift` 26.x）的同�
 自定义 verifier 需求。C 线须在 UI 呈现「配对 pin ≠ 全链路 pin」这一已知限制。
 
 **责任边界**：A 线维护本契约与签发是否写入 `fp`（#128 接入方式）；C 线实现
-§3.3.2（自锚 + SAN/有效期/EKU + `(scheme,host,port)` 作用域，#132-PR2）、确认页
+§3.3.2（自锚 + SAN/有效期/EKU + `(scheme,host,port)` 作用域，#132-PR1）、确认页
 展示、以及 SDK 无法 pin 时的用户提示。
 
 ### 3.4 编码与解析规则
@@ -396,7 +397,7 @@ matrix-rust-sdk（当前绑定如 `matrix-rust-components-swift` 26.x）的同�
 
 - 服务端实现（存储、HTTP 端点、限流、管理页/CLI）——按本契约与 OpenAPI 落地；
 - App 扫码 UI 与流程引导（C2.2）；
-- App TLS 实现对齐 §3.3.2（自锚 + SAN/有效期/EKU + `(scheme,host,port)` 作用域；#132-PR2）；
+- App TLS 实现对齐 §3.3.2（自锚 + SAN/有效期/EKU + `(scheme,host,port)` 作用域；#132-PR1）；
 - SDK 同步在自签环境下的连通性（注入根 spike / 描述文件 / 上游需求，见 §3.3.3）；
 - `registration_token` / `login_token` 在 homeserver 侧的核销实现；
 - `features_url` 指向的功能清单内容结构（网关契约）；

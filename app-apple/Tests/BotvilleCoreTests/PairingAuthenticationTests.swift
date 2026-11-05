@@ -150,6 +150,21 @@ final class PairingAuthenticationTests: XCTestCase {
                                                    certificateFingerprint: Data(repeating: 3, count: 32)))
     }
 
+    func testConfiguredPairingTransportCarriesHomeserverHostAndPort() throws {
+        let host = "matrix.example.test"
+        let port = 8448
+        let configured = MatrixPairingCredentialAuthentication().configuredForPairing(
+            fingerprint: Data(repeating: 4, count: 32), host: host, port: port
+        )
+        let pairingTransport = try XCTUnwrap(configured as? MatrixPairingCredentialAuthentication)
+        defer { pairingTransport.session.invalidateAndCancel() }
+        let delegate = try XCTUnwrap(pairingTransport.session.delegate as? PairingTLSDelegate)
+        XCTAssertEqual(challengeResult(delegate: delegate, host: host, port: port), .cancelAuthenticationChallenge)
+        XCTAssertEqual(challengeResult(delegate: delegate.requestDelegate(), host: host, port: port), .cancelAuthenticationChallenge)
+        XCTAssertEqual(challengeResult(delegate: delegate, host: host, port: 443), .performDefaultHandling)
+        XCTAssertEqual(challengeResult(delegate: delegate, host: "other.example.test", port: port), .performDefaultHandling)
+    }
+
     private func fakeSession(_ handler: @escaping (URLRequest) throws -> (Int, String)) -> URLSession {
         PairingAuthenticationURLProtocol.handler = { request in
             let response = try handler(request)
@@ -174,6 +189,22 @@ final class PairingAuthenticationTests: XCTestCase {
         }
         return data
     }
+
+    private func challengeResult(delegate: PairingTLSDelegate, host: String, port: Int) -> URLSession.AuthChallengeDisposition {
+        let protectionSpace = URLProtectionSpace(host: host, port: port, protocol: "https", realm: nil, authenticationMethod: NSURLAuthenticationMethodServerTrust)
+        let challenge = URLAuthenticationChallenge(protectionSpace: protectionSpace, proposedCredential: nil, previousFailureCount: 0, failureResponse: nil, error: nil, sender: PairingAuthenticationChallengeSender())
+        var result: URLSession.AuthChallengeDisposition?
+        delegate.urlSession(URLSession.shared, task: URLSession.shared.dataTask(with: URL(string: "https://\(host)/")!), didReceive: challenge) { disposition, _ in result = disposition }
+        return result!
+    }
+}
+
+private final class PairingAuthenticationChallengeSender: NSObject, URLAuthenticationChallengeSender {
+    func use(_ credential: URLCredential, for challenge: URLAuthenticationChallenge) {}
+    func continueWithoutCredential(for challenge: URLAuthenticationChallenge) {}
+    func cancel(_ challenge: URLAuthenticationChallenge) {}
+    func performDefaultHandling(for challenge: URLAuthenticationChallenge) {}
+    func rejectProtectionSpaceAndContinue(with challenge: URLAuthenticationChallenge) {}
 }
 
 private final class PairingAuthenticationURLProtocol: URLProtocol {

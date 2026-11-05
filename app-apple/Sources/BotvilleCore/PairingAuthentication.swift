@@ -12,11 +12,11 @@ public protocol PairingCredentialAuthenticating: Sendable {
                   password: String, deviceDisplayName: String, deadline: Date) async throws -> Session
     func login(at homeserver: URL, loginToken: String,
                deviceDisplayName: String, deadline: Date) async throws -> Session
-    func configuredForPairing(fingerprint: Data?, host: String?) -> any PairingCredentialAuthenticating
+    func configuredForPairing(fingerprint: Data?, host: String?, port: Int?) -> any PairingCredentialAuthenticating
 }
 
 public extension PairingCredentialAuthenticating {
-    func configuredForPairing(fingerprint: Data?, host: String?) -> any PairingCredentialAuthenticating { self }
+    func configuredForPairing(fingerprint: Data?, host: String?, port: Int? = nil) -> any PairingCredentialAuthenticating { self }
 }
 
 /// A one-time pairing exchange may have created a remote session before a
@@ -31,7 +31,7 @@ public enum PairingAuthenticationError: LocalizedError, Equatable, Sendable {
 }
 
 public struct MatrixPairingCredentialAuthentication: PairingCredentialAuthenticating {
-    private let session: URLSession
+    let session: URLSession
 
     public init() {
         let configuration = URLSessionConfiguration.ephemeral
@@ -42,9 +42,9 @@ public struct MatrixPairingCredentialAuthentication: PairingCredentialAuthentica
 
     public init(session: URLSession) { self.session = session }
 
-    public func configuredForPairing(fingerprint: Data?, host: String?) -> any PairingCredentialAuthenticating {
+    public func configuredForPairing(fingerprint: Data?, host: String?, port: Int? = nil) -> any PairingCredentialAuthenticating {
         guard let fingerprint, let host else { return self }
-        return MatrixPairingCredentialAuthentication(session: PairingURLSession.make(fingerprint: fingerprint, host: host))
+        return MatrixPairingCredentialAuthentication(session: PairingURLSession.make(fingerprint: fingerprint, host: host, port: port))
     }
 
     public func register(at homeserver: URL, registrationToken: String, username: String,
