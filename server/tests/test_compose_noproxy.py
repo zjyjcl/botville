@@ -78,6 +78,8 @@ EXPECTED_DEFAULT_ENTRIES = frozenset((
     "gateway", "admin",
     "synapse-a", "synapse-b", "pairing-a", "pairing-b",
     "fedgate-a", "fedgate-b",
+    # fedgate network aliases peers resolve server_name to (pairing key fetch).
+    "hs-a", "hs-b",
     ".local", ".internal",
     "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
 ))

@@ -170,7 +170,7 @@ fedgate：
 背景与完整说明见 [`docs/deploy/push-sygnal.md` §11 主机有代理时](push-sygnal.md#主机有代理时no_proxy-固化issue-134)：docker 客户端与 Docker Desktop 会把主机的 `HTTP(S)_PROXY` 注入每个新建容器，而容器内 `127.0.0.1` 是容器自己——主机上的环回代理在容器内不可达。本联邦栈的 `docker-compose.federation.yml` 顶部有**同一个 `x-noproxy-env` 锚点**，六个服务（synapse-a/b、pairing-a/b、fedgate-a/b）全部合并：固定默认名单与主 compose **逐字节相同**（单一名单服务两套栈，`server/tests/test_compose_noproxy.py` 保证不漂移），**不可覆盖**，`BOTVILLE_NO_PROXY_EXTRA` 只做追加，同样不设置/不清空 `HTTP(S)_PROXY`。
 
 - **EXTRA 怎么传进来**：本栈 compose 插值只用 `server/compose/federation/generated/federation.env`（Makefile `FED_COMPOSE` 的 `--env-file`），不读主栈的 `server/compose/.env`。`server/scripts/federation-setup.py` 因此把 `BOTVILLE_NO_PROXY_EXTRA`（shell 环境变量优先，其次 `server/compose/.env` 里的同名项）写进 `federation.env`；`make federation-e2e` 每次先跑 setup，一处配置两套栈共用。
-- **注入代理的主机请追加 `hs-a,hs-b`**：联邦对端按 server_name 解析到 fedgate 的网络别名 `hs-a`/`hs-b`（是别名不是服务名，不在固定名单里），而 pairing 的对端 key 校验用标准库 `urllib`（遵循 `*_PROXY`）。设 `BOTVILLE_NO_PROXY_EXTRA=hs-a,hs-b`，否则 redeem 的 key 校验（`https://hs-a:443/...`）会被送进容器内不可达的环回代理、配对失败。fedgate 自身转发走 `http.client`（不读代理环境变量），不受影响。
+- **`hs-a,hs-b` 已在默认名单内**：联邦对端按 server_name 解析到 fedgate 的网络别名 `hs-a`/`hs-b`（是别名不是服务名），而 pairing 的对端 key 校验用标准库 `urllib`（遵循 `*_PROXY`），所以这两个别名已固化进默认 NO_PROXY（两份 compose 一致），无需再设 `BOTVILLE_NO_PROXY_EXTRA`。fedgate 自身转发走 `http.client`（不读代理环境变量），不受影响。
 
 主机有代理时的自检（宿主机执行；先 `make federation-e2e` 让 `federation.env` 存在）：
 
