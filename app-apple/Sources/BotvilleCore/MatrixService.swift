@@ -24,6 +24,12 @@ public final class MatrixService: ObservableObject {
     @Published public private(set) var isRestoring = false
     @Published public private(set) var sessionError: String?
     @Published public private(set) var connectionStatus: ConnectionStatus = .idle
+    /// Device token is kept only in process memory. It is intentionally never
+    /// copied to the session store or UserDefaults.
+    @Published public private(set) var pushToken: String?
+    @Published public private(set) var pushRegistrationStatus = "尚未注册推送。"
+    @Published public private(set) var pushRegistrationError: String?
+    @Published public private(set) var pushVerificationStatus: String?
 
     private let sessionStore: any SessionStore
     private var storeDirectory: SessionStoreDirectory?
@@ -83,6 +89,14 @@ public final class MatrixService: ObservableObject {
     private let passwordAuthentication: any PasswordAuthenticating
     private let pairingAuthentication: any PairingCredentialAuthenticating
     private let authenticationTimeout: TimeInterval
+    private let pusherTransport: any MatrixPusherTransport
+    private var pushConfiguration: (url: URL, deviceDisplayName: String)?
+    /// This is intentionally memory-only. After an app relaunch APNs normally
+    /// returns the current token again; a replaced token from a prior process
+    /// cannot be deleted without persisting the sensitive value.
+    private var lastRegisteredPushKey: String?
+    private var knownPushKeys = Set<String>()
+    private var pushOperation: Task<Void, Never>?
     private var authenticationAttempt: AuthenticationAttempt?
     var storeKeyFactory: () throws -> Data = SessionCredentials.makeStoreKey
     private var isLoggingOut = false
@@ -96,6 +110,7 @@ public final class MatrixService: ObservableObject {
                 passwordAuthentication: any PasswordAuthenticating = MatrixPasswordAuthentication(),
                 pairingAuthentication: any PairingCredentialAuthenticating = MatrixPairingCredentialAuthentication(),
                 authenticationTimeout: TimeInterval = 60,
+                pusherTransport: any MatrixPusherTransport = URLSessionMatrixPusherTransport(),
                 aiParticipantPolicy: AIParticipantPolicy = .configured()) {
         self.sessionStore = sessionStore
         self.storeDirectory = storeDirectory
@@ -104,6 +119,7 @@ public final class MatrixService: ObservableObject {
         self.pairingAuthentication = pairingAuthentication
         self.aiParticipantPolicy = aiParticipantPolicy
         self.authenticationTimeout = authenticationTimeout.isFinite && authenticationTimeout > 0 ? authenticationTimeout : 60
+        self.pusherTransport = pusherTransport
         if monitorNetwork {
             let monitor = NWPathMonitor()
             networkMonitor = monitor
@@ -119,6 +135,7 @@ public final class MatrixService: ObservableObject {
         networkMonitor?.cancel()
         authHandle?.cancel()
         authTask?.cancel()
+        pushOperation?.cancel()
         authDelegate?.continuation.finish()
         syncTask?.cancel()
         timelineHandle?.cancel()
@@ -542,6 +559,7 @@ public final class MatrixService: ObservableObject {
         sessionError = nil
         try await sync()
         try Task.checkCancellation()
+        enqueuePushRegistration()
     }
 
     public func applicationDidBecomeActive() async {
@@ -985,10 +1003,140 @@ public final class MatrixService: ObservableObject {
         return MatrixServiceError.operationFailed
     }
 
+    /// Configures the Sygnal endpoint for this running process. The app target
+    /// owns persistence of the non-secret URL; the access token and APNs token
+    /// never leave memory except in the authenticated Matrix request.
+    public func configurePush(notifyURL: String, deviceDisplayName: String, allowHTTP: Bool = false) async throws {
+        #if DEBUG
+        let permitsHTTP = allowHTTP
+        #else
+        let permitsHTTP = false
+        #endif
+        let url = try PushNotifyURLPolicy.validatedURL(notifyURL, allowHTTP: permitsHTTP)
+        pushConfiguration = (url, deviceDisplayName)
+        pushRegistrationError = nil
+        pushVerificationStatus = nil
+        pushRegistrationStatus = pushToken == nil ? "服务地址已保存，等待设备令牌。" : "服务地址已保存，正在注册推送。"
+        if pushToken != nil { enqueuePushRegistration() }
+    }
+
+    /// Called by the iOS application delegate after APNs succeeds. Conversion
+    /// happens before publication so the UI can copy a stable lower-case value.
+    public func receivePushDeviceToken(_ token: Data) {
+        let value = DevicePushToken.hexadecimal(token)
+        guard !value.isEmpty else { return }
+        pushToken = value
+        pushRegistrationStatus = "已取得设备令牌，等待注册。"
+        pushRegistrationError = nil
+        pushVerificationStatus = nil
+        enqueuePushRegistration()
+    }
+
+    /// Reads the server pusher list and reports only whether the in-memory
+    /// token has a matching app identifier; no pusher details are published.
+    public func verifyPushRegistration() async {
+        guard let credentials, let key = pushToken, isLoggedIn else {
+            pushVerificationStatus = "尚无可核对的登录会话或设备令牌。"
+            return
+        }
+        guard let homeserver = URL(string: credentials.homeserverURL) else {
+            pushVerificationStatus = "无法核对推送注册。"
+            return
+        }
+        let generation = sessionGeneration
+        do {
+            let response = try await pusherTransport.pushers(homeserver: homeserver, accessToken: credentials.accessToken)
+            guard generation == sessionGeneration, !isLoggingOut, pushToken == key,
+                  self.credentials?.userID == credentials.userID else { return }
+            pushVerificationStatus = response.contains(appID: Self.pusherAppID, pushKey: key) ? "服务器中存在匹配的推送注册。" : "服务器中未找到匹配的推送注册。"
+        } catch {
+            guard generation == sessionGeneration, !isLoggingOut, pushToken == key,
+                  self.credentials?.userID == credentials.userID else { return }
+            pushVerificationStatus = "无法核对推送注册。"
+        }
+    }
+
+    private static let pusherAppID = "com.zjyjcl.botville.apns"
+
+    private func enqueuePushRegistration() {
+        let preceding = pushOperation
+        let generation = sessionGeneration
+        let task = Task { @MainActor [weak self] in
+            await preceding?.value
+            guard let self, self.sessionGeneration == generation, !self.isLoggingOut else { return }
+            await self.registerCurrentPush()
+        }
+        pushOperation = task
+    }
+
+    private func waitForPushOperations() async {
+        let operation = pushOperation
+        await operation?.value
+        // Any operation queued while logout is in progress observes
+        // `isLoggingOut` and returns without issuing a request.
+        pushOperation = nil
+    }
+
+    private func registerCurrentPush() async {
+        guard let credentials, let configuration = pushConfiguration, let key = pushToken, isLoggedIn,
+              let homeserver = URL(string: credentials.homeserverURL) else { return }
+        let generation = sessionGeneration
+        do {
+            for previous in knownPushKeys.subtracting([key]) {
+                guard generation == sessionGeneration, !isLoggingOut else { return }
+                let deletion = PushRegistration.deletion(appID: Self.pusherAppID, pushKey: previous, appDisplayName: "botville")
+                try await pusherTransport.setPusher(homeserver: homeserver, accessToken: credentials.accessToken, registration: deletion)
+                guard generation == sessionGeneration, !isLoggingOut else { return }
+                knownPushKeys.remove(previous)
+            }
+            guard generation == sessionGeneration, !isLoggingOut else { return }
+            // Record before sending because the server may accept a request
+            // whose response is lost; logout must still delete it.
+            knownPushKeys.insert(key)
+            let data = try PushPusherData(url: configuration.url, allowHTTP: configuration.url.scheme?.lowercased() == "http")
+            let registration = PushRegistration(appID: Self.pusherAppID, pushKey: key, appDisplayName: "botville", data: data,
+                                                append: false, deviceDisplayName: configuration.deviceDisplayName, language: "zh-CN")
+            try await pusherTransport.setPusher(homeserver: homeserver, accessToken: credentials.accessToken, registration: registration)
+            guard generation == sessionGeneration, !isLoggingOut else { return }
+            lastRegisteredPushKey = key
+            pushRegistrationStatus = "已注册推送。"
+            pushRegistrationError = nil
+        } catch {
+            guard generation == sessionGeneration, !isLoggingOut else { return }
+            // Do not surface transport error strings: they can contain server
+            // request context and must never include device credentials in UI.
+            pushRegistrationStatus = "推送注册未完成。"
+            pushRegistrationError = "推送注册失败，请检查服务地址和网络。"
+        }
+    }
+
+    private func unregisterCurrentPush() async throws {
+        guard let credentials,
+              let homeserver = URL(string: credentials.homeserverURL) else { return }
+        var keys = knownPushKeys
+        if let lastRegisteredPushKey { keys.insert(lastRegisteredPushKey) }
+        if let pushToken { keys.insert(pushToken) }
+        for key in keys {
+            let deletion = PushRegistration.deletion(appID: Self.pusherAppID, pushKey: key, appDisplayName: "botville")
+            try await pusherTransport.setPusher(homeserver: homeserver, accessToken: credentials.accessToken, registration: deletion)
+            knownPushKeys.remove(key)
+        }
+        lastRegisteredPushKey = nil
+        pushRegistrationStatus = "已删除推送注册。"
+        pushRegistrationError = nil
+    }
+
     public func logout() async {
         guard let client, !isLoggingOut else { return }
         isLoggingOut = true
         defer { isLoggingOut = false }
+        await waitForPushOperations()
+        do { try await unregisterCurrentPush() }
+        catch {
+            pushRegistrationError = "推送注销失败；会话仍保留，请联网后重试。"
+            syncError = "推送注销失败；会话仍保留，请联网后重试。"
+            return
+        }
         do { try await client.logout() }
         catch {
             guard PasswordLoginResultClassifier.isExpiredSession(error) else {
@@ -1058,6 +1206,9 @@ public final class MatrixService: ObservableObject {
         observedEncryptedRooms.removeAll()
         roomRefreshGeneration = UUID()
         cryptoSafetyWarnings = []
+        lastRegisteredPushKey = nil
+        knownPushKeys.removeAll()
+        pushVerificationStatus = nil
         await client?.enableAllSendQueues(enable: false)
         await previous?.value
         client = nil

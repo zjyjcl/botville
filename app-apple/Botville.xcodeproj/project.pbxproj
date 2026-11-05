@@ -14,6 +14,7 @@
 		A10000000000000000000006 /* DynamicUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000016 /* DynamicUI.swift */; };
 		A10000000000000000000007 /* ModuleWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000017 /* ModuleWebView.swift */; };
 		A10000000000000000000008 /* PairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000018 /* PairingView.swift */; };
+		A10000000000000000000009 /* PushDiagnosticsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000019 /* PushDiagnosticsView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -26,6 +27,8 @@
 		A10000000000000000000016 /* DynamicUI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = DynamicUI.swift; path = Sources/BotvilleApp/DynamicUI.swift; sourceTree = SOURCE_ROOT; };
 		A10000000000000000000017 /* ModuleWebView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ModuleWebView.swift; path = Sources/BotvilleApp/ModuleWebView.swift; sourceTree = SOURCE_ROOT; };
 		A10000000000000000000018 /* PairingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PairingView.swift; path = Sources/BotvilleApp/PairingView.swift; sourceTree = SOURCE_ROOT; };
+		A10000000000000000000019 /* PushDiagnosticsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PushDiagnosticsView.swift; path = Sources/BotvilleApp/PushDiagnosticsView.swift; sourceTree = SOURCE_ROOT; };
+		A1000000000000000000001A /* BotvilleApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = BotvilleApp/BotvilleApp.entitlements; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -57,6 +60,8 @@
 				A10000000000000000000017 /* ModuleWebView.swift */,
 				A10000000000000000000018 /* PairingView.swift */,
 				A10000000000000000000016 /* DynamicUI.swift */,
+				A10000000000000000000019 /* PushDiagnosticsView.swift */,
+				A1000000000000000000001A /* BotvilleApp.entitlements */,
 			);
 			name = BotvilleApp;
 			sourceTree = "<group>";
@@ -90,7 +95,7 @@
 /* Begin PBXProject section */
 		A10000000000000000000060 /* Project object */ = {
 			isa = PBXProject;
-			attributes = { LastSwiftUpdateCheck = 2700; LastUpgradeCheck = 2700; TargetAttributes = { A10000000000000000000050 = { CreatedOnToolsVersion = 27.2; }; }; };
+			attributes = { LastSwiftUpdateCheck = 2700; LastUpgradeCheck = 2700; TargetAttributes = { A10000000000000000000050 = { CreatedOnToolsVersion = 27.2; SystemCapabilities = { com.apple.Push = { enabled = 1; }; }; }; }; };
 			buildConfigurationList = A10000000000000000000062 /* Build configuration list for PBXProject "Botville" */;
 			compatibilityVersion = "Xcode 16.0";
 			developmentRegion = en;
@@ -122,6 +127,7 @@
 				A10000000000000000000007 /* ModuleWebView.swift in Sources */,
 				A10000000000000000000006 /* DynamicUI.swift in Sources */,
 				A10000000000000000000008 /* PairingView.swift in Sources */,
+				A10000000000000000000009 /* PushDiagnosticsView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -130,8 +136,8 @@
 /* Begin XCBuildConfiguration section */
 		A10000000000000000000070 /* Debug */ = { isa = XCBuildConfiguration; buildSettings = { CLANG_ENABLE_MODULES = YES; SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) DEBUG"; SWIFT_VERSION = 5.0; }; name = Debug; };
 		A10000000000000000000071 /* Release */ = { isa = XCBuildConfiguration; buildSettings = { CLANG_ENABLE_MODULES = YES; SWIFT_VERSION = 5.0; }; name = Release; };
-		A10000000000000000000072 /* Debug */ = { isa = XCBuildConfiguration; buildSettings = { ASSETCATALOG_COMPILER_APPICON_NAME = ""; CODE_SIGNING_ALLOWED = NO; "CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]" = YES; "CODE_SIGN_IDENTITY[sdk=iphonesimulator*]" = "-"; CODE_SIGNING_REQUIRED = NO; CODE_SIGN_STYLE = Manual; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = "BotvilleApp/Info-Debug.plist"; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 0.1; PRODUCT_BUNDLE_IDENTIFIER = com.zjyjcl.botville; PRODUCT_NAME = BotvilleApp; SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
-		A10000000000000000000073 /* Release */ = { isa = XCBuildConfiguration; buildSettings = { ASSETCATALOG_COMPILER_APPICON_NAME = ""; CODE_SIGNING_ALLOWED = NO; CODE_SIGNING_REQUIRED = NO; CODE_SIGN_STYLE = Manual; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = BotvilleApp/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 0.1; PRODUCT_BUNDLE_IDENTIFIER = com.zjyjcl.botville; PRODUCT_NAME = BotvilleApp; SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_OPTIMIZATION_LEVEL = "-O"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		A10000000000000000000072 /* Debug */ = { isa = XCBuildConfiguration; buildSettings = { ASSETCATALOG_COMPILER_APPICON_NAME = ""; CODE_SIGN_ENTITLEMENTS = BotvilleApp/BotvilleApp.entitlements; CODE_SIGNING_ALLOWED = NO; "CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]" = YES; "CODE_SIGN_IDENTITY[sdk=iphonesimulator*]" = "-"; CODE_SIGNING_REQUIRED = NO; CODE_SIGN_STYLE = Manual; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = "BotvilleApp/Info-Debug.plist"; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 0.1; PRODUCT_BUNDLE_IDENTIFIER = com.zjyjcl.botville; PRODUCT_NAME = BotvilleApp; SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		A10000000000000000000073 /* Release */ = { isa = XCBuildConfiguration; buildSettings = { ASSETCATALOG_COMPILER_APPICON_NAME = ""; CODE_SIGN_ENTITLEMENTS = BotvilleApp/BotvilleApp.entitlements; CODE_SIGNING_ALLOWED = NO; CODE_SIGNING_REQUIRED = NO; CODE_SIGN_STYLE = Manual; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = BotvilleApp/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 0.1; PRODUCT_BUNDLE_IDENTIFIER = com.zjyjcl.botville; PRODUCT_NAME = BotvilleApp; SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_OPTIMIZATION_LEVEL = "-O"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */

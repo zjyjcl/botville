@@ -8,13 +8,12 @@ import SwiftUI
 struct LoginView: View {
     @ObservedObject var service: MatrixService
 
-    @State private var homeserver = "https://matrix.example.org"
+    @State private var homeserver = ""
     @State private var username = ""
     @State private var password = ""
     @State private var isLoggingIn = false
     @State private var errorMessage: String?
     @State private var confirmLocalClear = false
-    @State private var confirmSoftLogout = false
     @State private var isClearing = false
     @State private var showPairing = false
 #if DEBUG
@@ -22,10 +21,18 @@ struct LoginView: View {
 #endif
 
     private var canLogIn: Bool {
-        !homeserver.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        showsPasswordLogin && !homeserver.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !password.isEmpty
             && !isLoggingIn && !service.isAuthenticating && !service.isRestoring && !isClearing
+    }
+
+    private var showsPasswordLogin: Bool {
+#if DEBUG
+        true
+#else
+        service.requiresPasswordReauthentication
+#endif
     }
 
     var body: some View {
@@ -41,27 +48,28 @@ struct LoginView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Form {
-                TextField("Homeserver", text: $homeserver)
-                    .autocorrectionDisabled()
-                    .disabled(service.requiresPasswordReauthentication)
-#if os(iOS)
-                    .textInputAutocapitalization(.never)
-                    .keyboardType(.URL)
-#endif
-                TextField("用户名或用户 ID", text: $username)
-                    .autocorrectionDisabled()
-                    .disabled(service.requiresPasswordReauthentication)
-#if os(iOS)
-                    .textInputAutocapitalization(.never)
-#endif
-                SecureField("密码", text: $password)
+            if showsPasswordLogin {
+                Form {
 #if DEBUG
-                Toggle("允许本机 HTTP（仅 localhost/127.0.0.1）", isOn: $allowLocalHTTP)
-                    .disabled(service.requiresPasswordReauthentication)
+                    ManualHomeserverLoginView(
+                        homeserver: $homeserver, allowLocalHTTP: $allowLocalHTTP,
+                        isReauthenticating: service.requiresPasswordReauthentication)
+                    TextField("用户名或用户 ID", text: $username)
+                        .autocorrectionDisabled()
+                        .disabled(service.requiresPasswordReauthentication)
+#if os(iOS)
+                        .textInputAutocapitalization(.never)
 #endif
+#else
+                    // Release can reauthenticate the saved account without
+                    // exposing a manual server or account-switching entry.
+                    LabeledContent("服务器", value: homeserver)
+                    LabeledContent("账号", value: username)
+#endif
+                    SecureField("密码", text: $password)
+                }
+                .frame(maxWidth: 480)
             }
-            .frame(maxWidth: 480)
 
             if let errorMessage = errorMessage ?? service.sessionError {
                 Text(errorMessage)
@@ -87,24 +95,22 @@ struct LoginView: View {
             }
 
             if service.canClearLocalSession {
-                if service.requiresPasswordReauthentication {
-                    Button("退出登录", role: .destructive) { confirmSoftLogout = true }
-                        .disabled(isLoggingIn || service.isAuthenticating || service.isRestoring || isClearing)
-                }
                 Button("清除本地会话", role: .destructive) { confirmLocalClear = true }
                     .disabled(isLoggingIn || service.isAuthenticating || service.isRestoring || isClearing)
             }
 
-            Button(action: logIn) {
-                if isLoggingIn {
-                    ProgressView()
-                        .controlSize(.small)
-                } else {
-                    Text("登录")
+            if showsPasswordLogin {
+                Button(action: logIn) {
+                    if isLoggingIn {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Text("登录")
+                    }
                 }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canLogIn)
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(!canLogIn)
 
             Button { showPairing = true } label: {
                 Label("扫码配对", systemImage: "qrcode.viewfinder")
@@ -117,12 +123,6 @@ struct LoginView: View {
             Button("取消", role: .cancel) {}
         } message: {
             Text("将删除此 App 的 Keychain 会话和本地消息数据库，包括尚未发送的消息。服务器上的消息不会删除；此操作不会撤销服务器上的设备会话。")
-        }
-        .confirmationDialog("退出登录？", isPresented: $confirmSoftLogout, titleVisibility: .visible) {
-            Button("退出登录并清除本地会话", role: .destructive) { clearLocalSession() }
-            Button("取消", role: .cancel) {}
-        } message: {
-            Text("将删除此 App 的 Keychain 会话和本地消息数据库，包括尚未发送的消息。服务器上的消息和设备会话不会撤销；之后可使用其他账号登录。")
         }
         .padding(32)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -174,3 +174,26 @@ struct LoginView: View {
         }
     }
 }
+
+#if DEBUG
+/// Manual server selection is a development-only entry. Release uses pairing
+/// and can only reauthenticate the account already saved in Keychain.
+@MainActor
+private struct ManualHomeserverLoginView: View {
+    @Binding var homeserver: String
+    @Binding var allowLocalHTTP: Bool
+    let isReauthenticating: Bool
+
+    var body: some View {
+        TextField("Homeserver（https://matrix.example.invalid）", text: $homeserver)
+            .autocorrectionDisabled()
+            .disabled(isReauthenticating)
+#if os(iOS)
+            .textInputAutocapitalization(.never)
+            .keyboardType(.URL)
+#endif
+        Toggle("允许局域网 HTTP（仅开发调试）", isOn: $allowLocalHTTP)
+            .disabled(isReauthenticating)
+    }
+}
+#endif

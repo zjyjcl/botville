@@ -677,6 +677,79 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         XCTAssertNil(try store.load())
     }
 
+    func testPushTokenRotationDeletesOldPusherBeforeSettingNewAndLogoutDeletesKnownKey() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let transport = RecordingPusherTransport()
+        let service = MatrixService(sessionStore: InMemorySessionStore(), storeDirectory: SessionStoreDirectory(baseURL: temporary), discovery: PasswordDiscovery(), monitorNetwork: false, passwordAuthentication: FakePasswordAuthentication(), pusherTransport: transport)
+        service.clientFactory = { _, _, _ in FakeClient() }
+        try await service.configurePush(notifyURL: "https://sygnal.example.invalid/_matrix/push/v1/notify", deviceDisplayName: "test")
+        try await service.login(homeserver: "https://matrix.test", username: "push", password: "test-password")
+        service.receivePushDeviceToken(Data([1]))
+        try await waitUntil { transport.calls.count == 1 }
+        service.receivePushDeviceToken(Data([2]))
+        try await waitUntil { transport.calls.count == 3 }
+        let calls = transport.calls
+        XCTAssertEqual(calls.map(\.pushKey), ["01", "01", "02"])
+        XCTAssertEqual(calls.map(\.kind), ["http", nil, "http"])
+
+        await service.logout()
+        try await waitUntil { transport.calls.count == 4 }
+        XCTAssertEqual(transport.calls.last?.kind, nil)
+        XCTAssertEqual(transport.calls.last?.pushKey, "02")
+    }
+
+    func testPushLogoutWaitsForSuspendedSetAndNeverSetsRotatedTokenAfterLogout() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let transport = BlockingPusherTransport()
+        let service = MatrixService(sessionStore: InMemorySessionStore(), storeDirectory: SessionStoreDirectory(baseURL: temporary), discovery: PasswordDiscovery(), monitorNetwork: false, passwordAuthentication: FakePasswordAuthentication(), pusherTransport: transport)
+        service.clientFactory = { _, _, _ in FakeClient() }
+        try await service.configurePush(notifyURL: "https://sygnal.example.invalid/_matrix/push/v1/notify", deviceDisplayName: "test")
+        try await service.login(homeserver: "https://matrix.test", username: "push-race", password: "test-password")
+        service.receivePushDeviceToken(Data([1]))
+        try await waitUntil { transport.isFirstSetBlocked }
+        service.receivePushDeviceToken(Data([2]))
+        let started = expectation(description: "logout has entered the main actor")
+        let logout = Task {
+            started.fulfill()
+            await service.logout()
+        }
+        await fulfillment(of: [started], timeout: 1)
+        transport.releaseFirstSet()
+        await logout.value
+        XCTAssertFalse(transport.calls.contains { $0.kind == "http" && $0.pushKey == "02" })
+        XCTAssertTrue(transport.calls.contains { $0.kind == nil && $0.pushKey == "01" })
+        XCTAssertFalse(service.isLoggedIn)
+    }
+
+    func testPushDeletionFailurePreventsReplacementAndPreservesSessionUntilRetry() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let transport = RecordingPusherTransport()
+        let store = InMemorySessionStore()
+        let service = MatrixService(sessionStore: store, storeDirectory: SessionStoreDirectory(baseURL: temporary), discovery: PasswordDiscovery(), monitorNetwork: false, passwordAuthentication: FakePasswordAuthentication(), pusherTransport: transport)
+        service.clientFactory = { _, _, _ in FakeClient() }
+        try await service.configurePush(notifyURL: "https://sygnal.example.invalid/_matrix/push/v1/notify", deviceDisplayName: "test")
+        try await service.login(homeserver: "https://matrix.example.invalid", username: "push-failure", password: "test-password")
+        service.receivePushDeviceToken(Data([1]))
+        try await waitUntil { transport.calls.count == 1 }
+        transport.rejectDeletions = true
+        service.receivePushDeviceToken(Data([2]))
+        try await waitUntil { service.pushRegistrationError != nil }
+        XCTAssertEqual(transport.calls.map(\.kind), ["http", nil])
+        XCTAssertEqual(transport.calls.map(\.pushKey), ["01", "01"])
+        await service.logout()
+        XCTAssertTrue(service.isLoggedIn)
+        XCTAssertNotNil(try store.load())
+        XCTAssertNotNil(service.pushRegistrationError)
+        transport.rejectDeletions = false
+        await service.logout()
+        XCTAssertFalse(service.isLoggedIn)
+        XCTAssertNil(try store.load())
+        XCTAssertFalse(transport.calls.contains { $0.kind == "http" && $0.pushKey == "02" })
+    }
+
     func testCorruptKeychainCanBeClearedWithAllStoresAndLoginCanResume() async throws {
         let temporary = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: temporary) }
@@ -889,6 +962,61 @@ private final class CountingPasswordDiscovery: LoginCapabilityDiscovering, @unch
     func discover(at homeserver: URL) async throws -> LoginCapabilities {
         calls += 1
         return LoginCapabilities(supportsPassword: true)
+    }
+}
+
+private final class RecordingPusherTransport: MatrixPusherTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedCalls: [PushRegistration] = []
+    private var rejects = false
+    var calls: [PushRegistration] { lock.withLock { storedCalls } }
+    var rejectDeletions: Bool {
+        get { lock.withLock { rejects } }
+        set { lock.withLock { rejects = newValue } }
+    }
+
+    func setPusher(homeserver: URL, accessToken: String, registration: PushRegistration) async throws {
+        let reject = lock.withLock {
+            storedCalls.append(registration)
+            return rejects && registration.kind == nil
+        }
+        if reject { throw MatrixPusherTransportError.serverRejected }
+    }
+
+    func pushers(homeserver: URL, accessToken: String) async throws -> MatrixPushersResponse {
+        MatrixPushersResponse(pushers: [])
+    }
+}
+
+private final class BlockingPusherTransport: MatrixPusherTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedCalls: [PushRegistration] = []
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var didBlock = false
+    var calls: [PushRegistration] { lock.withLock { storedCalls } }
+    var isFirstSetBlocked: Bool { lock.withLock { didBlock && continuation != nil } }
+
+    func setPusher(homeserver: URL, accessToken: String, registration: PushRegistration) async throws {
+        let shouldBlock = lock.withLock {
+            storedCalls.append(registration)
+            guard !didBlock, registration.kind == "http" else { return false }
+            didBlock = true
+            return true
+        }
+        if shouldBlock {
+            await withCheckedContinuation { continuation in
+                lock.withLock { self.continuation = continuation }
+            }
+        }
+    }
+
+    func releaseFirstSet() {
+        let pending = lock.withLock { let value = continuation; continuation = nil; return value }
+        pending?.resume()
+    }
+
+    func pushers(homeserver: URL, accessToken: String) async throws -> MatrixPushersResponse {
+        MatrixPushersResponse(pushers: [])
     }
 }
 

@@ -6,7 +6,7 @@
 
 - Release 在核心登录与恢复入口禁用本地 HTTP，旧 Keychain 中的 `allowLocalHTTP=true` 不能绕过策略；旧 HTTP 会话被拒绝并清除，显示可读错误；清理失败时保留重试出口。
 - Xcode Debug 使用 `BotvilleApp/Info-Debug.plist`，仅该配置启用 `NSAllowsLocalNetworking`。Release 使用 `BotvilleApp/Info.plist`，完全不含 `NSAppTransportSecurity`。没有 `NSAllowsArbitraryLoads`。
-- Debug 的应用层策略仍默认关闭 HTTP，显式开启后仅允许 `localhost` / `127.0.0.1`，并要求无凭据、有效端口及同源重定向。`NSAllowsLocalNetworking` 的系统范围比 loopback 大，因此不能代替应用层校验；Rust SDK 的请求也不能只依赖 URLSession ATS。
+- Debug 的应用层策略仍默认关闭 HTTP。显式开启后仅允许 `localhost`、规范的 `.local` 名称、带字母的 Compose 单标签名称，以及私网/loopback/link-local 地址；公共 DNS、非规范数字地址、凭据、无效端口、query 与 fragment 均拒绝。`NSAllowsLocalNetworking` 的系统范围比应用层规则大，因此不能代替应用层校验；Rust SDK 的请求也不能只依赖 URLSession ATS。
 - [Apple 的 NSExceptionDomains 文档](https://developer.apple.com/documentation/bundleresources/information-property-list/nsapptransportsecurity/nsexceptiondomains)明确：**从 iOS 17 / macOS 14 开始支持 IP 字面量及 CIDR**，因此不能笼统认定 `127.0.0.1` 条目无效。项目最低版本正是 iOS 17 / macOS 14。本次改为 Debug 专用 `NSAllowsLocalNetworking`，统一覆盖开发时两种 loopback 写法，不保留独立 IP 域名例外；其版本行为见 [NSAllowsLocalNetworking](https://developer.apple.com/documentation/bundleresources/information-property-list/nsapptransportsecurity/nsallowslocalnetworking)。
 - `swift run BotvilleApp` 是未附带 Info.plist 的 macOS 可执行文件，不能把 Xcode 的 plist 配置当作其运行证据。Release 是否接受 HTTP 始终由核心策略决定。
 
@@ -14,7 +14,7 @@
 
 `PushPusherData` 的构造与 Codable 解码共用 `URLComponents` 校验：只接受 HTTPS；要求非空 host，`percentEncodedHost` 不含 `%`；拒绝 userinfo、fragment、空白、控制字符和 IPv6 zone。原始 authority 的端口必须是 1–65535 的十进制整数，不能依赖 `components.port == nil` 判定“未指定端口”，从而拒绝空端口和整数溢出。测试覆盖 `%40/%00/%20/%09/%5c/%2f`、超长端口、构造/Codable/嵌套解码，以及合法 wire-format roundtrip 与 Noop 注册。Homeserver 复用相同 authority 校验；旧 HTTP 记录先去除首尾空白再按当前构建策略判定。
 
-该校验保证 URL 语法和传输协议，不是 SSRF 防火墙：合法私网/loopback IP 仍可作为部署配置，DNS 解析、重绑定和出站网络隔离由 homeserver/网关负责，不能把 URL 模型当作任意用户可选的代理目的地。PR #96 的 `docs/deploy/push-sygnal.md` 仅作接口参考：`app_id` 对应 Sygnal app、`pushkey` 为 APNs device token、`data.url` 为 HTTPS 网关；服务端 CI 的内网 HTTP 示例不放宽 App 的 HTTPS 策略。当前仍使用 Noop 注册，未接入 Sygnal/APNs、entitlement 或密钥。
+该校验保证 URL 语法和传输协议，不是 SSRF 防火墙：合法私网/loopback IP 仍可作为部署配置，DNS 解析、重绑定和出站网络隔离由 homeserver/网关负责，不能把 URL 模型当作任意用户可选的代理目的地。PR #96 的 `docs/deploy/push-sygnal.md` 仅作接口参考：`app_id` 对应 Sygnal app、`pushkey` 为 APNs device token、`data.url` 为 HTTPS 网关；服务端 CI 的内网 HTTP 示例不放宽 Release 的 HTTPS 策略。当前真机推送接入与测试边界见 `docs/push-device.md`。
 
 网络分类仅依据明确的 `URLError.Code` transport 白名单、SDK `ClientBuildError.ServerUnreachable`、`ClientError.MatrixApi` 的 `.connectionFailed/.connectionTimeout`。HTTP 状态和 Matrix 错误码保留业务/限流语义；未知 SDK Generic/Sdk 字符串和解析错误不通过英文词语猜测网络状态。固定 SDK 26.10.27 的 Generic/Sdk 变体没有结构化 transport 子类，因此可能显示较保守的服务端错误，但不会因为服务器文案带有 “connection” 等词而误判网络故障。
 
