@@ -18,6 +18,7 @@
 		B10000000000000000000001 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000011 /* NotificationService.swift */; };
 		B10000000000000000000002 /* SharedPushCredentials.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000012 /* SharedPushCredentials.swift */; };
 		B10000000000000000000003 /* BotvilleNotificationService.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = B10000000000000000000010 /* BotvilleNotificationService.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy,); }; };
+		B10000000000000000000004 /* PushNotificationContent.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000015 /* PushNotificationContent.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -60,6 +61,8 @@
 		B10000000000000000000012 /* SharedPushCredentials.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SharedPushCredentials.swift; path = Sources/BotvilleCore/SharedPushCredentials.swift; sourceTree = SOURCE_ROOT; };
 		B10000000000000000000013 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		B10000000000000000000014 /* NotificationService.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = NotificationService.entitlements; sourceTree = "<group>"; };
+		B10000000000000000000015 /* PushNotificationContent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PushNotificationContent.swift; path = Sources/BotvilleCore/PushNotificationContent.swift; sourceTree = SOURCE_ROOT; };
+		B10000000000000000000016 /* Info-Debug.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Info-Debug.plist"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -116,7 +119,9 @@
 			children = (
 				B10000000000000000000011 /* NotificationService.swift */,
 				B10000000000000000000012 /* SharedPushCredentials.swift */,
+				B10000000000000000000015 /* PushNotificationContent.swift */,
 				B10000000000000000000013 /* Info.plist */,
+				B10000000000000000000016 /* Info-Debug.plist */,
 				B10000000000000000000014 /* NotificationService.entitlements */,
 			);
 			path = NotificationService;
@@ -181,7 +186,7 @@
 		B10000000000000000000020 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
-			files = (B10000000000000000000001 /* NotificationService.swift in Sources */, B10000000000000000000002 /* SharedPushCredentials.swift in Sources */,);
+			files = (B10000000000000000000001 /* NotificationService.swift in Sources */, B10000000000000000000002 /* SharedPushCredentials.swift in Sources */, B10000000000000000000004 /* PushNotificationContent.swift in Sources */,);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		A10000000000000000000020 /* Sources */ = {
@@ -224,7 +229,7 @@
 				DEVELOPMENT_TEAM = 3Z8WP6U6F7;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = NotificationService/Info.plist;
+				INFOPLIST_FILE = "NotificationService/Info-Debug.plist";
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks";
 				MARKETING_VERSION = 0.1;

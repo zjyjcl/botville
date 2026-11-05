@@ -224,10 +224,14 @@ App（iOS 客户端）向 homeserver 注册 pusher 时需要的四个关键值�
 （真实模式的 `app_id` 即 `<bundle-id>.apns`——init.sh 推导的 `APNS_APP_ID`，
 单 app 约定见 §2；联调用 `org.botville.mock`。`data.url` 上表两种取值按部署
 模式选。）`default_payload` 只用于 APNs 的 NSE 唤醒和内容为空时的占位提示；它不改变
-`event_id_only`，也不应带 Matrix 正文。iOS PR1 的 NSE 原样返回 `…`；PR2 才会用
-`event_id`/`room_id` 和共享凭据拉正文，并把加密房间显示为「加密消息」。部署真实设备前
-须再次执行 `pushers/set`，让 homeserver 保存新 payload，详情见
-`app-apple/docs/push-device.md`。
+`event_id_only`，也不应带 Matrix 正文。其值保持仅有 `mutable-content: 1` 与 body「…」。
+iOS PR2 的 NSE 读取 Sygnal 顶层 `event_id`/`room_id`；上游
+[`_get_payload_event_id_only`](https://github.com/matrix-org/sygnal/blob/main/sygnal/apnspushkin.py)
+直接取 notification 的这两个字段。NSE 对 `notification`、`data`、`notification.data` 和
+`data.notification` 的支持只是兼容非真机抓包证据的包装形式，再通过 homeserver 的 Matrix
+Client-Server API 拉取事件；因此正文仍不会经 Sygnal 或 APNs 传递。
+加密或无法展示的事件显示「加密消息」，请求失败显示降级内容。部署真实设备前须再次执行
+`pushers/set`，让 homeserver 保存新 payload，详情见 `app-apple/docs/push-device.md`。
 
 反向代理是**可选**的（#128 决策，`BOTVILLE_PUSH_PUBLIC` 默认 `false`）：默认
 不开公网 push 域名，homeserver 走 compose 内网 `http://sygnal:5000`。仅当
@@ -309,8 +313,8 @@ make up HS=continuwuity PUSH=1 && make push-e2e
 - 带 `event_id_only` 时：homeserver 发给网关的通知**只含 event_id/room_id/
   计数等元数据，不含消息内容**；sygnal 转给 APNs 的 payload 同样不含明文
   内容，**消息正文不会离开自己的部署**、不会发给 Apple。App 收到推送后自行
-  通过 Matrix CS API 拉取事件正文解密/展示（端到端加密房间中正文本来就只有
-  客户端能解）。
+  通过 Matrix CS API 拉取事件正文展示；PR2 NSE 对 `m.room.encrypted` 不解密，
+  只显示「加密消息」（端到端加密房间的正文本来就只有客户端能解）。
 - 自动化兜底：mock pushkin 把通知 content 的**键名**记进 `has_content`，
   `push_e2e.py` 断言其为空——homeserver 或注册侧退回全量正文时 CI 会红，
   而不是静默泄内容。

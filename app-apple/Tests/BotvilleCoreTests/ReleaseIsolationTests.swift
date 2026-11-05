@@ -48,7 +48,7 @@ final class ReleaseIsolationTests: XCTestCase {
             productType: "com.apple.product-type.app-extension",
             bundleID: "com.zjyjcl.botville.notification",
             entitlements: ["Debug": "NotificationService/NotificationService.entitlements", "Release": "NotificationService/NotificationService.entitlements"],
-            plists: ["Debug": "NotificationService/Info.plist", "Release": "NotificationService/Info.plist"]
+            plists: ["Debug": "NotificationService/Info-Debug.plist", "Release": "NotificationService/Info.plist"]
         )
     }
 
@@ -61,6 +61,7 @@ final class ReleaseIsolationTests: XCTestCase {
         XCTAssertEqual(try plist("BotvilleApp/Info.plist")["BotvilleSharedKeychainAccessGroup"] as? String, "$(AppIdentifierPrefix)com.zjyjcl.botville.shared")
         XCTAssertEqual(try plist("BotvilleApp/Info-Debug.plist")["BotvilleSharedKeychainAccessGroup"] as? String, "$(AppIdentifierPrefix)com.zjyjcl.botville.shared")
         XCTAssertEqual(try plist("NotificationService/Info.plist")["BotvilleSharedKeychainAccessGroup"] as? String, "$(AppIdentifierPrefix)com.zjyjcl.botville.shared")
+        XCTAssertEqual(try plist("NotificationService/Info-Debug.plist")["BotvilleSharedKeychainAccessGroup"] as? String, "$(AppIdentifierPrefix)com.zjyjcl.botville.shared")
     }
 
     func testEntitlementAndDebugViewsAreIsolated() throws {
@@ -82,8 +83,9 @@ final class ReleaseIsolationTests: XCTestCase {
         try guarded("static let isDebugBuild = true", at: core.appendingPathComponent("PushRegistrar.swift"))
         let matrixService = try String(contentsOf: core.appendingPathComponent("MatrixService.swift"), encoding: .utf8)
         XCTAssertTrue(matrixService.contains("PushHTTPPolicy.permitsHTTP(allowHTTP)"))
-        try assertNotificationServiceBoundary()
-        try assertNotificationServiceIsEmbedded(try XCTUnwrap(projectJSON()["objects"] as? [String: Any]))
+        let objects = try XCTUnwrap(projectJSON()["objects"] as? [String: Any])
+        try assertNotificationServiceBoundary(objects)
+        try assertNotificationServiceIsEmbedded(objects)
     }
 
     private var root: URL { URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent() }
@@ -166,10 +168,17 @@ final class ReleaseIsolationTests: XCTestCase {
         }
         XCTAssertTrue(stack.isEmpty); XCTAssertTrue(found, "\(needle) missing from \(url)")
     }
-    private func assertNotificationServiceBoundary() throws {
-        let directory = root.appendingPathComponent("NotificationService")
-        for source in try swiftSources(in: directory) {
+    private func assertNotificationServiceBoundary(_ objects: [String: Any]) throws {
+        let sources = try notificationServiceSources(objects)
+        XCTAssertEqual(Set(sources.map(\.lastPathComponent)), ["NotificationService.swift", "SharedPushCredentials.swift", "PushNotificationContent.swift"])
+        for source in sources {
             let text = try String(contentsOf: source, encoding: .utf8)
+            XCTAssertFalse(text.contains("import MatrixRustSDK"), "NSE must not import MatrixRustSDK")
+            XCTAssertFalse(text.contains("import BotvilleCore"), "NSE must not import BotvilleCore")
+            if source.lastPathComponent != "PushNotificationContent.swift" {
+                XCTAssertFalse(text.contains("URLSession"), "Only PushNotificationContent may use URLSession in NSE")
+                XCTAssertFalse(text.contains("URLRequest"), "Only PushNotificationContent may use URLRequest in NSE")
+            }
             XCTAssertNil(text.range(of: #"\b(?:print|debugPrint|dump|NSLog|os_log)\s*\("#, options: .regularExpression), "NSE must use only its safe Logger diagnostics")
             for line in text.split(separator: "\n") where line.range(of: #"\b\w+\.(?:trace|debug|info|notice|warning|error|fault|critical|log)\s*\("#, options: .regularExpression) != nil {
                 let lower = line.lowercased()
@@ -183,6 +192,53 @@ final class ReleaseIsolationTests: XCTestCase {
                 XCTAssertFalse(text.contains(forbidden), "NSE must not use plaintext credential storage: \(forbidden)")
             }
         }
+        let content = try String(contentsOf: root.appendingPathComponent("Sources/BotvilleCore/PushNotificationContent.swift"), encoding: .utf8)
+        XCTAssertTrue(content.contains("URLSession"))
+        XCTAssertTrue(content.contains("/_matrix/client/v3/rooms/"))
+        XCTAssertTrue(content.contains("/event/"))
+        XCTAssertEqual(content.components(separatedBy: "dataTask(with:").count - 1, 1)
+        XCTAssertEqual(content.components(separatedBy: "URLRequest(url:").count - 1, 1)
+        XCTAssertEqual(content.components(separatedBy: "httpMethod =").count - 1, 1)
+        XCTAssertTrue(content.contains("httpMethod = \"GET\""))
+        XCTAssertTrue(content.contains("Authorization"))
+        XCTAssertTrue(content.contains(".ephemeral"))
+        XCTAssertTrue(content.contains("willPerformHTTPRedirection"))
+        XCTAssertTrue(content.contains("requestTimeout"))
+        XCTAssertTrue(content.contains("timeBudget"))
+        XCTAssertEqual(content.components(separatedBy: "/_matrix/client/v3/rooms/").count - 1, 1)
+        XCTAssertEqual(content.components(separatedBy: "/_matrix/client/").count - 1, 1)
+        XCTAssertTrue(content.contains("components.percentEncodedPath = base + \"/_matrix/client/v3/rooms/\" + room + \"/event/\" + event"))
+    }
+    private func notificationServiceSources(_ objects: [String: Any]) throws -> [URL] {
+        let target = try XCTUnwrap(objects.values.compactMap { $0 as? [String: Any] }.first { $0["isa"] as? String == "PBXNativeTarget" && $0["name"] as? String == "BotvilleNotificationService" })
+        XCTAssertTrue((target["packageProductDependencies"] as? [String] ?? []).isEmpty, "NSE must not link package products")
+        let phases = target["buildPhases"] as? [String] ?? []
+        for phase in phases.compactMap({ objects[$0] as? [String: Any] }) where phase["isa"] as? String == "PBXFrameworksBuildPhase" {
+            XCTAssertTrue((phase["files"] as? [String] ?? []).isEmpty, "NSE must not link frameworks")
+        }
+        let sourcePhase = try XCTUnwrap(phases.compactMap { objects[$0] as? [String: Any] }.first { $0["isa"] as? String == "PBXSourcesBuildPhase" })
+        return try XCTUnwrap(sourcePhase["files"] as? [String]).map { identifier in
+            let buildFile = try XCTUnwrap(objects[identifier] as? [String: Any])
+            let fileRef = try XCTUnwrap(buildFile["fileRef"] as? String)
+            let file = try XCTUnwrap(objects[fileRef] as? [String: Any])
+            return try notificationServiceSourceURL(file: file, fileRefID: fileRef, objects: objects)
+        }
+    }
+    private func notificationServiceSourceURL(file: [String: Any], fileRefID: String, objects: [String: Any]) throws -> URL {
+        let path = try XCTUnwrap(file["path"] as? String)
+        let sourceTree = try XCTUnwrap(file["sourceTree"] as? String)
+        let expected: [String: (String, String)] = [
+            "NotificationService.swift": ("<group>", "NotificationService/NotificationService.swift"),
+            "Sources/BotvilleCore/SharedPushCredentials.swift": ("SOURCE_ROOT", "Sources/BotvilleCore/SharedPushCredentials.swift"),
+            "Sources/BotvilleCore/PushNotificationContent.swift": ("SOURCE_ROOT", "Sources/BotvilleCore/PushNotificationContent.swift")
+        ]
+        let value = try XCTUnwrap(expected[path], "Unexpected NSE source")
+        XCTAssertEqual(sourceTree, value.0, "NSE source must use its approved source tree")
+        if sourceTree == "<group>" {
+            let containingGroup = try XCTUnwrap(objects.values.compactMap { $0 as? [String: Any] }.first { ($0["children"] as? [String] ?? []).contains(fileRefID) })
+            XCTAssertEqual(containingGroup["path"] as? String, "NotificationService")
+        }
+        return root.appendingPathComponent(value.1)
     }
     private func swiftSources(in directory: URL) throws -> [URL] {
         let enumerator = try XCTUnwrap(FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil))
