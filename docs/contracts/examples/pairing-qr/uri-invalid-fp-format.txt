@@ -1,0 +1,1 @@
+botville://pair?v=1&hs=https://hs.example.org&gw=https://gw.example.org&fp=ExampleSpkiSha256DigestForPairingQrContracA&code=QRPAIREXAMPLECODE0000000000000000000000000A&exp=1791000000
