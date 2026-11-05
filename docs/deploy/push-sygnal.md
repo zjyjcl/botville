@@ -192,9 +192,9 @@ App（iOS 客户端）向 homeserver 注册 pusher 时需要的四个关键值�
 | 参数 | 值 | 说明 |
 |---|---|---|
 | `app_id` | `org.botville.mock`（联调）或 `<APNS_APP_ID>`（真实） | 必须与 sygnal.yaml `apps:` 下的键一致；不一致时 sygnal 按规范把 pushkey 放进 `rejected`，homeserver 会丢弃该 pusher |
-| `pushkey` | APNs device token（hex 字符串） | 系统注册远程通知回调里拿到的 `deviceToken` 转 hex；一个设备一个 token，可能失效（App 重装/系统重置），失效后由 `rejected` 机制回收 |
+| `pushkey` | APNs device token 的标准 Base64 字符串（保留 `=` 填充） | 系统注册远程通知回调里拿到的 `deviceToken` 用 `Data.base64EncodedString()` 编码；一个设备一个 token，可能失效（App 重装/系统重置），失效后由 `rejected` 机制回收 |
 | `data.url` | `http://sygnal:5000/_matrix/push/v1/notify` | homeserver 回调网关的地址，唯一要求是**homeserver 容器可达**（App 自身不访问它）。本仓库默认（`BOTVILLE_PUSH_PUBLIC=false`，#128 决策）用 compose 内网地址 `http://sygnal:5000/_matrix/push/v1/notify`（即 CI 里的值，放行面见 §10）；仅当 `BOTVILLE_PUSH_PUBLIC=true` 开了公网反代才用 `https://<push-domain>/_matrix/push/v1/notify` |
-| `data.format` | `event_id_only`（**硬前置**） | 本仓库推送链路的隐私前提，不是可选建议：注册 pusher **必须**带 `data.format=event_id_only`，否则通知正文会经网关明文流转（§8）。注意 App 仓现状：`PushPusherData`（`app-apple/Sources/BotvilleCore/PushRegistrar.swift`）**尚缺 `format` 字段**，且 App 侧的推送注册目前是 C2.1 的 Noop（尚未实现，需 C 线补齐）——在此之前不要按该模型注册 pusher，联调用 `server/tests/push_e2e.py` 的做法 |
+| `data.format` | `event_id_only`（**硬前置**） | 本仓库推送链路的隐私前提，不是可选建议：注册 pusher **必须**带 `data.format=event_id_only`，否则通知正文会经网关明文流转（§8）。`PushPusherData`（`app-apple/Sources/BotvilleCore/PushRegistrar.swift`）已包含 `format` 字段，类型为 `PushPusherDataFormat`，默认 `.eventIDOnly`（编码为 `event_id_only`）；DEBUG iOS App 已支持实际注册 pusher，入口与限制见 `app-apple/docs/push-device.md` |
 
 注册示例（标准 `POST /_matrix/client/v3/pushers/set`，即
 `server/tests/push_e2e.py` 里的做法）：
@@ -202,7 +202,7 @@ App（iOS 客户端）向 homeserver 注册 pusher 时需要的四个关键值�
 ```json
 {
   "app_id": "<bundle-id>.apns",
-  "pushkey": "<APNs device token hex>",
+  "pushkey": "<APNs device token standard Base64 with = padding>",
   "kind": "http",
   "app_display_name": "Botville",
   "device_display_name": "iPhone",
@@ -265,16 +265,17 @@ make up HS=continuwuity PUSH=1 && make push-e2e
 前置：Apple 开发者账号、按 §3 放好 .p8 并启用、真机装了带推送 entitlement
 的 debug 构建、`APNS_PLATFORM` 与构建类型匹配。
 
-**App 端现状（截至 A1.2）**：App 侧的推送注册是 C2.1 的 Noop（尚未实现，
-需 C 线补齐），且 `PushPusherData`（`app-apple/Sources/BotvilleCore/
-PushRegistrar.swift`）还缺 `data.format` 字段。真机手工验证时可临时用
-脚本/其他客户端按 §5 的示例注册（务必带 `format=event_id_only`）；C 线补齐
-App 注册前，本节的真机时延无法从 App 自身发起。
+**App 端现状**：DEBUG iOS App 已支持 APNs 注册、Matrix HTTP pusher 注册及
+推送诊断，操作步骤与限制见 `app-apple/docs/push-device.md`。
+`PushPusherData`（`app-apple/Sources/BotvilleCore/PushRegistrar.swift`）已包含
+`format` 字段，默认编码为 `event_id_only`。也可用脚本/其他客户端按 §5
+的示例注册（务必带 `format=event_id_only`）；真实送达与时延仍待真机验证。
 
 1. `make up PUSH=1`，确认 `grep 'type: apns' server/compose/generated/sygnal/sygnal.yaml`
    有输出，`docker compose ... --profile push ps` 里 sygnal 为 running；
 2. 真机 App 登录任一账号（bob），允许通知，注册 pusher（`app_id=<APNS_APP_ID>`，
-   `pushkey=deviceToken hex`，`data.url` 按 §5 表取值（默认内网
+   `pushkey=deviceToken.base64EncodedString()`（标准 Base64，保留 `=` 填充），
+   `data.url` 按 §5 表取值（默认内网
    `http://sygnal:5000/...`，公网模式用 `https://<push-domain>/...`），
    `format=event_id_only`）；
 3. 保持 App **在后台/锁屏**（前台时 iOS 默认不展示横幅，容易误判「收不到」）；
@@ -513,9 +514,10 @@ make push-e2e
 make logs PUSH=1
 ```
 
-**真机验收**（sygnal → APNs → 真机横幅 < 5s）需要 C 线提供 APNs device token
-（App 端 pusher 注册目前是 C2.1 的 Noop，见 §5/§7 的现状说明）：拿到 token 后按
-§7 手工注册 pusher（务必 `data.format=event_id_only`、`app_id=<bundle-id>.apns`、
+**真机验收**（sygnal → APNs → 真机横幅 < 5s）可通过 DEBUG iOS App 的推送诊断
+注册 pusher（见 `app-apple/docs/push-device.md`），也可按 §7 手工注册
+（务必使用标准 Base64 APNs token，保留 `=` 填充，并设置
+`data.format=event_id_only`、`app_id=<bundle-id>.apns`、
 `data.url` 按 §5 表取值——默认内网 `http://sygnal:5000/_matrix/push/v1/notify`，
 公网模式 `https://<BOTVILLE_PUSH_DOMAIN>/_matrix/push/v1/notify`）掐表验收并回填。
 

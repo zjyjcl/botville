@@ -15,7 +15,7 @@
 
 notify URL 必须无凭据、无 query/fragment，路径严格为 `/_matrix/push/v1/notify`。默认/Release 策略仅允许 HTTPS；DEBUG 显式允许 HTTP。该地址供 **homeserver 访问 Sygnal**，因此 Compose 内部服务名可作 notify URL；iPhone 本身不必能解析该名称。App 不直接向 Sygnal 上传 token。
 
-`pushkey` 是 APNs device token 的 Foundation 标准 Base64 编码（`Data.base64EncodedString()`，保留 `=` 填充），与 Element iOS 和 Sygnal 的默认约定一致。不得同时注册 hex 与 Base64 两种形式。此次编码变更合入后，真机必须通过 `pushers/set` 重新注册；已有小写 hex pusher 需先删除再以 Base64 重新注册。
+`pushkey` 是 APNs device token 的 Foundation 标准 Base64 编码（`Data.base64EncodedString()`，保留 `=` 填充），与 Element iOS 和 Sygnal 的默认约定一致。不得同时注册 hex 与 Base64 两种形式。此次编码变更合入后，真机必须通过 `pushers/set` 重新注册；已有小写 hex pusher 需先删除再以 Base64 重新注册。App 升级后内存中已不知道旧 hex pushkey，不会自动删除旧 hex pusher；需由服务端/管理侧手工删除，或待 homeserver 在 Sygnal 返回 `rejected` 后自动丢弃。
 
 DEBUG 登录页保留手动 homeserver 输入及局域网 HTTP 开关。开关仅允许本地/私有地址、`.local` 名称和 Compose 单标签主机名；含字母的单标签主机名可能经设备的 DNS search domain 解析，不能保证仍在局域网内，因此只能在 DEBUG 显式开启后使用。iPhone 连接 homeserver 时仍需使用手机可解析、可到达的地址。Release 不编译手动输入视图，初次使用扫码配对；已有账号软退出时可对固定的已保存服务器/账号重新输入密码。
 
