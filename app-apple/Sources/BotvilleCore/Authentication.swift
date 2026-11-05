@@ -3,9 +3,11 @@
 
 import Foundation
 import MatrixRustSDK
+import Network
 
-/// A homeserver origin policy. Production clients require HTTPS; the local HTTP
-/// escape hatch is deliberately explicit and accepts loopback hosts only.
+/// A homeserver origin policy. Production clients require HTTPS. The explicit
+/// development HTTP escape hatch is limited to names and addresses that are
+/// meaningful on a local network or a compose-style private network.
 public struct HomeserverPolicy: Sendable {
     public let allowLocalHTTP: Bool
 
@@ -20,10 +22,79 @@ public struct HomeserverPolicy: Sendable {
               let scheme = components.scheme?.lowercased(),
               let host = components.host?.lowercased(),
               components.query == nil, components.fragment == nil,
-              scheme == "https" || (allowLocalHTTP && scheme == "http" && (host == "localhost" || host == "127.0.0.1")) else {
+              scheme == "https" || (allowLocalHTTP && scheme == "http" && Self.isLocalNetworkHost(host)) else {
             throw AuthenticationError.invalidHomeserver
         }
         return url
+    }
+
+    /// Keep the development exception narrow. In particular, a dotted public
+    /// DNS name cannot quietly become a cleartext homeserver just because a
+    /// Debug caller supplied `allowLocalHTTP`.
+    private static func isLocalNetworkHost(_ host: String) -> Bool {
+        if host == "localhost" { return true }
+        if isPrivateIPv4(host) || isLocalIPv6(host) { return true }
+
+        if host.hasSuffix(".local") && isWellFormedDNSHost(host) { return true }
+
+        // Docker Compose service names are deliberately single-label. These
+        // names can resolve through a device DNS search domain and therefore
+        // are not guaranteed to remain on the local network; this DEBUG-only
+        // exception requires explicit opt-in. Reject labels containing URL
+        // delimiters and labels with a public DNS suffix.
+        return isWellFormedDNSLabel(host)
+            && !host.lowercased().hasPrefix("0x")
+            && host.unicodeScalars.contains(where: isASCIIAlpha)
+    }
+
+    private static func isPrivateIPv4(_ host: String) -> Bool {
+        guard let address = IPv4Address(host),
+              String(describing: address) == host,
+              let raw = IPv4Address(host)?.rawValue,
+              raw.count == 4 else { return false }
+        switch (raw[0], raw[1]) {
+        case (10, _), (127, _), (169, 254), (192, 168), (172, 16...31):
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func isLocalIPv6(_ host: String) -> Bool {
+        let literal: String
+        if host.hasPrefix("[") && host.hasSuffix("]") {
+            literal = String(host.dropFirst().dropLast())
+        } else {
+            literal = host
+        }
+        guard let raw = IPv6Address(literal)?.rawValue, raw.count == 16 else { return false }
+        let loopback = raw.dropLast().allSatisfy { $0 == 0 } && raw.last == 1
+        let linkLocal = raw[0] == 0xfe && (raw[1] & 0xc0) == 0x80 // fe80::/10
+        let uniqueLocal = (raw[0] & 0xfe) == 0xfc // fc00::/7
+        return loopback || linkLocal || uniqueLocal
+    }
+
+    private static func isWellFormedDNSHost(_ host: String) -> Bool {
+        let labels = host.split(separator: ".", omittingEmptySubsequences: false)
+        return labels.count > 1 && labels.allSatisfy { isWellFormedDNSLabel(String($0)) }
+    }
+
+    private static func isWellFormedDNSLabel(_ label: String) -> Bool {
+        guard (1...63).contains(label.utf8.count),
+              let first = label.unicodeScalars.first,
+              let last = label.unicodeScalars.last,
+              isASCIIAlphaNumeric(first), isASCIIAlphaNumeric(last) else { return false }
+        return label.unicodeScalars.allSatisfy {
+            isASCIIAlphaNumeric($0) || $0 == "-"
+        }
+    }
+
+    private static func isASCIIAlpha(_ scalar: Unicode.Scalar) -> Bool {
+        (65...90).contains(scalar.value) || (97...122).contains(scalar.value)
+    }
+
+    private static func isASCIIAlphaNumeric(_ scalar: Unicode.Scalar) -> Bool {
+        isASCIIAlpha(scalar) || (48...57).contains(scalar.value)
     }
 }
 
@@ -125,7 +196,7 @@ public enum AuthenticationError: LocalizedError, Equatable, Sendable {
 
     public var errorDescription: String? {
         switch self {
-        case .invalidHomeserver: return "请输入完整的 HTTPS homeserver 地址；开发 HTTP 仅允许 localhost 或 127.0.0.1。"
+        case .invalidHomeserver: return "请输入完整的 HTTPS homeserver 地址；开发 HTTP 仅允许局域网或 compose 本地地址。"
         case .discoveryFailed: return "服务器能力探测失败，请确认这是兼容的 Matrix homeserver。"
         case .networkFailure: return "无法连接服务器，请检查网络后重试。"
         case .invalidCredentials: return "用户名或密码错误。"

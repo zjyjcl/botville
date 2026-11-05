@@ -20,7 +20,7 @@ swift run BotvilleApp
 
 填写完整 homeserver URL、用户名（或 `@user:server`）和密码。客户端先探测 `/_matrix/client/versions` 和 `/_matrix/client/v3/login` 的密码流；可区分发现失败、网络故障、密码错误和不支持的登录方式。SSO/OIDC 不在本轮范围内。遇到 429 / `M_LIMIT_EXCEEDED` 会显示 `Retry-After`（秒或 HTTP 日期）或 `retry_after_ms` 的等待时长；未提供时长时提示稍后重试并间隔 5 秒重试。等待期间可以取消。登录和恢复共用默认 60 秒的整体超时（可通过 `MatrixService(authenticationTimeout:)` 配置），覆盖探测、请求、SDK 初始化和恢复；超时返回可读错误。
 
-生产默认只接受 HTTPS homeserver。开发时可在 DEBUG 中显式开启本地 HTTP，且仅允许 `http://localhost` 或 `http://127.0.0.1`；默认关闭；Release 核心登录/恢复路径均忽略已保存的开发 HTTP 开关并拒绝非 HTTPS 会话。仅 Debug 的 `Info-Debug.plist` 声明 `NSAllowsLocalNetworking`；Release 的 `Info.plist` 没有 ATS 例外。具体策略及平台验证边界见[安全加固说明](docs/security-hardening.md)。URL 不接受账号密码、查询参数、片段或无效端口，且登录探测重定向必须保持同一 origin。
+生产默认只接受 HTTPS homeserver。开发时可在 DEBUG 中显式开启 HTTP，默认关闭；显式开启后仅允许 `localhost`、规范的 `.local` 名称、带字母的 Compose 单标签名称，以及私网、loopback 或 link-local 地址。Release 核心登录/恢复路径均忽略已保存的开发 HTTP 开关并拒绝非 HTTPS 会话。仅 Debug 的 `Info-Debug.plist` 声明 `NSAllowsLocalNetworking`；Release 的 `Info.plist` 没有 ATS 例外。具体策略及平台验证边界见[安全加固说明](docs/security-hardening.md)。URL 不接受账号密码、查询参数、片段或无效端口，且登录探测重定向必须保持同一 origin。
 
 ### iOS 模拟器
 
@@ -33,10 +33,10 @@ xcodebuild -project Botville.xcodeproj \
   -scheme BotvilleApp-iOS -configuration Debug \
   -destination 'generic/platform=iOS Simulator' \
   -derivedDataPath .build/xcode \
-  -sdk iphonesimulator CODE_SIGN_IDENTITY="-" CODE_SIGNING_ALLOWED=YES build
+  -sdk iphonesimulator CODE_SIGN_IDENTITY="-" build
 ```
 
-也可用 Xcode 打开 `Botville.xcodeproj`，选择 `BotvilleApp-iOS` 和一个已安装的 iPhone 模拟器，点击 Run。Debug 目标仅对 Simulator SDK 默认启用 ad-hoc 签名（`CODE_SIGN_IDENTITY="-"`），不需要 Apple 账号或开发证书。不要传 `CODE_SIGNING_ALLOWED=NO`：这会丢失 Keychain 所需的应用标识 entitlement，导致新安装后 `SecItemCopyMatching` 返回 `errSecMissingEntitlement (-34018)`。真机及 Release 的签名设置不受本修复影响。真机安装、分发和 TestFlight 不在本次范围内。
+也可用 Xcode 打开 `Botville.xcodeproj`，选择 `BotvilleApp-iOS` 和一个已安装的 iPhone 模拟器，点击 Run。App target 的 Debug 与 Release 都使用 Automatic signing，开发团队为 `3Z8WP6U6F7`。两种配置均以 `CODE_SIGN_IDENTITY[sdk=iphonesimulator*]="-"` 保留模拟器默认 ad-hoc 签名；命令行仍可用 `CODE_SIGN_IDENTITY="-"` 覆盖。不要传 `CODE_SIGNING_ALLOWED=NO`：这会丢失 Keychain 所需的应用标识 entitlement，导致新安装后 `SecItemCopyMatching` 返回 `errSecMissingEntitlement (-34018)`。Debug 才挂 development 推送 entitlement；仓库没有加入证书、描述文件或 provisioning profile。
 
 Keychain 诊断只记录 Security 操作名和数值 OSStatus，不记录查询、账号、令牌、密码或会话数据。用目标模拟器的 UDID 替换下方 `<UDID>`：
 
@@ -69,7 +69,7 @@ CFFIXED_USER_HOME="$PWD/.build/xcode-home" \
   -derivedDataPath .build/xcode -clonedSourcePackagesDirPath .build \
   -packageCachePath .build/cache -disablePackageRepositoryCache \
   -IDEPackageSupportDisableManifestSandbox=YES \
-  -sdk iphonesimulator CODE_SIGN_IDENTITY="-" CODE_SIGNING_ALLOWED=YES \
+  -sdk iphonesimulator CODE_SIGN_IDENTITY="-" \
   'OTHER_SWIFT_FLAGS=$(inherited) -disable-sandbox' build
 ```
 
@@ -99,7 +99,7 @@ Tests/BotvilleCoreTests/       认证、会话、发送和重连的单元测试
 - 房间列表同时展示 joined 与邀请，按最新活动排序。DM/群区分使用 SDK 的 `Room.isDirect()`（`m.direct` 语义），加入/邀请分别按 membership 展示，不以显示名猜测；未读数优先使用 SDK 给出的计数。
 - 文本消息区分排队、已发送、可恢复失败的发送暂停和不可恢复失败的发送暂停，详细操作边界见下方“发送语义”。
 - `/sync` 失败按有限退避重连，网络恢复和 App 回前台会触发补拉；界面显示离线或重连状态。
-- 推送只定义 `PushRegistrar`、pusher 注册参数模型和 `NoopPushRegistrar`；pusher URL 在构造与解码时只接受无凭据、含 host 的 HTTPS 地址。按 A 线 A1.2（#96）要求，注册默认携带 `data.format=event_id_only`，推送载荷不带消息内容；解码缺省或 null 时使用该默认值，未知格式拒绝解码。没有添加 Push entitlement、证书或真机注册；真实 APNs/Sygnal 接入依赖 A1.2。
+- DEBUG 包含 APNs token 回调、权限申请、Matrix HTTP pusher 注册和诊断页。`Info-Debug.plist` 提供 Compose 内网默认地址 `http://sygnal:5000/_matrix/push/v1/notify`，诊断页可修改覆盖；DEBUG 诊断流程允许该 HTTP 地址，Release 只接受 HTTPS。pusher 注册默认携带 `data.format=event_id_only`，推送载荷不带消息内容；development 推送 entitlement 只在 Debug 配置。真实 Sygnal/APNs 投递仍需对 Mac mini 连接的 iPhone 15 完成联调，详见 [DEBUG 真机推送](docs/push-device.md)。
 
 ## 加密策略（C2.6）
 
@@ -178,7 +178,7 @@ env \
 
 ## 未完成项
 
-- A1.2 完成后接入 Sygnal + APNs，并在真机验证权限、前后台/终止态、深链和换 token；本轮只交付接口与 Noop 实现。
+- Sygnal + APNs 的真实送达验收：当前已实现 APNs token 与 Matrix pusher 注册，仍需在真机验证权限、前后台/终止态、深链和换 token。
 - 非本地 homeserver、macOS UI、iOS 模拟器 UI、真机和进程重启/真实 Keychain 的端到端验收。
 - E2EE 设备验证、密钥备份/恢复和旧加密历史恢复；SSO/OIDC、多账号和设备会话管理。
 - 媒体、搜索、按房间 ID/别名主动加入、已读回执，以及 C11 规定的互操作与性能测量；C2.6 仅新增 MXID 建房和邀请入口。

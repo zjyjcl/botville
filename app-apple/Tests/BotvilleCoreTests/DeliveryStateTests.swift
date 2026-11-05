@@ -76,7 +76,7 @@ final class DeliveryStateTests: XCTestCase {
             appID: "com.zjyjcl.botville.apns",
             pushKey: "test-key",
             appDisplayName: "botville",
-            data: try PushPusherData(url: XCTUnwrap(URL(string: "https://push.example.org/notify")))
+            data: try PushPusherData(url: XCTUnwrap(URL(string: "https://push.example.org/_matrix/push/v1/notify")))
         )
         let registrar = NoopPushRegistrar()
         try await registrar.register(registration)

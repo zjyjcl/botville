@@ -13,6 +13,12 @@ import AppKit
 @MainActor
 struct BotvilleApp: App {
     @StateObject private var matrixService = MatrixService()
+#if DEBUG
+    @StateObject private var pushDevice = PushDeviceController.shared
+#if os(iOS)
+    @UIApplicationDelegateAdaptor(PushApplicationDelegate.self) private var pushDelegate
+#endif
+#endif
     @State private var selectedTab = Self.initialTab
     @State private var debugPairingPresented = Self.opensPairConfirm
 
@@ -70,10 +76,18 @@ struct BotvilleApp: App {
                     .tabItem { Label("动态", systemImage: "square.grid.2x2") }
                     .tag(1)
             }
+#if DEBUG
+            PushProfileView(service: matrixService, device: pushDevice)
+                .tabItem { Label("我", systemImage: "person.crop.circle") }
+                .tag(2)
+#endif
         }
         .onChange(of: showsGatewayFeatures) { _, visible in
-            if !visible { selectedTab = 0 }
+            if !visible && selectedTab == 1 { selectedTab = 0 }
         }
+#if DEBUG
+        .task { await pushDevice.prepare(service: matrixService) }
+#endif
     }
 
     private var showsGatewayFeatures: Bool {

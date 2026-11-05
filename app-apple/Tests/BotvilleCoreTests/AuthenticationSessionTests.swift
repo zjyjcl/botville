@@ -3,6 +3,7 @@
 
 @testable import BotvilleCore
 import MatrixRustSDK
+import Network
 import XCTest
 
 final class AuthenticationSessionTests: XCTestCase {
@@ -12,13 +13,18 @@ final class AuthenticationSessionTests: XCTestCase {
         super.tearDown()
     }
 
-    func testHomeserverPolicyRequiresHTTPSExceptExplicitLoopbackDevelopment() throws {
+    func testHomeserverPolicyRequiresHTTPSExceptExplicitLocalDevelopment() throws {
         XCTAssertEqual(try HomeserverPolicy().validatedURL(" https://matrix.example.org/base ").absoluteString, "https://matrix.example.org/base")
         XCTAssertThrowsError(try HomeserverPolicy().validatedURL("http://127.0.0.1:8008"))
         let development = HomeserverPolicy(allowLocalHTTP: true)
         XCTAssertEqual(try development.validatedURL("http://localhost:8008").host, "localhost")
-        for unsafe in ["http://example.test", "http://[::1]", "http://user:pass@localhost", "http://localhost?token=x", "http://localhost#x", "http://localhost:0", "http://localhost:65536"] {
-            XCTAssertThrowsError(try development.validatedURL(unsafe))
+        XCTAssertEqual(try development.validatedURL("http://matrix.local:8008").host, "matrix.local")
+        XCTAssertEqual(try development.validatedURL("http://synapse:8008").host, "synapse")
+        XCTAssertEqual(try development.validatedURL("http://[::1]:8008").host, "::1")
+        let privateAddress = try XCTUnwrap(IPv4Address(Data([10, 0, 0, 1])))
+        XCTAssertEqual(try development.validatedURL("http://\(privateAddress):8008").host, String(describing: privateAddress))
+        for unsafe in ["http://example.test", "http://fcorp.example.invalid", "http://fdb.example.invalid", "http://134744072", "http://0x08080808", "http://010.000.000.001", "http://user:pass@localhost", "http://localhost?token=x", "http://localhost#x", "http://localhost:0", "http://localhost:65536"] {
+            XCTAssertThrowsError(try development.validatedURL(unsafe), "Expected local HTTP policy to reject \(unsafe)")
         }
     }
 
