@@ -1,9 +1,13 @@
 # APNs app appended by server/scripts/init.sh to generated/sygnal/sygnal.yaml
-# when BOTVILLE_APNS_ENABLED=true (A1.2). Values come from server/compose/.env:
-# APNS_APP_ID/APNS_KEY_ID/APNS_TEAM_ID/APNS_TOPIC/APNS_PLATFORM. init.sh only
-# renders this block when every value is real (not left as a placeholder) and
-# server/compose/secrets/apns.p8 exists — no fabricated APNs values ever get
-# rendered. keyfile points at the read-only ./secrets bind mount.
+# when BOTVILLE_APNS_ENABLED=true (A1.2 / issue #4 single-app plan). Values
+# come from server/compose/.env: APNS_APP_ID/APNS_KEY_ID/APNS_TEAM_ID/
+# APNS_TOPIC/APNS_PLATFORM. init.sh only renders this block when every
+# prerequisite is real (BOTVILLE_APNS_BUNDLE_ID reverse-domain, Key/Team IDs
+# 10 uppercase alphanumerics, platform sandbox|production, and a non-empty
+# secrets/apns.p8 with mode 600/400) — APNS_TOPIC defaults to the bundle id
+# and APNS_APP_ID to the bundle id with .apns appended. No fabricated APNs
+# values ever get rendered. keyfile points at the read-only single-file
+# /secrets/apns.p8 bind mount.
   "${APNS_APP_ID}":
     type: apns
     keyfile: /secrets/apns.p8

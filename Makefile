@@ -2,7 +2,10 @@
 #
 #   make up              # core one-button start (synapse + postgres)
 #   make up HS=tuwunel   # same for tuwunel / continuwuity
-#   make up PUSH=1       # also start the sygnal push gateway (A1.2), any HS
+#   make up PUSH=1       # also start the sygnal push gateway (A1.2), any HS;
+#                        # force-recreates ONLY sygnal so freshly rendered
+#                        # APNs config (APNS_PLATFORM / BOTVILLE_APNS_ENABLED /
+#                        # ...) is picked up by the running gateway (PR #127 B1)
 #   make smoke           # run server/tests/smoke.py against the running stack
 #   make backup          # dump synapse DB + data volume into ./backups/<ts>/ (A1.1)
 #   make restore RESTORE_DIR=backups/<ts>   # destructive restore of a backup (A1.1)
@@ -54,6 +57,12 @@ endif
 # network would otherwise linger; idempotent when push was never started —
 # PUSH=0 does not opt out of `down`). Loopback port mirrors
 # BOTVILLE_PUSH_PORT; homeservers reach sygnal in-network at sygnal:5000.
+# `up` with PUSH=1 additionally force-recreates ONLY the sygnal container
+# after `up -d` (PR #127 B1): the APNs-related .env keys are consumed by
+# init.sh when RENDERING the bind-mounted generated/sygnal/sygnal.yaml, not
+# by compose interpolation — the service config hash never changes, `up -d`
+# alone leaves the old container running, and sygnal parses its config only
+# at startup. Without PUSH, `up` never touches sygnal.
 PUSH ?=
 PUSH_PROFILE := $(if $(filter 1 true yes,$(PUSH)),--profile push,)
 PUSH_PORT ?= $(shell sed -n 's/^BOTVILLE_PUSH_PORT=//p' $(ENV_FILE) 2>/dev/null | tail -n 1)
@@ -73,12 +82,22 @@ init:
 
 # Core one-button startup: bootstrap .env + rendered synapse config, then
 # start the selected homeserver profile detached (plus the push gateway with
-# PUSH=1). continuwuity additionally registers its first-boot admin account
-# (one-time token from the container logs; see
+# PUSH=1). PUSH=1 additionally force-recreates ONLY the sygnal container
+# after `up -d` (PR #127 B1): APNs-related .env keys (APNS_PLATFORM,
+# BOTVILLE_APNS_ENABLED, ...) only change init.sh's rendering of the
+# bind-mounted generated/sygnal/sygnal.yaml — compose interpolation never
+# sees them, so `up -d` alone leaves the old container (and its
+# startup-parsed config) running. --force-recreate --no-deps reloads the
+# config without touching the homeserver/postgres. Without PUSH, up never
+# touches sygnal. continuwuity additionally registers its first-boot admin
+# account (one-time token from the container logs; see
 # server/scripts/bootstrap-continuwuity.sh).
 up:
 	bash server/scripts/init.sh
 	$(COMPOSE) --profile $(HS) $(PUSH_PROFILE) up -d
+ifneq ($(PUSH_PROFILE),)
+	$(COMPOSE) --profile $(HS) --profile push up -d --force-recreate --no-deps sygnal
+endif
 ifeq ($(HS),continuwuity)
 	COMPOSE='$(COMPOSE)' bash server/scripts/bootstrap-continuwuity.sh
 endif

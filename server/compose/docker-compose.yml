@@ -156,10 +156,20 @@ services:
         # by init.sh — the image runs as root) rather than a named volume so
         # the file stays readable from the host.
       - ./generated/sygnal-data:/data
-      # Real APNs key goes here (secrets/, created 0700 by init.sh; apns.p8
-      # mode 600, gitignored); mounted read-only. With no key, only the mock
-      # app is configured.
-      - ./secrets:/secrets:ro
+      # Real APNs key, mounted as a SINGLE read-only file (not the whole
+      # secrets/ dir, issue #4). create_host_path: false keeps Docker from
+      # silently creating a directory here; init.sh always keeps an empty
+      # placeholder file at secrets/apns.p8 (mode 600) so this mount never
+      # breaks mock-only deployments — the APNs app is only rendered when a
+      # real (non-empty) key is in place, and sygnal then reads exactly
+      # /secrets/apns.p8. gitignored (*.p8 + secrets/); CI guards against
+      # any .p8/private key ever being tracked (scripts/check_no_secrets.sh).
+      - type: bind
+        source: ./secrets/apns.p8
+        target: /secrets/apns.p8
+        read_only: true
+        bind:
+          create_host_path: false
     healthcheck:
       # The image's own HEALTHCHECK shells out to curl, but the runtime image
       # has no curl, so the container would go unhealthy ~70s in; probe

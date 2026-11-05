@@ -28,6 +28,7 @@ Push Gateway `/_matrix/push/v1/notify`）；不引入任何私有 homeserver API
 8. [隐私](#隐私)
 9. [运维与排障](#运维与排障)
 10. [内网推送放行](#内网推送放行botville_docker_subnet-与-botville_sygnal_ip)
+11. [8845 mini PC（Ubuntu Server 24.04）部署](#8845-mini-pcubuntu-server-2404-部署)
 
 ---
 
@@ -60,12 +61,23 @@ APNs ──► iOS 真机横幅
 ## 启动与配置项
 
 ```bash
-make up PUSH=1          # synapse + postgres + sygnal（当前 HS 按 .env）
+make up PUSH=1          # synapse + postgres + sygnal（当前 HS 按 .env）；
+                        # PUSH=1 时每次都会 force-recreate 仅 sygnal，保证
+                        # init.sh 刚渲染的 sygnal.yaml 被运行中的网关重新加载
 make up HS=tuwunel PUSH=1
 make push-e2e           # 时延验收（见 §6）
 make logs PUSH=1        # 跟踪含 sygnal 的日志
 make down               # 停止（总是连带 sygnal 一起停；数据卷保留）
 ```
+
+为什么 `PUSH=1` 的 `up` 要 force-recreate sygnal：`APNS_*` /
+`BOTVILLE_APNS_ENABLED` 等键只被 init.sh 用来**渲染**
+`generated/sygnal/sygnal.yaml`（bind mount 进容器），不参与 compose 插值——
+改值不会改变服务配置哈希，`up -d` 不会重建容器；而 sygnal 只在进程启动时读
+一次配置（无热加载）。所以 `make up PUSH=1` 在 `up -d` 之后用
+`up -d --force-recreate --no-deps sygnal` **只重建 sygnal**（不动
+homeserver/postgres），保证首起、反复 up、改配置后再 up 三种情况网关都用的是
+新配置。不带 `PUSH` 的 `make up` 完全不碰 sygnal。
 
 `server/compose/.env` 中的推送相关键（`server/compose/.env.example` 只有占位符，
 由 `server/scripts/init.sh` 生成/补齐）：
@@ -74,13 +86,16 @@ make down               # 停止（总是连带 sygnal 一起停；数据卷保�
 |---|---|---|
 | `BOTVILLE_PUSH_PORT` | `8019` | sygnal 5000 端口映射到宿主 `127.0.0.1` 的端口，仅供本机手工探测/`push_e2e.py`；homeserver 走 compose 内网 `http://sygnal:5000`，不需要它对外暴露 |
 | `BOTVILLE_SYGNAL_IP` | `172.31.250.2` | sygnal 容器在 compose 网络里的固定 IP（`BOTVILLE_DOCKER_SUBNET` 的 `.2`，须在动态池 `BOTVILLE_DOCKER_IP_RANGE` 之外——池外的固定地址才不会被动态分配抢走）。**整个部署唯一放行的私网地址**：Synapse `ip_range_whitelist` 与 tuwunel/continuwuity 的 denylist 例外都只有这个 /32。必须在子网内且不是网络/网关(`.1`)/广播地址，非法时 init.sh 友好报错退出；**留空 = 完全不放行内网**（denylist 用完整上游默认、Synapse 不写 whitelist），见 §10 |
-| `BOTVILLE_PUSH_MOCK` | `true` | 是否在生成的 sygnal.yaml 里带 `org.botville.mock` 测试 pushkin（`make push-e2e` / CI 依赖）。生产只跑真实 APNs 时设 `false`；它与 APNs app 都关时 sygnal 无任何 app，init.sh 会 WARNING |
-| `BOTVILLE_APNS_ENABLED` | `false` | 真值（`true/1/yes`，大小写不敏感；其他值打 WARNING 并按真处理）时 init.sh 尝试渲染 APNs app（前置条件见 §3） |
-| `APNS_APP_ID` | `org.botville.app.ios` | Sygnal 侧（及 App 端 pusher 的）`app_id`，与 Apple 后台无必然关系，但两端必须一致 |
-| `APNS_TOPIC` | `<bundle-id>` | APNs topic，填 App 的 Bundle ID（如 `org.botville.app.ios`） |
-| `APNS_KEY_ID` | `<key-id>` | Apple 后台 Keys 页的 10 位 Key ID |
-| `APNS_TEAM_ID` | `<team-id>` | Apple 开发者 Team ID（10 位） |
-| `APNS_PLATFORM` | `sandbox` | `sandbox`（开发构建）或 `production`（TestFlight/App Store），见 §4 |
+| `BOTVILLE_PUSH_MOCK` | `true` | 是否在生成的 sygnal.yaml 里带 `org.botville.mock` 测试 pushkin（`make push-e2e` / CI 依赖）。生产只跑真实 APNs 时设 `false`；它与 APNs app 都关时 sygnal 无任何 app，init.sh 会 WARNING——**且 sygnal v0.17 会因 "No app IDs are configured" 拒绝启动并反复重启**（实测），两个开关不要同时关 |
+| `BOTVILLE_APNS_ENABLED` | `false` | 真值（`true/1/yes`，大小写不敏感；其他值打 WARNING 并按真处理）时 init.sh 尝试渲染 APNs app（前置条件见 §3）。**缺项/占位 → WARNING 跳过（mock 照常）；已填但格式非法或 .p8 权限不对 → init.sh 直接报错退出（exit 1）**，报错只写字段名和规则、不回显值 |
+| `BOTVILLE_APNS_BUNDLE_ID` | `<bundle-id>` | iOS Bundle ID（反向域名，即 Xcode 的 `PRODUCT_BUNDLE_IDENTIFIER`）。`APNS_TOPIC` 默认取它，`APNS_APP_ID` 默认推导为 `<bundle-id>.apns`；格式非法时 exit 1 |
+| `APNS_APP_ID` | 由 bundle 推导 | Sygnal 侧（及 App 端 pusher 的）`app_id`。单 app 约定（issue #4 方案 A）：**必须等于 `<bundle-id>.apns`**；留空/占位时 init.sh 推导并写回 `.env`，显式填了但不符则 exit 1 |
+| `APNS_TOPIC` | 由 bundle 推导 | APNs topic = App 的 Bundle ID。留空/占位时 init.sh 取 `BOTVILLE_APNS_BUNDLE_ID` 并写回 `.env`；显式填了但不是反向域名格式则 exit 1 |
+| `APNS_KEY_ID` | `<key-id>` | Apple 后台 Keys 页的 10 位 Key ID（`[A-Z0-9]{10}`，填了但格式不对 exit 1） |
+| `APNS_TEAM_ID` | `<team-id>` | Apple 开发者 Team ID（10 位，同上格式校验） |
+| `APNS_PLATFORM` | `sandbox` | `sandbox`（开发构建）或 `production`（TestFlight/App Store），见 §4；切环境只改这一项后重启（方案 A，单 app） |
+| `BOTVILLE_PUSH_DOMAIN` | `<push-domain>` | 推送公网域名（反代 `push.<domain>` 用）。**仅在 `BOTVILLE_PUSH_PUBLIC=true` 时需要**：App 注册 pusher 的 `data.url` 即 `https://<BOTVILLE_PUSH_DOMAIN>/_matrix/push/v1/notify`；运维参考值，compose 栈本身不消费它（见 §11 反代示例） |
+| `BOTVILLE_PUSH_PUBLIC` | `false` | #128 决策：`push.<domain>` **默认不对公网开放**。`false`（默认）= homeserver → sygnal 走 compose 内网 `http://sygnal:5000`（放行面只有 `BOTVILLE_SYGNAL_IP` 那一个 /32，见 §10），不部署公网反代，App 的 `data.url` 用内网地址（只需 homeserver 容器可达，App 自身不访问它）；`true` 才按 §11 的反代示例把网关暴露到 `BOTVILLE_PUSH_DOMAIN`（仅当 homeserver 无法经内网到达 sygnal 时才需要）。运维开关，compose 栈本身不消费（同 `BOTVILLE_PUSH_DOMAIN`） |
 | `SYGNAL_IMAGE` | pin 值 | 镜像覆盖，规则同其他服务（tag@sha256 digest） |
 
 配置渲染：`server/compose/sygnal/sygnal.yaml.tmpl` →
@@ -116,27 +131,37 @@ apps:
 
    ```bash
    cp /path/to/AuthKey_XXXXXXXXXX.p8 server/compose/secrets/apns.p8
-   chmod 600 server/compose/secrets/apns.p8
+   chmod 600 server/compose/secrets/apns.p8   # 或 400；644 等会被 init.sh 拒绝
    ```
 
-   `.gitignore` 已覆盖 `secrets/` 与 `*.p8`；**任何情况下不要把 .p8 或其内容
-   提交进仓库、贴进 issue/日志**。compose 把 `./secrets` 只读挂载到容器
-   `/secrets`（目录里只应放 apns.p8——挂载对整个目录只读生效）。
+   `.gitignore` 已覆盖 `secrets/` 与 `*.p8`，CI 另有守卫（`server/scripts/
+   check_no_secrets.sh`：任何被跟踪的 `*.p8` 或私钥 PEM 头直接红）；**任何情况下
+   不要把 .p8 或其内容提交进仓库、贴进 issue/日志**。compose 把 **单个文件**
+   `./secrets/apns.p8` 只读挂载到容器 `/secrets/apns.p8`（`create_host_path:
+   false`，不挂整个目录；init.sh 会在没有真实 key 时维护一个 0600 的**空占位
+   文件**，保证不启用 APNs 的部署 `up` 也不受影响——空文件永远不会被当成真 key）。
+   init.sh 对该文件只用 `stat` 检查（存在、普通文件、mode 600/400、非空），
+   **绝不读取/回显其内容**。
 2. 编辑 `server/compose/.env`：
 
    ```bash
    BOTVILLE_APNS_ENABLED=true
-   APNS_APP_ID=org.botville.app.ios      # 与 App 端 pusher app_id 一致
-   APNS_TOPIC=<你的 Bundle ID>
-   APNS_KEY_ID=<10 位 Key ID>
-   APNS_TEAM_ID=<10 位 Team ID>
-   APNS_PLATFORM=sandbox                 # 或 production，见 §4
+   BOTVILLE_APNS_BUNDLE_ID=<你的 iOS Bundle ID>   # 反向域名，如 org.botville.app.ios
+   APNS_KEY_ID=<10 位大写字母数字 Key ID>
+   APNS_TEAM_ID=<10 位大写字母数字 Team ID>
+   APNS_PLATFORM=sandbox                           # 或 production，见 §4
+   # 可留占位（推荐），由 init.sh 从 Bundle ID 推导并写回 .env：
+   #   APNS_TOPIC=<你的 Bundle ID>
+   #   APNS_APP_ID=<你的 Bundle ID>.apns           # 必须恰好是 <bundle-id>.apns
    ```
-3. `make up PUSH=1`（会先跑 init.sh）：init.sh 只有在
-   **`APNS_*` 全为真实值（没有 `<placeholder>`）且 `secrets/apns.p8` 存在**时，
-   才把 APNs app 追加渲染进 `generated/sygnal/sygnal.yaml`（keyfile 固定指向
-   `/secrets/apns.p8`）；否则打印 WARNING 并**跳过 APNs app**（mock pushkin 不受
-   影响）。这是有意设计：占位值渲染出去只会让 sygnal 起不来，还会连累 mock 链路。
+3. `make up PUSH=1`（会先跑 init.sh），校验分两类：
+   - **缺项/占位**（bundle/Key ID/Team ID/platform 为空或 `<...>`、没有真实
+     .p8）：打印 WARNING 并**跳过 APNs app**（mock pushkin 不受影响）。这是有意
+     设计：占位值渲染出去只会让 sygnal 起不来，还会连累 mock 链路。
+   - **已填但非法**（Key/Team ID 不是 10 位大写字母数字、bundle/topic 不是反向
+     域名、`APNS_APP_ID` 不等于 `<bundle-id>.apns`、platform 不是
+     sandbox/production、.p8 权限不是 600/400 或不是普通文件）：**init.sh 直接
+     exit 1**，报错只写字段名和规则、不回显值。成功日志同理不含任何 APNs 值。
 4. 验证渲染结果：
 
    ```bash
@@ -154,8 +179,11 @@ apps:
 - `APNS_PLATFORM=production`：TestFlight / App Store 构建。
 - 两者**互不相通**：sandbox 证书发的推送 production 构建收不到，反之亦然。
   真机联调常见「发了但收不到」就是环境配错。
-- 升级到 production 只需改 `.env` 里 `APNS_PLATFORM=production` 后
-  `make up PUSH=1` 重新渲染。
+- 方案 A（issue #4，已确认）：**单个 APNs app**，切环境只改 `.env` 里
+  `APNS_PLATFORM=production`（或改回 `sandbox`）后 `make up PUSH=1`——它会
+  重跑 init.sh 重新渲染 sygnal.yaml，并 **force-recreate 仅 sygnal**（不动
+  homeserver/postgres），新 platform 随即生效；不做双 app。完整切换/回滚
+  步骤与原因见 §11.8/§11.9。
 
 ## App 端需要的参数
 
@@ -165,7 +193,7 @@ App（iOS 客户端）向 homeserver 注册 pusher 时需要的四个关键值�
 |---|---|---|
 | `app_id` | `org.botville.mock`（联调）或 `<APNS_APP_ID>`（真实） | 必须与 sygnal.yaml `apps:` 下的键一致；不一致时 sygnal 按规范把 pushkey 放进 `rejected`，homeserver 会丢弃该 pusher |
 | `pushkey` | APNs device token（hex 字符串） | 系统注册远程通知回调里拿到的 `deviceToken` 转 hex；一个设备一个 token，可能失效（App 重装/系统重置），失效后由 `rejected` 机制回收 |
-| `data.url` | `https://<push-domain>/_matrix/push/v1/notify` | homeserver 回调网关的地址，必须是**homeserver 容器可达**的公网 https 地址（反代到 sygnal 的 5000；内网部署联调可用 `http://sygnal:5000/_matrix/push/v1/notify`，即 CI 里的值） |
+| `data.url` | `http://sygnal:5000/_matrix/push/v1/notify` | homeserver 回调网关的地址，唯一要求是**homeserver 容器可达**（App 自身不访问它）。本仓库默认（`BOTVILLE_PUSH_PUBLIC=false`，#128 决策）用 compose 内网地址 `http://sygnal:5000/_matrix/push/v1/notify`（即 CI 里的值，放行面见 §10）；仅当 `BOTVILLE_PUSH_PUBLIC=true` 开了公网反代才用 `https://<push-domain>/_matrix/push/v1/notify` |
 | `data.format` | `event_id_only`（**硬前置**） | 本仓库推送链路的隐私前提，不是可选建议：注册 pusher **必须**带 `data.format=event_id_only`，否则通知正文会经网关明文流转（§8）。注意 App 仓现状：`PushPusherData`（`app-apple/Sources/BotvilleCore/PushRegistrar.swift`）**尚缺 `format` 字段**，且 App 侧的推送注册目前是 C2.1 的 Noop（尚未实现，需 C 线补齐）——在此之前不要按该模型注册 pusher，联调用 `server/tests/push_e2e.py` 的做法 |
 
 注册示例（标准 `POST /_matrix/client/v3/pushers/set`，即
@@ -173,22 +201,30 @@ App（iOS 客户端）向 homeserver 注册 pusher 时需要的四个关键值�
 
 ```json
 {
-  "app_id": "org.botville.app.ios",
+  "app_id": "<bundle-id>.apns",
   "pushkey": "<APNs device token hex>",
   "kind": "http",
   "app_display_name": "Botville",
   "device_display_name": "iPhone",
   "lang": "zh-Hans",
   "data": {
-    "url": "https://push.example.invalid/_matrix/push/v1/notify",
+    "url": "http://sygnal:5000/_matrix/push/v1/notify",
     "format": "event_id_only"
   }
 }
 ```
 
-反向代理：把 `push.example.invalid`（示例占位域名）TLS 终止后转发到
-`127.0.0.1:8019`（或直接转发到 compose 内网 `sygnal:5000`）。App 到 APNs 的
-长连接与本仓库无关；这里只需要保证 homeserver → `data.url` 可达。
+（真实模式的 `app_id` 即 `<bundle-id>.apns`——init.sh 推导的 `APNS_APP_ID`，
+单 app 约定见 §2；联调用 `org.botville.mock`。`data.url` 上表两种取值按部署
+模式选。）
+
+反向代理是**可选**的（#128 决策，`BOTVILLE_PUSH_PUBLIC` 默认 `false`）：默认
+不开公网 push 域名，homeserver 走 compose 内网 `http://sygnal:5000`。仅当
+`BOTVILLE_PUSH_PUBLIC=true` 时才把 `BOTVILLE_PUSH_DOMAIN`（如
+`push.example.invalid`，示例占位域名）TLS 终止后转发到
+`127.0.0.1:${BOTVILLE_PUSH_PORT}`（默认 8019）。App 到 APNs 的长连接与本仓库
+无关；这里只需要保证 homeserver → `data.url` 可达。配置示例见 §11（Caddy/
+nginx，均标注「仅当开关打开时」）。
 
 ## 时延验收：mock 链路（已自动化）
 
@@ -238,7 +274,9 @@ App 注册前，本节的真机时延无法从 App 自身发起。
 1. `make up PUSH=1`，确认 `grep 'type: apns' server/compose/generated/sygnal/sygnal.yaml`
    有输出，`docker compose ... --profile push ps` 里 sygnal 为 running；
 2. 真机 App 登录任一账号（bob），允许通知，注册 pusher（`app_id=<APNS_APP_ID>`，
-   `pushkey=deviceToken hex`，`data.url` 指向公网网关地址，`format=event_id_only`）；
+   `pushkey=deviceToken hex`，`data.url` 按 §5 表取值（默认内网
+   `http://sygnal:5000/...`，公网模式用 `https://<push-domain>/...`），
+   `format=event_id_only`）；
 3. 保持 App **在后台/锁屏**（前台时 iOS 默认不展示横幅，容易误判「收不到」）；
 4. 另一账号（alice）给 bob 发一条消息，掐表记录从发送到真机横幅出现的时间；
    目标 < 5s（覆盖 homeserver→sygnal 实测约几十至几百 ms，剩余预算在
@@ -287,9 +325,10 @@ App 注册前，本节的真机时延无法从 App 自身发起。
 - 相关文件索引：`server/compose/sygnal/`（sygnal.yaml.tmpl、mock-app.yaml.part、
   apns-app.yaml.part、botville_mock_pushkin.py）、
   `server/scripts/render_push_denylist.py`（§10 的 denylist 渲染）、
+  `server/scripts/check_no_secrets.sh`（§3 的密钥入库守卫，CI lint 跑）、
   `server/tests/push_e2e.py`、`server/tests/test_push_sygnal.py`、
-  `server/tests/test_push_denylist.py`、Makefile（`PUSH=1` / `push-e2e`）、
-  CI job `push-e2e`。
+  `server/tests/test_push_denylist.py`、`server/tests/test_check_no_secrets.py`、
+  Makefile（`PUSH=1` / `push-e2e`）、CI job `push-e2e` / lint。
 
 ## 内网推送放行（BOTVILLE_DOCKER_SUBNET 与 BOTVILLE_SYGNAL_IP）
 
@@ -321,8 +360,208 @@ App 注册前，本节的真机时延无法从 App 自身发起。
 `BOTVILLE_DOCKER_IP_RANGE` 与 `BOTVILLE_SYGNAL_IP` 相应取各自网段的
 `.64/26` 与 `.2`，否则 compose 建网络时会冲突（init.sh 会指出该改哪个值）。
 
-生产上若 Sygnal 部署在公网 HTTPS 域名后：把 `BOTVILLE_SYGNAL_IP` **留空**即可
+生产上若选择了公网网关模式（`BOTVILLE_PUSH_PUBLIC=true`，见 §2/§11.3——**非默认**，
+#128 决策默认内网直连）：把 `BOTVILLE_SYGNAL_IP` **留空**即可
 关闭内网放行——denylist 用完整上游默认、Synapse 不写 `ip_range_whitelist`，
 pusher 的 `data.url` 用公网地址。（留空时 compose 仍按其 `ipv4_address` 的回退
 默认 `.250.2` 赋地址，故仅默认网段下可直接起 push profile；自定义网段又留空的
 组合，init.sh 会 WARNING 提示。）
+
+---
+
+## 8845 mini PC（Ubuntu Server 24.04）部署
+
+Botville 的参考生产宿主是一台 8845 mini PC（Ubuntu Server 24.04）。本节是该机器上
+启用真实 APNs 推送的完整 runbook（通用原理见前文各节；尚未在真机执行过，执行后回填）。
+
+### 1. 首次初始化，然后放置 APNs 密钥（.p8）
+
+顺序很重要：**先初始化、后放密钥**。全新 checkout 上 `server/compose/.env`、
+`server/compose/secrets/` 都还不存在，先跑一次 `make up`（或 `make init`）让
+init.sh 生成 `.env`（`<change-me>` 自动随机化）、创建 `secrets/`（0700）与其中
+0600 的**空占位** `apns.p8`（compose 的单文件挂载依赖它存在；空文件永远不会被
+当成真 key），**然后**再放入真实密钥：
+
+```bash
+cd /path/to/botville
+make up                                   # 首次初始化（不带 PUSH 也可以）
+cp /path/to/AuthKey_XXXXXXXXXX.p8 server/compose/secrets/apns.p8
+chmod 600 server/compose/secrets/apns.p8  # 或 400；644 等会被 init.sh exit 1 拒绝
+```
+
+（目录已是 0700；若手动重建，`chmod 700 server/compose/secrets`。）
+
+init.sh 只用 `stat` 检查该文件（普通文件、mode 600/400、非空），**绝不读取或回显
+内容**。`.gitignore` 忽略 `*.p8` 与 `secrets/`，CI 另有
+`server/scripts/check_no_secrets.sh` 守卫（任何被跟踪的 .p8 / 私钥 PEM 头直接红）。
+
+### 2. 填写 server/compose/.env（占位说明）
+
+`.env` 已在步骤 1 生成。APNs 相关键按 §3 填：
+
+```bash
+BOTVILLE_APNS_ENABLED=true
+BOTVILLE_APNS_BUNDLE_ID=<你的 iOS Bundle ID>     # 反向域名；唯一必须手填的 APNs 标识
+APNS_KEY_ID=<10 位大写字母数字>                   # Apple 后台 Keys 页
+APNS_TEAM_ID=<10 位大写字母数字>                  # Apple 开发者 Team ID
+APNS_PLATFORM=sandbox                            # 开发构建先 sandbox，见下
+# push 域名默认不对公网开放（#128 决策）：homeserver 走 compose 内网
+# http://sygnal:5000，以下两项保持默认即可；确需公网网关才改
+# BOTVILLE_PUSH_PUBLIC=true 并填真实域名（见「3. 反向代理」）。
+BOTVILLE_PUSH_PUBLIC=false
+BOTVILLE_PUSH_DOMAIN=<push-domain>               # 仅 BOTVILLE_PUSH_PUBLIC=true 时需要
+# APNS_TOPIC / APNS_APP_ID 留占位即可：init.sh 推导为 <bundle-id> / <bundle-id>.apns
+# 并写回 .env；显式填写的值必须符合该规则，否则 exit 1。
+```
+
+注意 `.env` 里**只应有占位符和你的真实部署值**；任何示例文件（.env.example）都不
+允许出现真实 Key ID / Team ID / Bundle ID。
+
+### 3. 反向代理 push.<domain>（可选：仅当 BOTVILLE_PUSH_PUBLIC=true）
+
+**默认不开公网**（#128 决策，`BOTVILLE_PUSH_PUBLIC=false`）：`push.<domain>` 不对
+外暴露，homeserver → sygnal 走 compose 内网 `http://sygnal:5000`（sygnal 容器的
+固定 IP `BOTVILLE_SYGNAL_IP` 是部署唯一放行的私网 /32，见 §10）；App 注册 pusher
+的 `data.url` 也用该内网地址（只需要 homeserver 容器可达，App 自身不访问它）。
+
+仅当 homeserver 无法经 compose 内网到达 sygnal（如两者不同机）时，才把 `.env` 里
+`BOTVILLE_PUSH_PUBLIC=true`，并按下例反代（sygnal 的宿主端口本就只绑
+`127.0.0.1`，默认 `BOTVILLE_PUSH_PORT=8019`，由反代对外提供
+`https://push.<domain>`；此时 App 的 `data.url` 用
+`https://<BOTVILLE_PUSH_DOMAIN>/_matrix/push/v1/notify`）。sygnal 无 WebSocket
+需求，普通 HTTP 反代即可，TLS 由反代终止。
+
+Caddy（自动 HTTPS，推荐；仅当开关打开时）：
+
+```caddyfile
+push.example.invalid {
+    reverse_proxy 127.0.0.1:8019
+}
+```
+
+nginx（证书自备，`certbot` 或手动放置；仅当开关打开时）：
+
+```nginx
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name push.example.invalid;
+    ssl_certificate     /etc/letsencrypt/live/push.example.invalid/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/push.example.invalid/privkey.pem;
+    location / {
+        proxy_pass http://127.0.0.1:8019;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+```
+
+（两例中的 `8019` 即 `${BOTVILLE_PUSH_PORT}` 默认值，改过端口的话同步。）
+
+### 4. 出站网络（到 Apple）
+
+放行出站 TCP 443 到 `api.push.apple.com` 与 `api.sandbox.push.apple.com`（DNS 解析
+多个 IP，按域名放行而非按 IP）。ufw 示例（默认 deny outgoing 的部署才需要显式
+放行；默认 allow 的无需配置）：
+
+```bash
+sudo ufw allow out 443/tcp
+```
+
+### 5. NTP 时间同步（JWT 依赖时钟）
+
+sygnal 用 .p8 对每个 APNs 请求签发短期 JWT（provider token）；时钟偏差过大（约
+>50s）会被 Apple 以 `JWTExpired` / 403 拒绝。确认时间同步已开启：
+
+```bash
+timedatectl          # 期望 "NTP service: active" 且 "synchronized: yes"
+# 未开启时：
+sudo timedatectl set-ntp true
+```
+
+### 6. 启动
+
+```bash
+make up PUSH=1     # 先跑 init.sh（校验 APNs 配置）再起 synapse + postgres + sygnal；
+                   # PUSH=1 会 force-recreate 仅 sygnal（--no-deps），网关加载的
+                   # 一定是刚渲染的 sygnal.yaml（PR #127 B1）
+```
+
+init.sh 校验语义：缺项/占位 → WARNING 跳过 APNs app（mock 照常）；已填但非法
+（ID 格式、bundle 反向域名、`APNS_APP_ID != <bundle-id>.apns`、platform、.p8
+权限）→ **exit 1**，`make up` 直接失败，改好 `.env` 重跑。
+
+### 7. 验证
+
+```bash
+# a) 渲染与启动：APNs app 在配置里、sygnal 健康
+grep -A6 'type: apns' server/compose/generated/sygnal/sygnal.yaml
+docker compose -f server/compose/docker-compose.yml --env-file server/compose/.env \
+    -p botville --profile push ps     # sygnal 应为 running/healthy
+
+# b) notify 路径功能探测（未知 app_id 必须 200 且 rejected 含 pushkey）
+BOTVILLE_PUSH_PORT="$(sed -n 's/^BOTVILLE_PUSH_PORT=//p' server/compose/.env | tail -n 1)"
+curl -s -X POST "http://127.0.0.1:${BOTVILLE_PUSH_PORT}/_matrix/push/v1/notify" \
+  -H 'Content-Type: application/json' \
+  -d '{"notification":{"event_id":"$probe","room_id":"!r:x","counts":{"unread":1},"devices":[{"app_id":"org.botville.unknown","pushkey":"probe","data":{},"tweaks":{}}]}}'
+# 期望 {"rejected": ["probe"]}
+
+# c) 时延验收（mock 链路，自动化）
+make push-e2e
+
+# d) 日志（最后看：前台跟随输出，Ctrl-C 退出，别放在上面的命令之前）
+make logs PUSH=1
+```
+
+**真机验收**（sygnal → APNs → 真机横幅 < 5s）需要 C 线提供 APNs device token
+（App 端 pusher 注册目前是 C2.1 的 Noop，见 §5/§7 的现状说明）：拿到 token 后按
+§7 手工注册 pusher（务必 `data.format=event_id_only`、`app_id=<bundle-id>.apns`、
+`data.url` 按 §5 表取值——默认内网 `http://sygnal:5000/_matrix/push/v1/notify`，
+公网模式 `https://<BOTVILLE_PUSH_DOMAIN>/_matrix/push/v1/notify`）掐表验收并回填。
+
+### 8. sandbox ↔ production 切换（方案 A：单 app，改环境重启）
+
+```bash
+sed -i 's/^APNS_PLATFORM=.*/APNS_PLATFORM=production/' server/compose/.env
+make up PUSH=1     # init.sh 重渲染 sygnal.yaml + force-recreate 仅 sygnal；切回 sandbox 同理
+```
+
+**为什么需要重启**：`APNS_PLATFORM` 只被 init.sh 用来渲染
+`generated/sygnal/sygnal.yaml`（bind mount 进容器），不参与 compose 插值——改值
+不会改变服务配置哈希，`up -d` 不会重建容器，而 sygnal 只在进程启动时读一次配置
+（无热加载）。所以 `make up PUSH=1` 在 `up -d` 之后会 force-recreate **仅
+sygnal**（`--no-deps`，synapse/postgres 原容器不动），运行中的网关随即用上新
+platform。不重启的话磁盘 yaml 已更新、运行中的 sygnal 仍是旧环境（PR #127 B1）。
+
+不需要动 .p8 / Key ID / Team ID / Bundle ID；两个环境互不相通（§4），切完用对
+应构建类型的真机验证。
+
+### 9. 回滚（关闭真实 APNs）
+
+```bash
+sed -i 's/^BOTVILLE_APNS_ENABLED=.*/BOTVILLE_APNS_ENABLED=false/' server/compose/.env
+make up PUSH=1     # init.sh 重渲染（APNs app 移除，只剩 mock，若 BOTVILLE_PUSH_MOCK=true）
+                   # + force-recreate 仅 sygnal
+```
+
+与 §8 同理：`BOTVILLE_APNS_ENABLED=false` 也不参与 compose 插值，仅靠 `up -d`
+不会让运行中的 sygnal 丢掉已加载的 APNs app——`make up PUSH=1` 的 force-recreate
+才用无 APNs app 的新配置重建容器。
+
+回滚后**不要只看磁盘 yaml**，要确认**运行中的 sygnal** 已无 APNs app——用曾经
+启用过的 app_id（`<bundle-id>.apns`）打 notify，应被 `rejected`：
+
+```bash
+BOTVILLE_PUSH_PORT="$(sed -n 's/^BOTVILLE_PUSH_PORT=//p' server/compose/.env | tail -n 1)"
+curl -s -X POST "http://127.0.0.1:${BOTVILLE_PUSH_PORT}/_matrix/push/v1/notify" \
+  -H 'Content-Type: application/json' \
+  -d '{"notification":{"event_id":"$probe","room_id":"!r:x","counts":{"unread":1},"devices":[{"app_id":"<bundle-id>.apns","pushkey":"probe","data":{},"tweaks":{}}]}}'
+# 期望 {"rejected": ["probe"]}：运行中的 sygnal 已不认识该 app（回滚前它不会被拒）。
+# 也可以进容器看运行进程实际加载的配置（bind mount，即 init.sh 刚渲染的版本）：
+#   docker compose -f server/compose/docker-compose.yml --env-file server/compose/.env \
+#       -p botville --profile push exec -T sygnal cat /config/sygnal.yaml
+```
+
+homeserver 侧已注册的真实 pusher 会因 sygnal 不再认识该 app_id 走 `rejected`
+机制被回收。不需要删 `.p8`（留在 `secrets/` 里无妨；删除的话 init.sh 会维护空
+占位文件以满足 compose 的单文件挂载，空文件永远不会被当成真 key）。

@@ -7,8 +7,10 @@
 #   - sygnal/mock-app.yaml.part (org.botville.mock) unless BOTVILLE_PUSH_MOCK
 #     is false/0/no (default true — CI/local latency tests need it);
 #   - sygnal/apns-app.yaml.part when BOTVILLE_APNS_ENABLED=true and the
-#     prerequisites are in place (real APNS_KEY_ID/APNS_TEAM_ID/APNS_TOPIC
-#     plus server/compose/secrets/apns.p8).
+#     prerequisites are in place (real BOTVILLE_APNS_BUNDLE_ID — APNS_TOPIC
+#     defaults to it, APNS_APP_ID to the bundle id with .apns appended —
+#     real APNS_KEY_ID/APNS_TEAM_ID/APNS_PLATFORM, plus a non-empty
+#     server/compose/secrets/apns.p8 with mode 600/400).
 # With both off, sygnal.yaml ends up with no apps and init.sh warns.
 # Edit this template, never the generated file. See docs/deploy/push-sygnal.md.
 log:
