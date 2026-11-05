@@ -375,6 +375,10 @@ jobs:
               # the homeservers may push to (A1.2); must stay in the subnet
               # above and not be its .0/.1/.255.
               "BOTVILLE_SYGNAL_IP": "172.31.250.2",
+              # Issue #134: append-only additions to the compose stack's
+              # fixed NO_PROXY list (docker-compose.yml x-noproxy-env);
+              # empty = defaults only.
+              "BOTVILLE_NO_PROXY_EXTRA": "",
               # org.botville.mock test pushkin in generated sygnal.yaml;
               # push-e2e / CI rely on it staying true.
               "BOTVILLE_PUSH_MOCK": "true",

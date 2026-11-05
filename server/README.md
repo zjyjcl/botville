@@ -103,7 +103,7 @@ continuwuity 默认关闭上游 announcements 检查（避免 SIGTERM 卡到 SIG
   已填但格式/权限非法 → init.sh exit 1**。key 以**单文件**只读挂载进容器
   （无真实 key 时 init.sh 维护 0600 空占位文件，mock-only 部署不受影响），
   `BOTVILLE_PUSH_DOMAIN` 记录反代用的推送公网域名（运维参考）。**当前无 Apple
-  账号，真实 APNs 送达未验证**（8845 mini PC 部署 runbook 见 push-sygnal.md §11）。
+  账号，真实 APNs 送达未验证**（8845 mini PC 部署 runbook 见 push-sygnal.md §12）。
   homeserver 的内网推送放行只有 sygnal 容器的固定 IP `BOTVILLE_SYGNAL_IP`（一个
   /32，留空则完全不放行；详见 push-sygnal.md 的「内网推送放行」）。CI 的
   `push-e2e` job 在 synapse、tuwunel、continuwuity 三家上各跑一遍；lint 另有
