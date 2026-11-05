@@ -15,9 +15,11 @@
 
 PR1 新增 `BotvilleNotificationService`（iOS Notification Service Extension），通过主 App 的 **Embed Foundation Extensions** 嵌入。主 App 与扩展都使用 App Group `group.com.zjyjcl.botville`，并共享 Keychain access group `$(AppIdentifierPrefix)com.zjyjcl.botville.shared`；主 App ID `com.zjyjcl.botville` 与 NSE App ID `com.zjyjcl.botville.notification` 必须在真机签名能力中同时启用该 App Group 和 Keychain 共享。两个 target 均使用团队 `3Z8WP6U6F7` 和 Automatic signing。仓库不提交证书、描述文件或真实凭据。
 
-主 App 在登录/恢复成功后，仅向共享 Keychain 写入 homeserver URL、userId、accessToken、deviceId 和可选 refreshToken；退出、清除本地会话或软退出时清除。每个 target 的私有 Keychain group 保留为第一项，完整主会话和本地加密库密钥仍在私有组。共享条目使用 `AfterFirstUnlockThisDeviceOnly`；不将 token 写入 App Group 文件或 UserDefaults。共享 Keychain 不可用时记录固定诊断且不阻断主会话；本 PR 没有任何 DEBUG 或 Release 私有组/明文回退。单测注入内存存储。
+主 App 在登录/恢复成功后，仅向共享 Keychain 写入 homeserver URL、userId、accessToken 和 deviceId，不共享 refreshToken；退出、清除本地会话或软退出时清除。每个 target 的私有 Keychain group 保留为第一项，完整主会话和本地加密库密钥仍在私有组。共享条目使用 `AfterFirstUnlockThisDeviceOnly`；不将 token 写入 App Group 文件或 UserDefaults。共享 Keychain 不可用时记录固定诊断且不阻断主会话；本 PR 没有任何 DEBUG 或 Release 私有组/明文回退。凭据的字符串及调试描述固定脱敏；单测通过可注入的 Keychain backend 验证存取失败分支。
 
-NSE 只读共享凭据并通过 `os.Logger` 记录存在/不可用状态，绝不记录 token 或请求内容；本轮原样交回通知（body 保持 `…`），到期时同样交回 `bestAttemptContent`。PR2 才会以 `event_id`/`room_id` 和共享会话凭据拉取正文；加密房间届时显示「加密消息」。
+若共享条目删除失败，仅在 UserDefaults 持久保存待清理布尔标记，下次启动恢复流程先重试删除；成功删除或成功写入新凭据后清除标记。此标记与完整主会话的清理状态分开，软退出仍保留主会话和加密数据库。Keychain 故障期间不能保证旧共享条目已消失。
+
+NSE 只读共享凭据，以 `debug` 记录是否存在、以 `warning` 记录不可用，绝不记录 token 或请求内容；PR1 故意同步立即原样交回通知（body 保持 `…`），不消耗时间预算，到期时同样交回 `bestAttemptContent`。PR2 才会以 `event_id`/`room_id` 和共享会话凭据拉取正文；加密房间届时显示「加密消息」。
 
 notify URL 必须无凭据、无 query/fragment，路径严格为 `/_matrix/push/v1/notify`。默认/Release 策略仅允许 HTTPS；DEBUG 显式允许 HTTP。该地址供 **homeserver 访问 Sygnal**，因此 Compose 内部服务名可作 notify URL；iPhone 本身不必能解析该名称。App 不直接向 Sygnal 上传 token。
 
@@ -68,7 +70,7 @@ xcodebuild -project Botville.xcodeproj -scheme BotvilleApp-iOS \
 
 | 检查 | 结果 |
 | --- | --- |
-| `swift test`，macOS | 共 210 项，208 通过，2 跳过，0 失败 |
+| `swift test`，macOS | 共 221 项，219 通过，2 跳过，0 失败 |
 | Release 隔离脚本 | 通过 |
 | Debug，generic iOS Simulator，`CODE_SIGN_IDENTITY="-"` | BUILD SUCCEEDED |
 | Release，同上 | BUILD SUCCEEDED |
@@ -76,4 +78,4 @@ xcodebuild -project Botville.xcodeproj -scheme BotvilleApp-iOS \
 
 本轮两项 Synapse 集成测试因未设置 `BOTVILLE_E2E_HOMESERVER` 跳过。推送测试覆盖 token 编码、完整请求字段与 Bearer header、删除体 `kind:null`、列表解析/匹配、URL 两种策略、轮换删除顺序、注册响应未返回时退出、删除失败后的保留与重试，以及 Release 文件隔离。未执行 iPhone/APNs/Sygnal 的真实送达验收。
 
-本轮 PR1 日志为 `.build/nse-swift-test.log`、`.build/nse-debug-build.log`、`.build/nse-release-build.log`，产物检查结果为 `.build/nse-product-check.json`（构建目录不提交）。主 scheme 的 Debug/Release 产物均包含 `PlugIns/BotvilleNotificationService.appex`；验证两者 Bundle ID、展开后的共享分组及 ad-hoc 签名。构建仍有 Matrix SDK 外部 dSYM 路径等警告；未验证最低支持系统或真机送达。本轮命令使用 `TMPDIR=/tmp`，并以 `env -u GIT_CONFIG_COUNT -u GIT_CONFIG_VALUE_0` 移除本机不完整的 Git 环境覆盖，不改动 Git 配置。
+本轮审查修复日志为 `.build/nit-swift-test.log`、`.build/nit-debug-build.log`、`.build/nit-release-build.log`，产物检查结果为 `.build/nit-product-check.json`（构建目录不提交）。主 scheme 的 Debug/Release 产物均包含 `PlugIns/BotvilleNotificationService.appex`；验证两者 Bundle ID、`-Simulated.xcent` 中展开后的共享分组及 ad-hoc 签名。构建仍有 Matrix SDK 外部 dSYM 路径等警告；未验证最低支持系统或真机送达。本轮命令使用 `TMPDIR=/tmp`，并以 `env -u GIT_CONFIG_COUNT -u GIT_CONFIG_VALUE_0` 移除本机不完整的 Git 环境覆盖，不改动 Git 配置。

@@ -6,6 +6,8 @@ import XCTest
 
 final class ReleaseIsolationTests: XCTestCase {
     private let forbidden: Set<String> = ["NSAppTransportSecurity", "NSAllowsLocalNetworking", "NSLocalNetworkUsageDescription", "BotvilleSygnalNotifyURL"]
+    // Controlled production signing changes this to "production" with the entitlement.
+    private let releaseAppAPSEnvironment: String? = nil
 
     func testReleasePlistRecursivelyExcludesDebugKeys() throws {
         XCTAssertTrue(forbidden.isDisjoint(with: keys(try plist("BotvilleApp/Info.plist"))))
@@ -31,6 +33,7 @@ final class ReleaseIsolationTests: XCTestCase {
                 XCTAssertNotEqual(value as? String, "NO", key)
             }
         }
+        try assertEveryNativeReleaseTargetIsIsolated(objects)
         try assertTarget(
             objects: objects,
             name: "BotvilleApp-iOS",
@@ -51,7 +54,8 @@ final class ReleaseIsolationTests: XCTestCase {
 
     func testReleaseEntitlementsAllowOnlySharedCredentialInfrastructure() throws {
         try assertEntitlements("BotvilleApp/BotvilleApp.entitlements", privateKeychainGroup: "$(AppIdentifierPrefix)com.zjyjcl.botville", apsEnvironment: "development")
-        try assertEntitlements("BotvilleApp/BotvilleApp-Release.entitlements", privateKeychainGroup: "$(AppIdentifierPrefix)com.zjyjcl.botville", apsEnvironment: nil)
+        // Temporary release gate; the NSE intentionally remains APNs-free.
+        try assertEntitlements("BotvilleApp/BotvilleApp-Release.entitlements", privateKeychainGroup: "$(AppIdentifierPrefix)com.zjyjcl.botville", apsEnvironment: releaseAppAPSEnvironment)
         try assertEntitlements("NotificationService/NotificationService.entitlements", privateKeychainGroup: "$(AppIdentifierPrefix)com.zjyjcl.botville.notification", apsEnvironment: nil)
 
         XCTAssertEqual(try plist("BotvilleApp/Info.plist")["BotvilleSharedKeychainAccessGroup"] as? String, "$(AppIdentifierPrefix)com.zjyjcl.botville.shared")
@@ -68,14 +72,18 @@ final class ReleaseIsolationTests: XCTestCase {
         let sources = root.appendingPathComponent("Sources/BotvilleApp")
         try guarded("struct PushDiagnosticsView", at: sources.appendingPathComponent("PushDiagnosticsView.swift"))
         try guarded("ManualHomeserverLoginView", at: sources.appendingPathComponent("LoginView.swift"))
-        for url in try FileManager.default.contentsOfDirectory(at: sources, includingPropertiesForKeys: nil).filter({ $0.pathExtension == "swift" }) {
-            let text = try String(contentsOf: url, encoding: .utf8)
-            for token in ["PushDiagnosticsView(", "ManualHomeserverLoginView("] where text.contains(token) { try guarded(token, at: url) }
+        for directory in [sources, root.appendingPathComponent("NotificationService")] {
+            for url in try swiftSources(in: directory) {
+                let text = try String(contentsOf: url, encoding: .utf8)
+                for token in ["PushDiagnosticsView(", "ManualHomeserverLoginView("] where text.contains(token) { try guarded(token, at: url) }
+            }
         }
         let core = root.appendingPathComponent("Sources/BotvilleCore")
         try guarded("static let isDebugBuild = true", at: core.appendingPathComponent("PushRegistrar.swift"))
         let matrixService = try String(contentsOf: core.appendingPathComponent("MatrixService.swift"), encoding: .utf8)
         XCTAssertTrue(matrixService.contains("PushHTTPPolicy.permitsHTTP(allowHTTP)"))
+        try assertNotificationServiceBoundary()
+        try assertNotificationServiceIsEmbedded(try XCTUnwrap(projectJSON()["objects"] as? [String: Any]))
     }
 
     private var root: URL { URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent() }
@@ -118,6 +126,29 @@ final class ReleaseIsolationTests: XCTestCase {
             }
         }
     }
+    private func assertEveryNativeReleaseTargetIsIsolated(_ objects: [String: Any]) throws {
+        for target in objects.values.compactMap({ $0 as? [String: Any] }) where target["isa"] as? String == "PBXNativeTarget" {
+            let targetName = target["name"] as? String ?? "unnamed target"
+            let listID = try XCTUnwrap(target["buildConfigurationList"] as? String)
+            let list = try XCTUnwrap(objects[listID] as? [String: Any])
+            let release = try XCTUnwrap((try XCTUnwrap(list["buildConfigurations"] as? [String])).compactMap { objects[$0] as? [String: Any] }.first { $0["name"] as? String == "Release" }, "\(targetName) needs Release")
+            let settings = try XCTUnwrap(release["buildSettings"] as? [String: Any])
+            let plistSettings = settings.filter { $0.key.hasPrefix("INFOPLIST_FILE") }
+            if let type = target["productType"] as? String, ["com.apple.product-type.application", "com.apple.product-type.app-extension"].contains(type) {
+                XCTAssertFalse(plistSettings.isEmpty, "\(targetName) Release needs a shipping plist")
+            }
+            for (key, value) in plistSettings {
+                let relative = try XCTUnwrap(value as? String, "\(targetName) \(key)")
+                XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(relative).path), "\(targetName) Release plist missing")
+                XCTAssertTrue(forbidden.isDisjoint(with: keys(try plist(relative))), "\(targetName) Release plist leaks DEBUG-only keys")
+            }
+            for (key, value) in settings where key.hasPrefix("CODE_SIGN_ENTITLEMENTS") {
+                let relative = try XCTUnwrap(value as? String, "\(targetName) \(key)")
+                XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(relative).path), "\(targetName) Release entitlements missing")
+                XCTAssertNotEqual(try plist(relative)["aps-environment"] as? String, "development", "\(targetName) Release must not use development APNs")
+            }
+        }
+    }
     private func assertEntitlements(_ relative: String, privateKeychainGroup: String, apsEnvironment: String?) throws {
         let value = try plist(relative)
         XCTAssertEqual(value["com.apple.security.application-groups"] as? [String], ["group.com.zjyjcl.botville"])
@@ -134,5 +165,49 @@ final class ReleaseIsolationTests: XCTestCase {
             if line.contains(needle) { found = true; XCTAssertTrue(stack.contains(true), "\(needle) must be DEBUG-guarded at \(url):\(offset + 1)") }
         }
         XCTAssertTrue(stack.isEmpty); XCTAssertTrue(found, "\(needle) missing from \(url)")
+    }
+    private func assertNotificationServiceBoundary() throws {
+        let directory = root.appendingPathComponent("NotificationService")
+        for source in try swiftSources(in: directory) {
+            let text = try String(contentsOf: source, encoding: .utf8)
+            XCTAssertNil(text.range(of: #"\b(?:print|debugPrint|dump|NSLog|os_log)\s*\("#, options: .regularExpression), "NSE must use only its safe Logger diagnostics")
+            for line in text.split(separator: "\n") where line.range(of: #"\b\w+\.(?:trace|debug|info|notice|warning|error|fault|critical|log)\s*\("#, options: .regularExpression) != nil {
+                let lower = line.lowercased()
+                XCTAssertFalse(lower.contains("token"), "NSE logs must not expose tokens")
+                XCTAssertTrue([
+                    "logger.debug(\"Shared push credentials present: \\(present, privacy: .public)\")",
+                    "logger.warning(\"Shared push credentials unavailable\")"
+                ].contains(String(line).trimmingCharacters(in: .whitespaces)), "NSE only permits its two safe diagnostic logs")
+            }
+            for forbidden in ["UserDefaults", "FileHandle", "write(to:", "Data(contentsOf:"] {
+                XCTAssertFalse(text.contains(forbidden), "NSE must not use plaintext credential storage: \(forbidden)")
+            }
+        }
+    }
+    private func swiftSources(in directory: URL) throws -> [URL] {
+        let enumerator = try XCTUnwrap(FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil))
+        return enumerator.compactMap { $0 as? URL }.filter { $0.pathExtension == "swift" }
+    }
+    private func assertNotificationServiceIsEmbedded(_ objects: [String: Any]) throws {
+        let targets = objects.compactMap { identifier, value -> (String, [String: Any])? in
+            guard let target = value as? [String: Any], target["isa"] as? String == "PBXNativeTarget" else { return nil }
+            return (identifier, target)
+        }
+        let app = try XCTUnwrap(targets.first { $0.1["name"] as? String == "BotvilleApp-iOS" })
+        let nse = try XCTUnwrap(targets.first { $0.1["name"] as? String == "BotvilleNotificationService" })
+        let nseProduct = try XCTUnwrap(nse.1["productReference"] as? String)
+        let dependencies = app.1["dependencies"] as? [String] ?? []
+        XCTAssertTrue(dependencies.contains {
+            let dependency = objects[$0] as? [String: Any]
+            return dependency?["isa"] as? String == "PBXTargetDependency" && dependency?["target"] as? String == nse.0
+        })
+        let phases = app.1["buildPhases"] as? [String] ?? []
+        XCTAssertTrue(phases.contains { phaseID in
+            guard let phase = objects[phaseID] as? [String: Any], phase["isa"] as? String == "PBXCopyFilesBuildPhase", String(describing: phase["dstSubfolderSpec"] ?? "") == "13" else { return false }
+            return (phase["files"] as? [String] ?? []).contains {
+                let file = objects[$0] as? [String: Any]
+                return file?["isa"] as? String == "PBXBuildFile" && file?["fileRef"] as? String == nseProduct
+            }
+        })
     }
 }

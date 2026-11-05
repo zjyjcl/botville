@@ -23,17 +23,19 @@ final class NotificationService: UNNotificationServiceExtension {
 
         do {
             let present = try credentialsStore.load() != nil
-            logger.info("Shared push credentials present: \(present, privacy: .public)")
+            logger.debug("Shared push credentials present: \(present, privacy: .public)")
         } catch {
             // Missing entitlements / locked Keychain / simulator failures must
             // never prevent delivery. Do not log credentials or error payloads.
-            logger.info("Shared push credentials unavailable")
+            logger.warning("Shared push credentials unavailable")
         }
 
         // TODO(PR2): Use event_id / room_id from request.content.userInfo and
         // the shared credentials to fetch the event body. Encrypted rooms must
         // display “加密消息”. PR1 does no network work and returns the original
         // bestAttemptContent, preserving the default payload's U+2026 “…” body.
+        // PR1 intentionally delivers synchronously and immediately; it does not
+        // consume the extension's time budget while no event fetch is implemented.
         deliverBestAttemptContent()
     }
 

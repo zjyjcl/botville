@@ -76,13 +76,39 @@ public struct PushDefaultPayload: Codable, Equatable, Sendable {
     private enum APSCodingKeys: String, CodingKey { case mutableContent = "mutable-content", alert }
     private enum AlertCodingKeys: String, CodingKey { case body }
 
+    // Enum CodingKeys omit unknown keys from allKeys. Preserve every key while
+    // decoding so additional APNs content cannot silently pass validation.
+    private struct PayloadKey: CodingKey {
+        let stringValue: String
+        var intValue: Int? { nil }
+        init(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { return nil }
+
+        static let aps = Self(stringValue: "aps")
+        static let mutableContent = Self(stringValue: "mutable-content")
+        static let alert = Self(stringValue: "alert")
+        static let body = Self(stringValue: "body")
+    }
+
+    private static func requireKeys(_ keys: Set<String>, in container: KeyedDecodingContainer<PayloadKey>) throws {
+        guard Set(container.allKeys.map(\.stringValue)) == keys else {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: container.codingPath,
+                debugDescription: "default_payload must contain only the NSE placeholder keys"
+            ))
+        }
+    }
+
     public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        let aps = try container.nestedContainer(keyedBy: APSCodingKeys.self, forKey: .aps)
+        let container = try decoder.container(keyedBy: PayloadKey.self)
+        try Self.requireKeys(["aps"], in: container)
+        let aps = try container.nestedContainer(keyedBy: PayloadKey.self, forKey: .aps)
+        try Self.requireKeys(["mutable-content", "alert"], in: aps)
         guard try aps.decode(Int.self, forKey: .mutableContent) == 1 else {
             throw DecodingError.dataCorruptedError(forKey: .mutableContent, in: aps, debugDescription: "default_payload must set aps.mutable-content to 1")
         }
-        let alert = try aps.nestedContainer(keyedBy: AlertCodingKeys.self, forKey: .alert)
+        let alert = try aps.nestedContainer(keyedBy: PayloadKey.self, forKey: .alert)
+        try Self.requireKeys(["body"], in: alert)
         guard try alert.decode(String.self, forKey: .body) == "…" else {
             throw DecodingError.dataCorruptedError(forKey: .body, in: alert, debugDescription: "default_payload must use the NSE placeholder body")
         }
@@ -134,6 +160,8 @@ public struct PushPusherData: Codable, Equatable, Sendable {
         }
         self.url = try Self.validatedAndNormalizedURL(url, originalSource: source, allowHTTP: false)
         self.format = try container.decodeIfPresent(PushPusherDataFormat.self, forKey: .format) ?? .eventIDOnly
+        // Legacy pusher data may omit default_payload (or use null). Normalize
+        // those records to the placeholder; any supplied object is strict.
         self.defaultPayload = try container.decodeIfPresent(PushDefaultPayload.self, forKey: .defaultPayload) ?? PushDefaultPayload()
     }
 

@@ -150,10 +150,29 @@ final class PushRegistrationTests: XCTestCase {
 
         for invalid in [
             #"{"aps":{"mutable-content":1,"alert":{"body":"新消息"}}}"#,
-            #"{"aps":{"mutable-content":0,"alert":{"body":"…"}}}"#
+            #"{"aps":{"mutable-content":0,"alert":{"body":"…"}}}"#,
+            #"{"aps":{"mutable-content":1,"alert":{"body":"…"}},"extra":null}"#,
+            #"{"aps":{"mutable-content":1,"alert":{"body":"…"},"sound":"default"}}"#,
+            #"{"aps":{"mutable-content":1,"alert":{"body":"…","title":"extra"}}}"#
         ] {
             let json = Data("{\"url\":\"https://push.example.org/_matrix/push/v1/notify\",\"default_payload\":\(invalid)}".utf8)
             XCTAssertThrowsError(try JSONDecoder().decode(PushPusherData.self, from: json), invalid)
+        }
+    }
+
+    func testLegacyPusherDataNormalizesMissingOrNullDefaultPayload() throws {
+        for json in [
+            #"{"url":"https://push.example.org/_matrix/push/v1/notify"}"#,
+            #"{"url":"https://push.example.org/_matrix/push/v1/notify","default_payload":null}"#
+        ] {
+            let data = try JSONDecoder().decode(PushPusherData.self, from: Data(json.utf8))
+            XCTAssertEqual(data.defaultPayload, PushDefaultPayload())
+            let encoded = try jsonObject(data)
+            let payload = try XCTUnwrap(encoded["default_payload"] as? [String: Any])
+            XCTAssertEqual(Set(payload.keys), ["aps"])
+            let aps = try XCTUnwrap(payload["aps"] as? [String: Any])
+            XCTAssertEqual(aps["mutable-content"] as? Int, 1)
+            XCTAssertEqual((aps["alert"] as? [String: Any])?["body"] as? String, "…")
         }
     }
 
@@ -354,7 +373,7 @@ final class PushRegistrationTests: XCTestCase {
         XCTAssertEqual(get.value(forHTTPHeaderField: "Authorization"), "Bearer token")
     }
 
-    private func jsonObject(_ value: PushRegistration) throws -> [String: Any] {
+    private func jsonObject(_ value: some Encodable) throws -> [String: Any] {
         try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(value)) as? [String: Any])
     }
 }
