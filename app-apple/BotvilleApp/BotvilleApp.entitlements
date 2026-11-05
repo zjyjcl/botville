@@ -4,5 +4,14 @@
 <dict>
     <key>aps-environment</key>
     <string>development</string>
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>group.com.zjyjcl.botville</string>
+    </array>
+    <key>keychain-access-groups</key>
+    <array>
+        <string>$(AppIdentifierPrefix)com.zjyjcl.botville</string>
+        <string>$(AppIdentifierPrefix)com.zjyjcl.botville.shared</string>
+    </array>
 </dict>
 </plist>

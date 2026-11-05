@@ -25,6 +25,10 @@ final class PushRegistrationTests: XCTestCase {
         XCTAssertEqual(json["append"] as? Bool, false)
         XCTAssertEqual((json["data"] as? [String: Any])?["url"] as? String, "https://push.example.org/_matrix/push/v1/notify")
         XCTAssertEqual((json["data"] as? [String: Any])?["format"] as? String, "event_id_only")
+        let aps = try XCTUnwrap(((json["data"] as? [String: Any])?["default_payload"] as? [String: Any])?["aps"] as? [String: Any])
+        XCTAssertEqual(Set(aps.keys), ["mutable-content", "alert"])
+        XCTAssertEqual(aps["mutable-content"] as? Int, 1)
+        XCTAssertEqual((aps["alert"] as? [String: Any])?["body"] as? String, "…")
         XCTAssertEqual(json["device_display_name"] as? String, "iPhone")
         XCTAssertEqual(json["lang"] as? String, "zh-CN")
     }
@@ -113,6 +117,7 @@ final class PushRegistrationTests: XCTestCase {
         let data = try PushPusherData(url: XCTUnwrap(URL(string: "https://push.example.org/_matrix/push/v1/notify")))
 
         XCTAssertEqual(data.format, .eventIDOnly)
+        XCTAssertEqual(data.defaultPayload, PushDefaultPayload())
     }
 
     func testPusherDataDecodesMissingOrNullFormatAsEventIDOnly() throws {
@@ -125,6 +130,49 @@ final class PushRegistrationTests: XCTestCase {
 
             XCTAssertEqual(data.format, .eventIDOnly)
             XCTAssertEqual(encoded["format"] as? String, "event_id_only")
+        }
+    }
+
+    func testPusherDataDecodesOnlyTheExactNotificationServiceDefaultPayload() throws {
+        let exact = Data(#"{"url":"https://push.example.org/_matrix/push/v1/notify","format":"event_id_only","default_payload":{"aps":{"mutable-content":1,"alert":{"body":"…"}}}}"#.utf8)
+        let payload = try JSONDecoder().decode(PushPusherData.self, from: exact)
+        XCTAssertEqual(payload.defaultPayload, PushDefaultPayload())
+
+        let encoded = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(payload)) as? [String: Any])
+        let defaultPayload = try XCTUnwrap(encoded["default_payload"] as? [String: Any])
+        XCTAssertEqual(Set(defaultPayload.keys), ["aps"])
+        let aps = try XCTUnwrap(defaultPayload["aps"] as? [String: Any])
+        XCTAssertEqual(Set(aps.keys), ["mutable-content", "alert"])
+        let alert = try XCTUnwrap(aps["alert"] as? [String: Any])
+        XCTAssertEqual(Set(alert.keys), ["body"])
+        let body = try XCTUnwrap(alert["body"] as? String)
+        XCTAssertEqual(body.unicodeScalars.map(\.value), [0x2026])
+
+        for invalid in [
+            #"{"aps":{"mutable-content":1,"alert":{"body":"新消息"}}}"#,
+            #"{"aps":{"mutable-content":0,"alert":{"body":"…"}}}"#,
+            #"{"aps":{"mutable-content":1,"alert":{"body":"…"}},"extra":null}"#,
+            #"{"aps":{"mutable-content":1,"alert":{"body":"…"},"sound":"default"}}"#,
+            #"{"aps":{"mutable-content":1,"alert":{"body":"…","title":"extra"}}}"#
+        ] {
+            let json = Data("{\"url\":\"https://push.example.org/_matrix/push/v1/notify\",\"default_payload\":\(invalid)}".utf8)
+            XCTAssertThrowsError(try JSONDecoder().decode(PushPusherData.self, from: json), invalid)
+        }
+    }
+
+    func testLegacyPusherDataNormalizesMissingOrNullDefaultPayload() throws {
+        for json in [
+            #"{"url":"https://push.example.org/_matrix/push/v1/notify"}"#,
+            #"{"url":"https://push.example.org/_matrix/push/v1/notify","default_payload":null}"#
+        ] {
+            let data = try JSONDecoder().decode(PushPusherData.self, from: Data(json.utf8))
+            XCTAssertEqual(data.defaultPayload, PushDefaultPayload())
+            let encoded = try jsonObject(data)
+            let payload = try XCTUnwrap(encoded["default_payload"] as? [String: Any])
+            XCTAssertEqual(Set(payload.keys), ["aps"])
+            let aps = try XCTUnwrap(payload["aps"] as? [String: Any])
+            XCTAssertEqual(aps["mutable-content"] as? Int, 1)
+            XCTAssertEqual((aps["alert"] as? [String: Any])?["body"] as? String, "…")
         }
     }
 
@@ -311,6 +359,12 @@ final class PushRegistrationTests: XCTestCase {
         XCTAssertEqual(body["append"] as? Bool, false)
         XCTAssertEqual((body["data"] as? [String: Any])?["url"] as? String, "https://sygnal.example.invalid/_matrix/push/v1/notify")
         XCTAssertEqual((body["data"] as? [String: Any])?["format"] as? String, "event_id_only")
+        let payload = try XCTUnwrap((body["data"] as? [String: Any])?["default_payload"] as? [String: Any])
+        XCTAssertEqual(Set(payload.keys), ["aps"])
+        let aps = try XCTUnwrap(payload["aps"] as? [String: Any])
+        XCTAssertEqual(Set(aps.keys), ["mutable-content", "alert"])
+        XCTAssertEqual(aps["mutable-content"] as? Int, 1)
+        XCTAssertEqual((aps["alert"] as? [String: Any])?["body"] as? String, "…")
 
         _ = try await transport.pushers(homeserver: XCTUnwrap(URL(string: "https://matrix.test/base")), accessToken: "token")
         let get = try XCTUnwrap(recorder.requests.last)
@@ -319,7 +373,7 @@ final class PushRegistrationTests: XCTestCase {
         XCTAssertEqual(get.value(forHTTPHeaderField: "Authorization"), "Bearer token")
     }
 
-    private func jsonObject(_ value: PushRegistration) throws -> [String: Any] {
+    private func jsonObject(_ value: some Encodable) throws -> [String: Any] {
         try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(value)) as? [String: Any])
     }
 }

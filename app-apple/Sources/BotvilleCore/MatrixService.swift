@@ -5,6 +5,7 @@ import Combine
 import Foundation
 import MatrixRustSDK
 import Network
+import OSLog
 
 /// SDK ownership and all UI-facing state live on the main actor. Async SDK
 /// operations run in Rust; the same client retains the /sync since token.
@@ -32,6 +33,8 @@ public final class MatrixService: ObservableObject {
     @Published public private(set) var pushVerificationStatus: String?
 
     private let sessionStore: any SessionStore
+    private let sharedPushCredentialsStore: any SharedPushCredentialsStore
+    private let sharedPushCredentialsCleanupStateStore: any SharedPushCredentialsCleanupStateStore
     private var storeDirectory: SessionStoreDirectory?
     private let discovery: any LoginCapabilityDiscovering
     private var credentials: SessionCredentials?
@@ -102,8 +105,11 @@ public final class MatrixService: ObservableObject {
     private var isLoggingOut = false
     private var softLogoutCredentials: SessionCredentials?
     private var paginationGeneration: UUID?
+    private static let sharedPushCredentialsLogger = Logger(subsystem: "com.zjyjcl.botville", category: "PushCredentials")
 
     public init(sessionStore: any SessionStore = KeychainSessionStore(),
+                sharedPushCredentialsStore: any SharedPushCredentialsStore = KeychainSharedPushCredentialsStore(),
+                sharedPushCredentialsCleanupStateStore: any SharedPushCredentialsCleanupStateStore = UserDefaultsSharedPushCredentialsCleanupStateStore(),
                 storeDirectory: SessionStoreDirectory? = nil,
                 discovery: any LoginCapabilityDiscovering = MatrixLoginCapabilityDiscovery(),
                 monitorNetwork: Bool = true,
@@ -113,6 +119,8 @@ public final class MatrixService: ObservableObject {
                 pusherTransport: any MatrixPusherTransport = URLSessionMatrixPusherTransport(),
                 aiParticipantPolicy: AIParticipantPolicy = .configured()) {
         self.sessionStore = sessionStore
+        self.sharedPushCredentialsStore = sharedPushCredentialsStore
+        self.sharedPushCredentialsCleanupStateStore = sharedPushCredentialsCleanupStateStore
         self.storeDirectory = storeDirectory
         self.discovery = discovery
         self.passwordAuthentication = passwordAuthentication
@@ -266,6 +274,7 @@ public final class MatrixService: ObservableObject {
             try sessionStore.save(stored)
             credentials = stored
             try await activate(newClient, stored: stored)
+            publishSharedPushCredentials(stored)
             canClearLocalSession = false
             canRetryRestore = false
         } catch {
@@ -353,6 +362,7 @@ public final class MatrixService: ObservableObject {
             if previous != nil {
                 try sessionStore.save(stored)
             }
+            publishSharedPushCredentials(stored)
             softLogoutCredentials = nil
             requiresPasswordReauthentication = false
             reauthenticationHomeserver = nil
@@ -440,6 +450,7 @@ public final class MatrixService: ObservableObject {
         var candidate: Client?
         do {
             try Task.checkCancellation()
+            retrySharedPushCredentialsCleanupIfNeeded()
             if cleanupRequired { try cleanStoredSession() }
             guard let stored = try sessionStore.load() else { return }
             credentials = stored
@@ -453,6 +464,7 @@ public final class MatrixService: ObservableObject {
             try await retryRateLimits { try await restored.restoreSession(session: stored.sdkSession) }
             try Task.checkCancellation()
             try await activate(restored, stored: stored)
+            publishSharedPushCredentials(stored)
             softLogoutCredentials = nil
             requiresPasswordReauthentication = false
             reauthenticationHomeserver = nil
@@ -508,6 +520,7 @@ public final class MatrixService: ObservableObject {
         await detachClient()
         cleanupRequired = true
         var failed = false
+        removeSharedPushCredentials()
         do { try sessionStore.delete() } catch { failed = true }
         do { try directory().removeAll() } catch { failed = true }
         guard !failed else {
@@ -1156,6 +1169,7 @@ public final class MatrixService: ObservableObject {
         guard !isLoggingOut, let saved = credentials else { return }
         isLoggingOut = true
         await detachClient()
+        removeSharedPushCredentials()
         credentials = saved
         softLogoutCredentials = saved
         requiresPasswordReauthentication = true
@@ -1211,6 +1225,9 @@ public final class MatrixService: ObservableObject {
     }
 
     private func cleanStoredSession() throws {
+        // Try to clear extension-readable credentials first. If Keychain is
+        // unavailable, a durable non-secret marker retries removal at startup.
+        removeSharedPushCredentials()
         if let stored = try credentials ?? sessionStore.load() {
             try directory().remove(for: stored.storeID)
         }
@@ -1222,6 +1239,59 @@ public final class MatrixService: ObservableObject {
         reauthenticationUserID = nil
         cleanupRequired = false
     }
+
+    /// Publish only after the caller has persisted and activated the session.
+    /// Missing extension entitlements (including ad-hoc simulator builds) are
+    /// diagnostic-only and never change the primary login/restore result.
+    private func publishSharedPushCredentials(_ stored: SessionCredentials) {
+        do {
+            try sharedPushCredentialsStore.save(SharedPushCredentials(
+                homeserverURL: stored.homeserverURL,
+                userID: stored.userID,
+                accessToken: stored.accessToken,
+                deviceID: stored.deviceID
+            ))
+            // A successful save supersedes any stale credential whose delete
+            // previously failed, so it also resolves the pending cleanup.
+            sharedPushCredentialsCleanupStateStore.setCleanupRequired(false)
+        } catch {
+            Self.sharedPushCredentialsLogger.warning("Could not save shared push credentials.")
+        }
+    }
+
+    private func removeSharedPushCredentials() {
+        do {
+            try sharedPushCredentialsStore.delete()
+            sharedPushCredentialsCleanupStateStore.setCleanupRequired(false)
+        } catch {
+            // Keep this independent from `cleanupRequired`: a soft logout
+            // must retain its primary session and encrypted store even when
+            // the extension-readable Keychain item cannot be removed.
+            sharedPushCredentialsCleanupStateStore.setCleanupRequired(true)
+            Self.sharedPushCredentialsLogger.warning("Could not remove shared push credentials.")
+        }
+    }
+
+    private func retrySharedPushCredentialsCleanupIfNeeded() {
+        guard sharedPushCredentialsCleanupStateStore.isCleanupRequired else { return }
+        removeSharedPushCredentials()
+    }
+}
+
+/// Persists only whether removal of extension-readable credentials must be
+/// retried. It deliberately contains no token or other session material.
+public protocol SharedPushCredentialsCleanupStateStore: Sendable {
+    var isCleanupRequired: Bool { get }
+    func setCleanupRequired(_ required: Bool)
+}
+
+public final class UserDefaultsSharedPushCredentialsCleanupStateStore: SharedPushCredentialsCleanupStateStore, @unchecked Sendable {
+    private static let key = "com.zjyjcl.botville.shared-push-credentials-cleanup-required"
+    private let defaults: UserDefaults
+
+    public init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+    public var isCleanupRequired: Bool { defaults.bool(forKey: Self.key) }
+    public func setCleanupRequired(_ required: Bool) { defaults.set(required, forKey: Self.key) }
 }
 
 private func isSoftLogoutError(_ error: Error) -> Bool {

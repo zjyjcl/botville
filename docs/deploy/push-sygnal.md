@@ -210,14 +210,24 @@ App（iOS 客户端）向 homeserver 注册 pusher 时需要的四个关键值�
   "lang": "zh-Hans",
   "data": {
     "url": "http://sygnal:5000/_matrix/push/v1/notify",
-    "format": "event_id_only"
+    "format": "event_id_only",
+    "default_payload": {
+      "aps": {
+        "mutable-content": 1,
+        "alert": { "body": "…" }
+      }
+    }
   }
 }
 ```
 
 （真实模式的 `app_id` 即 `<bundle-id>.apns`——init.sh 推导的 `APNS_APP_ID`，
 单 app 约定见 §2；联调用 `org.botville.mock`。`data.url` 上表两种取值按部署
-模式选。）
+模式选。）`default_payload` 只用于 APNs 的 NSE 唤醒和内容为空时的占位提示；它不改变
+`event_id_only`，也不应带 Matrix 正文。iOS PR1 的 NSE 原样返回 `…`；PR2 才会用
+`event_id`/`room_id` 和共享凭据拉正文，并把加密房间显示为「加密消息」。部署真实设备前
+须再次执行 `pushers/set`，让 homeserver 保存新 payload，详情见
+`app-apple/docs/push-device.md`。
 
 反向代理是**可选**的（#128 决策，`BOTVILLE_PUSH_PUBLIC` 默认 `false`）：默认
 不开公网 push 域名，homeserver 走 compose 内网 `http://sygnal:5000`。仅当
@@ -579,6 +589,7 @@ make logs PUSH=1
 注册 pusher（见 `app-apple/docs/push-device.md`），也可按 §7 手工注册
 （务必使用标准 Base64 APNs token，保留 `=` 填充，并设置
 `data.format=event_id_only`、`app_id=<bundle-id>.apns`、
+`data.default_payload={"aps":{"mutable-content":1,"alert":{"body":"…"}}}`，
 `data.url` 按 §5 表取值——默认内网 `http://sygnal:5000/_matrix/push/v1/notify`，
 公网模式 `https://<BOTVILLE_PUSH_DOMAIN>/_matrix/push/v1/notify`）掐表验收并回填。
 

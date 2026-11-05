@@ -9,6 +9,122 @@ import Combine
 
 @MainActor
 final class MatrixServiceLifecycleTests: XCTestCase {
+    func testLoginWritesAndClearLocalSessionRemovesSharedPushCredentials() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let sessionStore = InMemorySessionStore()
+        let sharedStore = InMemorySharedPushCredentialsStore()
+        let cleanupState = InMemorySharedPushCredentialsCleanupStateStore()
+        cleanupState.setCleanupRequired(true)
+        let service = makeService(
+            sessionStore: sessionStore,
+            directory: temporary,
+            client: FakeClient(),
+            sharedPushCredentialsStore: sharedStore,
+            sharedPushCredentialsCleanupStateStore: cleanupState
+        )
+
+        try await service.login(homeserver: "https://matrix.test", username: "shared-credentials", password: "test-password")
+
+        let shared = try XCTUnwrap(sharedStore.load())
+        XCTAssertEqual(shared.homeserverURL, "https://matrix.test")
+        XCTAssertEqual(shared.userID, "@shared-credentials:matrix.test")
+        XCTAssertEqual(shared.deviceID, "C21TEST")
+        XCTAssertEqual(shared.accessToken, "fake-access")
+        XCTAssertFalse(cleanupState.isCleanupRequired)
+
+        try await service.clearLocalSession()
+
+        XCTAssertNil(try sharedStore.load())
+    }
+
+    func testRestoreWritesSharedPushCredentials() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let saved = testCredentials(userID: "@restore-shared:matrix.test")
+        let sessionStore = InMemorySessionStore(saved)
+        let sharedStore = InMemorySharedPushCredentialsStore()
+        _ = try SessionStoreDirectory(baseURL: temporary).create(for: saved.storeID)
+        let service = makeService(
+            sessionStore: sessionStore,
+            directory: temporary,
+            client: FakeClient(),
+            sharedPushCredentialsStore: sharedStore
+        )
+
+        await service.restoreSession()
+
+        XCTAssertEqual(try sharedStore.load(), SharedPushCredentials(
+            homeserverURL: saved.homeserverURL,
+            userID: saved.userID,
+            accessToken: saved.accessToken,
+            deviceID: saved.deviceID
+        ))
+    }
+
+    func testUnavailableSharedPushStoreDoesNotBlockLogin() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let service = makeService(
+            sessionStore: InMemorySessionStore(),
+            directory: temporary,
+            client: FakeClient(),
+            sharedPushCredentialsStore: UnavailableSharedPushCredentialsStore()
+        )
+
+        try await service.login(homeserver: "https://matrix.test", username: "shared-unavailable", password: "test-password")
+
+        XCTAssertTrue(service.isLoggedIn)
+    }
+
+    func testSharedCredentialDeleteFailureIsRetriedOnNextStartupWithoutSession() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let suiteName = "MatrixServiceLifecycleTests.\(UUID().uuidString)"
+        let firstDefaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { firstDefaults.removePersistentDomain(forName: suiteName) }
+        let sessionStore = InMemorySessionStore()
+        let sharedStore = FailOnceDeleteSharedPushCredentialsStore()
+        let cleanupState = UserDefaultsSharedPushCredentialsCleanupStateStore(defaults: firstDefaults)
+        let service = makeService(sessionStore: sessionStore, directory: temporary, client: FakeClient(),
+                                  sharedPushCredentialsStore: sharedStore, sharedPushCredentialsCleanupStateStore: cleanupState)
+
+        try await service.login(homeserver: "https://matrix.test", username: "retry-shared-delete", password: "test-password")
+        await service.logout()
+        XCTAssertTrue(cleanupState.isCleanupRequired)
+        XCTAssertEqual(sharedStore.deleteCalls, 1)
+        XCTAssertNotNil(try sharedStore.load())
+        XCTAssertNil(try sessionStore.load())
+
+        let restartedDefaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let restartedCleanupState = UserDefaultsSharedPushCredentialsCleanupStateStore(defaults: restartedDefaults)
+        let restarted = makeService(sessionStore: sessionStore, directory: temporary, client: FakeClient(),
+                                    sharedPushCredentialsStore: sharedStore, sharedPushCredentialsCleanupStateStore: restartedCleanupState)
+        await restarted.restoreSession()
+        XCTAssertFalse(restartedCleanupState.isCleanupRequired)
+        XCTAssertEqual(sharedStore.deleteCalls, 2)
+        XCTAssertNil(try sharedStore.load())
+    }
+
+    func testPairingLoginWritesSharedPushCredentials() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let sharedStore = InMemorySharedPushCredentialsStore()
+        let pairing = FakePairingAuthentication(session: fakeSession(userID: "@paired:matrix.test", deviceID: "PAIR"))
+        let service = makeService(sessionStore: InMemorySessionStore(), directory: temporary, client: FakeClient(),
+                                  sharedPushCredentialsStore: sharedStore, pairingAuthentication: pairing)
+        let expiration = Int(Date().addingTimeInterval(60).timeIntervalSince1970)
+        let code = Data(repeating: 0, count: 32).base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+        let qr = try PairingQRCode.parse("botville://pair?v=1&hs=https://matrix.test&code=\(code)&exp=\(expiration)")
+        let response = PairingRedeemResponse(homeserver: URL(string: "https://matrix.test")!, gateway: nil,
+                                             auth: PairingAuthentication(type: .loginToken, token: "test-token", expiresInMS: 30_000),
+                                             featuresURL: nil, receivedAt: Date())
+
+        try await service.completePairing(response: response, qrCode: qr)
+
+        XCTAssertEqual(try sharedStore.load(), SharedPushCredentials(homeserverURL: "https://matrix.test", userID: "@paired:matrix.test", accessToken: "fake-access", deviceID: "PAIR"))
+    }
+
     func testReleaseRestorePolicyRejectsStoredLoopbackHTTP() {
         XCTAssertThrowsError(
             try RestoredHomeserverPolicy(storedAllowLocalHTTP: true, isDebugBuild: false)
@@ -113,19 +229,49 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         let softLogout = ClientError.MatrixApi(kind: .unknownToken(softLogout: true), code: "M_UNKNOWN_TOKEN", msg: "redacted", details: nil)
         let store = InMemorySessionStore()
         let client = FakeClient(syncError: softLogout)
-        let service = makeService(sessionStore: store, directory: temporary, client: client)
+        let sharedStore = InMemorySharedPushCredentialsStore()
+        let service = makeService(sessionStore: store, directory: temporary, client: client, sharedPushCredentialsStore: sharedStore)
 
         try await service.login(homeserver: "https://matrix.test", username: "c21_soft", password: "test-password")
         let saved = try XCTUnwrap(store.load())
         try await waitUntil { service.requiresPasswordReauthentication }
 
         XCTAssertFalse(service.isLoggedIn)
+        XCTAssertNil(try sharedStore.load())
         XCTAssertTrue(service.canClearLocalSession)
         XCTAssertEqual(try store.load(), saved)
         XCTAssertTrue(FileManager.default.fileExists(atPath: temporary.appendingPathComponent(saved.storeID.uuidString).path))
         XCTAssertEqual(service.reauthenticationHomeserver, saved.homeserverURL)
         XCTAssertEqual(service.reauthenticationUserID, saved.userID)
         XCTAssertEqual(service.sessionError, "会话需要重新输入密码；将使用当前设备 ID 重新登录，已加密的本地数据会保留。")
+    }
+
+    func testSoftLogoutSharedCredentialDeleteFailureRetainsPrimarySessionAndRetriesOnRestart() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let softLogout = ClientError.MatrixApi(kind: .unknownToken(softLogout: true), code: "M_UNKNOWN_TOKEN", msg: "redacted", details: nil)
+        let sessionStore = InMemorySessionStore()
+        let sharedStore = FailOnceDeleteSharedPushCredentialsStore()
+        let cleanupState = InMemorySharedPushCredentialsCleanupStateStore()
+        let client = FakeClient(syncError: softLogout)
+        let service = makeService(sessionStore: sessionStore, directory: temporary, client: client,
+                                  sharedPushCredentialsStore: sharedStore, sharedPushCredentialsCleanupStateStore: cleanupState)
+
+        try await service.login(homeserver: "https://matrix.test", username: "soft-delete-retry", password: "test-password")
+        let saved = try XCTUnwrap(sessionStore.load())
+        try await waitUntil { service.requiresPasswordReauthentication }
+        XCTAssertTrue(cleanupState.isCleanupRequired)
+        XCTAssertNotNil(try sharedStore.load())
+        XCTAssertEqual(try sessionStore.load(), saved)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: temporary.appendingPathComponent(saved.storeID.uuidString).path))
+
+        let restarted = makeService(sessionStore: sessionStore, directory: temporary, client: FakeClient(),
+                                    sharedPushCredentialsStore: sharedStore, sharedPushCredentialsCleanupStateStore: cleanupState)
+        await restarted.restoreSession()
+        XCTAssertFalse(cleanupState.isCleanupRequired)
+        XCTAssertEqual(try sessionStore.load(), saved)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: temporary.appendingPathComponent(saved.storeID.uuidString).path))
+        XCTAssertNotNil(try sharedStore.load())
     }
 
     func testAuthDelegatePreservesSoftLogoutFlag() async throws {
@@ -252,12 +398,13 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: temporary) }
         let saved = testCredentials(userID: "@c21_save_soft:matrix.test")
         let store = FailOnceSaveSessionStore(saved)
+        let sharedStore = InMemorySharedPushCredentialsStore()
         let softLogout = ClientError.MatrixApi(kind: .unknownToken(softLogout: true), code: "M_UNKNOWN_TOKEN", msg: "redacted", details: nil)
         let first = FakeClient(syncError: softLogout)
         let replacement = FakeClient()
         let clients = ClientSequence([first, replacement, replacement])
         let authentication = FakePasswordAuthentication()
-        let service = MatrixService(sessionStore: store, storeDirectory: SessionStoreDirectory(baseURL: temporary), discovery: PasswordDiscovery(), monitorNetwork: false, passwordAuthentication: authentication)
+        let service = MatrixService(sessionStore: store, sharedPushCredentialsStore: sharedStore, storeDirectory: SessionStoreDirectory(baseURL: temporary), discovery: PasswordDiscovery(), monitorNetwork: false, passwordAuthentication: authentication)
         service.clientFactory = { _, _, _ in try clients.next() }
         _ = try SessionStoreDirectory(baseURL: temporary).create(for: saved.storeID)
 
@@ -273,10 +420,12 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         }
         XCTAssertEqual(try store.load(), saved)
         XCTAssertTrue(service.requiresPasswordReauthentication)
+        XCTAssertNil(try sharedStore.load(), "A failed replacement session must not publish a token to the NSE")
 
         try await service.login(homeserver: "https://wrong.invalid", username: "wrong", password: "new-password")
         XCTAssertTrue(service.isLoggedIn)
         XCTAssertFalse(service.requiresPasswordReauthentication)
+        XCTAssertEqual(try sharedStore.load()?.accessToken, try store.load()?.accessToken)
     }
 
     func testCancelledSoftLogoutReauthenticationRetainsStoreDuringActivation() async throws {
@@ -411,11 +560,13 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         let temporary = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: temporary) }
         let sessionStore = InMemorySessionStore()
+        let sharedStore = InMemorySharedPushCredentialsStore()
         let client = FakeClient()
-        let service = makeService(sessionStore: sessionStore, directory: temporary, client: client)
+        let service = makeService(sessionStore: sessionStore, directory: temporary, client: client, sharedPushCredentialsStore: sharedStore)
 
         try await service.login(homeserver: "https://matrix.test", username: "c21_logout", password: "test-password")
         let saved = try XCTUnwrap(sessionStore.load())
+        XCTAssertNotNil(try sharedStore.load())
         let unrelated = temporary.appendingPathComponent("unrelated", isDirectory: true)
         try FileManager.default.createDirectory(at: unrelated, withIntermediateDirectories: true)
 
@@ -424,6 +575,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         XCTAssertTrue(client.didLogout)
         XCTAssertFalse(service.isLoggedIn)
         XCTAssertNil(try sessionStore.load())
+        XCTAssertNil(try sharedStore.load())
         XCTAssertFalse(FileManager.default.fileExists(atPath: temporary.appendingPathComponent(saved.storeID.uuidString).path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.path))
     }
@@ -919,13 +1071,19 @@ final class MatrixServiceLifecycleTests: XCTestCase {
     }
 
     private func makeService(sessionStore: any SessionStore, directory: URL, client: FakeClient,
-                             authentication: FakePasswordAuthentication = FakePasswordAuthentication()) -> MatrixService {
+                             authentication: FakePasswordAuthentication = FakePasswordAuthentication(),
+                             sharedPushCredentialsStore: any SharedPushCredentialsStore = InMemorySharedPushCredentialsStore(),
+                             sharedPushCredentialsCleanupStateStore: any SharedPushCredentialsCleanupStateStore = InMemorySharedPushCredentialsCleanupStateStore(),
+                             pairingAuthentication: any PairingCredentialAuthenticating = MatrixPairingCredentialAuthentication()) -> MatrixService {
         let service = MatrixService(
             sessionStore: sessionStore,
+            sharedPushCredentialsStore: sharedPushCredentialsStore,
+            sharedPushCredentialsCleanupStateStore: sharedPushCredentialsCleanupStateStore,
             storeDirectory: SessionStoreDirectory(baseURL: directory),
             discovery: PasswordDiscovery(),
             monitorNetwork: false,
             passwordAuthentication: authentication,
+            pairingAuthentication: pairingAuthentication,
             authenticationTimeout: 5
         )
         service.clientFactory = { _, _, _ in client }
@@ -1247,6 +1405,42 @@ private final class FailFirstDeleteSessionStore: SessionStore, @unchecked Sendab
         }
         value = nil
     }
+}
+
+private final class UnavailableSharedPushCredentialsStore: SharedPushCredentialsStore, @unchecked Sendable {
+    func load() throws -> SharedPushCredentials? { throw SharedPushCredentialsStoreError.unavailable }
+    func save(_ credentials: SharedPushCredentials) throws { throw SharedPushCredentialsStoreError.unavailable }
+    func delete() throws { throw SharedPushCredentialsStoreError.unavailable }
+}
+
+private final class FailOnceDeleteSharedPushCredentialsStore: SharedPushCredentialsStore, @unchecked Sendable {
+    private var value: SharedPushCredentials?
+    private var shouldFailDelete = true
+    private(set) var deleteCalls = 0
+
+    func load() throws -> SharedPushCredentials? { value }
+    func save(_ credentials: SharedPushCredentials) throws { value = credentials }
+    func delete() throws {
+        deleteCalls += 1
+        if shouldFailDelete {
+            shouldFailDelete = false
+            throw SharedPushCredentialsStoreError.unavailable
+        }
+        value = nil
+    }
+}
+
+private final class InMemorySharedPushCredentialsCleanupStateStore: SharedPushCredentialsCleanupStateStore, @unchecked Sendable {
+    var isCleanupRequired = false
+    func setCleanupRequired(_ required: Bool) { isCleanupRequired = required }
+}
+
+private final class FakePairingAuthentication: PairingCredentialAuthenticating, @unchecked Sendable {
+    private let session: Session
+    init(session: Session) { self.session = session }
+    func register(at homeserver: URL, registrationToken: String, username: String, password: String,
+                  deviceDisplayName: String, deadline: Date) async throws -> Session { session }
+    func login(at homeserver: URL, loginToken: String, deviceDisplayName: String, deadline: Date) async throws -> Session { session }
 }
 
 private final class ClientSequence: @unchecked Sendable {
