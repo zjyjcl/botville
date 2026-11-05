@@ -74,7 +74,7 @@ botville://pair?v=1&hs=<https-url>[&gw=<https-url>][&fp=<spki-hash>]&code=<b64ur
 | `v` | ✅ | 固定字符串 `"1"` | 契约版本。未知值（`2`、`01`、`1.0`…）整体拒绝；旧 App 遇新 `v` 应提示升级 |
 | `hs` | ✅ | `https://` 绝对 URL（§3.2） | homeserver 基址；兑换端点由它拼出 |
 | `gw` | ❌ | `https://` 绝对 URL（§3.2） | AI 网关基址；无网关部署省略（见 §5.1.1「无网关时的行为」）。出现时仍须通过 §3.2 全部校验，空值（`gw=`）按格式错误拒绝 |
-| `fp` | ❌ | `sha256:<base64url-43>`（§3.3） | hs 叶证书 SPKI 的 sha256；**仅**自签或私有 CA 部署提供，公网 CA 部署省略 |
+| `fp` | ❌ | `sha256:<base64url-43>`（§3.3） | hs 叶证书 SPKI 的 sha256；有则 **仅 pin、替代系统信任**（§3.3.2）；**仅**自签或私有 CA 部署提供，公网 CA 部署省略 |
 | `code` | ✅ | 43 字符 base64url 无填充 | 32 字节随机数（§4.2） |
 | `exp` | ✅ | 十进制 Unix 秒 | code 过期时刻 = 签发时刻 + 300s |
 
@@ -92,24 +92,57 @@ botville://pair?v=1&hs=<https-url>[&gw=<https-url>][&fp=<spki-hash>]&code=<b64ur
 - 值 = `"sha256:" + base64url(sha256(SPKI(叶证书)))`，**无填充**，摘要段恰好 43 字符
   （解码 32 字节）；base64url 必须是规范编码（解码后重新编码与原文一致，尾部残留位
   非零即拒绝）。
-- 语义：App 在与 hs 建立 TLS 时做证书锁定（pinning）的参考值；**仅自签或私有 CA
-  部署提供**，公网 CA（如 Let's Encrypt）部署省略该参数——证书轮换会让指纹失效。
+- 语义：有 `fp` 时，它是 App 对 **hs 主机** HTTPS 的**唯一**信任根据（叶证书
+  SPKI 的 SHA-256 pin），**替代**系统信任链——匹配即信任该叶证，不匹配即拒绝；
+  **不再要求**系统信任评估通过。**仅自签或私有 CA 部署提供**；公网 CA（如
+  Let's Encrypt）部署省略该参数——证书轮换会让指纹失效。无 `fp` 时的信任见 §3.3.2。
 
 ### 3.3.1 何时必须带 fp（定稿：fp 可选）
 
-`fp` 是可选参数（总管拍板；C 线 #130 已按可选合并）。原因：Cloudflare Tunnel 与公网 CA 证书会轮换，无法 pin。
+`fp` 是可选参数（总管拍板；C 线 #130 已按可选合并）。原因：Cloudflare Tunnel 与公网 CA 证书会轮换，无法 pin。信任语义（有/无 fp）定稿见 §3.3.2 与 #132。
 
 | 部署场景 | fp | 说明 |
 |---|---|---|
-| 自签证书 | **必须带** | 系统不信任该证书，App 只能按 fp 锁定 |
+| 自签证书 | **必须带** | 有 fp 时 **仅 SPKI pin**（匹配即信，不要求系统信任）；系统根不会信任该叶证 |
 | frp（TLS 在 8845 端终止，云服务器仅 TCP 透传） | **必须带** | 证书由本机签发/持有时按自签处理；若本机用公网 CA（ACME）证书，则按“公网 CA”行处理 |
-| 局域网（仅测试，外网无法连接） | **必须带** | 局域网无公网 CA 证书 |
-| 公网 CA 证书（如 IPv6+DDNS 用 ACME 证书） | 可以不带 | 证书轮换会使 pin 失效 |
-| Cloudflare Tunnel | 可以不带 | 边缘证书由 Cloudflare 管理并轮换 |
+| 局域网（仅测试，外网无法连接） | **必须带** | 局域网通常无公网 CA 证书；有 fp 时仅 pin |
+| 公网 CA 证书（如 IPv6+DDNS 用 ACME 证书） | 可以不带 | 证书轮换会使 pin 失效；不带则仅系统信任 |
+| Cloudflare Tunnel | 可以不带 | 边缘证书由 Cloudflare 管理并轮换；不带则仅系统信任 |
 
 - **不带 fp 时，App 只依赖系统信任链**（操作系统根证书 + 常规主机名校验），不做额外锁定。
 - 签发端（管理页/向导）应按当前接入方式自动决定是否写入 fp；“必须带”的场景缺 fp 时签发端拒绝签发（服务端签发约束，URI 解析层仍视 fp 为可选）。
-- 自签证书的信任与下发问题另见 #132。
+
+### 3.3.2 信任语义（有 fp / 无 fp）（#132 定稿）
+
+棉棉霸 2026-11-06 拍板。**不采用**「pin 或系统信任任一通过」。
+
+| 情况 | App 对 **hs 主机** HTTPS 的信任 |
+|---|---|
+| **有 `fp`** | **只用**叶 SPKI SHA-256 pin：与 `fp` 匹配 → 信任该叶证；不匹配 → 拒绝（如 `certificateMismatch`）。**不得**再要求系统信任链 / `SecTrustEvaluateWithError` 通过（避免自签被系统信任挡死，也避免 pin 被系统信任旁路）。仍须校验 challenge host 与二维码 `hs` host 一致（大小写不敏感）。 |
+| **无 `fp`** | **仅**系统信任（OS 根 + 常规 hostname），**不做** SPKI pin。 |
+
+Pin 适用范围（与 C 线 #130 范围对齐；本契约约束行为，实现另 PR）：
+
+- **覆盖**：hs host 上 App 自管的 HTTPS——兑换（`/_botville/pair/redeem`）、同 host 的注册/登录 URLSession、同 host 的网关 API（如 `HTTPGatewayClient`）。
+- **不覆盖**：`gw` 与 `hs` **不同 host** 时的网关请求（走系统 TLS，不得因 QR 的 `fp` 拒绝）；WebKit 模块页；跨 origin 重定向（仍禁止把 code/令牌送走）。
+- **缓解**（有 fp 时的 TOFU）：配对码一次性 + 短过期、二维码传递通道、确认页展示 `hs` 与指纹摘要；用户确认后才兑换。
+- **证书轮换**：hs 换证后旧二维码 / 已保存的 pin 会失败 → 须重新签发配对码并重新配对（会话侧如何提示由 App 实现）。
+
+### 3.3.3 SDK 同步与 pin 边界（已知限制）
+
+matrix-rust-sdk（当前绑定如 `matrix-rust-components-swift` 26.x）的同步、消息等**内部** HTTPS **无法**做叶 SPKI pin 或注入自定义 TLS verifier / URLSession。暴露的根证书接口（如 `addRootCertificates`）**不等于**叶 SPKI pin；**禁止**用关闭 TLS 校验代替 pin。
+
+| 阶段 | 路径 | 能否按 `fp` pin？ |
+|---|---|---|
+| 扫码 → 确认页 | 本地解析 URI，无 HTTPS | N/A |
+| redeem + 同 hs host 凭证交换 | App URLSession / TLS delegate | **能**（有 fp 时按 §3.3.2） |
+| 同 host 网关 API | App URLSession | **能** |
+| **SDK sync / 消息等** | SDK 自带 TLS | **不能**；仍系统信任（或 SDK 自带策略） |
+| WebKit 模块页 | 系统 TLS | **不能** |
+
+**产品后果（自签 / 私有 CA）**：有 fp 时兑换与同 host App HTTPS 可通，但 **SDK 同步仍可能**因系统不信任叶证而失败。本契约**不**宣称 SDK 流量已 pin。缓解（预装根、其它信任配置、等上游）属部署/App 产品决策，**不在本契约 PR 范围**。
+
+**责任边界**：A 线维护本契约与签发是否写入 `fp`（#128 接入方式）；C 线实现「有 fp 时仅 pin」的 TLS delegate（另 PR）、确认页展示、以及 SDK 无法 pin 时的用户提示/已知限制说明。
 
 ### 3.4 编码与解析规则
 
@@ -296,6 +329,8 @@ botville://pair?v=1&hs=<https-url>[&gw=<https-url>][&fp=<spki-hash>]&code=<b64ur
 
 - 二维码不含长期凭据（§3.6）；`code` 一次性、5 分钟、只存哈希。
 - 兑换仅在 `https://` 之上（`hs` 强制 https）；`fp` 供自签/私有 CA 部署锁定证书。
+  有 `fp` 时 **仅 SPKI pin 替代系统信任**；无 `fp` 时仅系统信任（§3.3.2）。
+  SDK 同步仍无法 pin（§3.3.3）。
 - 查无 code 与格式错同码 400，不泄露 code 存在性；限流先于查询（§4.5）。
 - 原子核销杜绝双花（§4.3）；审计不含 code 明文与 token（§4.6）。
 - 管理面不暴露公网匿名访问：Matrix 管理员登录或 loopback CLI + 一次性 token（§4.1）。
@@ -316,6 +351,8 @@ botville://pair?v=1&hs=<https-url>[&gw=<https-url>][&fp=<spki-hash>]&code=<b64ur
 
 - 服务端实现（存储、HTTP 端点、限流、管理页/CLI）——按本契约与 OpenAPI 落地；
 - App 扫码 UI 与流程引导（C2.2）；
+- App TLS 实现改为「有 fp 时仅 pin」（#132 C 线；本文件只定语义）；
+- SDK 同步在自签环境下的连通性（预装根 / 上游 pin 能力等，见 §3.3.3）；
 - `registration_token` / `login_token` 在 homeserver 侧的核销实现；
 - `features_url` 指向的功能清单内容结构（网关契约）；
 - 管理页对签发记录的列表/筛选/批量作废等运维功能细节。

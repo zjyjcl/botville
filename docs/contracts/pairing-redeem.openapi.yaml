@@ -25,6 +25,10 @@ info:
       签发后 5 分钟过期、一次性、事务内原子核销。
     - 成功响应的 `homeserver` 是**签发时保存的 hs 原样返回**；App 必须与二维码中
       的 `hs` 逐字符比对，不一致即拒绝。
+    - 二维码可选 `fp`（叶证书 SPKI SHA-256）。App 信任规则见
+      `docs/contracts/pairing-qr.md` §3.3.2：有 `fp` 时对 hs 主机 HTTPS **仅** SPKI
+      pin（匹配即信、不匹配拒绝，**替代**系统信任）；无 `fp` 时仅系统信任。`fp`
+      不出现在本兑换请求/响应 schema 中。SDK 同步仍无法 pin（同文档 §3.3.3）。
     - 错误体统一 `{errcode, error[, retry_after_ms]}`；
       `BV_PAIR_RATE_LIMITED` **必带** `retry_after_ms`（由下方 if/then 强制）。
     - 请求体服务端拒绝未知字段；响应中未声明字段客户端必须忽略（前向兼容）。
