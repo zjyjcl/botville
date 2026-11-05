@@ -20,8 +20,13 @@ public struct SessionCredentials: Codable, Equatable, Sendable {
     public let storeID: UUID
     public let storeKey: Data
     public let allowLocalHTTP: Bool
+    /// Non-secret gateway trust configuration obtained from a confirmed QR.
+    /// The pairing code and temporary auth token are deliberately absent.
+    public let gatewayURL: String?
+    public let gatewayCertificateFingerprint: Data?
 
-    public init(accessToken: String, refreshToken: String?, userID: String, deviceID: String, homeserverURL: String, oauthData: String?, storeID: UUID, storeKey: Data, allowLocalHTTP: Bool = false) {
+    public init(accessToken: String, refreshToken: String?, userID: String, deviceID: String, homeserverURL: String, oauthData: String?, storeID: UUID, storeKey: Data, allowLocalHTTP: Bool = false,
+                gatewayURL: String? = nil, gatewayCertificateFingerprint: Data? = nil) {
         self.accessToken = accessToken
         self.refreshToken = refreshToken
         self.userID = userID
@@ -31,10 +36,13 @@ public struct SessionCredentials: Codable, Equatable, Sendable {
         self.storeID = storeID
         self.storeKey = storeKey
         self.allowLocalHTTP = allowLocalHTTP
+        self.gatewayURL = gatewayURL
+        self.gatewayCertificateFingerprint = gatewayCertificateFingerprint
     }
 
-    public init(session: Session, storeID: UUID, storeKey: Data, allowLocalHTTP: Bool = false) {
-        self.init(accessToken: session.accessToken, refreshToken: session.refreshToken, userID: session.userId, deviceID: session.deviceId, homeserverURL: session.homeserverUrl, oauthData: session.oauthData, storeID: storeID, storeKey: storeKey, allowLocalHTTP: allowLocalHTTP)
+    public init(session: Session, storeID: UUID, storeKey: Data, allowLocalHTTP: Bool = false,
+                gatewayURL: String? = nil, gatewayCertificateFingerprint: Data? = nil) {
+        self.init(accessToken: session.accessToken, refreshToken: session.refreshToken, userID: session.userId, deviceID: session.deviceId, homeserverURL: session.homeserverUrl, oauthData: session.oauthData, storeID: storeID, storeKey: storeKey, allowLocalHTTP: allowLocalHTTP, gatewayURL: gatewayURL, gatewayCertificateFingerprint: gatewayCertificateFingerprint)
     }
 
     /// C2.1 uses standard /sync, so restored password sessions always resume

@@ -14,6 +14,7 @@ import AppKit
 struct BotvilleApp: App {
     @StateObject private var matrixService = MatrixService()
     @State private var selectedTab = Self.initialTab
+    @State private var debugPairingPresented = Self.opensPairConfirm
 
     private static var initialTab: Int {
 #if DEBUG
@@ -23,12 +24,48 @@ struct BotvilleApp: App {
 #endif
     }
 
+    private static var opensPairEntry: Bool {
+#if DEBUG
+        ProcessInfo.processInfo.arguments.contains("-pair-entry")
+#else
+        false
+#endif
+    }
+
+    private static var opensPairConfirm: Bool {
+#if DEBUG
+        ProcessInfo.processInfo.arguments.contains("-pair-confirm")
+#else
+        false
+#endif
+    }
+
     private var root: some View {
+#if DEBUG
+        // Screenshot/demo routes must not restore a user's session in the
+        // background. They are intentionally isolated from normal startup.
+        Group {
+            if Self.opensPairConfirm {
+            Color.clear
+            } else if Self.opensPairEntry {
+                LoginView(service: matrixService)
+            } else {
+                normalRoot
+            }
+        }
+#else
+        normalRoot
+#endif
+    }
+
+    private var normalRoot: some View {
         TabView(selection: $selectedTab) {
             AppRootView(service: matrixService)
                 .tabItem { Label("会话", systemImage: "bubble.left.and.bubble.right") }
                 .tag(0)
-            DynamicUIView(onOpenChat: { selectedTab = 0 })
+            DynamicUIView(
+                onOpenChat: { selectedTab = 0 },
+                matrixService: matrixService)
                 .tabItem { Label("动态", systemImage: "square.grid.2x2") }
                 .tag(1)
         }
@@ -38,10 +75,28 @@ struct BotvilleApp: App {
 #if os(macOS)
         Window("botville", id: "main") {
             root
+                .sheet(isPresented: $debugPairingPresented) {
+#if DEBUG
+                    PairingFlowView(
+                        matrixService: matrixService, isPresented: $debugPairingPresented,
+                        initialURI: Self.opensPairConfirm ? PairingMockData.exampleURI : nil)
+#else
+                    EmptyView()
+#endif
+                }
         }
 #else
         WindowGroup {
             root
+                .sheet(isPresented: $debugPairingPresented) {
+#if DEBUG
+                    PairingFlowView(
+                        matrixService: matrixService, isPresented: $debugPairingPresented,
+                        initialURI: Self.opensPairConfirm ? PairingMockData.exampleURI : nil)
+#else
+                    EmptyView()
+#endif
+                }
         }
 #endif
     }

@@ -53,7 +53,8 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
     private let session: URLSession
     private let intentKeys = ActionIntentKeys()
 
-    public init(baseURL: URL, allowLocalHTTP: Bool = false, token: String? = nil, session: URLSession? = nil)
+    public init(baseURL: URL, allowLocalHTTP: Bool = false, token: String? = nil, session: URLSession? = nil,
+                certificateFingerprint: Data? = nil)
         throws
     {
         do {
@@ -65,9 +66,15 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         else {
             throw GatewayClientError.invalidBaseURL
         }
+        // A caller-provided session could silently omit the TLS delegate. Pin
+        // configuration therefore owns its transport; test injection remains
+        // available only for unpinned clients.
+        guard certificateFingerprint == nil || session == nil else { throw GatewayClientError.invalidBaseURL }
         self.token = token
         if let session {
             self.session = session
+        } else if let certificateFingerprint {
+            self.session = PairingURLSession.make(fingerprint: certificateFingerprint, host: self.baseURL.host)
         } else {
             let configuration = URLSessionConfiguration.ephemeral
             configuration.httpCookieStorage = nil
@@ -80,12 +87,14 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
     }
 
     public convenience init(
-        baseURL: String, allowLocalHTTP: Bool = false, token: String? = nil, session: URLSession? = nil
+        baseURL: String, allowLocalHTTP: Bool = false, token: String? = nil, session: URLSession? = nil,
+        certificateFingerprint: Data? = nil
     ) throws {
         guard let url = URL(string: baseURL.trimmingCharacters(in: .whitespacesAndNewlines)) else {
             throw GatewayClientError.invalidBaseURL
         }
-        try self.init(baseURL: url, allowLocalHTTP: allowLocalHTTP, token: token, session: session)
+        try self.init(baseURL: url, allowLocalHTTP: allowLocalHTTP, token: token, session: session,
+                      certificateFingerprint: certificateFingerprint)
     }
 
     public func capabilities(locale: String? = nil, appVersion: String? = nil) async throws

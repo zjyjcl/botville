@@ -13,6 +13,7 @@
 		A10000000000000000000005 /* BotvilleCore in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000031 /* BotvilleCore */; };
 		A10000000000000000000006 /* DynamicUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000016 /* DynamicUI.swift */; };
 		A10000000000000000000007 /* ModuleWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000017 /* ModuleWebView.swift */; };
+		A10000000000000000000008 /* PairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000018 /* PairingView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -24,6 +25,7 @@
 		A10000000000000000000015 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = BotvilleApp/Info.plist; sourceTree = SOURCE_ROOT; };
 		A10000000000000000000016 /* DynamicUI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = DynamicUI.swift; path = Sources/BotvilleApp/DynamicUI.swift; sourceTree = SOURCE_ROOT; };
 		A10000000000000000000017 /* ModuleWebView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ModuleWebView.swift; path = Sources/BotvilleApp/ModuleWebView.swift; sourceTree = SOURCE_ROOT; };
+		A10000000000000000000018 /* PairingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PairingView.swift; path = Sources/BotvilleApp/PairingView.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -53,6 +55,7 @@
 				A10000000000000000000014 /* RoomView.swift */,
 				A10000000000000000000015 /* Info.plist */,
 				A10000000000000000000017 /* ModuleWebView.swift */,
+				A10000000000000000000018 /* PairingView.swift */,
 				A10000000000000000000016 /* DynamicUI.swift */,
 			);
 			name = BotvilleApp;
@@ -118,6 +121,7 @@
 				A10000000000000000000004 /* RoomView.swift in Sources */,
 				A10000000000000000000007 /* ModuleWebView.swift in Sources */,
 				A10000000000000000000006 /* DynamicUI.swift in Sources */,
+				A10000000000000000000008 /* PairingView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
