@@ -65,14 +65,14 @@ name: botville-fed
 # expansion. This stack interpolates ONLY from generated/federation.env
 # (Makefile FED_COMPOSE --env-file), so federation-setup.py propagates
 # BOTVILLE_NO_PROXY_EXTRA from the shell environment or server/compose/.env
-# into it. hs-a/hs-b are network aliases, not service names, so they are
-# NOT in the fixed list — a host that injects a proxy should append them:
-# BOTVILLE_NO_PROXY_EXTRA=hs-a,hs-b. HTTP_PROXY/HTTPS_PROXY are
+# into it. hs-a/hs-b are fedgate network aliases (not service names) that
+# pairing's stdlib urllib key fetch uses; they are in the fixed default
+# list, so no EXTRA is needed for them. HTTP_PROXY/HTTPS_PROXY are
 # deliberately NOT set or cleared here either — some deployments
 # intentionally route outbound traffic through a proxy.
 x-noproxy-env: &noproxy-env
-  NO_PROXY: "localhost,127.0.0.1,::1,sygnal,postgres,synapse,tuwunel,continuwuity,gateway,admin,synapse-a,synapse-b,pairing-a,pairing-b,fedgate-a,fedgate-b,.local,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${BOTVILLE_NO_PROXY_EXTRA:+,${BOTVILLE_NO_PROXY_EXTRA}}"
-  no_proxy: "localhost,127.0.0.1,::1,sygnal,postgres,synapse,tuwunel,continuwuity,gateway,admin,synapse-a,synapse-b,pairing-a,pairing-b,fedgate-a,fedgate-b,.local,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${BOTVILLE_NO_PROXY_EXTRA:+,${BOTVILLE_NO_PROXY_EXTRA}}"
+  NO_PROXY: "localhost,127.0.0.1,::1,sygnal,postgres,synapse,tuwunel,continuwuity,gateway,admin,synapse-a,synapse-b,pairing-a,pairing-b,fedgate-a,fedgate-b,hs-a,hs-b,.local,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${BOTVILLE_NO_PROXY_EXTRA:+,${BOTVILLE_NO_PROXY_EXTRA}}"
+  no_proxy: "localhost,127.0.0.1,::1,sygnal,postgres,synapse,tuwunel,continuwuity,gateway,admin,synapse-a,synapse-b,pairing-a,pairing-b,fedgate-a,fedgate-b,hs-a,hs-b,.local,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${BOTVILLE_NO_PROXY_EXTRA:+,${BOTVILLE_NO_PROXY_EXTRA}}"
 
 services:
   synapse-a:
