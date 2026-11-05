@@ -14,6 +14,7 @@ Run:  python3 -m unittest discover -s server/tests -p "test_*.py" -v
 import asyncio
 import importlib.util
 import json
+import os
 import shutil
 import stat
 import subprocess
@@ -217,17 +218,22 @@ APNS_DISABLED_ENV = SYGNAL_ENV + "BOTVILLE_APNS_ENABLED=false\n"
 
 APNS_PLACEHOLDER_ENV = SYGNAL_ENV + (
     "BOTVILLE_APNS_ENABLED=true\n"
-    "APNS_APP_ID=org.botville.app.ios\n"
+    "BOTVILLE_APNS_BUNDLE_ID=<bundle-id>\n"
+    "APNS_APP_ID=<bundle-id>.apns\n"
     "APNS_TOPIC=<bundle-id>\n"
     "APNS_KEY_ID=<key-id>\n"
     "APNS_TEAM_ID=<team-id>\n"
     "APNS_PLATFORM=sandbox\n"
 )
 
+# Real bundle id with APNS_TOPIC/APNS_APP_ID left as placeholders: init.sh
+# must derive topic = bundle id and app id = "<bundle id>.apns" (issue #4
+# single-app convention) and write them back to .env.
 APNS_REAL_ENV = SYGNAL_ENV + (
     "BOTVILLE_APNS_ENABLED=true\n"
-    "APNS_APP_ID=org.botville.app.ios\n"
-    "APNS_TOPIC=org.botville.app.ios\n"
+    "BOTVILLE_APNS_BUNDLE_ID=org.botville.app.ios\n"
+    "APNS_APP_ID=<bundle-id>.apns\n"
+    "APNS_TOPIC=<bundle-id>\n"
     "APNS_KEY_ID=AB12CD34EF\n"
     "APNS_TEAM_ID=WXYZ1234AB\n"
     "APNS_PLATFORM=sandbox\n"
@@ -301,6 +307,21 @@ class SygnalInitScriptTest(unittest.TestCase):
     def sygnal_yaml(self):
         return self.generated.read_text(encoding="utf-8")
 
+    def place_apns_key(self, mode=0o600, content="not-a-real-key-fixture\n"):
+        """Fake APNs key file (never real key material) with a given mode.
+
+        init.sh validates existence/regular-file/mode/size via stat only and
+        never reads the contents, so a dummy string is all that is needed."""
+        secrets_dir = self.tmp / "compose" / "secrets"
+        secrets_dir.mkdir(parents=True, exist_ok=True)
+        key = secrets_dir / "apns.p8"
+        key.write_text(content, encoding="utf-8")
+        os.chmod(key, mode)
+        return key
+
+    def apns_key_path(self):
+        return self.tmp / "compose" / "secrets" / "apns.p8"
+
     def test_mock_only_by_default_and_data_dir_mode(self):
         self.write_env(APNS_DISABLED_ENV)
         proc = self.run_init()
@@ -320,6 +341,13 @@ class SygnalInitScriptTest(unittest.TestCase):
         secrets_dir = self.tmp / "compose" / "secrets"
         self.assertTrue(secrets_dir.is_dir())
         self.assertEqual(stat.S_IMODE(secrets_dir.stat().st_mode), 0o700)
+        # With APNs disabled no key file is required — but compose mounts the
+        # key as a single file (create_host_path: false), so init.sh keeps an
+        # EMPTY 0600 placeholder that is never treated as a real key.
+        placeholder = secrets_dir / "apns.p8"
+        self.assertTrue(placeholder.is_file())
+        self.assertEqual(stat.S_IMODE(placeholder.stat().st_mode), 0o600)
+        self.assertEqual(placeholder.stat().st_size, 0)
 
     def test_push_mock_false_skips_mock_app_and_warns_no_apps(self):
         self.write_env(APNS_DISABLED_ENV + "BOTVILLE_PUSH_MOCK=false\n")
@@ -336,21 +364,22 @@ class SygnalInitScriptTest(unittest.TestCase):
         self.assertIn('"org.botville.mock":', yaml_text)
         self.assertNotIn("type: apns", yaml_text)
         # Names the missing pieces so the operator knows what to fill in.
+        # APNS_TOPIC/APNS_APP_ID are NOT listed: they are derived from the
+        # bundle id once that is real (issue #4).
         warnings = proc.stderr
-        for key in ("APNS_TOPIC", "APNS_KEY_ID", "APNS_TEAM_ID", "secrets/apns.p8"):
+        for key in ("BOTVILLE_APNS_BUNDLE_ID", "APNS_KEY_ID", "APNS_TEAM_ID", "secrets/apns.p8"):
             self.assertIn(key, warnings)
         self.assertIn("NOT rendered", warnings)
 
     def test_apns_rendered_when_enabled_and_key_present(self):
         self.write_env(APNS_REAL_ENV)
-        secrets_dir = self.tmp / "compose" / "secrets"
-        secrets_dir.mkdir()
-        (secrets_dir / "apns.p8").write_text("not-a-real-key-fixture\n", encoding="utf-8")
+        self.place_apns_key()
         proc = self.run_init()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         yaml_text = self.sygnal_yaml()
         self.assertIn('"org.botville.mock":', yaml_text)  # mock stays available
-        self.assertIn('"org.botville.app.ios":', yaml_text)
+        # app id derived as "<bundle id>.apns", topic as the bundle id.
+        self.assertIn('"org.botville.app.ios.apns":', yaml_text)
         self.assertIn("type: apns", yaml_text)
         self.assertIn("keyfile: /secrets/apns.p8", yaml_text)
         self.assertIn('key_id: "AB12CD34EF"', yaml_text)
@@ -359,15 +388,134 @@ class SygnalInitScriptTest(unittest.TestCase):
         self.assertIn('platform: "sandbox"', yaml_text)
         self.assertNotIn("${", yaml_text)
         self.assertNotIn("<", yaml_text)  # no placeholder ever gets rendered
-        self.assertIn("rendered APNs app (org.botville.app.ios)", proc.stdout)
+        # The success log names no APNs values either (issue #4: no value
+        # echo — not even the app id).
+        self.assertIn("rendered APNs app into", proc.stdout)
+        self.assertNotIn("rendered APNs app (", proc.stdout)
+        # Derived values are written back to .env (and survive re-runs).
+        env_text = self.env_file.read_text(encoding="utf-8")
+        self.assertIn("APNS_TOPIC=org.botville.app.ios\n", env_text)
+        self.assertIn("APNS_APP_ID=org.botville.app.ios.apns\n", env_text)
+        self.assertIn("derived from BOTVILLE_APNS_BUNDLE_ID", proc.stderr)
+        self.assertIn("derived as BOTVILLE_APNS_BUNDLE_ID", proc.stderr)
+
+    def test_apns_explicit_topic_and_app_id_accepted(self):
+        # Explicit values are fine as long as topic is reverse-domain and
+        # app id follows the "<bundle id>.apns" rule.
+        env = APNS_REAL_ENV.replace(
+            "APNS_APP_ID=<bundle-id>.apns", "APNS_APP_ID=org.botville.app.ios.apns"
+        ).replace("APNS_TOPIC=<bundle-id>", "APNS_TOPIC=org.botville.app.ios")
+        self.write_env(env)
+        self.place_apns_key()
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        yaml_text = self.sygnal_yaml()
+        self.assertIn('"org.botville.app.ios.apns":', yaml_text)
+        self.assertIn('topic: "org.botville.app.ios"', yaml_text)
+        self.assertNotIn("derived", proc.stderr)
+
+    def test_apns_key_mode_644_rejected(self):
+        # A world/group-readable key is a hard failure (issue #4): exit 1,
+        # never a WARNING-skip that would leave the APNs app unrendered for
+        # reasons the operator cannot see in the warning path.
+        self.write_env(APNS_REAL_ENV)
+        self.place_apns_key(mode=0o644)
+        proc = self.run_init()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("600 or 400", proc.stderr)
+        self.assertIn("apns.p8", proc.stderr)
+        self.assertNotIn("type: apns", self.sygnal_yaml())
+
+    def test_apns_key_mode_400_accepted(self):
+        self.write_env(APNS_REAL_ENV)
+        self.place_apns_key(mode=0o400)
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("type: apns", self.sygnal_yaml())
+
+    def test_apns_key_is_directory_rejected(self):
+        self.write_env(APNS_REAL_ENV)
+        secrets_dir = self.tmp / "compose" / "secrets"
+        secrets_dir.mkdir(parents=True, exist_ok=True)
+        (secrets_dir / "apns.p8").mkdir()
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("not a regular file", proc.stderr)
+
+    def test_apns_key_id_format_rejected_without_echo(self):
+        # 10 lowercase chars: right length, wrong case — must hard-fail with
+        # the field name and rule only, never the value. This holds even
+        # though the key file is missing too: present-but-invalid beats the
+        # missing WARNING path.
+        env = APNS_REAL_ENV.replace("APNS_KEY_ID=AB12CD34EF", "APNS_KEY_ID=ab12cd34ef")
+        self.write_env(env)
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("APNS_KEY_ID", proc.stderr)
+        self.assertIn("10 uppercase alphanumeric", proc.stderr)
+        self.assertNotIn("ab12cd34ef", proc.stdout + proc.stderr)
+
+    def test_apns_team_id_format_rejected_without_echo(self):
+        env = APNS_REAL_ENV.replace("APNS_TEAM_ID=WXYZ1234AB", "APNS_TEAM_ID=TEAM123!")
+        self.write_env(env)
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("APNS_TEAM_ID", proc.stderr)
+        self.assertIn("10 uppercase alphanumeric", proc.stderr)
+        self.assertNotIn("TEAM123!", proc.stdout + proc.stderr)
+
+    def test_apns_bundle_id_bad_format_rejected_without_echo(self):
+        # No dot: not a reverse-domain id.
+        env = APNS_REAL_ENV.replace(
+            "BOTVILLE_APNS_BUNDLE_ID=org.botville.app.ios", "BOTVILLE_APNS_BUNDLE_ID=botville"
+        )
+        self.write_env(env)
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("BOTVILLE_APNS_BUNDLE_ID", proc.stderr)
+        self.assertIn("reverse-domain", proc.stderr)
+        self.assertNotIn("botville\n", proc.stderr)
+        self.assertNotIn("BOTVILLE_APNS_BUNDLE_ID=botville", proc.stdout + proc.stderr)
+
+    def test_apns_app_id_mismatch_rejected_without_echo(self):
+        # The single-app convention (issue #4): app id must be
+        # "<bundle id>.apns" exactly.
+        env = APNS_REAL_ENV.replace(
+            "APNS_APP_ID=<bundle-id>.apns", "APNS_APP_ID=org.other.app.apns"
+        )
+        self.write_env(env)
+        self.place_apns_key()
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("APNS_APP_ID", proc.stderr)
+        self.assertIn(".apns", proc.stderr)
+        self.assertNotIn("org.other.app.apns", proc.stdout + proc.stderr)
+
+    def test_apns_platform_invalid_rejected_without_echo(self):
+        env = APNS_REAL_ENV.replace("APNS_PLATFORM=sandbox", "APNS_PLATFORM=prod")
+        self.write_env(env)
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("APNS_PLATFORM", proc.stderr)
+        self.assertIn("sandbox or production", proc.stderr)
+        self.assertNotIn("APNS_PLATFORM=prod", proc.stdout + proc.stderr)
+
+    def test_apns_topic_bad_format_rejected_without_echo(self):
+        env = APNS_REAL_ENV.replace("APNS_TOPIC=<bundle-id>", "APNS_TOPIC=not a domain")
+        self.write_env(env)
+        self.place_apns_key()
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("APNS_TOPIC", proc.stderr)
+        self.assertIn("reverse-domain", proc.stderr)
+        self.assertNotIn("not a domain", proc.stdout + proc.stderr)
 
     def test_apns_enabled_capitalized_true_is_accepted(self):
         # true/1/yes in any case must enable; only genuinely unrecognized
         # values may warn.
         self.write_env(APNS_REAL_CAPITAL_ENV)
-        secrets_dir = self.tmp / "compose" / "secrets"
-        secrets_dir.mkdir()
-        (secrets_dir / "apns.p8").write_text("not-a-real-key-fixture\n", encoding="utf-8")
+        self.place_apns_key()
         proc = self.run_init()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("type: apns", self.sygnal_yaml())
@@ -376,28 +524,30 @@ class SygnalInitScriptTest(unittest.TestCase):
     def test_apns_enabled_garbage_value_warns_and_stays_enabled(self):
         env = APNS_REAL_ENV.replace("BOTVILLE_APNS_ENABLED=true", "BOTVILLE_APNS_ENABLED=maybe")
         self.write_env(env)
-        secrets_dir = self.tmp / "compose" / "secrets"
-        secrets_dir.mkdir()
-        (secrets_dir / "apns.p8").write_text("not-a-real-key-fixture\n", encoding="utf-8")
+        self.place_apns_key()
         proc = self.run_init()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("BOTVILLE_APNS_ENABLED=maybe is not a boolean", proc.stderr)
         self.assertIn("type: apns", self.sygnal_yaml())  # truthy reading
 
     def test_apns_skipped_when_keyfile_missing(self):
+        # Missing key file stays the soft path: WARNING + skip, mock keeps
+        # working, and init.sh leaves an empty placeholder file so the
+        # single-file compose bind mount stays valid.
         self.write_env(APNS_REAL_ENV)
         proc = self.run_init()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertNotIn("type: apns", self.sygnal_yaml())
         self.assertIn("secrets/apns.p8", proc.stderr)
+        placeholder = self.apns_key_path()
+        self.assertTrue(placeholder.is_file())
+        self.assertEqual(placeholder.stat().st_size, 0)
 
     def test_re_run_does_not_duplicate_apns_app(self):
         # init.sh rewrites sygnal.yaml from the template on every run, so a
         # second run must not append the APNs app twice.
         self.write_env(APNS_REAL_ENV)
-        secrets_dir = self.tmp / "compose" / "secrets"
-        secrets_dir.mkdir()
-        (secrets_dir / "apns.p8").write_text("not-a-real-key-fixture\n", encoding="utf-8")
+        self.place_apns_key()
         self.run_init()
         self.run_init()
         self.assertEqual(self.sygnal_yaml().count("type: apns"), 1)

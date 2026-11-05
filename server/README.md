@@ -94,12 +94,20 @@ continuwuity 默认关闭上游 announcements 检查（避免 SIGTERM 卡到 SIG
   5000；homeserver 走内网 `http://sygnal:5000`）。配置由 `init.sh` 从
   `sygnal/sygnal.yaml.tmpl` 渲染，默认带 `org.botville.mock` pushkin（写 JSONL，
   供 `make push-e2e` 测时延；`BOTVILLE_PUSH_MOCK=false` 可移除，生产只跑真实
-  APNs）；真实 APNs 仅当 `.env` 里 `BOTVILLE_APNS_ENABLED=true` 且 APNS_* 为真实值
-  且 `server/compose/secrets/apns.p8` 存在时渲染（**当前无 Apple 账号，真实 APNs
-  送达未验证**）。homeserver 的内网推送放行只有 sygnal 容器的固定 IP
-  `BOTVILLE_SYGNAL_IP`（一个 /32，留空则完全不放行；详见 push-sygnal.md 的
-  「内网推送放行」）。CI 的 `push-e2e` job 在 synapse、tuwunel、continuwuity
-  三家上各跑一遍。
+  APNs）；真实 APNs（issue #4，单 app 方案）仅当 `.env` 里
+  `BOTVILLE_APNS_ENABLED=true` 且前置齐备时渲染：`BOTVILLE_APNS_BUNDLE_ID`（反向
+  域名，`APNS_TOPIC` 默认取它、`APNS_APP_ID` 默认推导为 `<bundle-id>.apns`）、
+  `APNS_KEY_ID`/`APNS_TEAM_ID`（10 位大写字母数字）、`APNS_PLATFORM`
+  （sandbox|production）与 `server/compose/secrets/apns.p8`（普通文件、非空、
+  mode 600/400，只 stat 不读内容）；**缺项/占位 → WARNING 跳过（mock 照常），
+  已填但格式/权限非法 → init.sh exit 1**。key 以**单文件**只读挂载进容器
+  （无真实 key 时 init.sh 维护 0600 空占位文件，mock-only 部署不受影响），
+  `BOTVILLE_PUSH_DOMAIN` 记录反代用的推送公网域名（运维参考）。**当前无 Apple
+  账号，真实 APNs 送达未验证**（8845 mini PC 部署 runbook 见 push-sygnal.md §11）。
+  homeserver 的内网推送放行只有 sygnal 容器的固定 IP `BOTVILLE_SYGNAL_IP`（一个
+  /32，留空则完全不放行；详见 push-sygnal.md 的「内网推送放行」）。CI 的
+  `push-e2e` job 在 synapse、tuwunel、continuwuity 三家上各跑一遍；lint 另有
+  `server/scripts/check_no_secrets.sh` 守卫（任何被跟踪的 .p8 / 私钥 PEM 头即红）。
 - 镜像默认全部 pin 为 `tag@sha256:<digest>`（含 Postgres，digest 取多架构 index）；
   可在 `.env` 用 `POSTGRES_IMAGE` / `SYNAPSE_IMAGE` / `TUWUNEL_IMAGE` /
   `CONTINUWUITY_IMAGE` / `SYGNAL_IMAGE` 覆盖（如临时跟 `:latest`，不推荐）。
@@ -126,7 +134,7 @@ server/
 │   ├── federation/               # 配对联邦测试栈（A2.1，独立项目 botville-fed）
 │   │   ├── docker-compose.federation.yml  # hs-a/hs-b 双 Synapse + pairing + fedgate
 │   │   └── generated/            # 运行时证书/配置/token，gitignore
-│   ├── secrets/                  # 真实 apns.p8 放这里（init.sh 建 700，gitignore，绝不入库）
+│   ├── secrets/                  # 真实 apns.p8 放这里（init.sh 建 700，gitignore，绝不入库；单文件只读挂载）
 │   └── generated/                # 渲染产物 + mock 推送数据，gitignore（appservice/ 下 0600）
 ├── pairing/                      # 配对联邦组件（A2.1，纯标准库；python -m pairing.service|fedgate）
 │   ├── store.py                  # SQLite：invites（一次性，仅存 sha256）/ peers / events 审计
@@ -136,6 +144,7 @@ server/
 ├── scripts/
 │   ├── init.sh                   # .env 引导/补齐缺失键 + 模板渲染（含 sygnal）
 │   ├── render_push_denylist.py   # push denylist 渲染 + subnet/sygnal IP 校验（A1.2）
+│   ├── check_no_secrets.sh       # 密钥入库守卫：被跟踪 .p8 / 私钥 PEM 头即失败（#4）
 │   ├── federation-certs.sh       # 联邦测试栈自签证书（运行时生成，gitignore，A2.1）
 │   ├── federation-setup.py       # 联邦测试栈 Synapse 配置 + admin token 渲染（A2.1）
 │   ├── bootstrap-continuwuity.sh # continuwuity 首启引导注册（标准 UIA，仅 CS API）
@@ -149,8 +158,9 @@ server/
     ├── appservice_e2e.py         # appservice 代发验收（A1.3，复用 gateway/src）
     ├── federation_e2e.py         # 配对联邦验收：未配对拒绝/配对互发/双向切断（A2.1）
     ├── test_bootstrap_continuwuity.py  # bootstrap/init 脚本 mock 单测（CI lint 跑）
-    ├── test_push_sygnal.py       # mock pushkin + init.sh sygnal 渲染单测（A1.2）
-    └── test_push_denylist.py     # push denylist 渲染/校验单测（A1.2 review B1）
+    ├── test_push_sygnal.py       # mock pushkin + init.sh sygnal/APNs 渲染与校验单测（A1.2/#4）
+    ├── test_push_denylist.py     # push denylist 渲染/校验单测（A1.2 review B1）
+    └── test_check_no_secrets.py  # 密钥入库守卫脚本单测（#4）
 ```
 
 约束：只用 Matrix 标准接口（禁止 `/_synapse/admin` 与 admin room 命令）；仓库不含任何真实密钥；Apache-2.0。

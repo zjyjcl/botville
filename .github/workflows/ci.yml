@@ -33,9 +33,10 @@
 #         shellcheck, python syntax, stdlib unit tests for the bootstrap/
 #         init scripts and the pairing package (no Docker),
 #         notify/gateway contract validation, a guard that .env.example
-#         only ever contains placeholders, and a guard that every image
-#         defaults to tag@sha256 digest (no :latest) identically in compose
-#         and .env.example.
+#         only ever contains placeholders, a guard that no .p8 file or PEM
+#         private-key header is ever tracked (issue #4), and a guard that
+#         every image defaults to tag@sha256 digest (no :latest) identically
+#         in compose and .env.example.
 name: CI
 
 on:
@@ -282,7 +283,7 @@ jobs:
         run: |
           shellcheck -x server/scripts/init.sh server/scripts/bootstrap-continuwuity.sh \
             server/scripts/lib.sh server/scripts/backup-synapse.sh server/scripts/restore-synapse.sh \
-            server/scripts/federation-certs.sh
+            server/scripts/federation-certs.sh server/scripts/check_no_secrets.sh
 
       - name: Python syntax
         run: |
@@ -294,6 +295,11 @@ jobs:
 
       - name: Bootstrap/init script unit tests (stdlib mock, no Docker)
         run: python3 -m unittest discover -s server/tests -p "test_*.py" -v
+
+      # Issue #4: no APNs keys (.p8) or PEM private-key headers may ever be
+      # tracked; .gitignore must keep ignoring *.p8 and secrets/.
+      - name: No tracked private keys (.p8 / PEM headers, issue #4)
+        run: bash server/scripts/check_no_secrets.sh
 
       - name: Pairing package unit tests (stdlib mock, no Docker)
         run: python3 -m unittest discover -s server/pairing/tests -v
@@ -343,14 +349,20 @@ jobs:
               "BOTVILLE_ADMIN_PASSWORD": "<change-me>",
               "BOTVILLE_PUSH_PORT": "8019",
               # APNs placeholders only — real Apple values never ship in the
-              # repo (A1.2); init.sh refuses to render the APNs app from
-              # these placeholders. See docs/deploy/push-sygnal.md.
+              # repo (A1.2/#4); init.sh refuses to render the APNs app from
+              # these placeholders and hard-fails on malformed present
+              # values. See docs/deploy/push-sygnal.md.
               "BOTVILLE_APNS_ENABLED": "false",
-              "APNS_APP_ID": "org.botville.app.ios",
+              # iOS Bundle ID; APNS_TOPIC defaults to it, APNS_APP_ID to
+              # "<bundle-id>.apns" (derived by init.sh, single-app #4).
+              "BOTVILLE_APNS_BUNDLE_ID": "<bundle-id>",
+              "APNS_APP_ID": "<bundle-id>.apns",
               "APNS_TOPIC": "<bundle-id>",
               "APNS_KEY_ID": "<key-id>",
               "APNS_TEAM_ID": "<team-id>",
               "APNS_PLATFORM": "sandbox",
+              # Public push domain for the reverse proxy (docs only).
+              "BOTVILLE_PUSH_DOMAIN": "<push-domain>",
               "COMPOSE_PROJECT_NAME": "botville",
               "BOTVILLE_DOCKER_SUBNET": "172.31.250.0/24",
               # Dynamic-address pool of the compose network; keeps docker's

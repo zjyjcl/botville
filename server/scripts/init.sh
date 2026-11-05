@@ -20,10 +20,18 @@
 #      server/compose/generated/sygnal/sygnal.yaml, appending app parts:
 #      sygnal/mock-app.yaml.part (org.botville.mock) unless BOTVILLE_PUSH_MOCK
 #      is false/0/no (default true), and — only when BOTVILLE_APNS_ENABLED is
-#      truthy AND every APNS_* value is real (no <placeholder>) AND
-#      server/compose/secrets/apns.p8 exists — sygnal/apns-app.yaml.part.
-#      With APNs prerequisites missing the APNs app is skipped with a WARNING;
-#      with no app at all init.sh warns (sygnal could deliver nothing);
+#      truthy AND every APNs prerequisite is real — sygnal/apns-app.yaml.part
+#      (issue #4, single-app plan): BOTVILLE_APNS_BUNDLE_ID must be a real
+#      reverse-domain id (APNS_TOPIC defaults to it, APNS_APP_ID to
+#      "<bundle-id>.apns"), APNS_KEY_ID/APNS_TEAM_ID real 10-char uppercase
+#      alphanumeric ids, APNS_PLATFORM sandbox|production, and
+#      server/compose/secrets/apns.p8 a non-empty regular file with mode
+#      600/400 (checked via stat only — the key's contents are never read).
+#      Missing/placeholder prerequisites skip the APNs app with a WARNING
+#      (the mock pushkin stays usable); values that are present but invalid,
+#      or a key file with wrong permissions, abort with exit 1 (the error
+#      names the field and the rule, never the value); with no app at all
+#      init.sh warns (sygnal could deliver nothing);
 #   5. render generated/push-denylist.env via scripts/render_push_denylist.py:
 #      the tuwunel v1.9.4 upstream default IP denylist (incl. 0.0.0.0/8 and
 #      ::/128) minus the sygnal container's /32 (BOTVILLE_SYGNAL_IP; empty =
@@ -90,6 +98,27 @@ env_flag() {
             printf 'true\n'
             ;;
     esac
+}
+
+
+# True when an APNs-related .env value is usable at all: non-empty and not
+# left as a '<...>' placeholder (the APNs block of .env.example ships
+# <bundle-id>-style placeholders, not <change-me>). "Usable" is about
+# presence only — format checks live in the APNs section below.
+is_real_value() {
+    [[ -n "$1" && "$1" != '<'* ]]
+}
+
+# Apple Key ID / Team ID: exactly 10 uppercase alphanumeric characters.
+is_apns_id() {
+    [[ "$1" =~ ^[A-Z0-9]{10}$ ]]
+}
+
+# Reverse-domain identifier (iOS Bundle ID, APNs topic): at least two
+# dot-separated labels, each starting/ending alphanumeric (hyphens allowed
+# inside), e.g. com.example.app.
+is_reverse_domain() {
+    [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]
 }
 
 
@@ -300,6 +329,15 @@ python3 "${script_dir}/render_push_denylist.py" \
 # then only has to copy the key in.
 mkdir -p "${secrets_dir}"
 chmod 700 "${secrets_dir}"
+# docker-compose.yml bind-mounts the key as a single file (./secrets/apns.p8
+# with create_host_path: false), so `up` with the push profile fails outright
+# when the file is absent. Keep an empty placeholder (0600) whenever no key
+# file exists yet; the APNs gate below only accepts a NON-EMPTY regular file,
+# so the placeholder is never mistaken for a real key.
+if [[ ! -e "${secrets_dir}/apns.p8" ]]; then
+    : > "${secrets_dir}/apns.p8"
+    chmod 600 "${secrets_dir}/apns.p8"
+fi
 
 # Scratch dir for the mock pushkin's JSONL, bind-mounted at /data. The sygnal
 # image runs as root (verified against the pinned v0.17.0), so 755 is enough
@@ -462,39 +500,103 @@ if [[ "$(env_flag BOTVILLE_PUSH_MOCK true)" == "true" ]]; then
     apps_rendered=1
 fi
 
-# The APNs app: only rendered when BOTVILLE_APNS_ENABLED is truthy AND
-# everything real is in place. A half-configured APNs app (placeholder key
-# ids, missing .p8) would make sygnal fail to start and take the mock
-# pushkin down with it, so it is skipped with a WARNING instead — see
-# docs/deploy/push-sygnal.md.
+# The APNs app (issue #4, single-app plan: one APNs app, sandbox↔production
+# switched via APNS_PLATFORM + re-run). Rendered only when BOTVILLE_APNS_ENABLED
+# is truthy AND everything real is in place. Two failure classes, on purpose:
+#   - MISSING/placeholder prerequisites (incl. no real key file): WARNING +
+#     skip the APNs app — a half-configured app would make sygnal fail to
+#     start and take the mock pushkin down with it;
+#   - PRESENT-but-invalid values: exit 1 — a typo'd Key ID, a bad platform,
+#     an APNS_APP_ID that breaks the "<bundle-id>.apns" convention, or a key
+#     file with permissions wider than 600/400 is never silently skipped.
+# Error messages name the field and the rule only, never the value (the IDs
+# are not secrets, but echoing them buys nothing and trains bad habits).
 if [[ "$(env_flag BOTVILLE_APNS_ENABLED false)" == "true" ]]; then
     missing=()
-    for key in APNS_APP_ID APNS_KEY_ID APNS_TEAM_ID APNS_TOPIC; do
+
+    bundle_id="$(env_value BOTVILLE_APNS_BUNDLE_ID)"
+    if ! is_real_value "${bundle_id}"; then
+        missing+=("BOTVILLE_APNS_BUNDLE_ID")
+    elif ! is_reverse_domain "${bundle_id}"; then
+        echo "init.sh: BOTVILLE_APNS_BUNDLE_ID in ${env_file} must be a reverse-domain id (like com.example.app); refusing to continue." >&2
+        exit 1
+    fi
+
+    for key in APNS_KEY_ID APNS_TEAM_ID; do
         value="$(env_value "${key}")"
-        # Empty or still a <placeholder> (incl. <change-me>): not usable.
-        if [[ -z "${value}" || "${value}" == '<'* ]]; then
+        if ! is_real_value "${value}"; then
             missing+=("${key}")
+        elif ! is_apns_id "${value}"; then
+            echo "init.sh: ${key} in ${env_file} must be exactly 10 uppercase alphanumeric characters (the Apple Key ID / Team ID format); refusing to continue." >&2
+            exit 1
         fi
     done
+
     platform="$(env_value APNS_PLATFORM)"
-    if [[ "${platform}" != "sandbox" && "${platform}" != "production" ]]; then
-        missing+=("APNS_PLATFORM (must be sandbox or production)")
+    if ! is_real_value "${platform}"; then
+        missing+=("APNS_PLATFORM")
+    elif [[ "${platform}" != "sandbox" && "${platform}" != "production" ]]; then
+        echo "init.sh: APNS_PLATFORM in ${env_file} must be sandbox or production; refusing to continue." >&2
+        exit 1
     fi
+
     apns_key_file="${secrets_dir}/apns.p8"
-    if [[ ! -f "${apns_key_file}" ]]; then
-        missing+=("secrets/apns.p8")
+    apns_key_real=0
+    if [[ -e "${apns_key_file}" && ! -f "${apns_key_file}" ]]; then
+        echo "init.sh: ${apns_key_file} exists but is not a regular file; remove it and place the APNs key there as a regular file." >&2
+        exit 1
     fi
+    if [[ -f "${apns_key_file}" ]]; then
+        # stat only — the key's contents are never read, hashed or echoed
+        # here (mode/size are metadata, not key material). BSD stat first,
+        # GNU stat as fallback.
+        key_mode="$(stat -f '%Lp' "${apns_key_file}" 2>/dev/null || stat -c '%a' "${apns_key_file}" 2>/dev/null || echo '')"
+        key_size="$(stat -f '%z' "${apns_key_file}" 2>/dev/null || stat -c '%s' "${apns_key_file}" 2>/dev/null || echo 0)"
+        if [[ "${key_size}" =~ ^[0-9]+$ && "${key_size}" -gt 0 ]]; then
+            if [[ "${key_mode}" != "600" && "${key_mode}" != "400" ]]; then
+                echo "init.sh: ${apns_key_file} must have mode 600 or 400 (found ${key_mode}); refusing to continue." >&2
+                exit 1
+            fi
+            apns_key_real=1
+        fi
+        # size 0: the placeholder kept around for the compose bind mount —
+        # no real key placed yet, falls through to the missing list below.
+    fi
+    if [[ "${apns_key_real}" -eq 0 ]]; then
+        missing+=("secrets/apns.p8 (place the real key there, mode 600)")
+    fi
+
     if [[ "${#missing[@]}" -gt 0 ]]; then
         echo "WARNING: BOTVILLE_APNS_ENABLED=true but ${missing[*]} missing or placeholder." >&2
         echo "WARNING: the APNs app is NOT rendered; sygnal runs with the mock pushkin only." >&2
         echo "WARNING: see docs/deploy/push-sygnal.md (place the real key, fill APNS_* in .env)." >&2
     else
+        # APNS_TOPIC defaults to the bundle id; APNS_APP_ID must be
+        # "<bundle-id>.apns" (derived when left empty/placeholder).
+        topic="$(env_value APNS_TOPIC)"
+        if ! is_real_value "${topic}"; then
+            set_env_value APNS_TOPIC "${bundle_id}"
+            echo "init.sh: APNS_TOPIC in ${env_file} was empty/placeholder; derived from BOTVILLE_APNS_BUNDLE_ID" >&2
+        elif ! is_reverse_domain "${topic}"; then
+            echo "init.sh: APNS_TOPIC in ${env_file} must be a reverse-domain id (like com.example.app); refusing to continue." >&2
+            exit 1
+        fi
+
+        app_id="$(env_value APNS_APP_ID)"
+        if ! is_real_value "${app_id}"; then
+            set_env_value APNS_APP_ID "${bundle_id}.apns"
+            echo "init.sh: APNS_APP_ID in ${env_file} was empty/placeholder; derived as BOTVILLE_APNS_BUNDLE_ID with .apns appended" >&2
+        elif [[ "${app_id}" != "${bundle_id}.apns" ]]; then
+            echo "init.sh: APNS_APP_ID in ${env_file} must equal BOTVILLE_APNS_BUNDLE_ID with .apns appended (single-app convention, issue #4); refusing to continue." >&2
+            exit 1
+        fi
+
         apns_part="${compose_dir}/generated/.apns-app.part"
         render_template "${sygnal_apns_template}" "${apns_part}"
         cat "${apns_part}" >> "${sygnal_generated}"
         rm -f "${apns_part}"
         apps_rendered=1
-        echo "init.sh: rendered APNs app ($(env_value APNS_APP_ID)) into ${sygnal_generated}"
+        echo "init.sh: rendered APNs app into ${sygnal_generated}"
     fi
 fi
 
