@@ -21,6 +21,8 @@
     <string>$(MARKETING_VERSION)</string>
     <key>CFBundleVersion</key>
     <string>$(CURRENT_PROJECT_VERSION)</string>
+    <key>NSCameraUsageDescription</key>
+    <string>用于扫描配对二维码，连接你确认的 botville 服务。</string>
     <!-- Debug only. HomeserverPolicy separately restricts HTTP to explicit loopback opt-in. -->
     <key>NSAppTransportSecurity</key>
     <dict>

@@ -1,0 +1,11 @@
+{
+  "v": "1",
+  "homeserver": "https://hs.example.org",
+  "gateway": "https://gw.example.org",
+  "auth": {
+    "type": "login_token",
+    "token": "<redacted-example>",
+    "expires_in_ms": 120000
+  },
+  "features_url": "https://gw.example.org/features.json"
+}

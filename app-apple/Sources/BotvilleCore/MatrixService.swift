@@ -81,6 +81,7 @@ public final class MatrixService: ObservableObject {
     @Published public private(set) var reauthenticationHomeserver: String?
     @Published public private(set) var reauthenticationUserID: String?
     private let passwordAuthentication: any PasswordAuthenticating
+    private let pairingAuthentication: any PairingCredentialAuthenticating
     private let authenticationTimeout: TimeInterval
     private var authenticationAttempt: AuthenticationAttempt?
     var storeKeyFactory: () throws -> Data = SessionCredentials.makeStoreKey
@@ -93,12 +94,14 @@ public final class MatrixService: ObservableObject {
                 discovery: any LoginCapabilityDiscovering = MatrixLoginCapabilityDiscovery(),
                 monitorNetwork: Bool = true,
                 passwordAuthentication: any PasswordAuthenticating = MatrixPasswordAuthentication(),
+                pairingAuthentication: any PairingCredentialAuthenticating = MatrixPairingCredentialAuthentication(),
                 authenticationTimeout: TimeInterval = 60,
                 aiParticipantPolicy: AIParticipantPolicy = .configured()) {
         self.sessionStore = sessionStore
         self.storeDirectory = storeDirectory
         self.discovery = discovery
         self.passwordAuthentication = passwordAuthentication
+        self.pairingAuthentication = pairingAuthentication
         self.aiParticipantPolicy = aiParticipantPolicy
         self.authenticationTimeout = authenticationTimeout.isFinite && authenticationTimeout > 0 ? authenticationTimeout : 60
         if monitorNetwork {
@@ -161,6 +164,120 @@ public final class MatrixService: ObservableObject {
         }
     }
 
+    /// Finishes a pairing only after the confirmation view has redeemed its QR
+    /// code. The QR is retained in memory solely to defend against a response
+    /// that tries to move the Matrix credential exchange to another server.
+    /// Pairing credentials are never written to the SessionStore.
+    public func completePairing(response: PairingRedeemResponse, qrCode: PairingQRCode,
+                                username: String? = nil, password: String? = nil) async throws {
+        guard !isAuthenticating, !isRestoring, !isLoggedIn, !isLoggingOut else { throw MatrixServiceError.busy }
+        guard PairingURLPolicy.sameEndpoint(response.homeserver, qrCode.homeserver) else {
+            throw PairingError.homeserverMismatch
+        }
+        guard !response.isAuthExpired() else { throw PairingError.expired }
+        let server = try HomeserverPolicy().validatedURL(response.homeserver.absoluteString)
+        if response.auth.type == .registrationToken {
+            guard let username = username?.trimmingCharacters(in: .whitespacesAndNewlines), !username.isEmpty,
+                  let password, !password.isEmpty else { throw MatrixServiceError.missingCredentials }
+        }
+        isAuthenticating = true
+        sessionError = nil
+        let pairingTransport = pairingAuthentication.configuredForPairing(fingerprint: qrCode.fingerprint, host: qrCode.homeserver.host)
+        let attempt = AuthenticationAttempt()
+        authenticationAttempt = attempt
+        do {
+            try await attempt.run(timeout: authenticationTimeout) { [self] in
+                defer { isAuthenticating = false; authenticationAttempt = nil; authenticationStatus = nil }
+                try await performPairingLogin(server: server, response: response, qrCode: qrCode, username: username, password: password,
+                                              authentication: pairingTransport)
+            }
+        } catch {
+            sessionError = error is CancellationError ? "已取消配对。" : error.localizedDescription
+            throw error
+        }
+    }
+
+    private func performPairingLogin(server: URL, response: PairingRedeemResponse, qrCode: PairingQRCode,
+                                     username: String?, password: String?,
+                                     authentication: any PairingCredentialAuthenticating) async throws {
+        let storeID = UUID()
+        var candidate: Client?
+        var remoteSession: Session?
+        do {
+            try Task.checkCancellation()
+            if cleanupRequired { try cleanStoredSession() }
+            guard try sessionStore.load() == nil else { throw MatrixServiceError.storageUnavailable }
+            let key = try storeKeyFactory()
+            let path = try directory().create(for: storeID)
+            // Build the SDK client before consuming the one-time registration
+            // token. If registration succeeds but restore later fails, this
+            // method deliberately does not repeat registration.
+            let newClient = try await retryRateLimits { try await self.clientFactory(server.absoluteString, path, key) }
+            candidate = newClient
+            try Task.checkCancellation()
+            guard !response.isAuthExpired() else { throw PairingError.expired }
+            let session: Session
+            switch response.auth.type {
+            case .registrationToken:
+                guard let username = username?.trimmingCharacters(in: .whitespacesAndNewlines), !username.isEmpty,
+                      let password, !password.isEmpty else { throw MatrixServiceError.missingCredentials }
+                // Do not wrap a UIA registration in generic retry logic: a
+                // 401 continuation may already have consumed the one-time
+                // token. The UI receives a safe 429 error and can wait for a
+                // server-directed next step without replaying the exchange.
+                session = try await authentication.register(
+                        at: server, registrationToken: response.auth.token, username: username, password: password,
+                        deviceDisplayName: "botville C2.1", deadline: response.authExpiresAt
+                    )
+            case .loginToken:
+                session = try await authentication.login(at: server, loginToken: response.auth.token,
+                                                         deviceDisplayName: "botville C2.1", deadline: response.authExpiresAt)
+            }
+            remoteSession = session
+            try Task.checkCancellation()
+            try await retryRateLimits { try await newClient.restoreSession(session: session) }
+            try Task.checkCancellation()
+            // Owner decision: a QR without gw is chat-only. This deliberately
+            // differs from A-line §3.1 (gw required), pending alignment.
+            let gateway = qrCode.gateway == nil ? nil : response.gateway
+            let gatewayPin = gateway.flatMap {
+                PairingURLSession.fingerprint(qrCode.fingerprint, homeserver: qrCode.homeserver, requestURL: $0)
+            }
+            let stored = SessionCredentials(session: session, storeID: storeID, storeKey: key,
+                                            gatewayURL: gateway?.absoluteString,
+                                            gatewayCertificateFingerprint: gatewayPin)
+            try sessionStore.save(stored)
+            credentials = stored
+            try await activate(newClient, stored: stored)
+            canClearLocalSession = false
+            canRetryRestore = false
+        } catch {
+            await candidate?.enableAllSendQueues(enable: false)
+            if credentials?.storeID == storeID { await clearSession() }
+            else {
+                do { try directory().remove(for: storeID) }
+                catch { cleanupRequired = true; canClearLocalSession = true }
+            }
+            // The registration or login request is never replayed after it
+            // returned a session. Best-effort logout prevents an orphaned
+            // remote session if local SDK restoration then fails.
+            if let remoteSession {
+                await MatrixPasswordAuthentication().discard(remoteSession)
+                // A logout request is best-effort. Do not make a successful
+                // one-time operation look retry-safe merely because its local
+                // activation failed.
+                throw PairingAuthenticationError.remoteStateUnknown
+            }
+            if error is CancellationError { throw error }
+            if error is SessionStoreError || error is CocoaError {
+                canClearLocalSession = true
+                throw MatrixServiceError.storageUnavailable
+            }
+            if error is MatrixServiceError || error is PairingError { throw error }
+            throw PasswordLoginResultClassifier.error(for: error)
+        }
+    }
+
     private func performLogin(server: URL, username: String, password: String, allowLocalHTTP: Bool) async throws {
         let previous = softLogoutCredentials
         let storeID = previous?.storeID ?? UUID()
@@ -204,7 +321,9 @@ public final class MatrixService: ObservableObject {
             try Task.checkCancellation()
             try await retryRateLimits { try await newClient.restoreSession(session: session) }
             try Task.checkCancellation()
-            let stored = SessionCredentials(session: session, storeID: storeID, storeKey: key, allowLocalHTTP: allowLocalHTTP)
+            let stored = SessionCredentials(session: session, storeID: storeID, storeKey: key, allowLocalHTTP: allowLocalHTTP,
+                                            gatewayURL: previous?.gatewayURL,
+                                            gatewayCertificateFingerprint: previous?.gatewayCertificateFingerprint)
             // A new encrypted store must have its recovery record before it is
             // made active. Soft logout deliberately keeps the old record until
             // its replacement has activated successfully.
@@ -350,6 +469,17 @@ public final class MatrixService: ObservableObject {
 
     public func cancelAuthentication() {
         authenticationAttempt?.cancel()
+    }
+
+    /// Without a confirmed gateway, features are absent and only chat is shown.
+    public var hasConfirmedGateway: Bool { credentials?.gatewayURL != nil }
+
+    /// Recreates the confirmed gateway transport with its non-secret QR pin.
+    /// Pairing does not automatically activate gateway features; callers opt
+    /// into this client only after a logged-in session exists.
+    public func confirmedGatewayClient() throws -> HTTPGatewayClient? {
+        guard let stored = credentials, let source = stored.gatewayURL, let url = URL(string: source) else { return nil }
+        return try HTTPGatewayClient(baseURL: url, certificateFingerprint: stored.effectiveGatewayCertificateFingerprint)
     }
 
     /// Invoked only after the UI's destructive confirmation. No successful

@@ -2,6 +2,7 @@
 
 # 苹果端验证文档
 
+- [扫码配对](pairing-qr.md)：v1 二维码解析、兑换、注册/登录、SPKI 固定、mock 与 SDK 限制。
 - [C2.5 动态界面（mock）](dynamic-ui.md)：功能清单、通用卡片、模块网页 session cookie 与前向兼容策略（2026-11-04，#38）。
 - [C1.1 Element 验证与问题收集](c1.1-element-findings.md)：本地 Continuwuity + Element Web 实测、证据边界及 C2.x / C3.1 待办（2026-11-04，#33）。
 - [C2.1 安全加固与验证边界](security-hardening.md)：Release HTTPS、Debug ATS、推送 URL 与错误分类。

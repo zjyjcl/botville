@@ -16,6 +16,7 @@ struct LoginView: View {
     @State private var confirmLocalClear = false
     @State private var confirmSoftLogout = false
     @State private var isClearing = false
+    @State private var showPairing = false
 #if DEBUG
     @State private var allowLocalHTTP = false
 #endif
@@ -104,6 +105,12 @@ struct LoginView: View {
             }
             .buttonStyle(.borderedProminent)
             .disabled(!canLogIn)
+
+            Button { showPairing = true } label: {
+                Label("扫码配对", systemImage: "qrcode.viewfinder")
+            }
+            .buttonStyle(.bordered)
+            .disabled(isLoggingIn || service.isAuthenticating || service.isRestoring || isClearing)
         }
         .confirmationDialog("清除本地会话？", isPresented: $confirmLocalClear, titleVisibility: .visible) {
             Button("清除本地会话", role: .destructive) { clearLocalSession() }
@@ -123,6 +130,9 @@ struct LoginView: View {
             guard required else { return }
             if let value = service.reauthenticationHomeserver { homeserver = value }
             if let value = service.reauthenticationUserID { username = value }
+        }
+        .sheet(isPresented: $showPairing) {
+            PairingFlowView(matrixService: service, isPresented: $showPairing)
         }
     }
 

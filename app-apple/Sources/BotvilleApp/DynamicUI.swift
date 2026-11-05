@@ -39,6 +39,19 @@ final class DynamicUIModel: ObservableObject {
         }
     }
 
+    /// The service creates this transport from the paired session's stored
+    /// gateway URL and non-secret pin.  UI settings never reconstruct it,
+    /// which avoids silently losing certificate pinning after pairing.
+    func configureConfirmedGateway(_ replacement: HTTPGatewayClient) async {
+        generation += 1
+        client = replacement
+        isMock = false
+        manifest = nil
+        cards = []
+        selectedCapability = nil
+        await reload()
+    }
+
     func reload() async {
         let currentGeneration = generation
         loading = true
@@ -89,11 +102,13 @@ final class DynamicUIModel: ObservableObject {
 @MainActor
 struct DynamicUIView: View {
     let onOpenChat: () -> Void
+    @ObservedObject var matrixService: MatrixService
     @StateObject private var model = DynamicUIModel()
     @State private var showSettings = false
     @State private var useMock = true
     @State private var baseURL = "https://gateway.example.invalid"
     @State private var allowLocalHTTP = false
+    @State private var usesPairedGateway = false
     @State private var webDestination: WebDestination?
     @State private var pendingAction: ActionSelection?
     @State private var externalURL: URL?
@@ -208,6 +223,7 @@ struct DynamicUIView: View {
                 }
             }
             .task {
+                await activateConfirmedGatewayIfAvailable()
                 if model.manifest == nil { await model.reload() }
 #if DEBUG
                 // Deterministic offline browser smoke entry for Simulator.
@@ -218,6 +234,12 @@ struct DynamicUIView: View {
 #endif
             }
             .refreshable { await model.reload() }
+            .onChange(of: matrixService.isLoggedIn) { _, loggedIn in
+                Task {
+                    if loggedIn { await activateConfirmedGatewayIfAvailable() }
+                    else { usesPairedGateway = false; useMock = true; await model.configure(mock: true, baseURL: baseURL, allowLocalHTTP: false) }
+                }
+            }
             .sheet(isPresented: $showSettings) { settings }
             .sheet(item: $webDestination) { destination in
                 ModuleWebSheet(
@@ -269,11 +291,17 @@ struct DynamicUIView: View {
                 Section("数据来源") {
                     Toggle("使用示例数据", isOn: $useMock)
                     if !useMock {
-                        TextField("网关 Base URL", text: $baseURL)
-                            .autocorrectionDisabled()
+                        if usesPairedGateway {
+                            Text(baseURL).font(.footnote.monospaced())
+                            Text("此网关来自已确认的配对，并保留二维码证书固定。要更换网关，请重新配对。")
+                                .font(.footnote).foregroundStyle(.secondary)
+                        } else {
+                            TextField("网关 Base URL", text: $baseURL)
+                                .autocorrectionDisabled()
                         #if DEBUG
                             Toggle("允许本地 HTTP（仅开发）", isOn: $allowLocalHTTP)
                         #endif
+                        }
                         Text("真实网关尚未提供动态界面接口。当前入口用于连接准备就绪的网关；此处不保存访问令牌。")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
@@ -285,8 +313,11 @@ struct DynamicUIView: View {
                     Button("应用") {
                         showSettings = false
                         Task {
-                            await model.configure(
-                                mock: useMock, baseURL: baseURL, allowLocalHTTP: allowLocalHTTP)
+                            if !useMock, let paired = try? matrixService.confirmedGatewayClient() {
+                                await model.configureConfirmedGateway(paired)
+                            } else {
+                                await model.configure(mock: useMock, baseURL: baseURL, allowLocalHTTP: allowLocalHTTP)
+                            }
                         }
                     }
                 }
@@ -294,6 +325,14 @@ struct DynamicUIView: View {
             }
         }
         .frame(minWidth: 320, minHeight: 300)
+    }
+
+    private func activateConfirmedGatewayIfAvailable() async {
+        guard model.isMock, let paired = try? matrixService.confirmedGatewayClient() else { return }
+        baseURL = paired.baseURL.absoluteString
+        useMock = false
+        usesPairedGateway = true
+        await model.configureConfirmedGateway(paired)
     }
 
     private func moduleTitle(_ module: String) -> String {

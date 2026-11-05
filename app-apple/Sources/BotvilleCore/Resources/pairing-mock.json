@@ -1,0 +1,11 @@
+{
+  "v": "1",
+  "homeserver": "https://matrix.example.invalid",
+  "gateway": "https://gateway.example.invalid",
+  "auth": {
+    "type": "login_token",
+    "token": "debug-mock-token",
+    "expires_in_ms": 600000
+  },
+  "features_url": "https://gateway.example.invalid/features"
+}
