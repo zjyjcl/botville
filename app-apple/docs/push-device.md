@@ -2,13 +2,13 @@
 
 # DEBUG 真机推送
 
-本次提供 iOS 开发包的 APNs 注册、Matrix HTTP pusher 注册及诊断入口。真实开发者账号签名、棉棉霸自己的 iPhone、Sygnal/APNs 联调留待后续；模拟器构建和单元测试不能证明真实通知送达。
+本次提供 iOS 开发包的 APNs 注册、Matrix HTTP pusher 注册及诊断入口。真机目标为 Mac mini 连接的 iPhone 15；Sygnal/APNs 联调留待后续，模拟器构建和单元测试不能证明真实通知送达。
 
 ## 入口与配置
 
 在 Debug 包中打开 **我 → 设置 → 推送诊断**：
 
-1. 保存 Sygnal notify URL。默认从 `Info-Debug.plist` 的 `BotvilleSygnalNotifyURL` 读取（仓库留空），用户保存值优先，仅此地址存入 UserDefaults。示例为 `https://sygnal.example.invalid/_matrix/push/v1/notify`，占位域名不可用于真实联调。
+1. 保存 Sygnal notify URL。默认从 `Info-Debug.plist` 的 `BotvilleSygnalNotifyURL` 读取：`http://sygnal:5000/_matrix/push/v1/notify`。用户保存值优先，诊断页可修改覆盖，且仅此地址存入 UserDefaults。
 2. 点击「申请权限并注册 / 重试」，允许系统通知权限。获准后调用 `registerForRemoteNotifications`，通过 `UIApplicationDelegateAdaptor` 接收成功/失败回调。已授权的后续启动也会重新向 APNs 注册。
 3. 页面显示小写十六进制 device token、APNs 注册状态和安全化错误。可主动复制 token；iOS 剪贴板只在本机可用，120 秒后过期。不要将 token 贴到日志、工单或聊天中。
 4. 使用当前 Matrix 会话自动注册 pusher。点击「核对」读取 `GET /_matrix/client/v3/pushers`，检查 `app_id + pushkey` 是否同时匹配。显示匹配仅代表服务端有记录，不能替代送达验证。
@@ -19,9 +19,9 @@ DEBUG 登录页保留手动 homeserver 输入及局域网 HTTP 开关。开关�
 
 ## 后续真机验收步骤
 
-1. 在有权限的开发者环境中打开 `Botville.xcodeproj`，选择 `BotvilleApp-iOS` scheme 和 Debug 配置。由设备主人配置开发者账号、开发签名及描述文件，开启对应 App ID 的 Push Notifications；Bundle ID 保持 `com.zjyjcl.botville`。当前仓库保留原签名设置，默认不为真机签名，不能直接当成已签名真机包。
-2. 确认签名后的 entitlement 包含 `aps-environment=development`，描述文件也允许推送。Sygnal 配置使用 app ID `com.zjyjcl.botville.apns`，APNs topic 对应 Bundle ID，使用开发/sandbox 环境。任何私钥、证书、描述文件和 Team 设置仅在受控环境配置，不提交仓库。Release 配置不继承这个 development entitlement；归档或分发前，须在受控签名环境另配 `aps-environment=production`，并使用匹配的 App ID、生产描述文件和签名。
-3. 将 Debug 包安装到棉棉霸自己的 iPhone，按系统提示允许本地网络（使用局域网时）和通知。登录测试 Matrix 账号，保存可被 homeserver 访问的 notify URL。
+1. 在有权限的开发者环境中打开 `Botville.xcodeproj`，选择 `BotvilleApp-iOS` scheme 和 Debug 配置。App target 的 Debug 与 Release 都使用 Automatic signing，开发团队为 `3Z8WP6U6F7`；由 Xcode 为 Mac mini 连接的 iPhone 15 解析受控的开发签名。Bundle ID 保持 `com.zjyjcl.botville`。仓库不提交证书、描述文件或 provisioning profile。
+2. 确认对应 App ID 已开启 Push Notifications、Xcode 管理的开发描述文件允许推送，且签名后的 entitlement 包含 `aps-environment=development`。Sygnal 配置使用 app ID `com.zjyjcl.botville.apns`，APNs topic 对应 Bundle ID，使用开发/sandbox 环境。Release 配置不继承这个 development entitlement；归档或分发前，须在受控签名环境另配 `aps-environment=production` 与匹配的生产签名。
+3. 将 Debug 包安装到 Mac mini 连接的 iPhone 15，按系统提示允许本地网络（使用局域网时）和通知。登录测试 Matrix 账号，默认 notify URL 为 Compose 内网地址 `http://sygnal:5000/_matrix/push/v1/notify`；诊断页可按实际 homeserver 可达地址修改。
 4. 申请注册，确认 token 非空、pusher 注册成功，再点「核对」确认匹配。请求应包含 `Authorization: Bearer <当前会话>`，`kind=http`、`append=false`、`app_display_name=botville`、设备名称、`lang=zh-CN`，及 `data.format=event_id_only`。检查证据时不得记录真实 access token 或 device token。
 5. 将 App 放到后台，从另一个已授权测试账号发送符合通知规则的消息；检查 homeserver → Sygnal → APNs 的实际投递与手机表现。此步骤需要外部服务和真实设备，不能由 mock 测试代替。
 6. token 回调发生变化时，应先删除旧 pushkey，再注册新 pushkey；相同 token 的回调也可用于重试注册。APNs token 轮换无法在真机上可靠强制触发，自动化测试覆盖该顺序与失败处理。

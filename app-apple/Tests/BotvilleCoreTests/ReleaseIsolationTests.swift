@@ -15,7 +15,43 @@ final class ReleaseIsolationTests: XCTestCase {
         let value = try plist("BotvilleApp/Info-Debug.plist")
         XCTAssertEqual((value["NSAppTransportSecurity"] as? [String: Any])?["NSAllowsLocalNetworking"] as? Bool, true)
         XCTAssertNotNil(value["NSLocalNetworkUsageDescription"])
-        XCTAssertEqual(value["BotvilleSygnalNotifyURL"] as? String, "")
+        XCTAssertEqual(value["BotvilleSygnalNotifyURL"] as? String, "http://sygnal:5000/_matrix/push/v1/notify")
+    }
+
+    func testApplicationSigningSupportsDevicesAndAdHocSimulators() throws {
+        let objects = try XCTUnwrap(projectJSON()["objects"] as? [String: Any])
+        let configurations = objects.values.compactMap { $0 as? [String: Any] }.filter {
+            $0["isa"] as? String == "XCBuildConfiguration"
+        }
+        for config in configurations {
+            let settings = try XCTUnwrap(config["buildSettings"] as? [String: Any])
+            XCTAssertFalse(settings.keys.contains(where: { $0.hasPrefix("PROVISIONING_PROFILE") }))
+            for (key, value) in settings where key.hasPrefix("CODE_SIGNING_ALLOWED") || key.hasPrefix("CODE_SIGNING_REQUIRED") {
+                XCTAssertNotEqual(value as? String, "NO", key)
+            }
+        }
+        let apps = objects.values.compactMap { $0 as? [String: Any] }.filter {
+            $0["isa"] as? String == "PBXNativeTarget" && $0["productType"] as? String == "com.apple.product-type.application"
+        }
+        XCTAssertFalse(apps.isEmpty)
+        for app in apps {
+            let list = try XCTUnwrap(objects[try XCTUnwrap(app["buildConfigurationList"] as? String)] as? [String: Any])
+            var checked: Set<String> = []
+            for id in try XCTUnwrap(list["buildConfigurations"] as? [String]) {
+                let config = try XCTUnwrap(objects[id] as? [String: Any])
+                let name = try XCTUnwrap(config["name"] as? String)
+                guard name == "Debug" || name == "Release" else { continue }
+                checked.insert(name)
+                let settings = try XCTUnwrap(config["buildSettings"] as? [String: Any])
+                XCTAssertEqual(settings["CODE_SIGN_STYLE"] as? String, "Automatic", name)
+                XCTAssertEqual(settings["DEVELOPMENT_TEAM"] as? String, "3Z8WP6U6F7", name)
+                XCTAssertEqual(settings["CODE_SIGN_IDENTITY[sdk=iphonesimulator*]"] as? String, "-", name)
+                if name == "Debug" {
+                    XCTAssertEqual(settings["CODE_SIGN_ENTITLEMENTS"] as? String, "BotvilleApp/BotvilleApp.entitlements")
+                }
+            }
+            XCTAssertEqual(checked, ["Debug", "Release"])
+        }
     }
 
     func testEveryApplicationReleaseTargetUsesShippingPlist() throws {
@@ -52,7 +88,6 @@ final class ReleaseIsolationTests: XCTestCase {
         let project = try String(contentsOf: root.appendingPathComponent("Botville.xcodeproj/project.pbxproj"), encoding: .utf8)
         XCTAssertTrue(project.contains("CODE_SIGN_ENTITLEMENTS = BotvilleApp/BotvilleApp.entitlements;"))
         XCTAssertTrue(project.contains("com.apple.Push = { enabled = 1; };"))
-        XCTAssertFalse(project.contains("DEVELOPMENT_TEAM"))
         XCTAssertEqual(try plist("BotvilleApp/BotvilleApp.entitlements")["aps-environment"] as? String, "development")
         let sources = root.appendingPathComponent("Sources/BotvilleApp")
         try guarded("struct PushDiagnosticsView", at: sources.appendingPathComponent("PushDiagnosticsView.swift"))

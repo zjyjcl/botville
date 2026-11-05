@@ -32,7 +32,7 @@
     <key>NSLocalNetworkUsageDescription</key>
     <string>用于 DEBUG 包连接局域网中的 Matrix homeserver 和推送服务。</string>
     <key>BotvilleSygnalNotifyURL</key>
-    <string></string>
+    <string>http://sygnal:5000/_matrix/push/v1/notify</string>
     <key>UILaunchScreen</key>
     <dict/>
     <key>UIApplicationSceneManifest</key>

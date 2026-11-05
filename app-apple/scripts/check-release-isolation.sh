@@ -14,16 +14,33 @@ def json_plutil(path):
     return json.loads(subprocess.check_output(['plutil', '-convert', 'json', '-o', '-', str(path)]))
 objects = json_plutil(root / 'Botville.xcodeproj/project.pbxproj')['objects']
 for config in objects.values():
-    if config.get('isa') != 'XCBuildConfiguration' or config.get('name') != 'Release': continue
-    entitlements = [key for key in config.get('buildSettings', {}) if key.startswith('CODE_SIGN_ENTITLEMENTS')]
+    if config.get('isa') != 'XCBuildConfiguration': continue
+    settings = config.get('buildSettings', {})
+    if any(key.startswith('PROVISIONING_PROFILE') for key in settings):
+        raise SystemExit('Signing configuration must not pin a provisioning profile')
+    for key, value in settings.items():
+        if key.startswith(('CODE_SIGNING_ALLOWED', 'CODE_SIGNING_REQUIRED')) and value == 'NO':
+            raise SystemExit(f'Signing must remain enabled: {key}={value}')
+    if config.get('name') != 'Release': continue
+    entitlements = [key for key in settings if key.startswith('CODE_SIGN_ENTITLEMENTS')]
     if entitlements:
         raise SystemExit('Release configuration contains CODE_SIGN_ENTITLEMENTS: ' + ', '.join(sorted(entitlements)))
 releases = 0
 for target in objects.values():
     if target.get('isa') != 'PBXNativeTarget' or target.get('productType') != 'com.apple.product-type.application': continue
     configs = objects[target['buildConfigurationList']]['buildConfigurations']
+    checked = set()
     for identifier in configs:
         config = objects[identifier]
+        name = config.get('name')
+        settings = config.get('buildSettings', {})
+        if name in ('Debug', 'Release'):
+            checked.add(name)
+            expected = {'CODE_SIGN_STYLE': 'Automatic', 'DEVELOPMENT_TEAM': '3Z8WP6U6F7', 'CODE_SIGN_IDENTITY[sdk=iphonesimulator*]': '-'}
+            if name == 'Debug': expected['CODE_SIGN_ENTITLEMENTS'] = 'BotvilleApp/BotvilleApp.entitlements'
+            for key, value in expected.items():
+                if settings.get(key) != value:
+                    raise SystemExit(f'{name} target {target.get("name")} requires {key}={value}')
         if config.get('name') != 'Release': continue
         releases += 1
         got = config.get('buildSettings', {}).get('INFOPLIST_FILE')
@@ -31,6 +48,7 @@ for target in objects.values():
         for key, value in config.get('buildSettings', {}).items():
             if key.startswith('INFOPLIST_FILE[') and value != 'BotvilleApp/Info.plist':
                 raise SystemExit(f'Release conditional plist override: {key}={value}')
+    if checked != {'Debug', 'Release'}: raise SystemExit('Application target must have Debug and Release configurations')
 if not releases: raise SystemExit('No application Release configuration found')
 def keys(value):
     if isinstance(value, dict):
@@ -40,6 +58,11 @@ def keys(value):
 release = json_plutil(root / 'BotvilleApp/Info.plist')
 leaked = forbidden & set(keys(release))
 if leaked: raise SystemExit('Release Info.plist contains DEBUG-only key(s): ' + ', '.join(sorted(leaked)))
+debug = json_plutil(root / 'BotvilleApp/Info-Debug.plist')
+if debug.get('BotvilleSygnalNotifyURL') != 'http://sygnal:5000/_matrix/push/v1/notify':
+    raise SystemExit('Debug Info.plist must default to the compose Sygnal notify URL')
+if json_plutil(root / 'BotvilleApp/BotvilleApp.entitlements').get('aps-environment') != 'development':
+    raise SystemExit('Debug APNs entitlement must use the development environment')
 def guarded(path, needle):
     stack, found = [], False
     for number, raw in enumerate(path.read_text().splitlines(), 1):

@@ -198,13 +198,13 @@ final class PushRegistrationTests: XCTestCase {
     }
 
     func testDebugPushHTTPPolicyRequiresExplicitOptIn() throws {
-        let http = "http://localhost:5000/_matrix/push/v1/notify"
+        let http = "http://sygnal:5000/_matrix/push/v1/notify"
         XCTAssertThrowsError(try PushNotifyURLPolicy.validatedURL(
             http, allowHTTP: PushHTTPPolicy.permitsHTTP(false, isDebugBuild: true)
         ))
         XCTAssertEqual(try PushNotifyURLPolicy.validatedURL(
             http, allowHTTP: PushHTTPPolicy.permitsHTTP(true, isDebugBuild: true)
-        ).scheme, "http")
+        ).absoluteString, http)
     }
 
     func testPushHTTPPolicyDefaultsToCurrentBuildConfiguration() {
