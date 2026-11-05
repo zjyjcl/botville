@@ -687,16 +687,18 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         try await service.login(homeserver: "https://matrix.test", username: "push", password: "test-password")
         service.receivePushDeviceToken(Data([1]))
         try await waitUntil { transport.calls.count == 1 }
+        XCTAssertEqual(service.pushToken, "AQ==")
         service.receivePushDeviceToken(Data([2]))
         try await waitUntil { transport.calls.count == 3 }
+        XCTAssertEqual(service.pushToken, "Ag==")
         let calls = transport.calls
-        XCTAssertEqual(calls.map(\.pushKey), ["01", "01", "02"])
+        XCTAssertEqual(calls.map(\.pushKey), ["AQ==", "AQ==", "Ag=="])
         XCTAssertEqual(calls.map(\.kind), ["http", nil, "http"])
 
         await service.logout()
         try await waitUntil { transport.calls.count == 4 }
         XCTAssertEqual(transport.calls.last?.kind, nil)
-        XCTAssertEqual(transport.calls.last?.pushKey, "02")
+        XCTAssertEqual(transport.calls.last?.pushKey, "Ag==")
     }
 
     func testPushLogoutWaitsForSuspendedSetAndNeverSetsRotatedTokenAfterLogout() async throws {
@@ -718,8 +720,8 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         await fulfillment(of: [started], timeout: 1)
         transport.releaseFirstSet()
         await logout.value
-        XCTAssertFalse(transport.calls.contains { $0.kind == "http" && $0.pushKey == "02" })
-        XCTAssertTrue(transport.calls.contains { $0.kind == nil && $0.pushKey == "01" })
+        XCTAssertFalse(transport.calls.contains { $0.kind == "http" && $0.pushKey == "Ag==" })
+        XCTAssertTrue(transport.calls.contains { $0.kind == nil && $0.pushKey == "AQ==" })
         XCTAssertFalse(service.isLoggedIn)
     }
 
@@ -738,7 +740,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         service.receivePushDeviceToken(Data([2]))
         try await waitUntil { service.pushRegistrationError != nil }
         XCTAssertEqual(transport.calls.map(\.kind), ["http", nil])
-        XCTAssertEqual(transport.calls.map(\.pushKey), ["01", "01"])
+        XCTAssertEqual(transport.calls.map(\.pushKey), ["AQ==", "AQ=="])
         await service.logout()
         XCTAssertTrue(service.isLoggedIn)
         XCTAssertNotNil(try store.load())
@@ -747,7 +749,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         await service.logout()
         XCTAssertFalse(service.isLoggedIn)
         XCTAssertNil(try store.load())
-        XCTAssertFalse(transport.calls.contains { $0.kind == "http" && $0.pushKey == "02" })
+        XCTAssertFalse(transport.calls.contains { $0.kind == "http" && $0.pushKey == "Ag==" })
     }
 
     func testCorruptKeychainCanBeClearedWithAllStoresAndLoginCanResume() async throws {
