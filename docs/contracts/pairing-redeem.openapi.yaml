@@ -1,0 +1,259 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 botville contributors
+#
+# botville App 扫码配对 —— 兑换端点契约片段（issue #128 PR-a，仅契约）
+# 人类可读说明：docs/contracts/pairing-qr.md（冲突以本文件为准）
+# 示例：docs/contracts/examples/pairing-qr/
+openapi: 3.1.0
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+
+info:
+  title: botville App Pairing Redeem API
+  version: 0.1.0
+  summary: App 扫码配对的兑换端点：一次性 code 换注册/登录令牌。
+  description: |
+    botville App 扫码配对（`botville://pair?v=1` 二维码）的**唯一** HTTP 端点。
+    与服务器间联邦邀请（`botville-pair:v1:…`，docs/deploy/paired-federation.md）
+    完全分开，互不通用。
+
+    要点（详见 pairing-qr.md）：
+
+    - 兑换地址 = 二维码中 `hs` + `/_botville/pair/redeem`；仅 HTTPS。
+    - `code`：32 字节随机数的 base64url 无填充（43 字符）；服务端只存 sha256；
+      签发后 5 分钟过期、一次性、事务内原子核销。
+    - 成功响应的 `homeserver` 是**签发时保存的 hs 原样返回**；App 必须与二维码中
+      的 `hs` 逐字符比对，不一致即拒绝。
+    - 错误体统一 `{errcode, error[, retry_after_ms]}`；
+      `BV_PAIR_RATE_LIMITED` **必带** `retry_after_ms`（由下方 if/then 强制）。
+    - 请求体服务端拒绝未知字段；响应中未声明字段客户端必须忽略（前向兼容）。
+    - 所有域名/token 均为占位（example.org / `<redacted-example>`），本文件不含
+      任何真实凭据。
+
+    许可：Apache-2.0。
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  contact:
+    name: botville contributors
+
+servers:
+  - url: https://hs.example.org
+    description: 二维码中的 hs（占位域名；实际部署为该部署的 homeserver 基址）。
+
+paths:
+  /_botville/pair/redeem:
+    post:
+      operationId: redeemPairingCode
+      summary: 兑换一次性配对码
+      description: |
+        处理顺序（pairing-qr.md §4.5）：① 两层限流（IP + 全局）→ ② 请求结构校验
+        → ③ 按 sha256(code) 查记录（查无 → 400 BV_PAIR_INVALID，不与格式错区分）
+        → ④ 状态判定 used → revoked → expired → ⑤ 单事务内原子核销并签发 auth
+        token。请求体上限 64 KiB；未知请求字段拒绝；`BV_PAIR_RATE_LIMITED` 响应
+        可另带 `Retry-After` 头（秒，向下取整），客户端以 body 中
+        `retry_after_ms` 为准。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RedeemRequest"
+            example:
+              code: QRPAIREXAMPLECODE000000000000000000000000000A
+              device_display_name: Alice 的 iPhone 17
+      responses:
+        "200":
+          description: 兑换成功。`homeserver` 为签发时保存的 hs 逐字符原样返回；
+            App 与二维码中的 hs 逐字符比对，不一致即拒绝（不得规范化）。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RedeemResponse"
+              examples:
+                registrationToken:
+                  summary: 首次配对（换新账号注册）
+                  value:
+                    v: "1"
+                    homeserver: https://hs.example.org
+                    gateway: https://gw.example.org
+                    auth:
+                      type: registration_token
+                      token: "<redacted-example>"
+                      expires_in_ms: 600000
+                    features_url: https://gw.example.org/features.json
+                loginToken:
+                  summary: 已有账号添加新设备
+                  value:
+                    v: "1"
+                    homeserver: https://hs.example.org
+                    gateway: https://gw.example.org
+                    auth:
+                      type: login_token
+                      token: "<redacted-example>"
+                      expires_in_ms: 120000
+                    features_url: https://gw.example.org/features.json
+        "400":
+          description: |
+            BV_PAIR_INVALID —— 请求结构非法（缺字段/未知字段/code 格式错）或查无
+            此 code（两者同码，防探测）。不可重试。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PairingError"
+              example:
+                errcode: BV_PAIR_INVALID
+                error: "invalid or unknown pairing code"
+        "409":
+          description: BV_PAIR_USED —— code 已被兑换（重放）。不可重试。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PairingError"
+              example:
+                errcode: BV_PAIR_USED
+                error: "pairing code already redeemed"
+        "410":
+          description: |
+            BV_PAIR_EXPIRED / BV_PAIR_REVOKED —— code 过期或已被管理员作废。
+            不可重试，需重新签发。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PairingError"
+              examples:
+                expired:
+                  value:
+                    errcode: BV_PAIR_EXPIRED
+                    error: "pairing code expired"
+                revoked:
+                  value:
+                    errcode: BV_PAIR_REVOKED
+                    error: "pairing code revoked"
+        "429":
+          description: |
+            BV_PAIR_RATE_LIMITED —— 触发 IP 层或全局层限流；**必带**
+            `retry_after_ms`（毫秒，≥1）。按其等待后可重试。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PairingError"
+              example:
+                errcode: BV_PAIR_RATE_LIMITED
+                error: "too many redeem attempts; retry later"
+                retry_after_ms: 60000
+      security: []
+
+components:
+  schemas:
+    RedeemRequest:
+      type: object
+      additionalProperties: false
+      description: 兑换请求；服务端拒绝未知字段。
+      required: [code, device_display_name]
+      properties:
+        code:
+          type: string
+          pattern: "^[A-Za-z0-9_-]{43}$"
+          description: 32 字节随机数的 base64url 无填充（43 字符），与二维码 URI 中相同。
+          examples:
+            - QRPAIREXAMPLECODE000000000000000000000000000A
+        device_display_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: App 生成的设备显示名（1–128 个 Unicode 字符）。
+          examples:
+            - Alice 的 iPhone 17
+
+    RedeemResponse:
+      type: object
+      description: |
+        兑换成功响应。`homeserver`/`gateway` 为签发时逐字符保存的 hs/gw 原样返回，
+        不得按当前配置重算。客户端必须忽略未声明字段（前向兼容）。
+      required: [v, homeserver, gateway, auth, features_url]
+      properties:
+        v:
+          type: string
+          const: "1"
+        homeserver:
+          type: string
+          format: uri
+          pattern: "^https://"
+          description: 签发时保存的 hs，逐字符原样返回；App 与二维码中的 hs 比对，
+            不一致即拒绝（不做任何规范化）。
+          examples:
+            - https://hs.example.org
+        gateway:
+          type: string
+          format: uri
+          pattern: "^https://"
+          description: 签发时保存的 gw，逐字符原样返回。
+          examples:
+            - https://gw.example.org
+        auth:
+          $ref: "#/components/schemas/PairingAuth"
+        features_url:
+          type: string
+          format: uri
+          pattern: "^https://"
+          description: 功能清单（capability manifest）拉取地址；内容结构不在本契约。
+          examples:
+            - https://gw.example.org/features.json
+
+    PairingAuth:
+      type: object
+      description: 一次性短时令牌。`type` 由签发时管理面决定，契约只传输。
+      required: [type, token, expires_in_ms]
+      properties:
+        type:
+          type: string
+          enum: [registration_token, login_token]
+          description: |
+            `registration_token`：App 走 Matrix 注册流程换新账号；
+            `login_token`：App 走 `m.login.token` 登录已有账号。
+        token:
+          type: string
+          minLength: 1
+          description: 一次性短时令牌；示例一律 `<redacted-example>` 占位。
+          examples:
+            - "<redacted-example>"
+        expires_in_ms:
+          type: integer
+          format: int64
+          minimum: 1
+          description: token 有效期（毫秒）；建议 ≤ 600000（10 分钟）。
+          examples:
+            - 600000
+
+    PairingError:
+      type: object
+      description: |
+        错误体。`retry_after_ms` 仅 `BV_PAIR_RATE_LIMITED` 必带（if/then 强制），
+        其余错误码可选。状态码映射：BV_PAIR_INVALID=400、BV_PAIR_USED=409、
+        BV_PAIR_EXPIRED=410、BV_PAIR_REVOKED=410、BV_PAIR_RATE_LIMITED=429。
+      required: [errcode, error]
+      properties:
+        errcode:
+          type: string
+          enum:
+            - BV_PAIR_INVALID
+            - BV_PAIR_USED
+            - BV_PAIR_EXPIRED
+            - BV_PAIR_REVOKED
+            - BV_PAIR_RATE_LIMITED
+        error:
+          type: string
+          minLength: 1
+          description: 可展示英文短句；App 自行本地化。
+        retry_after_ms:
+          type: integer
+          format: int64
+          minimum: 1
+          description: 距最早可重试时刻的毫秒数；`BV_PAIR_RATE_LIMITED` 必带。
+      if:
+        properties:
+          errcode:
+            const: BV_PAIR_RATE_LIMITED
+        required: [errcode]
+      then:
+        required: [retry_after_ms]
