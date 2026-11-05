@@ -5,12 +5,17 @@ Checks the reference implementation against the contract documents
 (docs/contracts/pairing-qr.md + pairing-redeem.openapi.yaml) and the mock
 examples (docs/contracts/examples/pairing-qr/):
 
-- every example URI classifies as valid/invalid exactly as its filename says;
+- every example URI classifies as valid/invalid exactly as its filename says,
+  and each uri-invalid-* file is rejected for its mapped reason (message
+  substring), not merely for any reason;
 - duplicate / missing / unknown parameters are rejected, fp format rules hold,
-  hs/gw accept https:// only;
+  hs/gw accept https:// only; gw is optional (omittable; empty value rejected);
 - redeem 200 responses must echo the QR's hs byte-for-byte (no normalisation);
+  gateway may be null when issuance carried no gw;
 - BV_PAIR_RATE_LIMITED error bodies must carry retry_after_ms;
 - the OpenAPI fragment lists all five BV_PAIR_* error codes;
+- every code example in pairing-qr.md and the OpenAPI fragment is a legal
+  43-char base64url value, consistent with examples/pairing-qr/redeem-request.json;
 - the examples directory contains nothing that looks like a real secret
   (PEM blocks, long hex runs, non-placeholder token-ish fields).
 
@@ -51,6 +56,19 @@ SECRETISH_KEYS = {
     "api_key", "apikey", "private_key",
 }
 PLACEHOLDER_MARKS = ("example", "redacted", "change-me", "mock", "placeholder")
+
+# 每个 uri-invalid-* 示例预期触发的拒绝原因：PairUriError 消息必须包含的子串
+# （B2：按内容断言拒绝原因，不能只看文件名）。
+INVALID_URI_REASONS = {
+    "uri-invalid-code-length.txt": "code: length must be 43",
+    "uri-invalid-duplicate-param.txt": "duplicate parameter",
+    "uri-invalid-fp-format.txt": "fp: must start with",
+    "uri-invalid-http-scheme.txt": "hs: must start with https://",
+    "uri-invalid-missing-required.txt": "missing required parameter(s): ['code']",
+    "uri-invalid-missing-hs.txt": "missing required parameter(s): ['hs']",
+    "uri-invalid-unknown-param.txt": "unknown parameter",
+    "uri-invalid-unknown-v.txt": "unsupported v",
+}
 
 
 def load_contract():
@@ -112,12 +130,28 @@ class UriParseTest(unittest.TestCase):
         self.assertEqual(contract.parse_pair_uri("  \n" + shuffled + "\t\n"),
                          contract.parse_pair_uri(make_uri(fp=FP)))
 
+    def test_valid_without_gw(self):
+        # gw 可选（B1）：省略 gw 的 URI 合法，解析结果不含 "gw" 键
+        parsed = contract.parse_pair_uri(make_uri(gw=None))
+        self.assertEqual(parsed, {
+            "v": "1", "hs": HS, "code": CODE, "exp": int(EXP),
+        })
+        self.assertNotIn("gw", parsed)
+        # 与 fp 组合：两个可选参数同时省略 / 同时出现都合法
+        parsed = contract.parse_pair_uri(make_uri(gw=None, fp=FP))
+        self.assertEqual(parsed["fp"], FP)
+        self.assertNotIn("gw", parsed)
+
     def test_missing_required_rejected(self):
-        for key in ("v", "hs", "gw", "code", "exp"):
+        for key in ("v", "hs", "code", "exp"):
             with self.assertRaises(contract.PairUriError, msg=key):
                 contract.parse_pair_uri(make_uri(**{key: None}))
             with self.assertRaises(contract.PairUriError, msg=key + "="):
                 contract.parse_pair_uri(make_uri(**{key: ""}))
+        # gw 不算缺必填：省略合法（test_valid_without_gw）；
+        # 但出现且值为空串仍是格式错误（§3.2），不得当作省略
+        with self.assertRaises(contract.PairUriError, msg="gw="):
+            contract.parse_pair_uri(make_uri(gw=""))
 
     def test_duplicate_param_rejected(self):
         for key, value in (("v", "1"), ("hs", HS), ("code", CODE), ("exp", EXP)):
@@ -205,10 +239,15 @@ class UriParseTest(unittest.TestCase):
 class ExamplesTest(unittest.TestCase):
     def test_uri_examples_classification(self):
         files = sorted(EXAMPLES_DIR.glob("uri-*.txt"))
-        self.assertGreaterEqual(len(files), 9, "expected 2 valid + 7 invalid examples")
+        self.assertGreaterEqual(len(files), 11, "expected 3 valid + 8 invalid examples")
         names = " ".join(path.name for path in files)
         for category in ("duplicate", "missing", "http", "fp"):
             self.assertIn(category, names, "missing invalid-example category: " + category)
+        # 每个 uri-invalid-* 示例都必须有预期拒绝原因（B2：防名不副实的假绿）
+        invalid_names = {path.name for path in files
+                         if path.name.startswith("uri-invalid")}
+        self.assertEqual(invalid_names, set(INVALID_URI_REASONS),
+                         "every uri-invalid-* example needs an expected reason")
         valid = invalid = 0
         for path in files:
             text = path.read_text(encoding="utf-8").strip()
@@ -216,16 +255,24 @@ class ExamplesTest(unittest.TestCase):
             self.assertNotIn("\n", text, "one URI per file: %s" % path)
             if path.name.startswith("uri-valid"):
                 parsed = contract.parse_pair_uri(text)  # must not raise
-                self.assertEqual((parsed["hs"], parsed["gw"], parsed["code"]),
-                                 (HS, GW, CODE), path.name)
+                self.assertEqual(parsed["hs"], HS, path.name)
+                self.assertEqual(parsed["code"], CODE, path.name)
+                if path.name == "uri-valid-no-gw.txt":
+                    self.assertNotIn("gw", parsed, path.name)  # gw 可选，省略合法
+                else:
+                    self.assertEqual(parsed["gw"], GW, path.name)
                 valid += 1
             else:
                 self.assertTrue(path.name.startswith("uri-invalid"), path.name)
-                with self.assertRaises(contract.PairUriError, msg=path.name):
+                expected = INVALID_URI_REASONS[path.name]
+                with self.assertRaises(contract.PairUriError, msg=path.name) as ctx:
                     contract.parse_pair_uri(text)
+                # 断言实际拒绝原因（消息子串），不能只看文件名
+                self.assertIn(expected, str(ctx.exception),
+                              "%s: rejected for the wrong reason" % path.name)
                 invalid += 1
-        self.assertGreaterEqual(valid, 2)
-        self.assertGreaterEqual(invalid, 7)
+        self.assertGreaterEqual(valid, 3)
+        self.assertGreaterEqual(invalid, 8)
 
     def test_valid_fp_example_carries_fp(self):
         text = (EXAMPLES_DIR / "uri-valid-with-fp.txt").read_text(encoding="utf-8")
@@ -239,12 +286,18 @@ class ExamplesTest(unittest.TestCase):
         self.assertTrue(1 <= len(data["device_display_name"]) <= 128)
 
     def test_redeem_200_examples(self):
-        for name in ("redeem-200-registration-token.json", "redeem-200-login-token.json"):
+        for name in ("redeem-200-registration-token.json",
+                     "redeem-200-login-token.json",
+                     "redeem-200-no-gateway.json"):
             data = json.loads((EXAMPLES_DIR / name).read_text(encoding="utf-8"))
             result = contract.validate_redeem_response(data, HS)  # must not raise
             self.assertIn(result["auth"]["type"], contract.AUTH_TYPES)
             self.assertEqual(result["homeserver"], HS)
             self.assertEqual(data["auth"]["token"], "<redacted-example>")
+            if name == "redeem-200-no-gateway.json":
+                # gw 可选（B1）：无 gw 签发对应 gateway: null
+                self.assertIsNone(data["gateway"], name)
+                self.assertIsNone(result["gateway"], name)
 
     def test_error_examples_cover_all_codes(self):
         files = sorted(EXAMPLES_DIR.glob("redeem-*-bv-pair-*.json"))
@@ -290,6 +343,15 @@ class RedeemResponseTest(unittest.TestCase):
             resp = ok_response(homeserver=bad)
             with self.assertRaises(contract.PairRedeemError, msg=repr(bad)):
                 contract.validate_redeem_response(resp, HS)
+
+    def test_gateway_null_allowed_but_field_required(self):
+        # gateway 字段必现；签发时无 gw 则值为 null（B1，OpenAPI type: [string, "null"]）
+        result = contract.validate_redeem_response(ok_response(gateway=None), HS)
+        self.assertIsNone(result["gateway"])
+        resp = ok_response()
+        del resp["gateway"]
+        with self.assertRaises(contract.PairRedeemError):
+            contract.validate_redeem_response(resp, HS)
 
     def test_missing_and_bad_fields_rejected(self):
         for key in ("v", "homeserver", "gateway", "auth", "features_url"):
@@ -386,6 +448,38 @@ class OpenApiCoverageTest(unittest.TestCase):
             self.assertNotIn(banned, text)
 
 
+class DocCodeExampleTest(unittest.TestCase):
+    """B3：文档与 OpenAPI 里的 code 示例必须是 43 字符合法 base64url 值。
+
+    提取 pairing-qr.md（JSON 写法 "code": "…"）与 OpenAPI（YAML 写法 code: …
+    和 examples 列表项 - …）中的全部 code 示例值，逐个断言：43 字符、能被
+    参考实现的 code 校验接受、与 examples/pairing-qr/redeem-request.json 一致。
+    """
+
+    # "code": "VALUE"（md 中的 JSON 示例）
+    CODE_JSON_RE = re.compile(r'"code"\s*:\s*"([^"]+)"')
+    # 行首 code: VALUE 或列表项 - VALUE（openapi 中 ≥30 个 base64url 字符，
+    # 避开 BV_PAIR_* 等短枚举值）
+    CODE_YAML_RE = re.compile(r"(?m)^[ \t]*(?:code:[ \t]*|-[ \t]+)([A-Za-z0-9_-]{30,})[ \t]*$")
+
+    def test_doc_and_openapi_code_examples_are_legal(self):
+        request_code = json.loads(
+            (EXAMPLES_DIR / "redeem-request.json").read_text(encoding="utf-8"))["code"]
+        for path in (CONTRACT_DIR / "pairing-qr.md", OPENAPI):
+            text = path.read_text(encoding="utf-8")
+            codes = self.CODE_JSON_RE.findall(text) + self.CODE_YAML_RE.findall(text)
+            # 提取不到说明正则与文档漂移了，测试不得静默变绿
+            self.assertTrue(codes, "no code examples extracted from %s" % path)
+            for code in codes:
+                self.assertEqual(len(code), contract.CODE_CHARS,
+                                 "%s: %r must be %d chars"
+                                 % (path.name, code, contract.CODE_CHARS))
+                self.assertEqual(code, request_code,
+                                 "%s: %r differs from redeem-request.json"
+                                 % (path.name, code))
+                contract.parse_pair_uri(make_uri(code=code))  # must not raise
+
+
 class ExamplesSecretScanTest(unittest.TestCase):
     """Simple scan: nothing in the examples may look like a real secret."""
 
@@ -398,7 +492,7 @@ class ExamplesSecretScanTest(unittest.TestCase):
 
     def test_examples_contain_no_secrets(self):
         files = sorted(p for p in EXAMPLES_DIR.iterdir() if p.is_file())
-        self.assertGreaterEqual(len(files), 16)
+        self.assertGreaterEqual(len(files), 19)
         for path in files:
             text = path.read_text(encoding="utf-8")
             self.assertNotIn("-----BEGIN", path.name + ": PEM block")

@@ -9,10 +9,11 @@ Python 标准库 only；无网络、无存储、无副作用。
 
   parse_pair_uri(str) -> dict          解析 botville://pair?v=1… 二维码 URI
                                        （失败抛 PairUriError；exp 转成 int，
-                                       fp 仅在出现时包含在结果里）
+                                       gw/fp 可选，仅在出现时包含在结果里）
   validate_redeem_response(d, hs)      校验 200 兑换响应；homeserver 必须与
                                        二维码中的 hs 逐字符一致（失败抛
-                                       PairRedeemError），返回仅含已知字段的副本
+                                       PairRedeemError），返回仅含已知字段的副本；
+                                       gateway 为 null 表示签发时无 gw
   validate_error(d)                    校验 {errcode, error[, retry_after_ms]}
                                        错误体；BV_PAIR_RATE_LIMITED 必带
                                        retry_after_ms（失败抛 PairRedeemError）
@@ -29,9 +30,10 @@ import urllib.parse
 PAIR_URI_PREFIX = "botville://pair?"
 URI_VERSION = "1"  # v 参数唯一合法值
 
-# URI 参数：全部已知参数 + 全部必填参数（fp 可选）。
+# URI 参数：全部已知参数 + 全部必填参数（gw/fp 可选——无网关部署可省略 gw，
+# 见 pairing-qr.md §5.1.1「无网关时的行为」）。
 KNOWN_PARAMS = frozenset({"v", "hs", "gw", "fp", "code", "exp"})
-REQUIRED_PARAMS = ("v", "hs", "gw", "code", "exp")
+REQUIRED_PARAMS = ("v", "hs", "code", "exp")
 
 CODE_CHARS = 43  # 32 字节 base64url 无填充；43 字符解码恰好 32 字节
 _B64URL = frozenset(string.ascii_letters + string.digits + "-_")
@@ -124,9 +126,10 @@ def _check_fp(value, error):
 def parse_pair_uri(uri):
     """解析并整体校验 botville://pair?v=1&… 二维码 URI。
 
-    返回 {"v", "hs", "gw", "code", "exp"(int)[, "fp"]}；任一规则不满足
+    返回 {"v", "hs", "code", "exp"(int)[, "gw", "fp"]}；任一规则不满足
     （重复参数/缺必填/未知参数（含未知 v）/格式错误/percent 编码/fragment/
-    空白或控制字符）抛 PairUriError。解析只做格式校验：exp 是否已过期由
+    空白或控制字符）抛 PairUriError。gw 为可选参数：省略时结果不含 "gw" 键，
+    出现时仍须通过 §3.2 的 https URL 校验。解析只做格式校验：exp 是否已过期由
     App（对照本地时钟）与服务端（对照签发记录）另行判定。
     """
     if not isinstance(uri, str):
@@ -165,13 +168,16 @@ def parse_pair_uri(uri):
     if params["v"] != URI_VERSION:
         raise PairUriError("unsupported v: %r (only %r)" % (params["v"], URI_VERSION))
     _check_https_url(params["hs"], "hs", PairUriError)
-    _check_https_url(params["gw"], "gw", PairUriError)
+    if "gw" in params:  # 可选；出现时仍须 https 绝对 URL（§3.2）
+        _check_https_url(params["gw"], "gw", PairUriError)
     _check_b64url_no_pad(params["code"], "code", PairUriError)
     if not _EXP_RE.match(params["exp"]):
         raise PairUriError("exp: must be canonical decimal Unix seconds (no leading zero)")
 
-    result = {name: params[name] for name in ("v", "hs", "gw", "code")}
+    result = {name: params[name] for name in ("v", "hs", "code")}
     result["exp"] = int(params["exp"])
+    if "gw" in params:
+        result["gw"] = params["gw"]
     if "fp" in params:
         _check_fp(params["fp"], PairUriError)
         result["fp"] = params["fp"]
@@ -184,7 +190,8 @@ def validate_redeem_response(resp, expected_hs):
     expected_hs 必须来自 parse_pair_uri 的结果（即二维码中的 hs）。响应的
     homeserver 与它**逐字符**比对（不做任何规范化：多一个斜杠也算不一致），
     不一致抛 PairRedeemError —— 服务端必须返回签发时保存的 hs 原文，不得按
-    当前配置重算。未声明字段按契约忽略（前向兼容），返回仅含已知字段的副本。
+    当前配置重算。gateway 字段必须出现：签发时有 gw 则为该 gw 原文（须 https），
+    无 gw 则为 null。未声明字段按契约忽略（前向兼容），返回仅含已知字段的副本。
     """
     if not isinstance(resp, dict):
         raise PairRedeemError("redeem response must be a JSON object")
@@ -199,7 +206,9 @@ def validate_redeem_response(resp, expected_hs):
             "homeserver mismatch: response %r != expected %r (byte-for-byte, no normalisation)"
             % (hs, expected_hs))
     _check_https_url(hs, "homeserver", PairRedeemError)
-    _check_https_url(resp["gateway"], "gateway", PairRedeemError)
+    gateway = resp["gateway"]
+    if gateway is not None:  # null = 签发时无 gw（gw 可选，pairing-qr.md §5.1.1）
+        _check_https_url(gateway, "gateway", PairRedeemError)
     _check_https_url(resp["features_url"], "features_url", PairRedeemError)
 
     auth = resp["auth"]
@@ -219,7 +228,7 @@ def validate_redeem_response(resp, expected_hs):
     return {
         "v": resp["v"],
         "homeserver": hs,
-        "gateway": resp["gateway"],
+        "gateway": gateway,
         "auth": {
             "type": auth["type"],
             "token": auth["token"],

@@ -1,0 +1,1 @@
+botville://pair?v=1&gw=https://gw.example.org&code=QRPAIREXAMPLECODE0000000000000000000000000A&exp=1791000000

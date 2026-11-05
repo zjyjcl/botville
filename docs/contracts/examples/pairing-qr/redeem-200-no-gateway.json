@@ -1,0 +1,11 @@
+{
+  "v": "1",
+  "homeserver": "https://hs.example.org",
+  "gateway": null,
+  "auth": {
+    "type": "registration_token",
+    "token": "<redacted-example>",
+    "expires_in_ms": 600000
+  },
+  "features_url": "https://hs.example.org/features.json"
+}

@@ -43,7 +43,7 @@ botville 已有一套二维码配对：A2.1 的 `botville-pair:v1:…`（见
 管理员（管理页 / 本机 CLI）            App（C2.2）
   │ 签发：32 字节随机 code              │
   │   库里只存 sha256(code)，TTL 300s    │
-  │   记录保存签发时的 hs/gw(/fp)        │
+  │   记录保存签发时的 hs(/gw)(/fp)      │
   │                                     │
   │  ←—— 线下出示二维码（URI 文本）——→   │ 扫码得到 URI
   │                                     │ ① 解析 + 本地校验（§3，整体拒绝）
@@ -64,7 +64,7 @@ botville 已有一套二维码配对：A2.1 的 `botville-pair:v1:…`（见
 ## 3. 二维码 URI 规范
 
 ```
-botville://pair?v=1&hs=<https-url>&gw=<https-url>[&fp=<spki-hash>]&code=<b64url-43>&exp=<unix-sec>
+botville://pair?v=1&hs=<https-url>[&gw=<https-url>][&fp=<spki-hash>]&code=<b64url-43>&exp=<unix-sec>
 ```
 
 ### 3.1 参数表
@@ -73,7 +73,7 @@ botville://pair?v=1&hs=<https-url>&gw=<https-url>[&fp=<spki-hash>]&code=<b64url-
 |---|---|---|---|
 | `v` | ✅ | 固定字符串 `"1"` | 契约版本。未知值（`2`、`01`、`1.0`…）整体拒绝；旧 App 遇新 `v` 应提示升级 |
 | `hs` | ✅ | `https://` 绝对 URL（§3.2） | homeserver 基址；兑换端点由它拼出 |
-| `gw` | ✅ | `https://` 绝对 URL（§3.2） | AI 网关基址 |
+| `gw` | ❌ | `https://` 绝对 URL（§3.2） | AI 网关基址；无网关部署省略（见 §5.1.1「无网关时的行为」）。出现时仍须通过 §3.2 全部校验，空值（`gw=`）按格式错误拒绝 |
 | `fp` | ❌ | `sha256:<base64url-43>`（§3.3） | hs 叶证书 SPKI 的 sha256；**仅**自签或私有 CA 部署提供，公网 CA 部署省略 |
 | `code` | ✅ | 43 字符 base64url 无填充 | 32 字节随机数（§4.2） |
 | `exp` | ✅ | 十进制 Unix 秒 | code 过期时刻 = 签发时刻 + 300s |
@@ -109,7 +109,7 @@ botville://pair?v=1&hs=<https-url>&gw=<https-url>[&fp=<spki-hash>]&code=<b64url-
 以下情况**整体拒绝**（App 不发起兑换，提示二维码无效；绝不部分接受）：
 
 1. 任一参数**重复出现**（含大小写不同的同名参数——键名区分大小写，`V=` 是未知参数）；
-2. **缺少任一必填**参数（`v`、`hs`、`gw`、`code`、`exp`）；
+2. **缺少任一必填**参数（`v`、`hs`、`code`、`exp`；`gw`/`fp` 可选，不算缺必填）；
 3. `v` ≠ `"1"`；
 4. 任一参数**格式错误**（§3.1–§3.3，含 base64url 长度/字符集/规范编码、exp 非规范
    十进制秒、URL 违反 §3.2）；
@@ -132,15 +132,15 @@ botville://pair?v=1&hs=<https-url>&gw=<https-url>[&fp=<spki-hash>]&code=<b64url-
 
 签发与作废只经管理面（不对外匿名开放）：
 
-- **管理员 Matrix 账号登录**管理页（Web）：输入/确认 `hs`、`gw`（可选 `fp`），
-  服务端生成 `code` 并展示完整 URI / 二维码；
+- **管理员 Matrix 账号登录**管理页（Web）：输入/确认 `hs`、可选 `gw`（可选
+  `fp`），服务端生成 `code` 并展示完整 URI / 二维码；
 - 或**本机 CLI**（如 `botville-pairing admin issue`）持**一次性管理 token** 操作：
   token 生成后仅可用一次、短 TTL、仅监听 loopback。
 
 签发动作：32 字节 CSPRNG 随机 → base64url 无填充得到 `code` → 库中记录
-`sha256(code)`、`hs`/`gw`（逐字符原样）、`fp`（如有）、`exp = now + 300`、状态
-`unused` → 返回 URI（`code` 明文**只在签发响应里出现一次**，与 A2.1 invite secret
-同规格）。
+`sha256(code)`、`hs`（逐字符原样）、`gw`/`fp`（如有，逐字符原样）、
+`exp = now + 300`、状态 `unused` → 返回 URI（`code` 明文**只在签发响应里出现
+一次**，与 A2.1 invite secret 同规格）。
 
 ### 4.2 code 的属性
 
@@ -203,7 +203,7 @@ botville://pair?v=1&hs=<https-url>&gw=<https-url>[&fp=<spki-hash>]&code=<b64url-
 ```json
 // 请求
 {
-  "code": "QRPAIREXAMPLECODE000000000000000000000000000A",
+  "code": "QRPAIREXAMPLECODE0000000000000000000000000A",
   "device_display_name": "Alice 的 iPhone 17"
 }
 ```
@@ -232,13 +232,28 @@ botville://pair?v=1&hs=<https-url>&gw=<https-url>[&fp=<spki-hash>]&code=<b64url-
 |---|---|
 | `v` | `"1"` |
 | `homeserver` | **签发时保存的 hs 原样返回**（§5.2） |
-| `gateway` | 签发时保存的 gw 原样返回 |
+| `gateway` | 签发时保存的 gw 原样返回；签发时无 gw 则为 `null`（字段仍必现，见下） |
 | `auth.type` | `"registration_token"`（App 用 Matrix 注册流程换新账号）或 `"login_token"`（App 用 `m.login.token` 登录已有账号）；由签发时管理面决定，契约只传输 |
 | `auth.token` | 一次性短时令牌；建议 `expires_in_ms` ≤ 600000（10 分钟）；过期未用须重新配对 |
 | `features_url` | 功能清单（capability manifest）拉取地址，`https://` URL；其内容结构不在本契约（见网关契约） |
 
 `registration_token` 与 `login_token` 在 homeserver 侧的具体核销（注册流程 / 登录
 流程）由服务端实现负责，本契约只规定传输格式、短时性与一次性语义。
+
+### 5.1.1 无网关时的行为
+
+`gw` 是可选参数（§3.1）：无网关部署——App 所需能力全部由 hs 承载——签发时省略
+`gw`。此时：
+
+- **App 只使用 `hs`**；兑换端点只挂在 hs 域名下（`POST {hs}/_botville/pair/redeem`），
+  **`gw` 从不承载兑换**——无论二维码里有没有 `gw`，App 都不得向任何 gw 地址发
+  兑换请求（§2 的"兑换端点挂在二维码中 hs 域名下"对两种部署同样成立）；
+- 签发时无 `gw` 的配对，成功响应的 `gateway` 字段为 **`null`**：字段本身仍必须
+  出现（OpenAPI 中 `required` 且 `type: [string, "null"]`），只是值为 null；
+- `features_url` 仍为必填的 `https://` URL（指向该部署实际承载功能清单的服务）。
+
+完整示例：无 `gw` 的有效二维码 `examples/pairing-qr/uri-valid-no-gw.txt`，对应
+`gateway: null` 的成功响应 `examples/pairing-qr/redeem-200-no-gateway.json`。
 
 ### 5.2 hs 一致性规则（防篡改与配置漂移）
 
@@ -277,7 +292,7 @@ botville://pair?v=1&hs=<https-url>&gw=<https-url>[&fp=<spki-hash>]&code=<b64url-
 |---|---|
 | `docs/contracts/pairing-qr.md` | 本文档：人类可读契约（URI、生命周期、兑换、安全） |
 | `docs/contracts/pairing-redeem.openapi.yaml` | OpenAPI 3.1 片段：redeem 请求/响应/全部错误（机器可读，冲突以此为准） |
-| `docs/contracts/examples/pairing-qr/` | mock 示例：2 个有效 URI、7 个无效 URI、兑换请求、2 个 200、5 个错误体 |
+| `docs/contracts/examples/pairing-qr/` | mock 示例：3 个有效 URI、8 个无效 URI、兑换请求、3 个 200、5 个错误体 |
 | `server/pairing_qr_contract.py` | 标准库参考实现：`parse_pair_uri` / `validate_redeem_response` / `validate_error` |
 | `server/tests/test_pairing_qr_contract.py` | 单测：示例分类、拒绝规则、hs 一致性、429 必带字段、OpenAPI 错误码覆盖、密钥扫描 |
 

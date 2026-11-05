@@ -18,7 +18,9 @@ info:
 
     要点（详见 pairing-qr.md）：
 
-    - 兑换地址 = 二维码中 `hs` + `/_botville/pair/redeem`；仅 HTTPS。
+    - 兑换地址 = 二维码中 `hs` + `/_botville/pair/redeem`；仅 HTTPS。二维码的
+      `gw` 为可选参数：无网关部署省略之，兑换端点只挂在 `hs` 下（`gw` 从不
+      承载兑换），此时成功响应的 `gateway` 为 `null`（字段仍必现）。
     - `code`：32 字节随机数的 base64url 无填充（43 字符）；服务端只存 sha256；
       签发后 5 分钟过期、一次性、事务内原子核销。
     - 成功响应的 `homeserver` 是**签发时保存的 hs 原样返回**；App 必须与二维码中
@@ -59,7 +61,7 @@ paths:
             schema:
               $ref: "#/components/schemas/RedeemRequest"
             example:
-              code: QRPAIREXAMPLECODE000000000000000000000000000A
+              code: QRPAIREXAMPLECODE0000000000000000000000000A
               device_display_name: Alice 的 iPhone 17
       responses:
         "200":
@@ -92,6 +94,17 @@ paths:
                       token: "<redacted-example>"
                       expires_in_ms: 120000
                     features_url: https://gw.example.org/features.json
+                noGateway:
+                  summary: 无网关部署（二维码省略可选的 gw；gateway 为 null）
+                  value:
+                    v: "1"
+                    homeserver: https://hs.example.org
+                    gateway: null
+                    auth:
+                      type: registration_token
+                      token: "<redacted-example>"
+                      expires_in_ms: 600000
+                    features_url: https://hs.example.org/features.json
         "400":
           description: |
             BV_PAIR_INVALID —— 请求结构非法（缺字段/未知字段/code 格式错）或查无
@@ -156,7 +169,7 @@ components:
           pattern: "^[A-Za-z0-9_-]{43}$"
           description: 32 字节随机数的 base64url 无填充（43 字符），与二维码 URI 中相同。
           examples:
-            - QRPAIREXAMPLECODE000000000000000000000000000A
+            - QRPAIREXAMPLECODE0000000000000000000000000A
         device_display_name:
           type: string
           minLength: 1
@@ -169,7 +182,8 @@ components:
       type: object
       description: |
         兑换成功响应。`homeserver`/`gateway` 为签发时逐字符保存的 hs/gw 原样返回，
-        不得按当前配置重算。客户端必须忽略未声明字段（前向兼容）。
+        不得按当前配置重算；签发时未提供 gw 则 `gateway` 为 null（字段仍必现）。
+        客户端必须忽略未声明字段（前向兼容）。
       required: [v, homeserver, gateway, auth, features_url]
       properties:
         v:
@@ -184,12 +198,16 @@ components:
           examples:
             - https://hs.example.org
         gateway:
-          type: string
+          type: [string, "null"]
           format: uri
           pattern: "^https://"
-          description: 签发时保存的 gw，逐字符原样返回。
+          description: |
+            签发时保存的 gw，逐字符原样返回；签发时无 gw 则为 null。字段本身
+            必须出现（required），只是值可为 null。gw 从不承载兑换端点——
+            兑换只发往二维码中的 hs（pairing-qr.md §5.1.1「无网关时的行为」）。
           examples:
             - https://gw.example.org
+            - null
         auth:
           $ref: "#/components/schemas/PairingAuth"
         features_url:
