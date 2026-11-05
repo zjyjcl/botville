@@ -194,7 +194,7 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         let request = try request(
             ["capabilities", capabilityID, "session-cookies"], method: "POST",
             body: JSONEncoder().encode(["code": code]), authorize: false)
-        let (_, response) = try await session.data(for: request)
+        let (_, response) = try await PairingURLSession.data(for: request, using: session)
         guard let response = response as? HTTPURLResponse else { throw GatewayClientError.invalidResponse }
         guard response.statusCode == 204 else { throw GatewayClientError.httpStatus(response.statusCode) }
         return GatewayCookieExchange(statusCode: 204)
@@ -241,7 +241,7 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
     }
 
     private func decode<T: Decodable>(_ request: URLRequest, as: T.Type) async throws -> T {
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await PairingURLSession.data(for: request, using: session)
         guard let response = response as? HTTPURLResponse else { throw GatewayClientError.invalidResponse }
         guard (200..<300).contains(response.statusCode) else {
             throw GatewayClientError.httpStatus(response.statusCode)

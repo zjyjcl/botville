@@ -1,0 +1,5 @@
+{
+  "errcode": "BV_PAIR_RATE_LIMITED",
+  "error": "too many redeem attempts; retry later",
+  "retry_after_ms": 60000
+}

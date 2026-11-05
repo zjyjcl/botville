@@ -109,11 +109,12 @@ public struct MatrixPairingCredentialAuthentication: PairingCredentialAuthentica
 
     private func response(for request: URLRequest) async throws -> (data: Data, response: HTTPURLResponse) {
         do {
-            let (data, response) = try await session.data(for: request)
+            let (data, response) = try await PairingURLSession.data(for: request, using: session)
             guard let response = response as? HTTPURLResponse else { throw AuthenticationError.networkFailure }
             if let error = MatrixRateLimit.error(response: response, data: data) { throw error }
             return (data, response)
-        } catch let error as AuthenticationError { throw error }
+        } catch let error as PairingError { throw error }
+        catch let error as AuthenticationError { throw error }
         catch let error as URLError { throw PasswordLoginResultClassifier.error(for: error) }
         catch { throw AuthenticationError.networkFailure }
     }

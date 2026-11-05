@@ -25,6 +25,14 @@ public struct SessionCredentials: Codable, Equatable, Sendable {
     public let gatewayURL: String?
     public let gatewayCertificateFingerprint: Data?
 
+    /// Recheck the host on restore as older records may have copied the hs pin
+    /// to a different gateway. Cross-host gateways always use system TLS.
+    var effectiveGatewayCertificateFingerprint: Data? {
+        guard let homeserver = URL(string: homeserverURL), let gatewayURL,
+              let gateway = URL(string: gatewayURL) else { return nil }
+        return PairingURLSession.fingerprint(gatewayCertificateFingerprint, homeserver: homeserver, requestURL: gateway)
+    }
+
     public init(accessToken: String, refreshToken: String?, userID: String, deviceID: String, homeserverURL: String, oauthData: String?, storeID: UUID, storeKey: Data, allowLocalHTTP: Bool = false,
                 gatewayURL: String? = nil, gatewayCertificateFingerprint: Data? = nil) {
         self.accessToken = accessToken

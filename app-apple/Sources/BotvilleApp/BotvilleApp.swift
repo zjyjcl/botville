@@ -63,12 +63,25 @@ struct BotvilleApp: App {
             AppRootView(service: matrixService)
                 .tabItem { Label("会话", systemImage: "bubble.left.and.bubble.right") }
                 .tag(0)
-            DynamicUIView(
-                onOpenChat: { selectedTab = 0 },
-                matrixService: matrixService)
-                .tabItem { Label("动态", systemImage: "square.grid.2x2") }
-                .tag(1)
+            if showsGatewayFeatures {
+                DynamicUIView(
+                    onOpenChat: { selectedTab = 0 },
+                    matrixService: matrixService)
+                    .tabItem { Label("动态", systemImage: "square.grid.2x2") }
+                    .tag(1)
+            }
         }
+        .onChange(of: showsGatewayFeatures) { _, visible in
+            if !visible { selectedTab = 0 }
+        }
+    }
+
+    private var showsGatewayFeatures: Bool {
+#if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-dynamic-ui-mock") { return true }
+#endif
+        // Missing gateway means absent features: keep only the chat entry.
+        return matrixService.hasConfirmedGateway
     }
 
     var body: some Scene {

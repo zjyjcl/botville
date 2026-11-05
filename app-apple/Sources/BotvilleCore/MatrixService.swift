@@ -182,9 +182,7 @@ public final class MatrixService: ObservableObject {
         }
         isAuthenticating = true
         sessionError = nil
-        let redeemHost = (qrCode.gateway ?? qrCode.homeserver).host?.lowercased()
-        let pinForHomeserver = redeemHost == server.host?.lowercased() ? qrCode.fingerprint : nil
-        let pairingTransport = pairingAuthentication.configuredForPairing(fingerprint: pinForHomeserver, host: server.host)
+        let pairingTransport = pairingAuthentication.configuredForPairing(fingerprint: qrCode.fingerprint, host: qrCode.homeserver.host)
         let attempt = AuthenticationAttempt()
         authenticationAttempt = attempt
         do {
@@ -239,9 +237,15 @@ public final class MatrixService: ObservableObject {
             try Task.checkCancellation()
             try await retryRateLimits { try await newClient.restoreSession(session: session) }
             try Task.checkCancellation()
+            // Owner decision: a QR without gw is chat-only. This deliberately
+            // differs from A-line §3.1 (gw required), pending alignment.
+            let gateway = qrCode.gateway == nil ? nil : response.gateway
+            let gatewayPin = gateway.flatMap {
+                PairingURLSession.fingerprint(qrCode.fingerprint, homeserver: qrCode.homeserver, requestURL: $0)
+            }
             let stored = SessionCredentials(session: session, storeID: storeID, storeKey: key,
-                                            gatewayURL: response.gateway?.absoluteString,
-                                            gatewayCertificateFingerprint: qrCode.fingerprint)
+                                            gatewayURL: gateway?.absoluteString,
+                                            gatewayCertificateFingerprint: gatewayPin)
             try sessionStore.save(stored)
             credentials = stored
             try await activate(newClient, stored: stored)
@@ -467,12 +471,15 @@ public final class MatrixService: ObservableObject {
         authenticationAttempt?.cancel()
     }
 
+    /// Without a confirmed gateway, features are absent and only chat is shown.
+    public var hasConfirmedGateway: Bool { credentials?.gatewayURL != nil }
+
     /// Recreates the confirmed gateway transport with its non-secret QR pin.
     /// Pairing does not automatically activate gateway features; callers opt
     /// into this client only after a logged-in session exists.
     public func confirmedGatewayClient() throws -> HTTPGatewayClient? {
         guard let stored = credentials, let source = stored.gatewayURL, let url = URL(string: source) else { return nil }
-        return try HTTPGatewayClient(baseURL: url, certificateFingerprint: stored.gatewayCertificateFingerprint)
+        return try HTTPGatewayClient(baseURL: url, certificateFingerprint: stored.effectiveGatewayCertificateFingerprint)
     }
 
     /// Invoked only after the UI's destructive confirmation. No successful

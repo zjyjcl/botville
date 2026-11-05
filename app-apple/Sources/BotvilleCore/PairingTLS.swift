@@ -19,12 +19,40 @@ public enum PairingURLSession {
         configuration.timeoutIntervalForResource = 60
         return URLSession(configuration: configuration, delegate: PairingTLSDelegate(fingerprint: fingerprint, host: host), delegateQueue: nil)
     }
+
+    /// URLSession reports a rejected trust challenge as a transport error. Keep
+    /// the rejection on a per-request delegate so concurrent requests cannot
+    /// turn an unrelated network failure into a certificate mismatch.
+    static func data(for request: URLRequest, using session: URLSession) async throws -> (Data, URLResponse) {
+        guard let configuration = session.delegate as? PairingTLSDelegate else {
+            return try await session.data(for: request)
+        }
+        let delegate = configuration.requestDelegate()
+        do {
+            return try await session.data(for: request, delegate: delegate)
+        } catch {
+            if delegate.rejectedCertificate { throw PairingError.certificateMismatch }
+            throw error
+        }
+    }
+
+    /// A QR pin identifies the hs leaf SPKI, never an unrelated gateway host.
+    static func fingerprint(_ fingerprint: Data?, homeserver: URL, requestURL: URL) -> Data? {
+        guard let host = homeserver.host, requestURL.scheme == "https",
+              requestURL.host?.lowercased() == host.lowercased() else { return nil }
+        return fingerprint
+    }
 }
 
 final class PairingTLSDelegate: NSObject, URLSessionTaskDelegate {
     private let fingerprint: Data?
     private let host: String?
+    private let rejectionLock = NSLock()
+    private var didRejectCertificate = false
     init(fingerprint: Data?, host: String?) { self.fingerprint = fingerprint; self.host = host?.lowercased() }
+
+    var rejectedCertificate: Bool { rejectionLock.withLock { didRejectCertificate } }
+    func requestDelegate() -> PairingTLSDelegate { PairingTLSDelegate(fingerprint: fingerprint, host: host) }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
         guard let original = task.originalRequest?.url, let target = request.url, HTTPSRedirectPolicy.allowsRedirect(from: original, to: target) else { completionHandler(nil); return }
@@ -33,13 +61,15 @@ final class PairingTLSDelegate: NSObject, URLSessionTaskDelegate {
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
         guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust else { completionHandler(.performDefaultHandling, nil); return }
-        guard let fingerprint else { completionHandler(.performDefaultHandling, nil); return }
-        guard let host, challenge.protectionSpace.host.lowercased() == host,
-              let trust = challenge.protectionSpace.serverTrust,
+        guard let fingerprint, let host, challenge.protectionSpace.host.lowercased() == host else {
+            completionHandler(.performDefaultHandling, nil); return
+        }
+        guard let trust = challenge.protectionSpace.serverTrust,
               SecTrustSetPolicies(trust, SecPolicyCreateSSL(true, host as CFString)) == errSecSuccess,
               SecTrustEvaluateWithError(trust, nil),
               let certificate = SecTrustCopyCertificateChain(trust) as? [SecCertificate], let leaf = certificate.first,
               Self.matchesLeafCertificateDER(SecCertificateCopyData(leaf) as Data, fingerprint: fingerprint) else {
+            rejectionLock.withLock { didRejectCertificate = true }
             completionHandler(.cancelAuthenticationChallenge, nil); return
         }
         completionHandler(.useCredential, URLCredential(trust: trust))

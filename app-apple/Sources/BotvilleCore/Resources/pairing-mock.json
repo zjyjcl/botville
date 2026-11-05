@@ -1,5 +1,5 @@
 {
-  "v": 1,
+  "v": "1",
   "homeserver": "https://matrix.example.invalid",
   "gateway": "https://gateway.example.invalid",
   "auth": {

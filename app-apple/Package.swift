@@ -19,6 +19,10 @@ let package = Package(
             .product(name: "MatrixRustSDK", package: "matrix-rust-components-swift")
         ], resources: [.process("Resources")]),
         .executableTarget(name: "BotvilleApp", dependencies: ["BotvilleCore"]),
-        .testTarget(name: "BotvilleCoreTests", dependencies: ["BotvilleCore"])
+        .testTarget(
+            name: "BotvilleCoreTests",
+            dependencies: ["BotvilleCore"],
+            resources: [.process("Fixtures")]
+        )
     ]
 )
