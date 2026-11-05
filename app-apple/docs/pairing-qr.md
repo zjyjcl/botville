@@ -56,11 +56,13 @@ botville://pair?v=1&hs=<https>&gw=<https，可选>&fp=sha256:<base64url，可选
 
 ## TLS 固定与边界
 
-有 `fp` 时，URLSession delegate 对 **hs 主机**的叶证书 SPKI SHA-256 做固定：覆盖兑换及本 App URLSession 发起的同 host 凭证交换和网关请求。系统证书链和 hostname 验证仍须通过；固定失败归类为 `certificateMismatch`，不作为一般网络失败。禁止跨 origin 重定向，不把兑换码或凭证发送到未确认的服务器。
+有 `fp` 时，专用配对 `URLSession` 只在 challenge 的 `(host, port)` 与 QR `hs` 对齐时自行评估：端口缺省为 443，host 小写精确比较。先以常量时间比较叶证书 DER 中 `SubjectPublicKeyInfo` 的 SHA-256；匹配后把该叶证书设为唯一信任锚，并用该 host 的 TLS 策略重新评估。这个路径以 QR pin 替代系统根信任链，不要求证书链被系统根信任。
 
-确认页将摘要转换为每 4 个十六进制字符一组显示，并标明 SHA-256。`gw` 与 `hs` 不是同一 host 时不得因指纹而拒绝：网关请求仅在 `gw` host 与 `hs` host 相同才套用该 pin，否则使用系统 TLS。网关 URL 和指纹作为非秘密配置随 Matrix 会话保存在 Keychain，恢复及 soft logout 重新认证时保留；配对码和兑换所得临时 token 不保存。动态页启用已配对网关时复用固定传输，设置页不能将其静默改建为无指纹客户端。这里的网关固定范围为 `HTTPGatewayClient` 的 API 请求；WebKit 模块网页仍遵循现有网页 origin 与系统 TLS 策略。
+自评估仍强制校验叶证书的 SAN 主机名（仅 `dNSName` / `iPAddress`，不接受只写 CN 的回退）、有效期与 `serverAuth` EKU；SAN 不含该 DNS 名或 IP、未生效或已过期、缺少 serverAuth 都拒绝，且没有忽略过期的开关。自签证书可在此路径使用，但二维码必须带正确的叶 SPKI 指纹，设备系统时间必须正确；叶自锚模式可接受有效期超过公网 CA 的 398 天惯例。任一 pin 或自评估失败归类为 `certificateMismatch`，不作为一般网络失败。无 `fp`、或 challenge 不属于 QR `hs` 的 `(host, port)` 时，保持 `.performDefaultHandling`，仍由系统 TLS 信任。禁止跨 origin 重定向，不把兑换码或凭证发送到未确认的服务器。
 
-**Matrix Rust SDK 内部请求的 SPKI 固定：待定。** 当前精确固定依赖为 `matrix-rust-components-swift` **26.10.27**。其生成的 `Sources/MatrixRustSDK/matrix_sdk_ffi.swift` 中 `ClientBuilderProtocol`（约 4421–4634 行）暴露 `addRootCertificates`、`disableBuiltInRootCertificates`、`disableSslVerification` 等接口，但没有叶证书 SPKI pin 或自定义 TLS verifier / URLSession 注入接口。自定义根证书不等于叶证书 SPKI 固定，不能用关闭 TLS 校验代替。SDK 的同步、消息及其内部请求继续使用系统 TLS；本次不宣称它们已固定指纹。后续须由上游绑定增加能力或另行评估 Rust 层实现。
+确认页将摘要转换为每 4 个十六进制字符一组显示，并标明 SHA-256。`gw` 只在 `(scheme, host, port)` 与 `hs` 全部相同时复用 pin；不同 host、scheme 或 port 的网关一律使用系统 TLS；不同源的自签网关不受此 pin 支持，建议让 `gw` 与 `hs` 共用同源反代。网关 URL 和适用的指纹作为非秘密配置随 Matrix 会话保存在 Keychain，恢复及 soft logout 重新认证时保留；配对码和兑换所得临时 token 不保存。动态页启用已配对网关时复用固定传输，设置页不能将其静默改建为无指纹客户端。这里的网关固定范围为 `HTTPGatewayClient` 的 API 请求；WebKit 模块网页仍遵循现有网页 origin 与系统 TLS 策略。
+
+**Matrix Rust SDK 内部请求的 SPKI 固定仍待定，不受 `fp` SPKI pin 保护。** 当前精确固定依赖为 `matrix-rust-components-swift` **26.10.27**。其生成的 `Sources/MatrixRustSDK/matrix_sdk_ffi.swift` 中 `ClientBuilderProtocol`（约 4421–4634 行）暴露 `addRootCertificates`、`disableBuiltInRootCertificates`、`disableSslVerification` 等接口，但没有叶证书 SPKI pin 或自定义 TLS verifier / URLSession 注入接口。自定义根证书不等于叶证书 SPKI 固定，且绝不能用 `disableSslVerification` 关闭校验代替。SDK 的同步、消息及其内部请求继续使用 SDK 默认 TLS 信任策略；自签服务器可能通过配对 HTTP 请求却仍无法完成 SDK 登录或同步，本 PR 不宣称全链路已 pin。#132-PR2 将先验证是否能为单个 SDK Client 注入根证书，不能时改为引导安装信任描述文件，并向上游提出 per-client SPKI pin / custom verifier 需求。
 
 ## Mock 与本地验证
 
@@ -85,7 +87,7 @@ xcodebuild -project Botville.xcodeproj -scheme BotvilleApp-iOS \
 
 测试逐个加载契约的 `uri-valid*`、`uri-invalid*` 与 `redeem-*.json` fixture，并注入 `now` 避免示例 `exp` 自然过期；另覆盖未知参数、原始 `%`、可选 `gw`、固定兑换地址、字符串版响应 `v`、逐字符 homeserver、大小写 HTTPS 和设备名边界。测试证书与私钥不进入源码；mock 截图也不证明真实摄像头、真实兑换服务或 SDK 内部 pin 已验收。
 
-## 本次验证（2026-11-05，Asia/Shanghai）
+## 既有验证（#130，2026-11-05，Asia/Shanghai）
 
 - `swift test`：186 项，184 项通过，0 失败；**环境相关 skip**：本机 2 项 Synapse 集成测试未设置 E2E 环境变量，未计为配对联调通过。配对相关 33 项全部通过，覆盖全部 17 个契约 fixture；临时本地 TLS 服务也验证了公开 redeem 路径将证书拒绝报告为 `certificateMismatch`。
 - macOS Debug `swift build`：通过。iOS Simulator ad-hoc Debug：`BUILD SUCCEEDED`，arm64 + x86_64，`codesign` 确认 `Signature=adhoc`，bundle id 保持 `org.example.botville.c01`。

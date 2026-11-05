@@ -74,7 +74,7 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         if let session {
             self.session = session
         } else if let certificateFingerprint {
-            self.session = PairingURLSession.make(fingerprint: certificateFingerprint, host: self.baseURL.host)
+            self.session = PairingURLSession.make(fingerprint: certificateFingerprint, host: self.baseURL.host, port: self.baseURL.port)
         } else {
             let configuration = URLSessionConfiguration.ephemeral
             configuration.httpCookieStorage = nil

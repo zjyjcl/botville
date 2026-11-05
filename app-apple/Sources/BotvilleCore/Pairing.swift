@@ -111,7 +111,7 @@ public enum PairingError: Error, LocalizedError, Equatable, Sendable {
         case .expiredLocally: return "二维码已过期，请重新扫码。"
         case .invalidResponse: return "配对服务返回了无效响应。"
         case .homeserverMismatch: return "配对服务返回的 Homeserver 与二维码不一致，已拒绝。"
-        case .certificateMismatch: return "服务器证书与二维码指纹不匹配，已拒绝。"
+        case .certificateMismatch: return "服务器证书校验失败，已拒绝。请检查二维码指纹、证书主机名、有效期及设备时间。"
         case .networkFailure: return "无法连接配对服务，请检查网络后重试。"
         case .serverFailure: return "配对服务暂时无法处理请求，请稍后重试。"
         case .invalid: return "配对码无效，请重新扫码。"
@@ -165,8 +165,8 @@ public struct HTTPPairingService: PairingService {
         let request = try Self.redeemRequest(pairing: pairing, deviceDisplayName: deviceDisplayName)
         // The QR pin protects the homeserver's redeem request. A gateway is not
         // an alternate redeem endpoint; pinning gateway traffic is decided when
-        // its host is known to equal this homeserver host.
-        let session = PairingURLSession.make(fingerprint: pairing.fingerprint, host: pairing.homeserver.host)
+        // its origin is known to equal this homeserver origin.
+        let session = PairingURLSession.make(fingerprint: pairing.fingerprint, host: pairing.homeserver.host, port: pairing.homeserver.port)
         defer { session.invalidateAndCancel() }
         do {
             let (data, response) = try await PairingURLSession.data(for: request, using: session)
