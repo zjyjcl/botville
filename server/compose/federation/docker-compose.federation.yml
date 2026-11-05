@@ -48,9 +48,39 @@
 
 name: botville-fed
 
+# --- NO_PROXY pinning (issue #134, PR2) ------------------------------------
+# Same anchor as server/compose/docker-compose.yml (PR1): the docker client
+# (~/.docker/config.json "proxies") and Docker Desktop inject the host's
+# HTTP_PROXY/HTTPS_PROXY into every NEW container, where 127.0.0.1 is the
+# container itself — a host loopback proxy is unreachable there. In this
+# stack the *_PROXY-honoring client is the pairing service (stdlib urllib
+# reads http(s)_proxy): its redeem-time peer-key fetch
+# (https://hs-a:443 / hs-b:443, the fedgate network aliases) would be sent
+# into that dead proxy. fedgate proxies via raw http.client (no env
+# proxies), but its NO_PROXY is pinned anyway — one rule for every service.
+# The default list below is byte-identical to the main compose's on
+# purpose: one list serves both stacks and cannot be overridden;
+# server/tests/test_compose_noproxy.py asserts the two stay in sync.
+# BOTVILLE_NO_PROXY_EXTRA only APPENDS via the same nested ${VAR:+,${VAR}}
+# expansion. This stack interpolates ONLY from generated/federation.env
+# (Makefile FED_COMPOSE --env-file), so federation-setup.py propagates
+# BOTVILLE_NO_PROXY_EXTRA from the shell environment or server/compose/.env
+# into it. hs-a/hs-b are network aliases, not service names, so they are
+# NOT in the fixed list — a host that injects a proxy should append them:
+# BOTVILLE_NO_PROXY_EXTRA=hs-a,hs-b. HTTP_PROXY/HTTPS_PROXY are
+# deliberately NOT set or cleared here either — some deployments
+# intentionally route outbound traffic through a proxy.
+x-noproxy-env: &noproxy-env
+  NO_PROXY: "localhost,127.0.0.1,::1,sygnal,postgres,synapse,tuwunel,continuwuity,gateway,admin,synapse-a,synapse-b,pairing-a,pairing-b,fedgate-a,fedgate-b,.local,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${BOTVILLE_NO_PROXY_EXTRA:+,${BOTVILLE_NO_PROXY_EXTRA}}"
+  no_proxy: "localhost,127.0.0.1,::1,sygnal,postgres,synapse,tuwunel,continuwuity,gateway,admin,synapse-a,synapse-b,pairing-a,pairing-b,fedgate-a,fedgate-b,.local,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${BOTVILLE_NO_PROXY_EXTRA:+,${BOTVILLE_NO_PROXY_EXTRA}}"
+
 services:
   synapse-a:
     image: ${SYNAPSE_IMAGE:-docker.io/matrixdotorg/synapse:v1.164.1@sha256:fa4aa980f279bcf26d4e7ecc2a2c9a701c73f2ebe8841da9bdcf3b2fdf693d75}
+    # NO_PROXY/no_proxy so a host-injected proxy never intercepts this
+    # instance's traffic (x-noproxy-env at the top of this file).
+    environment:
+      <<: *noproxy-env
     entrypoint:
       - sh
       - -c
@@ -74,6 +104,10 @@ services:
 
   synapse-b:
     image: ${SYNAPSE_IMAGE:-docker.io/matrixdotorg/synapse:v1.164.1@sha256:fa4aa980f279bcf26d4e7ecc2a2c9a701c73f2ebe8841da9bdcf3b2fdf693d75}
+    # NO_PROXY/no_proxy so a host-injected proxy never intercepts this
+    # instance's traffic (x-noproxy-env at the top of this file).
+    environment:
+      <<: *noproxy-env
     entrypoint:
       - sh
       - -c
@@ -102,6 +136,7 @@ services:
     working_dir: /app
     command: python -m pairing.service
     environment:
+      <<: *noproxy-env
       PAIRING_DB: /data/pairing.db
       PAIRING_ADMIN_TOKEN: ${PAIRING_ADMIN_TOKEN_A:?run python3 server/scripts/federation-setup.py first}
       PAIRING_SERVER_NAME: hs-a
@@ -141,6 +176,7 @@ services:
     working_dir: /app
     command: python -m pairing.service
     environment:
+      <<: *noproxy-env
       PAIRING_DB: /data/pairing.db
       PAIRING_ADMIN_TOKEN: ${PAIRING_ADMIN_TOKEN_B:?run python3 server/scripts/federation-setup.py first}
       PAIRING_SERVER_NAME: hs-b
@@ -176,6 +212,7 @@ services:
     working_dir: /app
     command: python -m pairing.fedgate
     environment:
+      <<: *noproxy-env
       FEDGATE_HOST: 0.0.0.0
       FEDGATE_PORT: "443"
       FEDGATE_WELL_KNOWN_SERVER: "hs-a:443"
@@ -216,6 +253,7 @@ services:
     working_dir: /app
     command: python -m pairing.fedgate
     environment:
+      <<: *noproxy-env
       FEDGATE_HOST: 0.0.0.0
       FEDGATE_PORT: "443"
       FEDGATE_WELL_KNOWN_SERVER: "hs-b:443"
