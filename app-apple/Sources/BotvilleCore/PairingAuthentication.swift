@@ -31,7 +31,7 @@ public enum PairingAuthenticationError: LocalizedError, Equatable, Sendable {
 }
 
 public struct MatrixPairingCredentialAuthentication: PairingCredentialAuthenticating {
-    private let session: URLSession
+    let session: URLSession
 
     public init() {
         let configuration = URLSessionConfiguration.ephemeral

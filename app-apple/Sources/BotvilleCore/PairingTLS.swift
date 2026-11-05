@@ -9,6 +9,11 @@ import Security
 /// A narrowly-scoped session used only for the QR-selected pairing endpoint.
 /// It rejects cross-origin redirects so a one-time code never follows one.
 public enum PairingURLSession {
+    static func normalizedHTTPSPort(_ port: Int?) -> Int {
+        guard let port, port != 0 else { return 443 }
+        return port
+    }
+
     public static func make(fingerprint: Data?, host: String?, port: Int? = nil) -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.httpCookieStorage = nil
@@ -43,7 +48,7 @@ public enum PairingURLSession {
               requestURL.scheme?.lowercased() == "https",
               let host = homeserver.host,
               requestURL.host?.lowercased() == host.lowercased(),
-              (requestURL.port ?? 443) == (homeserver.port ?? 443) else { return nil }
+              normalizedHTTPSPort(requestURL.port) == normalizedHTTPSPort(homeserver.port) else { return nil }
         return fingerprint
     }
 }
@@ -57,7 +62,7 @@ final class PairingTLSDelegate: NSObject, URLSessionTaskDelegate {
     init(fingerprint: Data?, host: String?, port: Int? = nil) {
         self.fingerprint = fingerprint
         self.host = host?.lowercased()
-        self.port = port ?? 443
+        self.port = PairingURLSession.normalizedHTTPSPort(port)
     }
 
     var rejectedCertificate: Bool { rejectionLock.withLock { didRejectCertificate } }
@@ -70,14 +75,21 @@ final class PairingTLSDelegate: NSObject, URLSessionTaskDelegate {
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
         guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust else { completionHandler(.performDefaultHandling, nil); return }
+        // A pin only applies to its QR-selected origin. If host or normalized
+        // port differs, use the platform's system trust rather than pinning a
+        // different endpoint.
         guard let fingerprint, let host, challenge.protectionSpace.host.lowercased() == host,
-              challenge.protectionSpace.port == port else {
+              PairingURLSession.normalizedHTTPSPort(challenge.protectionSpace.port) == port else {
             completionHandler(.performDefaultHandling, nil); return
         }
         guard let trust = challenge.protectionSpace.serverTrust,
-              let certificates = SecTrustCopyCertificateChain(trust) as? [SecCertificate], let leaf = certificates.first,
-              Self.matchesLeafCertificateDER(SecCertificateCopyData(leaf) as Data, fingerprint: fingerprint),
-              Self.leafAllowsServerAuthentication(SecCertificateCopyData(leaf) as Data, host: host),
+              let certificates = SecTrustCopyCertificateChain(trust) as? [SecCertificate], let leaf = certificates.first else {
+            rejectionLock.withLock { didRejectCertificate = true }
+            completionHandler(.cancelAuthenticationChallenge, nil); return
+        }
+        let leafDER = SecCertificateCopyData(leaf) as Data
+        guard Self.matchesLeafCertificateDER(leafDER, fingerprint: fingerprint),
+              Self.leafAllowsServerAuthentication(leafDER, host: host),
               SecTrustSetPolicies(trust, SecPolicyCreateSSL(true, host as CFString)) == errSecSuccess,
               SecTrustSetAnchorCertificates(trust, [leaf] as CFArray) == errSecSuccess,
               SecTrustSetAnchorCertificatesOnly(trust, true) == errSecSuccess,
@@ -111,8 +123,9 @@ final class PairingTLSDelegate: NSObject, URLSessionTaskDelegate {
     }
 
     /// A trust anchor can receive different validity/EKU treatment from a
-    /// normal leaf. Enforce the QR contract on the leaf itself before asking
-    /// Security to validate SSL hostnames (including wildcard restrictions).
+    /// normal leaf. Check leaf validity, required SAN type (and exact IP SAN
+    /// bytes) and serverAuth EKU here; Security's SSL policy performs the
+    /// hostname and wildcard comparison.
     /// SecCertificateCopyValues is unavailable on iOS, so use its DER fields.
     private static func leafAllowsServerAuthentication(_ certificate: Data, host: String, now: Date = Date()) -> Bool {
         guard let outer = DER.element(certificate, at: 0), outer.tag == 0x30,

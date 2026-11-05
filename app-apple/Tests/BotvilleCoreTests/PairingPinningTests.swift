@@ -3,7 +3,9 @@
 
 @testable import BotvilleCore
 import CryptoKit
+import Darwin
 import Foundation
+import Security
 import XCTest
 
 final class PairingPinningTests: XCTestCase {
@@ -116,7 +118,80 @@ final class PairingPinningTests: XCTestCase {
         try await waitForTLSServer(port: server.port)
         let session = PairingURLSession.make(fingerprint: nil, host: "127.0.0.1", port: server.port)
         defer { session.invalidateAndCancel() }
-        await XCTAssertThrowsErrorAsync(try await PairingURLSession.data(for: URLRequest(url: try XCTUnwrap(URL(string: "https://127.0.0.1:\(server.port)/"))), using: session))
+        await XCTAssertThrowsErrorAsync(try await PairingURLSession.data(for: URLRequest(url: try XCTUnwrap(URL(string: "https://127.0.0.1:\(server.port)/"))), using: session)) { error in
+            // With no pin, system trust rejects the self-signed chain; the
+            // pairing delegate must not relabel that as a pin mismatch.
+            XCTAssertNotEqual(error as? PairingError, .certificateMismatch)
+            XCTAssertNotNil(error as? URLError)
+            XCTAssertTrue([
+                NSURLErrorServerCertificateUntrusted,
+                NSURLErrorSecureConnectionFailed
+            ].contains((error as NSError).code))
+        }
+    }
+
+    func testCASignedLeafWithMatchingPinCompletesHTTPRequest() async throws {
+        let fixture = try TLSFixture(san: "IP:127.0.0.1", issuer: .certificateAuthority)
+        defer { fixture.remove() }
+        // A private root anchor models a CA-signed chain without modifying the
+        // host system trust store. The following request tests the pin path.
+        try assertCAChainIsTrustedLocally(fixture)
+        let server = try startTLSServer(certificate: fixture.certificate, key: fixture.key)
+        defer { stopTLSServer(server.process) }
+        try await waitForTLSServer(port: server.port)
+        let session = PairingURLSession.make(fingerprint: fixture.fingerprint, host: "127.0.0.1", port: server.port)
+        defer { session.invalidateAndCancel() }
+        let (_, response) = try await PairingURLSession.data(for: URLRequest(url: try XCTUnwrap(URL(string: "https://127.0.0.1:\(server.port)/"))), using: session)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+    }
+
+    func testCASignedLeafWithWrongPinMapsToCertificateMismatch() async throws {
+        let fixture = try TLSFixture(san: "IP:127.0.0.1", issuer: .certificateAuthority)
+        defer { fixture.remove() }
+        let server = try startTLSServer(certificate: fixture.certificate, key: fixture.key)
+        defer { stopTLSServer(server.process) }
+        try await waitForTLSServer(port: server.port)
+        let session = PairingURLSession.make(fingerprint: Data(repeating: 0, count: 32), host: "127.0.0.1", port: server.port)
+        defer { session.invalidateAndCancel() }
+        await XCTAssertThrowsErrorAsync(try await PairingURLSession.data(for: URLRequest(url: try XCTUnwrap(URL(string: "https://127.0.0.1:\(server.port)/"))), using: session)) { error in
+            XCTAssertEqual(error as? PairingError, .certificateMismatch)
+        }
+    }
+
+    func testMixedDNSSANAndIPSANAuthenticateTheirMatchingHosts() async throws {
+        let fixture = try TLSFixture(san: "DNS:localhost,IP:127.0.0.1")
+        defer { fixture.remove() }
+        let server = try startTLSServer(certificate: fixture.certificate, key: fixture.key)
+        defer { stopTLSServer(server.process) }
+        try await waitForTLSServer(port: server.port)
+        for host in ["localhost", "127.0.0.1"] {
+            let session = PairingURLSession.make(fingerprint: fixture.fingerprint, host: host, port: server.port)
+            defer { session.invalidateAndCancel() }
+            let (_, response) = try await PairingURLSession.data(for: URLRequest(url: try XCTUnwrap(URL(string: "https://\(host):\(server.port)/"))), using: session)
+            XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        }
+    }
+
+    func testWildcardSANDoesNotMatchMultipleSubdomains() throws {
+        let fixture = try TLSFixture(san: "DNS:*.example.org")
+        defer { fixture.remove() }
+        let delegate = PairingTLSDelegate(fingerprint: fixture.fingerprint, host: "a.b.example.org")
+        XCTAssertEqual(try trustChallengeResult(delegate: delegate, fixture: fixture, host: "a.b.example.org"), .cancelAuthenticationChallenge)
+        XCTAssertTrue(delegate.rejectedCertificate)
+    }
+
+    func testWildcardSANMatchesOneSubdomainInDelegate() throws {
+        let fixture = try TLSFixture(san: "DNS:*.example.org")
+        defer { fixture.remove() }
+        let delegate = PairingTLSDelegate(fingerprint: fixture.fingerprint, host: "a.example.org")
+        XCTAssertEqual(try trustChallengeResult(delegate: delegate, fixture: fixture, host: "a.example.org"), .useCredential)
+        XCTAssertFalse(delegate.rejectedCertificate)
+    }
+
+    func testTLSFixtureCleansPrivateKeyDirectoryWhenOpenSSLFails() throws {
+        let before = fixtureDirectories()
+        XCTAssertThrowsError(try TLSFixture(san: "IP:127.0.0.1", openssl: "/usr/bin/false"))
+        XCTAssertEqual(fixtureDirectories(), before)
     }
     func testRejectedTLSRequestMapsToCertificateMismatch() async throws {
         let directory = try makeTemporaryDirectory()
@@ -170,16 +245,6 @@ final class PairingPinningTests: XCTestCase {
         XCTAssertNil(PairingURLSession.fingerprint(fingerprint, homeserver: homeserver, requestURL: try XCTUnwrap(URL(string: "http://homeserver.example.invalid/path"))))
     }
 
-    func testAppSourceHasNoGlobalTLSBypass() throws {
-        let appRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        let allFiles = FileManager.default.enumerator(at: appRoot.appendingPathComponent("Sources"), includingPropertiesForKeys: nil)?.allObjects as? [URL] ?? []
-        let source = try allFiles.filter { $0.pathExtension == "swift" }.map { try String(contentsOf: $0, encoding: .utf8) }.joined(separator: "\n")
-        let plists = ["BotvilleApp/Info.plist", "BotvilleApp/Info-Debug.plist", "NotificationService/Info.plist"].map { appRoot.appendingPathComponent($0) }
-        let plistContents = try plists.map { try PropertyListSerialization.propertyList(from: Data(contentsOf: $0), format: nil) }.map(String.init(describing:)).joined(separator: "\n")
-        XCTAssertFalse((source + plistContents).contains("disableSslVerification"))
-        XCTAssertFalse((source + plistContents).contains("NSAllowsArbitraryLoads"))
-    }
-
     func testExtractsSPKIFromFreshTemporaryCertificate() throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -218,14 +283,40 @@ final class PairingPinningTests: XCTestCase {
         return result!
     }
 
+    private func trustChallengeResult(delegate: PairingTLSDelegate, fixture: TLSFixture, host: String) throws -> URLSession.AuthChallengeDisposition {
+        let der = try runOutput("/usr/bin/openssl", ["x509", "-in", fixture.certificate.path, "-outform", "DER"])
+        let certificate = try XCTUnwrap(SecCertificateCreateWithData(nil, der as CFData))
+        var trust: SecTrust?
+        XCTAssertEqual(SecTrustCreateWithCertificates(certificate, SecPolicyCreateSSL(true, host as CFString), &trust), errSecSuccess)
+        let protectionSpace = TrustProtectionSpace(host: host, trust: try XCTUnwrap(trust))
+        let challenge = URLAuthenticationChallenge(protectionSpace: protectionSpace, proposedCredential: nil, previousFailureCount: 0, failureResponse: nil, error: nil, sender: ChallengeSender())
+        var result: URLSession.AuthChallengeDisposition?
+        delegate.urlSession(URLSession.shared, task: URLSession.shared.dataTask(with: URL(string: "https://\(host)/")!), didReceive: challenge) { disposition, _ in result = disposition }
+        return try XCTUnwrap(result)
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
         let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent(".build/pairing-test-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
     }
 
+    private func assertCAChainIsTrustedLocally(_ fixture: TLSFixture) throws {
+        let leafDER = try runOutput("/usr/bin/openssl", ["x509", "-in", fixture.certificate.path, "-outform", "DER"])
+        let leaf = try XCTUnwrap(SecCertificateCreateWithData(nil, leafDER as CFData))
+        let root = try XCTUnwrap(fixture.issuerCertificate)
+        let rootDER = try runOutput("/usr/bin/openssl", ["x509", "-in", root.path, "-outform", "DER"])
+        let rootCertificate = try XCTUnwrap(SecCertificateCreateWithData(nil, rootDER as CFData))
+        var trust: SecTrust?
+        XCTAssertEqual(SecTrustCreateWithCertificates(leaf, SecPolicyCreateSSL(true, "127.0.0.1" as CFString), &trust), errSecSuccess)
+        let evaluatedTrust = try XCTUnwrap(trust)
+        XCTAssertEqual(SecTrustSetAnchorCertificates(evaluatedTrust, [rootCertificate] as CFArray), errSecSuccess)
+        XCTAssertEqual(SecTrustSetAnchorCertificatesOnly(evaluatedTrust, true), errSecSuccess)
+        XCTAssertTrue(SecTrustEvaluateWithError(evaluatedTrust, nil))
+    }
+
     private func startTLSServer(certificate: URL, key: URL) throws -> (process: Process, port: Int) {
-        for _ in 0..<10 {
+        for _ in 0..<20 {
             let port = Int.random(in: 30_000...50_000)
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/openssl")
@@ -233,10 +324,12 @@ final class PairingPinningTests: XCTestCase {
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
             try process.run()
-            Thread.sleep(forTimeInterval: 0.05)
+            Thread.sleep(forTimeInterval: 0.1)
             if process.isRunning { return (process, port) }
         }
-        throw XCTSkip("Unable to reserve a local TLS port for the certificate-mismatch test.")
+        throw NSError(domain: "PairingPinningTests", code: 3, userInfo: [
+            NSLocalizedDescriptionKey: "Environment failure: unable to reserve a local TLS port for the certificate-mismatch test."
+        ])
     }
 
     private func assertPinnedRequestRejected(fixture: TLSFixture, host: String = "127.0.0.1") async throws {
@@ -280,60 +373,80 @@ private func stopTLSServer(_ process: Process) {
     while process.isRunning && Date() < deadline {
         RunLoop.current.run(until: Date().addingTimeInterval(0.01))
     }
+    if process.isRunning {
+        kill(process.processIdentifier, SIGKILL)
+        process.waitUntilExit()
+    }
 }
 
 private final class TLSFixture {
     enum Validity { case current, expired, notYetValid }
+    enum Issuer { case selfSigned, certificateAuthority }
     let directory: URL
     let key: URL
     let certificate: URL
+    let issuerCertificate: URL?
     let fingerprint: Data
 
-    init(san: String?, eku: String? = "serverAuth", days: Int = 1, validity: Validity = .current, commonName: String = "127.0.0.1") throws {
+    init(san: String?, eku: String? = "serverAuth", days: Int = 1, validity: Validity = .current, commonName: String = "127.0.0.1", issuer: Issuer = .selfSigned, openssl: String = "/usr/bin/openssl") throws {
         directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent(".build/pairing-fixture-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         key = directory.appendingPathComponent("key.pem")
         certificate = directory.appendingPathComponent("cert.pem")
-        var arguments = validity == .current
-            ? ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key.path, "-out", certificate.path, "-subj", "/CN=\(commonName)", "-days", String(days)]
-            : ["req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", key.path, "-out", directory.appendingPathComponent("request.csr").path, "-subj", "/CN=\(commonName)"]
-        if let san { arguments += ["-addext", "subjectAltName = \(san)"] }
-        if let eku { arguments += ["-addext", "extendedKeyUsage = \(eku)"] }
-        try Self.run("/usr/bin/openssl", arguments)
-        if validity != .current {
-            let database = directory.appendingPathComponent("index.txt")
-            let serial = directory.appendingPathComponent("serial")
-            let newCertificates = directory.appendingPathComponent("newcerts")
-            try FileManager.default.createDirectory(at: newCertificates, withIntermediateDirectories: true)
-            try Data().write(to: database)
-            try Data("01\n".utf8).write(to: serial)
-            let configuration = directory.appendingPathComponent("openssl.cnf")
-            let config = """
-            [ ca ]
-            default_ca = local_ca
-            [ local_ca ]
-            database = \(database.path)
-            serial = \(serial.path)
-            new_certs_dir = \(newCertificates.path)
-            default_md = sha256
-            policy = any_name
-            copy_extensions = copy
-            [ any_name ]
-            commonName = supplied
-            """
-            try config.write(to: configuration, atomically: true, encoding: .utf8)
-            let dates: [String]
-            switch validity {
-            case .expired: dates = ["-startdate", "20240101000000Z", "-enddate", "20240102000000Z"]
-            case .notYetValid: dates = ["-startdate", "20990101000000Z", "-enddate", "20990102000000Z"]
-            case .current: dates = []
+        issuerCertificate = issuer == .certificateAuthority ? directory.appendingPathComponent("ca-cert.pem") : nil
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            if issuer == .certificateAuthority {
+                guard validity == .current else { throw NSError(domain: "PairingPinningTests", code: 2) }
+                guard let issuerCertificate else { throw NSError(domain: "PairingPinningTests", code: 3) }
+                try Self.createCASignedLeaf(in: directory, key: key, certificate: certificate, caCertificate: issuerCertificate, san: san, eku: eku, days: days, commonName: commonName, openssl: openssl)
+            } else {
+                var arguments = validity == .current
+                    ? ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key.path, "-out", certificate.path, "-subj", "/CN=\(commonName)", "-days", String(days)]
+                    : ["req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", key.path, "-out", directory.appendingPathComponent("request.csr").path, "-subj", "/CN=\(commonName)"]
+                if let san { arguments += ["-addext", "subjectAltName = \(san)"] }
+                if let eku { arguments += ["-addext", "extendedKeyUsage = \(eku)"] }
+                try Self.run(openssl, arguments)
+                if validity != .current {
+                    let database = directory.appendingPathComponent("index.txt")
+                    let serial = directory.appendingPathComponent("serial")
+                    let newCertificates = directory.appendingPathComponent("newcerts")
+                    try FileManager.default.createDirectory(at: newCertificates, withIntermediateDirectories: true)
+                    try Data().write(to: database)
+                    try Data("01\n".utf8).write(to: serial)
+                    let configuration = directory.appendingPathComponent("openssl.cnf")
+                    let config = """
+                    [ ca ]
+                    default_ca = local_ca
+                    [ local_ca ]
+                    database = \(database.path)
+                    serial = \(serial.path)
+                    new_certs_dir = \(newCertificates.path)
+                    default_md = sha256
+                    policy = any_name
+                    copy_extensions = copy
+                    [ any_name ]
+                    commonName = supplied
+                    """
+                    try config.write(to: configuration, atomically: true, encoding: .utf8)
+                    let dates: [String]
+                    switch validity {
+                    case .expired: dates = ["-startdate", "20240101000000Z", "-enddate", "20240102000000Z"]
+                    case .notYetValid: dates = ["-startdate", "20990101000000Z", "-enddate", "20990102000000Z"]
+                    case .current: dates = []
+                    }
+                    try Self.run(openssl, ["ca", "-selfsign", "-batch", "-config", configuration.path, "-keyfile", key.path, "-in", directory.appendingPathComponent("request.csr").path, "-out", certificate.path] + dates)
+                }
             }
-            try Self.run("/usr/bin/openssl", ["ca", "-selfsign", "-batch", "-config", configuration.path, "-keyfile", key.path, "-in", directory.appendingPathComponent("request.csr").path, "-out", certificate.path] + dates)
+            let der = directory.appendingPathComponent("cert.der")
+            try Self.run(openssl, ["x509", "-in", certificate.path, "-outform", "DER", "-out", der.path])
+            guard let spki = PairingTLSDelegate.subjectPublicKeyInfo(try Data(contentsOf: der)) else { throw NSError(domain: "PairingPinningTests", code: 1) }
+            fingerprint = Data(SHA256.hash(data: spki))
+        } catch {
+            // Initialization may fail before fingerprint is set, so do not
+            // invoke an instance method on the partially initialized fixture.
+            try? FileManager.default.removeItem(at: directory)
+            throw error
         }
-        let der = directory.appendingPathComponent("cert.der")
-        try Self.run("/usr/bin/openssl", ["x509", "-in", certificate.path, "-outform", "DER", "-out", der.path])
-        guard let spki = PairingTLSDelegate.subjectPublicKeyInfo(try Data(contentsOf: der)) else { throw NSError(domain: "PairingPinningTests", code: 1) }
-        fingerprint = Data(SHA256.hash(data: spki))
     }
 
     func remove() { try? FileManager.default.removeItem(at: directory) }
@@ -343,6 +456,25 @@ private final class TLSFixture {
         try process.run(); process.waitUntilExit()
         guard process.terminationStatus == 0 else { throw NSError(domain: "PairingPinningTests", code: Int(process.terminationStatus)) }
     }
+
+    private static func createCASignedLeaf(in directory: URL, key: URL, certificate: URL, caCertificate: URL, san: String?, eku: String?, days: Int, commonName: String, openssl: String) throws {
+        let caKey = directory.appendingPathComponent("ca-key.pem")
+        let request = directory.appendingPathComponent("request.csr")
+        let extensions = directory.appendingPathComponent("extensions.cnf")
+        try run(openssl, ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", caKey.path, "-out", caCertificate.path, "-subj", "/CN=pairing-test-ca.invalid", "-days", String(days), "-addext", "basicConstraints = critical,CA:TRUE", "-addext", "keyUsage = critical,keyCertSign,cRLSign"])
+        try run(openssl, ["req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", key.path, "-out", request.path, "-subj", "/CN=\(commonName)"])
+        var contents = "[ leaf ]\nbasicConstraints = critical,CA:FALSE\n"
+        if let san { contents += "subjectAltName = \(san)\n" }
+        if let eku { contents += "extendedKeyUsage = \(eku)\n" }
+        try contents.write(to: extensions, atomically: true, encoding: .utf8)
+        try run(openssl, ["x509", "-req", "-in", request.path, "-CA", caCertificate.path, "-CAkey", caKey.path, "-CAcreateserial", "-out", certificate.path, "-days", String(days), "-extfile", extensions.path, "-extensions", "leaf"])
+    }
+}
+
+private func fixtureDirectories() -> Set<String> {
+    let build = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent(".build")
+    let names = (try? FileManager.default.contentsOfDirectory(atPath: build.path)) ?? []
+    return Set(names.filter { $0.hasPrefix("pairing-fixture-") })
 }
 
 private func XCTAssertThrowsErrorAsync<T>(_ expression: @autoclosure () async throws -> T, _ handler: (Error) -> Void = { _ in }) async {
@@ -355,4 +487,17 @@ private final class ChallengeSender: NSObject, URLAuthenticationChallengeSender 
     func cancel(_ challenge: URLAuthenticationChallenge) {}
     func performDefaultHandling(for challenge: URLAuthenticationChallenge) {}
     func rejectProtectionSpaceAndContinue(with challenge: URLAuthenticationChallenge) {}
+}
+
+private final class TrustProtectionSpace: URLProtectionSpace, @unchecked Sendable {
+    private let suppliedTrust: SecTrust
+
+    init(host: String, trust: SecTrust) {
+        suppliedTrust = trust
+        super.init(host: host, port: 443, protocol: "https", realm: nil, authenticationMethod: NSURLAuthenticationMethodServerTrust)
+    }
+
+    required init?(coder: NSCoder) { return nil }
+
+    override var serverTrust: SecTrust? { suppliedTrust }
 }

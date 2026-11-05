@@ -56,7 +56,9 @@ botville://pair?v=1&hs=<https>&gw=<https，可选>&fp=sha256:<base64url，可选
 
 ## TLS 固定与边界
 
-有 `fp` 时，专用配对 `URLSession` 只在 challenge 的 `(host, port)` 与 QR `hs` 对齐时自行评估：端口缺省为 443，host 小写精确比较。先以常量时间比较叶证书 DER 中 `SubjectPublicKeyInfo` 的 SHA-256；匹配后把该叶证书设为唯一信任锚，并用该 host 的 TLS 策略重新评估。这个路径以 QR pin 替代系统根信任链，不要求证书链被系统根信任。
+有 `fp` 时，专用配对 `URLSession` 只在 challenge 的 `(host, port)` 与 QR `hs` 对齐时自行评估：端口缺省或为 0 时归一化为 443，host 小写精确比较。先以常量时间比较叶证书 DER 中 `SubjectPublicKeyInfo` 的 SHA-256；匹配后把该叶证书设为唯一信任锚，并用该 host 的 TLS 策略重新评估。这个路径以 QR pin 替代系统根信任链，不要求证书链被系统根信任。
+
+因此，这条 pin 路径不再检查中间证书、OCSP/CRL 吊销状态或证书透明度（CT）；轮换密钥或撤销旧 pin 需要重新扫码更新指纹，不能依赖系统吊销检查阻止旧 pin。复用同一密钥的换证不会改变 SPKI 指纹。
 
 自评估仍强制校验叶证书的 SAN 主机名（仅 `dNSName` / `iPAddress`，不接受只写 CN 的回退）、有效期与 `serverAuth` EKU；SAN 不含该 DNS 名或 IP、未生效或已过期、缺少 serverAuth 都拒绝，且没有忽略过期的开关。自签证书可在此路径使用，但二维码必须带正确的叶 SPKI 指纹，设备系统时间必须正确；叶自锚模式可接受有效期超过公网 CA 的 398 天惯例。任一 pin 或自评估失败归类为 `certificateMismatch`，不作为一般网络失败。无 `fp`、或 challenge 不属于 QR `hs` 的 `(host, port)` 时，保持 `.performDefaultHandling`，仍由系统 TLS 信任。禁止跨 origin 重定向，不把兑换码或凭证发送到未确认的服务器。
 
