@@ -2,8 +2,8 @@
 # Copyright 2026 botville contributors
 # SPDX-License-Identifier: Apache-2.0
 set -eu
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-plutil -lint "$root/BotvilleApp/Info.plist" "$root/BotvilleApp/Info-Debug.plist" "$root/NotificationService/Info.plist" >/dev/null
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+plutil -lint "$root/BotvilleApp/Info.plist" "$root/BotvilleApp/Info-Debug.plist" "$root/NotificationService/Info.plist" "$root/NotificationService/Info-Debug.plist" >/dev/null
 grep -q '^#if DEBUG$' "$root/Sources/BotvilleApp/PushDiagnosticsView.swift"
 grep -q '^#if DEBUG$' "$root/Sources/BotvilleApp/LoginView.swift"
 BOTVILLE_APP_ROOT="$root" python3 - <<'PY'
@@ -74,7 +74,7 @@ for target_name, configurations, bundle_id, entitlements, plists in (
      {'Debug': 'BotvilleApp/Info-Debug.plist', 'Release': 'BotvilleApp/Info.plist'}),
     ('BotvilleNotificationService', nse, 'com.zjyjcl.botville.notification',
      {'Debug': 'NotificationService/NotificationService.entitlements', 'Release': 'NotificationService/NotificationService.entitlements'},
-     {'Debug': 'NotificationService/Info.plist', 'Release': 'NotificationService/Info.plist'}),
+     {'Debug': 'NotificationService/Info-Debug.plist', 'Release': 'NotificationService/Info.plist'}),
 ):
     for name, settings in configurations.items():
         expected = {'CODE_SIGN_STYLE': 'Automatic', 'DEVELOPMENT_TEAM': '3Z8WP6U6F7',
@@ -144,9 +144,40 @@ if 'PushHTTPPolicy.permitsHTTP(allowHTTP)' not in (core / 'MatrixService.swift')
     raise SystemExit('MatrixService must delegate push HTTP policy to PushHTTPPolicy')
 
 # The notification extension is a separate process boundary. It may read the
-# shared keychain item, but must not log tokens or add plaintext storage.
-nse_sources = root / 'NotificationService'
-for source in nse_sources.rglob('*.swift'):
+# shared keychain item and make exactly the event GET, but must not log tokens
+# or add plaintext storage. Derive the allowlist from the extension target so
+# new source files cannot silently bypass this boundary.
+nse_target_id = next(identifier for identifier, target in release_targets.items()
+                     if target.get('name') == 'BotvilleNotificationService')
+nse_target = objects[nse_target_id]
+if nse_target.get('packageProductDependencies', []):
+    raise SystemExit('NSE must not link package products')
+for phase_id in nse_target['buildPhases']:
+    phase = objects[phase_id]
+    if phase.get('isa') == 'PBXFrameworksBuildPhase' and phase.get('files', []):
+        raise SystemExit('NSE must not link frameworks')
+nse_sources_phase = next(objects[phase_id] for phase_id in nse_target['buildPhases']
+                         if objects[phase_id].get('isa') == 'PBXSourcesBuildPhase')
+nse_source_paths = []
+for build_file_id in nse_sources_phase['files']:
+    file_ref_id = objects[build_file_id].get('fileRef')
+    file_ref = objects.get(file_ref_id, {})
+    path, source_tree = file_ref.get('path'), file_ref.get('sourceTree')
+    if not isinstance(path, str) or not isinstance(source_tree, str): raise SystemExit('NSE source has no path/sourceTree')
+    source_paths = {
+        ('NotificationService.swift', '<group>'): root / 'NotificationService/NotificationService.swift',
+        ('Sources/BotvilleCore/SharedPushCredentials.swift', 'SOURCE_ROOT'): root / 'Sources/BotvilleCore/SharedPushCredentials.swift',
+        ('Sources/BotvilleCore/PushNotificationContent.swift', 'SOURCE_ROOT'): root / 'Sources/BotvilleCore/PushNotificationContent.swift',
+    }
+    if (path, source_tree) not in source_paths or not source_paths[path, source_tree].is_file():
+        raise SystemExit(f'NSE source path/sourceTree is not in the controlled allowlist: {path} {source_tree}')
+    if source_tree == '<group>' and not any(file_ref_id in group.get('children', []) and group.get('path') == 'NotificationService'
+                                            for group in objects.values() if group.get('isa') == 'PBXGroup'):
+        raise SystemExit('NSE group-relative source must be in NotificationService group')
+    nse_source_paths.append(source_paths[path, source_tree])
+if {path.name for path in nse_source_paths} != {'NotificationService.swift', 'SharedPushCredentials.swift', 'PushNotificationContent.swift'}:
+    raise SystemExit('NSE source set must be exactly NotificationService, SharedPushCredentials, and PushNotificationContent')
+for source in nse_source_paths:
     source_text = source.read_text()
     if re.search(r'\b(?:print|debugPrint|dump|NSLog|os_log)\s*\(', source_text):
         raise SystemExit(f'NSE must use only its safe Logger diagnostics: {source}')
@@ -161,13 +192,30 @@ for source in nse_sources.rglob('*.swift'):
     for forbidden_storage in ('UserDefaults', 'FileHandle', 'write(to:', 'Data(contentsOf:'):
         if forbidden_storage in source_text:
             raise SystemExit(f'NSE must not use plaintext credential storage ({forbidden_storage}): {source}')
+    if 'import MatrixRustSDK' in source_text or 'import BotvilleCore' in source_text:
+        raise SystemExit(f'NSE must not import the Matrix SDK or BotvilleCore: {source}')
+    if source.name != 'PushNotificationContent.swift' and any(api in source_text for api in ('URLSession', 'URLRequest')):
+        raise SystemExit(f'Only PushNotificationContent may use URLSession/URLRequest in NSE: {source}')
+content_source = next(path for path in nse_source_paths if path.name == 'PushNotificationContent.swift')
+content_text = content_source.read_text()
+for required in ('URLSession', '/_matrix/client/v3/rooms/', '/event/', 'httpMethod = "GET"', 'Authorization', '.ephemeral', 'willPerformHTTPRedirection', 'requestTimeout', 'timeBudget'):
+    if required not in content_text:
+        raise SystemExit(f'NSE event fetch is missing required boundary {required!r}')
+if content_text.count('/_matrix/client/v3/rooms/') != 1:
+    raise SystemExit('NSE may contain only the single authorized Matrix event endpoint')
+if content_text.count('/_matrix/client/') != 1:
+    raise SystemExit('NSE may contain no Matrix endpoint other than the authorized event GET')
+if content_text.count('dataTask(with:') != 1 or content_text.count('URLRequest(url:') != 1:
+    raise SystemExit('NSE must construct and run exactly one event request')
+if content_text.count('httpMethod =') != 1 or 'httpMethod = "GET"' not in content_text:
+    raise SystemExit('NSE event request must use exactly one GET method assignment')
+if 'components.percentEncodedPath = base + "/_matrix/client/v3/rooms/" + room + "/event/" + event' not in content_text:
+    raise SystemExit('NSE must build only the percent-encoded room/event endpoint path')
 
 # Ensure the app embeds the NSE product and declares the matching target
 # dependency; an appex reference string alone is not sufficient.
 app_target_id = next(identifier for identifier, target in release_targets.items()
                      if target.get('name') == 'BotvilleApp-iOS')
-nse_target_id = next(identifier for identifier, target in release_targets.items()
-                     if target.get('name') == 'BotvilleNotificationService')
 app_target = objects[app_target_id]
 nse_product_ref = objects[nse_target_id].get('productReference')
 if not any(objects[dependency].get('isa') == 'PBXTargetDependency' and objects[dependency].get('target') == nse_target_id
