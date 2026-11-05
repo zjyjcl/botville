@@ -9,6 +9,7 @@ final class ReleaseIsolationTests: XCTestCase {
 
     func testReleasePlistRecursivelyExcludesDebugKeys() throws {
         XCTAssertTrue(forbidden.isDisjoint(with: keys(try plist("BotvilleApp/Info.plist"))))
+        XCTAssertTrue(forbidden.isDisjoint(with: keys(try plist("NotificationService/Info.plist"))))
     }
 
     func testDebugPlistContainsDebugNetworkingOnly() throws {
@@ -30,63 +31,38 @@ final class ReleaseIsolationTests: XCTestCase {
                 XCTAssertNotEqual(value as? String, "NO", key)
             }
         }
-        let apps = objects.values.compactMap { $0 as? [String: Any] }.filter {
-            $0["isa"] as? String == "PBXNativeTarget" && $0["productType"] as? String == "com.apple.product-type.application"
-        }
-        XCTAssertFalse(apps.isEmpty)
-        for app in apps {
-            let list = try XCTUnwrap(objects[try XCTUnwrap(app["buildConfigurationList"] as? String)] as? [String: Any])
-            var checked: Set<String> = []
-            for id in try XCTUnwrap(list["buildConfigurations"] as? [String]) {
-                let config = try XCTUnwrap(objects[id] as? [String: Any])
-                let name = try XCTUnwrap(config["name"] as? String)
-                guard name == "Debug" || name == "Release" else { continue }
-                checked.insert(name)
-                let settings = try XCTUnwrap(config["buildSettings"] as? [String: Any])
-                XCTAssertEqual(settings["CODE_SIGN_STYLE"] as? String, "Automatic", name)
-                XCTAssertEqual(settings["DEVELOPMENT_TEAM"] as? String, "3Z8WP6U6F7", name)
-                XCTAssertEqual(settings["CODE_SIGN_IDENTITY[sdk=iphonesimulator*]"] as? String, "-", name)
-                if name == "Debug" {
-                    XCTAssertEqual(settings["CODE_SIGN_ENTITLEMENTS"] as? String, "BotvilleApp/BotvilleApp.entitlements")
-                }
-            }
-            XCTAssertEqual(checked, ["Debug", "Release"])
-        }
+        try assertTarget(
+            objects: objects,
+            name: "BotvilleApp-iOS",
+            productType: "com.apple.product-type.application",
+            bundleID: "com.zjyjcl.botville",
+            entitlements: ["Debug": "BotvilleApp/BotvilleApp.entitlements", "Release": "BotvilleApp/BotvilleApp-Release.entitlements"],
+            plists: ["Debug": "BotvilleApp/Info-Debug.plist", "Release": "BotvilleApp/Info.plist"]
+        )
+        try assertTarget(
+            objects: objects,
+            name: "BotvilleNotificationService",
+            productType: "com.apple.product-type.app-extension",
+            bundleID: "com.zjyjcl.botville.notification",
+            entitlements: ["Debug": "NotificationService/NotificationService.entitlements", "Release": "NotificationService/NotificationService.entitlements"],
+            plists: ["Debug": "NotificationService/Info.plist", "Release": "NotificationService/Info.plist"]
+        )
     }
 
-    func testEveryApplicationReleaseTargetUsesShippingPlist() throws {
-        let objects = try XCTUnwrap(projectJSON()["objects"] as? [String: Any])
-        let releaseConfigurations = objects.values.compactMap { $0 as? [String: Any] }.filter {
-            $0["isa"] as? String == "XCBuildConfiguration" && $0["name"] as? String == "Release"
-        }
-        XCTAssertFalse(releaseConfigurations.isEmpty)
-        for config in releaseConfigurations {
-            let settings = try XCTUnwrap(config["buildSettings"] as? [String: Any])
-            XCTAssertFalse(settings.keys.contains(where: { $0.hasPrefix("CODE_SIGN_ENTITLEMENTS") }))
-        }
-        let apps = objects.values.compactMap { $0 as? [String: Any] }.filter { $0["isa"] as? String == "PBXNativeTarget" && $0["productType"] as? String == "com.apple.product-type.application" }
-        XCTAssertFalse(apps.isEmpty)
-        var releaseCount = 0
-        for app in apps {
-            let list = try XCTUnwrap(objects[try XCTUnwrap(app["buildConfigurationList"] as? String)] as? [String: Any])
-            for id in try XCTUnwrap(list["buildConfigurations"] as? [String]) {
-                let config = try XCTUnwrap(objects[id] as? [String: Any])
-                if config["name"] as? String == "Release" {
-                    releaseCount += 1
-                    let settings = try XCTUnwrap(config["buildSettings"] as? [String: Any])
-                    XCTAssertEqual(settings["INFOPLIST_FILE"] as? String, "BotvilleApp/Info.plist")
-                    for (key, value) in settings where key.hasPrefix("INFOPLIST_FILE[") {
-                        XCTAssertEqual(value as? String, "BotvilleApp/Info.plist", key)
-                    }
-                }
-            }
-        }
-        XCTAssertGreaterThan(releaseCount, 0)
+    func testReleaseEntitlementsAllowOnlySharedCredentialInfrastructure() throws {
+        try assertEntitlements("BotvilleApp/BotvilleApp.entitlements", privateKeychainGroup: "$(AppIdentifierPrefix)com.zjyjcl.botville", apsEnvironment: "development")
+        try assertEntitlements("BotvilleApp/BotvilleApp-Release.entitlements", privateKeychainGroup: "$(AppIdentifierPrefix)com.zjyjcl.botville", apsEnvironment: nil)
+        try assertEntitlements("NotificationService/NotificationService.entitlements", privateKeychainGroup: "$(AppIdentifierPrefix)com.zjyjcl.botville.notification", apsEnvironment: nil)
+
+        XCTAssertEqual(try plist("BotvilleApp/Info.plist")["BotvilleSharedKeychainAccessGroup"] as? String, "$(AppIdentifierPrefix)com.zjyjcl.botville.shared")
+        XCTAssertEqual(try plist("BotvilleApp/Info-Debug.plist")["BotvilleSharedKeychainAccessGroup"] as? String, "$(AppIdentifierPrefix)com.zjyjcl.botville.shared")
+        XCTAssertEqual(try plist("NotificationService/Info.plist")["BotvilleSharedKeychainAccessGroup"] as? String, "$(AppIdentifierPrefix)com.zjyjcl.botville.shared")
     }
 
     func testEntitlementAndDebugViewsAreIsolated() throws {
         let project = try String(contentsOf: root.appendingPathComponent("Botville.xcodeproj/project.pbxproj"), encoding: .utf8)
         XCTAssertTrue(project.contains("CODE_SIGN_ENTITLEMENTS = BotvilleApp/BotvilleApp.entitlements;"))
+        XCTAssertTrue(project.contains("Embed Foundation Extensions"))
         XCTAssertTrue(project.contains("com.apple.Push = { enabled = 1; };"))
         XCTAssertEqual(try plist("BotvilleApp/BotvilleApp.entitlements")["aps-environment"] as? String, "development")
         let sources = root.appendingPathComponent("Sources/BotvilleApp")
@@ -113,6 +89,40 @@ final class ReleaseIsolationTests: XCTestCase {
         let task = Process(); task.executableURL = URL(fileURLWithPath: "/usr/bin/plutil"); task.arguments = ["-convert", "json", "-o", "-", root.appendingPathComponent("Botville.xcodeproj/project.pbxproj").path]
         let pipe = Pipe(); task.standardOutput = pipe; try task.run(); task.waitUntilExit(); XCTAssertEqual(task.terminationStatus, 0)
         return try XCTUnwrap(JSONSerialization.jsonObject(with: pipe.fileHandleForReading.readDataToEndOfFile()) as? [String: Any])
+    }
+    private func assertTarget(
+        objects: [String: Any], name: String, productType: String, bundleID: String,
+        entitlements: [String: String], plists: [String: String]
+    ) throws {
+        let target = try XCTUnwrap(objects.values.compactMap { $0 as? [String: Any] }.first {
+            $0["isa"] as? String == "PBXNativeTarget" && $0["name"] as? String == name && $0["productType"] as? String == productType
+        })
+        let list = try XCTUnwrap(objects[try XCTUnwrap(target["buildConfigurationList"] as? String)] as? [String: Any])
+        let configurationIDs = try XCTUnwrap(list["buildConfigurations"] as? [String])
+        XCTAssertEqual(configurationIDs.count, 2)
+        for id in configurationIDs {
+            let config = try XCTUnwrap(objects[id] as? [String: Any])
+            let name = try XCTUnwrap(config["name"] as? String)
+            let settings = try XCTUnwrap(config["buildSettings"] as? [String: Any])
+            XCTAssertEqual(settings["CODE_SIGN_STYLE"] as? String, "Automatic", name)
+            XCTAssertEqual(settings["DEVELOPMENT_TEAM"] as? String, "3Z8WP6U6F7", name)
+            XCTAssertEqual(settings["CODE_SIGN_IDENTITY[sdk=iphonesimulator*]"] as? String, "-", name)
+            XCTAssertEqual(settings["PRODUCT_BUNDLE_IDENTIFIER"] as? String, bundleID, name)
+            XCTAssertEqual(settings["CODE_SIGN_ENTITLEMENTS"] as? String, entitlements[name], name)
+            XCTAssertEqual(settings["INFOPLIST_FILE"] as? String, plists[name], name)
+            for (key, value) in settings where key.hasPrefix("CODE_SIGN_ENTITLEMENTS[") {
+                XCTAssertEqual(value as? String, entitlements[name], key)
+            }
+            for (key, value) in settings where key.hasPrefix("INFOPLIST_FILE[") {
+                XCTAssertEqual(value as? String, plists[name], key)
+            }
+        }
+    }
+    private func assertEntitlements(_ relative: String, privateKeychainGroup: String, apsEnvironment: String?) throws {
+        let value = try plist(relative)
+        XCTAssertEqual(value["com.apple.security.application-groups"] as? [String], ["group.com.zjyjcl.botville"])
+        XCTAssertEqual(value["keychain-access-groups"] as? [String], [privateKeychainGroup, "$(AppIdentifierPrefix)com.zjyjcl.botville.shared"])
+        XCTAssertEqual(value["aps-environment"] as? String, apsEnvironment)
     }
     private func guarded(_ needle: String, at url: URL) throws {
         var stack: [Bool] = []; var found = false

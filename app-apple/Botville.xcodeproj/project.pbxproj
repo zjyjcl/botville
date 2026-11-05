@@ -15,7 +15,32 @@
 		A10000000000000000000007 /* ModuleWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000017 /* ModuleWebView.swift */; };
 		A10000000000000000000008 /* PairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000018 /* PairingView.swift */; };
 		A10000000000000000000009 /* PushDiagnosticsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000019 /* PushDiagnosticsView.swift */; };
+		B10000000000000000000001 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000011 /* NotificationService.swift */; };
+		B10000000000000000000002 /* SharedPushCredentials.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000012 /* SharedPushCredentials.swift */; };
+		B10000000000000000000003 /* BotvilleNotificationService.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = B10000000000000000000010 /* BotvilleNotificationService.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy,); }; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		B10000000000000000000032 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A10000000000000000000060 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = B10000000000000000000050;
+			remoteInfo = BotvilleNotificationService;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		B10000000000000000000022 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (B10000000000000000000003 /* BotvilleNotificationService.appex in Embed Foundation Extensions */,);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		A10000000000000000000010 /* BotvilleApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = BotvilleApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -29,6 +54,12 @@
 		A10000000000000000000018 /* PairingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PairingView.swift; path = Sources/BotvilleApp/PairingView.swift; sourceTree = SOURCE_ROOT; };
 		A10000000000000000000019 /* PushDiagnosticsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PushDiagnosticsView.swift; path = Sources/BotvilleApp/PushDiagnosticsView.swift; sourceTree = SOURCE_ROOT; };
 		A1000000000000000000001A /* BotvilleApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = BotvilleApp/BotvilleApp.entitlements; sourceTree = SOURCE_ROOT; };
+		A1000000000000000000001B /* BotvilleApp-Release.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "BotvilleApp/BotvilleApp-Release.entitlements"; sourceTree = SOURCE_ROOT; };
+		B10000000000000000000010 /* BotvilleNotificationService.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = BotvilleNotificationService.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		B10000000000000000000011 /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
+		B10000000000000000000012 /* SharedPushCredentials.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SharedPushCredentials.swift; path = Sources/BotvilleCore/SharedPushCredentials.swift; sourceTree = SOURCE_ROOT; };
+		B10000000000000000000013 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		B10000000000000000000014 /* NotificationService.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = NotificationService.entitlements; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -38,6 +69,12 @@
 			files = (A10000000000000000000005 /* BotvilleCore in Frameworks */,);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		B10000000000000000000021 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = ();
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -45,6 +82,7 @@
 			isa = PBXGroup;
 			children = (
 				A10000000000000000000041 /* BotvilleApp */,
+				B10000000000000000000041 /* NotificationService */,
 				A10000000000000000000042 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -62,14 +100,26 @@
 				A10000000000000000000016 /* DynamicUI.swift */,
 				A10000000000000000000019 /* PushDiagnosticsView.swift */,
 				A1000000000000000000001A /* BotvilleApp.entitlements */,
+				A1000000000000000000001B /* BotvilleApp-Release.entitlements */,
 			);
 			name = BotvilleApp;
 			sourceTree = "<group>";
 		};
 		A10000000000000000000042 /* Products */ = {
 			isa = PBXGroup;
-			children = (A10000000000000000000010 /* BotvilleApp.app */,);
+			children = (A10000000000000000000010 /* BotvilleApp.app */, B10000000000000000000010 /* BotvilleNotificationService.appex */,);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		B10000000000000000000041 /* NotificationService */ = {
+			isa = PBXGroup;
+			children = (
+				B10000000000000000000011 /* NotificationService.swift */,
+				B10000000000000000000012 /* SharedPushCredentials.swift */,
+				B10000000000000000000013 /* Info.plist */,
+				B10000000000000000000014 /* NotificationService.entitlements */,
+			);
+			path = NotificationService;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -81,21 +131,33 @@
 			buildPhases = (
 				A10000000000000000000020 /* Sources */,
 				A10000000000000000000021 /* Frameworks */,
+				B10000000000000000000022 /* Embed Foundation Extensions */,
 			);
 			buildRules = ();
-			dependencies = ();
+			dependencies = (B10000000000000000000031 /* PBXTargetDependency */,);
 			name = "BotvilleApp-iOS";
 			packageProductDependencies = (A10000000000000000000031 /* BotvilleCore */,);
 			productName = BotvilleApp;
 			productReference = A10000000000000000000010 /* BotvilleApp.app */;
 			productType = "com.apple.product-type.application";
 		};
+		B10000000000000000000050 /* BotvilleNotificationService */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B10000000000000000000061 /* Build configuration list for PBXNativeTarget "BotvilleNotificationService" */;
+			buildPhases = (B10000000000000000000020 /* Sources */, B10000000000000000000021 /* Frameworks */,);
+			buildRules = ();
+			dependencies = ();
+			name = BotvilleNotificationService;
+			productName = BotvilleNotificationService;
+			productReference = B10000000000000000000010 /* BotvilleNotificationService.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
 		A10000000000000000000060 /* Project object */ = {
 			isa = PBXProject;
-			attributes = { LastSwiftUpdateCheck = 2700; LastUpgradeCheck = 2700; TargetAttributes = { A10000000000000000000050 = { CreatedOnToolsVersion = 27.2; SystemCapabilities = { com.apple.Push = { enabled = 1; }; }; }; }; };
+			attributes = { LastSwiftUpdateCheck = 2700; LastUpgradeCheck = 2700; TargetAttributes = { A10000000000000000000050 = { CreatedOnToolsVersion = 27.2; SystemCapabilities = { com.apple.Push = { enabled = 1; }; com.apple.ApplicationGroups.iOS = { enabled = 1; }; com.apple.Keychain = { enabled = 1; }; }; }; B10000000000000000000050 = { CreatedOnToolsVersion = 27.2; SystemCapabilities = { com.apple.ApplicationGroups.iOS = { enabled = 1; }; com.apple.Keychain = { enabled = 1; }; }; }; }; };
 			buildConfigurationList = A10000000000000000000062 /* Build configuration list for PBXProject "Botville" */;
 			compatibilityVersion = "Xcode 16.0";
 			developmentRegion = en;
@@ -108,7 +170,7 @@
 			productRefGroup = A10000000000000000000042 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
-			targets = (A10000000000000000000050 /* BotvilleApp-iOS */,);
+			targets = (A10000000000000000000050 /* BotvilleApp-iOS */, B10000000000000000000050 /* BotvilleNotificationService */,);
 		};
 /* End PBXProject section */
 
@@ -116,6 +178,12 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		B10000000000000000000020 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (B10000000000000000000001 /* NotificationService.swift in Sources */, B10000000000000000000002 /* SharedPushCredentials.swift in Sources */,);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		A10000000000000000000020 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -133,16 +201,76 @@
 		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXTargetDependency section */
+		B10000000000000000000031 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = B10000000000000000000050 /* BotvilleNotificationService */;
+			targetProxy = B10000000000000000000032 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
 		A10000000000000000000070 /* Debug */ = { isa = XCBuildConfiguration; buildSettings = { CLANG_ENABLE_MODULES = YES; SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) DEBUG"; SWIFT_VERSION = 5.0; }; name = Debug; };
 		A10000000000000000000071 /* Release */ = { isa = XCBuildConfiguration; buildSettings = { CLANG_ENABLE_MODULES = YES; SWIFT_VERSION = 5.0; }; name = Release; };
 		A10000000000000000000072 /* Debug */ = { isa = XCBuildConfiguration; buildSettings = { ASSETCATALOG_COMPILER_APPICON_NAME = ""; CODE_SIGN_ENTITLEMENTS = BotvilleApp/BotvilleApp.entitlements; "CODE_SIGN_IDENTITY[sdk=iphonesimulator*]" = "-"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = 3Z8WP6U6F7; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = "BotvilleApp/Info-Debug.plist"; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 0.1; PRODUCT_BUNDLE_IDENTIFIER = com.zjyjcl.botville; PRODUCT_NAME = BotvilleApp; SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
-		A10000000000000000000073 /* Release */ = { isa = XCBuildConfiguration; buildSettings = { ASSETCATALOG_COMPILER_APPICON_NAME = ""; "CODE_SIGN_IDENTITY[sdk=iphonesimulator*]" = "-"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = 3Z8WP6U6F7; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = BotvilleApp/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 0.1; PRODUCT_BUNDLE_IDENTIFIER = com.zjyjcl.botville; PRODUCT_NAME = BotvilleApp; SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_OPTIMIZATION_LEVEL = "-O"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		A10000000000000000000073 /* Release */ = { isa = XCBuildConfiguration; buildSettings = { ASSETCATALOG_COMPILER_APPICON_NAME = ""; CODE_SIGN_ENTITLEMENTS = "BotvilleApp/BotvilleApp-Release.entitlements"; "CODE_SIGN_IDENTITY[sdk=iphonesimulator*]" = "-"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = 3Z8WP6U6F7; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = BotvilleApp/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 0.1; PRODUCT_BUNDLE_IDENTIFIER = com.zjyjcl.botville; PRODUCT_NAME = BotvilleApp; SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_OPTIMIZATION_LEVEL = "-O"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		B10000000000000000000072 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_ENTITLEMENTS = NotificationService/NotificationService.entitlements;
+				"CODE_SIGN_IDENTITY[sdk=iphonesimulator*]" = "-";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 3Z8WP6U6F7;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = NotificationService/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks";
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.zjyjcl.botville.notification;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		B10000000000000000000073 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_ENTITLEMENTS = NotificationService/NotificationService.entitlements;
+				"CODE_SIGN_IDENTITY[sdk=iphonesimulator*]" = "-";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 3Z8WP6U6F7;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = NotificationService/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks";
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.zjyjcl.botville.notification;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
 		A10000000000000000000061 /* Build configuration list for PBXNativeTarget "BotvilleApp-iOS" */ = { isa = XCConfigurationList; buildConfigurations = (A10000000000000000000072 /* Debug */, A10000000000000000000073 /* Release */,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
 		A10000000000000000000062 /* Build configuration list for PBXProject "Botville" */ = { isa = XCConfigurationList; buildConfigurations = (A10000000000000000000070 /* Debug */, A10000000000000000000071 /* Release */,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		B10000000000000000000061 /* Build configuration list for PBXNativeTarget "BotvilleNotificationService" */ = { isa = XCConfigurationList; buildConfigurations = (B10000000000000000000072 /* Debug */, B10000000000000000000073 /* Release */,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */

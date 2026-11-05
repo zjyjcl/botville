@@ -21,6 +21,8 @@
     <string>$(MARKETING_VERSION)</string>
     <key>CFBundleVersion</key>
     <string>$(CURRENT_PROJECT_VERSION)</string>
+    <key>BotvilleSharedKeychainAccessGroup</key>
+    <string>$(AppIdentifierPrefix)com.zjyjcl.botville.shared</string>
     <key>NSCameraUsageDescription</key>
     <string>用于扫描配对二维码，连接你确认的 botville 服务。</string>
     <key>UILaunchScreen</key>

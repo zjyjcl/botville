@@ -64,17 +64,55 @@ public enum PushPusherDataFormat: String, Codable, Equatable, Sendable {
     case eventIDOnly = "event_id_only"
 }
 
+/// The deliberately minimal APNs fallback used before the notification service
+/// extension can resolve a Matrix event.  Do not put event content here: the
+/// pusher continues to use `event_id_only`.
+public struct PushDefaultPayload: Codable, Equatable, Sendable {
+    /// This type deliberately has no configurable fields.  Matrix pusher data
+    /// must only contain the placeholder consumed by the NSE in PR1.
+    public init() {}
+
+    private enum CodingKeys: String, CodingKey { case aps }
+    private enum APSCodingKeys: String, CodingKey { case mutableContent = "mutable-content", alert }
+    private enum AlertCodingKeys: String, CodingKey { case body }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let aps = try container.nestedContainer(keyedBy: APSCodingKeys.self, forKey: .aps)
+        guard try aps.decode(Int.self, forKey: .mutableContent) == 1 else {
+            throw DecodingError.dataCorruptedError(forKey: .mutableContent, in: aps, debugDescription: "default_payload must set aps.mutable-content to 1")
+        }
+        let alert = try aps.nestedContainer(keyedBy: AlertCodingKeys.self, forKey: .alert)
+        guard try alert.decode(String.self, forKey: .body) == "…" else {
+            throw DecodingError.dataCorruptedError(forKey: .body, in: alert, debugDescription: "default_payload must use the NSE placeholder body")
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        var aps = container.nestedContainer(keyedBy: APSCodingKeys.self, forKey: .aps)
+        try aps.encode(1, forKey: .mutableContent)
+        var alert = aps.nestedContainer(keyedBy: AlertCodingKeys.self, forKey: .alert)
+        try alert.encode("…", forKey: .body)
+    }
+
+}
+
 /// Matrix pusher `data` object. The Sygnal endpoint is supplied by deployment
 /// configuration; it is never inferred from the user's homeserver.
 public struct PushPusherData: Codable, Equatable, Sendable {
     public let url: URL
     public let format: PushPusherDataFormat
+    /// Makes APNs invoke the notification service extension while retaining a
+    /// content-free fallback body until PR2 fetches the Matrix event.
+    public let defaultPayload: PushDefaultPayload
 
     /// The pusher endpoint receives device tokens. Production callers use the
     /// HTTPS default; Debug can explicitly opt into local HTTP.
     public init(url: URL, format: PushPusherDataFormat = .eventIDOnly) throws {
         self.url = try Self.validatedAndNormalizedURL(url, allowHTTP: false)
         self.format = format
+        self.defaultPayload = PushDefaultPayload()
     }
 
     public init(url: URL, allowHTTP: Bool, format: PushPusherDataFormat = .eventIDOnly) throws {
@@ -84,6 +122,7 @@ public struct PushPusherData: Codable, Equatable, Sendable {
     init(url: URL, allowHTTP: Bool, isDebugBuild: Bool, format: PushPusherDataFormat = .eventIDOnly) throws {
         self.url = try Self.validatedAndNormalizedURL(url, allowHTTP: allowHTTP, isDebugBuild: isDebugBuild)
         self.format = format
+        self.defaultPayload = PushDefaultPayload()
     }
 
     public init(from decoder: Decoder) throws {
@@ -95,10 +134,12 @@ public struct PushPusherData: Codable, Equatable, Sendable {
         }
         self.url = try Self.validatedAndNormalizedURL(url, originalSource: source, allowHTTP: false)
         self.format = try container.decodeIfPresent(PushPusherDataFormat.self, forKey: .format) ?? .eventIDOnly
+        self.defaultPayload = try container.decodeIfPresent(PushDefaultPayload.self, forKey: .defaultPayload) ?? PushDefaultPayload()
     }
 
     private enum CodingKeys: String, CodingKey {
         case url, format
+        case defaultPayload = "default_payload"
     }
 
     private static func validatedAndNormalizedURL(
