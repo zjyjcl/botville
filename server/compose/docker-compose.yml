@@ -29,12 +29,38 @@
 
 name: botville
 
+# --- NO_PROXY pinning (issue #134, PR1) -----------------------------------
+# Root cause: the docker client (~/.docker/config.json "proxies") and Docker
+# Desktop inject the host's HTTP_PROXY/HTTPS_PROXY into every NEW container.
+# Inside a container 127.0.0.1 is the container itself, so a host proxy like
+# http://127.0.0.1:7890 is unreachable there — and since Synapse's pusher
+# (and reqwest in tuwunel/continuwuity) honor *_PROXY, pushes to
+# http://sygnal:5000 were routed into that dead proxy. Merging this anchor
+# into every service pins NO_PROXY and no_proxy (both cases: curl, Python
+# and Go each look at different ones) so in-stack traffic never consults a
+# proxy.
+# HTTP_PROXY/HTTPS_PROXY are deliberately NOT set or cleared here — some
+# deployments intentionally route outbound traffic (federation, APNs)
+# through a proxy. The default list below is fixed and cannot be overridden;
+# BOTVILLE_NO_PROXY_EXTRA (server/compose/.env) only APPENDS entries: the
+# nested ${VAR:+,${VAR}} expansion renders ",<value>" when set and nothing
+# when empty/unset, so there is never a trailing comma. Twisted (Synapse)
+# matches NO_PROXY by hostname suffix only — not CIDR ranges — which is why
+# every in-stack service name is listed explicitly (gateway/admin are
+# reserved for services not yet in compose; synapse-a/b, pairing-a/b and
+# fedgate-a/b are federation-stack names, kept here so the same list serves
+# it — see server/tests/test_compose_noproxy.py).
+x-noproxy-env: &noproxy-env
+  NO_PROXY: "localhost,127.0.0.1,::1,sygnal,postgres,synapse,tuwunel,continuwuity,gateway,admin,synapse-a,synapse-b,pairing-a,pairing-b,fedgate-a,fedgate-b,.local,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${BOTVILLE_NO_PROXY_EXTRA:+,${BOTVILLE_NO_PROXY_EXTRA}}"
+  no_proxy: "localhost,127.0.0.1,::1,sygnal,postgres,synapse,tuwunel,continuwuity,gateway,admin,synapse-a,synapse-b,pairing-a,pairing-b,fedgate-a,fedgate-b,.local,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${BOTVILLE_NO_PROXY_EXTRA:+,${BOTVILLE_NO_PROXY_EXTRA}}"
+
 services:
   postgres:
     # Pinned tag@digest by default; override via POSTGRES_IMAGE.
     image: ${POSTGRES_IMAGE:-docker.io/library/postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab}
     profiles: [synapse]
     environment:
+      <<: *noproxy-env
       POSTGRES_USER: ${POSTGRES_USER:-botville}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in server/compose/.env}
       POSTGRES_DB: ${POSTGRES_DB:-synapse}
@@ -55,6 +81,10 @@ services:
     # defaults); upgrade flow in docs/ops/upgrade-images.md.
     image: ${SYNAPSE_IMAGE:-docker.io/matrixdotorg/synapse:v1.164.1@sha256:fa4aa980f279bcf26d4e7ecc2a2c9a701c73f2ebe8841da9bdcf3b2fdf693d75}
     profiles: [synapse]
+    # NO_PROXY/no_proxy so the pusher's http://sygnal:5000 never consults a
+    # host-injected proxy (x-noproxy-env at the top of this file).
+    environment:
+      <<: *noproxy-env
     # homeserver.yaml is rendered from synapse/homeserver.yaml.tmpl by
     # server/scripts/init.sh into ./generated/synapse/ (gitignored).
     entrypoint:
@@ -94,6 +124,7 @@ services:
     # interrupted; upstream recommends a long stop grace period.
     stop_grace_period: 10m
     environment:
+      <<: *noproxy-env
       TUWUNEL_SERVER_NAME: ${BOTVILLE_SERVER_NAME:-localhost}
       TUWUNEL_DATABASE_PATH: /var/lib/tuwunel
       TUWUNEL_ADDRESS: 0.0.0.0
@@ -131,6 +162,7 @@ services:
     image: ${SYGNAL_IMAGE:-docker.io/matrixdotorg/sygnal:v0.17.0@sha256:141f5e72fdf99a28e29ca87f3a46c19ed1cf21d5074aa3ef9df7c067e0c1c46a}
     profiles: [push]
     environment:
+      <<: *noproxy-env
       # Rendered from sygnal/sygnal.yaml.tmpl by server/scripts/init.sh into
       # ./generated/sygnal/ (gitignored); SYGNAL_CONF is how the image locates
       # its config.
@@ -190,6 +222,7 @@ services:
     profiles: [continuwuity]
     stop_grace_period: 10m
     environment:
+      <<: *noproxy-env
       CONTINUWUITY_SERVER_NAME: ${BOTVILLE_SERVER_NAME:-localhost}
       CONTINUWUITY_DATABASE_PATH: /var/lib/continuwuity
       CONTINUWUITY_ADDRESS: 0.0.0.0

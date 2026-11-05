@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 # Botville server bootstrap (A0.2):
+#   0. WARN (never fail, issue #134) when a host proxy env var or
+#      ~/.docker/config.json "proxies" points at a loopback address: docker
+#      injects host proxies into every new container, where 127.0.0.1 is the
+#      container itself. compose's x-noproxy-env already keeps in-stack
+#      traffic off any proxy; the WARNING only names the offending setting
+#      (host:port, credentials stripped) and points at
+#      docs/deploy/push-sygnal.md §11 (主机有代理时).
 #   1. create server/compose/.env from .env.example, replacing every
 #      <change-me> with a locally generated random value (openssl rand -hex 32).
 #      When .env already exists, keep every current value but:
@@ -201,6 +208,88 @@ warn_image_overrides() {
         echo "WARNING: ${key} is NOT updated automatically — back up, then update it per docs/ops/upgrade-images.md (§ existing deployments)." >&2
     done < <(grep -E '^[A-Za-z_][A-Za-z0-9_]*_IMAGE=' "${env_example}")
 }
+
+
+# Pure advisory check (issue #134): docker injects the host's proxy settings
+# into every NEW container — from ~/.docker/config.json's "proxies" section,
+# from Docker Desktop, and from the docker client's own environment. A proxy
+# listening on 127.0.0.1:<port> (or localhost) is unreachable inside a
+# container, where 127.0.0.1 is the container itself; e.g. a Synapse whose
+# pusher honors *_PROXY then fails every push to http://sygnal:5000.
+# docker-compose.yml's x-noproxy-env already pins NO_PROXY/no_proxy for all
+# in-stack service names, so this only WARNS about the loopback proxy itself.
+# Never fails (a missing python3 or an unreadable config.json skips the
+# check silently — later steps need python3 anyway) and never blocks
+# startup. Proxy URLs are echoed as host:port only: scheme, path and
+# userinfo (user:password@) are stripped so no credentials reach the log.
+warn_loopback_proxy() {
+    if ! python3 - >&2 <<'PY'
+import json
+import os
+
+WARN = (
+    "WARNING: %s points at the loopback proxy %s — docker injects host"
+    " proxies into new containers, where 127.0.0.1/localhost is the"
+    " container itself, so containers cannot use that proxy."
+)
+HINT = (
+    "WARNING: in-stack traffic already bypasses proxies via NO_PROXY"
+    " (docker-compose.yml x-noproxy-env); a container that should use a"
+    " proxy needs a container-reachable address such as"
+    " http://host.docker.internal:<port> instead — see"
+    " docs/deploy/push-sygnal.md §11 (主机有代理时)."
+)
+
+
+def strip_url(url):
+    """host:port of a proxy URL: drop scheme, path and userinfo."""
+    rest = url.strip().split("://", 1)[-1]
+    rest = rest.split("/", 1)[0]
+    if "@" in rest:
+        rest = rest.rsplit("@", 1)[-1]
+    return rest
+
+
+def is_loopback(url):
+    rest = url.strip().lower().split("://", 1)[-1]
+    if "@" in rest:
+        rest = rest.rsplit("@", 1)[-1]
+    return rest.startswith(("127.", "localhost", "::1", "[::1]"))
+
+
+def warn(source, url):
+    print(WARN % (source, strip_url(url)))
+    print(HINT)
+
+
+for var in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
+    url = os.environ.get(var)
+    if url and is_loopback(url):
+        warn("environment variable %s" % var, url)
+
+try:
+    with open(
+        os.path.join(os.path.expanduser("~"), ".docker", "config.json"),
+        encoding="utf-8",
+    ) as f:
+        proxies = json.load(f).get("proxies")
+except (OSError, ValueError):
+    proxies = None
+if isinstance(proxies, dict):
+    for scope, entry in sorted(proxies.items()):
+        if not isinstance(entry, dict):
+            continue
+        for key in ("httpProxy", "httpsProxy", "allProxy"):
+            url = entry.get(key)
+            if isinstance(url, str) and is_loopback(url):
+                warn("~/.docker/config.json proxies.%s.%s" % (scope, key), url)
+PY
+    then
+        : # advisory only — never let this check fail the bootstrap
+    fi
+}
+
+warn_loopback_proxy
 
 if [[ ! -f "${env_file}" ]]; then
     # openssl is only required when a secret actually has to be generated;

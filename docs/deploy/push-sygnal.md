@@ -28,7 +28,8 @@ Push Gateway `/_matrix/push/v1/notify`）；不引入任何私有 homeserver API
 8. [隐私](#隐私)
 9. [运维与排障](#运维与排障)
 10. [内网推送放行](#内网推送放行botville_docker_subnet-与-botville_sygnal_ip)
-11. [8845 mini PC（Ubuntu Server 24.04）部署](#8845-mini-pcubuntu-server-2404-部署)
+11. [主机有代理时](#主机有代理时no_proxy-固化issue-134)
+12. [8845 mini PC（Ubuntu Server 24.04）部署](#8845-mini-pcubuntu-server-2404-部署)
 
 ---
 
@@ -94,8 +95,8 @@ homeserver/postgres），保证首起、反复 up、改配置后再 up 三种情
 | `APNS_KEY_ID` | `<key-id>` | Apple 后台 Keys 页的 10 位 Key ID（`[A-Z0-9]{10}`，填了但格式不对 exit 1） |
 | `APNS_TEAM_ID` | `<team-id>` | Apple 开发者 Team ID（10 位，同上格式校验） |
 | `APNS_PLATFORM` | `sandbox` | `sandbox`（开发构建）或 `production`（TestFlight/App Store），见 §4；切环境只改这一项后重启（方案 A，单 app） |
-| `BOTVILLE_PUSH_DOMAIN` | `<push-domain>` | 推送公网域名（反代 `push.<domain>` 用）。**仅在 `BOTVILLE_PUSH_PUBLIC=true` 时需要**：App 注册 pusher 的 `data.url` 即 `https://<BOTVILLE_PUSH_DOMAIN>/_matrix/push/v1/notify`；运维参考值，compose 栈本身不消费它（见 §11 反代示例） |
-| `BOTVILLE_PUSH_PUBLIC` | `false` | #128 决策：`push.<domain>` **默认不对公网开放**。`false`（默认）= homeserver → sygnal 走 compose 内网 `http://sygnal:5000`（放行面只有 `BOTVILLE_SYGNAL_IP` 那一个 /32，见 §10），不部署公网反代，App 的 `data.url` 用内网地址（只需 homeserver 容器可达，App 自身不访问它）；`true` 才按 §11 的反代示例把网关暴露到 `BOTVILLE_PUSH_DOMAIN`（仅当 homeserver 无法经内网到达 sygnal 时才需要）。运维开关，compose 栈本身不消费（同 `BOTVILLE_PUSH_DOMAIN`） |
+| `BOTVILLE_PUSH_DOMAIN` | `<push-domain>` | 推送公网域名（反代 `push.<domain>` 用）。**仅在 `BOTVILLE_PUSH_PUBLIC=true` 时需要**：App 注册 pusher 的 `data.url` 即 `https://<BOTVILLE_PUSH_DOMAIN>/_matrix/push/v1/notify`；运维参考值，compose 栈本身不消费它（见 §12 反代示例） |
+| `BOTVILLE_PUSH_PUBLIC` | `false` | #128 决策：`push.<domain>` **默认不对公网开放**。`false`（默认）= homeserver → sygnal 走 compose 内网 `http://sygnal:5000`（放行面只有 `BOTVILLE_SYGNAL_IP` 那一个 /32，见 §10），不部署公网反代，App 的 `data.url` 用内网地址（只需 homeserver 容器可达，App 自身不访问它）；`true` 才按 §12 的反代示例把网关暴露到 `BOTVILLE_PUSH_DOMAIN`（仅当 homeserver 无法经内网到达 sygnal 时才需要）。运维开关，compose 栈本身不消费（同 `BOTVILLE_PUSH_DOMAIN`） |
 | `SYGNAL_IMAGE` | pin 值 | 镜像覆盖，规则同其他服务（tag@sha256 digest） |
 
 配置渲染：`server/compose/sygnal/sygnal.yaml.tmpl` →
@@ -183,7 +184,7 @@ apps:
   `APNS_PLATFORM=production`（或改回 `sandbox`）后 `make up PUSH=1`——它会
   重跑 init.sh 重新渲染 sygnal.yaml，并 **force-recreate 仅 sygnal**（不动
   homeserver/postgres），新 platform 随即生效；不做双 app。完整切换/回滚
-  步骤与原因见 §11.8/§11.9。
+  步骤与原因见 §12.8/§12.9。
 
 ## App 端需要的参数
 
@@ -223,7 +224,7 @@ App（iOS 客户端）向 homeserver 注册 pusher 时需要的四个关键值�
 `BOTVILLE_PUSH_PUBLIC=true` 时才把 `BOTVILLE_PUSH_DOMAIN`（如
 `push.example.invalid`，示例占位域名）TLS 终止后转发到
 `127.0.0.1:${BOTVILLE_PUSH_PORT}`（默认 8019）。App 到 APNs 的长连接与本仓库
-无关；这里只需要保证 homeserver → `data.url` 可达。配置示例见 §11（Caddy/
+无关；这里只需要保证 homeserver → `data.url` 可达。配置示例见 §12（Caddy/
 nginx，均标注「仅当开关打开时」）。
 
 ## 时延验收：mock 链路（已自动化）
@@ -361,12 +362,72 @@ make up HS=continuwuity PUSH=1 && make push-e2e
 `BOTVILLE_DOCKER_IP_RANGE` 与 `BOTVILLE_SYGNAL_IP` 相应取各自网段的
 `.64/26` 与 `.2`，否则 compose 建网络时会冲突（init.sh 会指出该改哪个值）。
 
-生产上若选择了公网网关模式（`BOTVILLE_PUSH_PUBLIC=true`，见 §2/§11.3——**非默认**，
+生产上若选择了公网网关模式（`BOTVILLE_PUSH_PUBLIC=true`，见 §2/§12.3——**非默认**，
 #128 决策默认内网直连）：把 `BOTVILLE_SYGNAL_IP` **留空**即可
 关闭内网放行——denylist 用完整上游默认、Synapse 不写 `ip_range_whitelist`，
 pusher 的 `data.url` 用公网地址。（留空时 compose 仍按其 `ipv4_address` 的回退
 默认 `.250.2` 赋地址，故仅默认网段下可直接起 push profile；自定义网段又留空的
 组合，init.sh 会 WARNING 提示。）
+
+## 主机有代理时（NO_PROXY 固化，issue #134）
+
+Docker 客户端（`~/.docker/config.json` 的 `proxies` 段）与 Docker Desktop 会把主机的
+`HTTP(S)_PROXY` 注入**每个新建容器**。容器里的 `127.0.0.1` 是容器自己，主机上
+`http://127.0.0.1:7890` 这类本地代理在容器内并不存在——于是遵循 `*_PROXY` 的出站
+HTTP（典型：Synapse pusher → `http://sygnal:5000`）被送进一个不可达的代理，推送
+静默失败。
+
+仓库的处理（`server/compose/docker-compose.yml` 顶部的 `x-noproxy-env` 锚点，合并进
+synapse / tuwunel / continuwuity / sygnal / postgres 五个服务）：
+
+- 固定默认 `NO_PROXY` **和**小写 `no_proxy`（curl / Python / Go 各认不同大小写）：
+  全部 compose 服务名 + 预留名（`gateway`/`admin`）+ 联邦栈服务名
+  （`synapse-a/b`、`pairing-a/b`、`fedgate-a/b`）+ `localhost,127.0.0.1,::1` +
+  `.local,.internal` + RFC1918 网段。**默认名单不可覆盖**；`server/compose/.env` 里
+  `BOTVILLE_NO_PROXY_EXTRA` 只做**追加**（留空 = 只有默认项，且不会出现尾部逗号）。
+- Synapse 的 Twisted 匹配 `NO_PROXY` 只认主机名/后缀、**不认 CIDR 网段**，所以服务
+  名必须逐个列出，不能只靠网段兜底（Python/requests/Go 认 CIDR，Twisted 不认）。
+- **不清空也不设置 `HTTP_PROXY`/`HTTPS_PROXY`**：有部署故意让 homeserver/sygnal
+  经代理出外网（联邦、APNs）。容器确需走代理时，地址必须换成容器可达的
+  `http://host.docker.internal:<port>`（改 `~/.docker/config.json` 的 proxies 或
+  Docker Desktop 的代理设置；`127.0.0.1`/`localhost` 在容器内永远指容器自己）。
+- `server/scripts/init.sh` 启动时若发现主机代理环境变量（`HTTP_PROXY`/
+  `HTTPS_PROXY` 及小写）或 `~/.docker/config.json` 的代理指向 `127.0.0.1`/
+  `localhost`，只打 WARNING（仅回显 host:port，凭据一律剥离），**不会**因此失败。
+
+主机有代理时的自检 4 步（宿主机上执行；`-p botville` 与 `--profile synapse` 按实际
+部署替换）：
+
+```bash
+# 1) 主机代理从哪来：docker info 的代理行 + ~/.docker/config.json 的 proxies 段。
+#    只看 proxies 段——config.json 里可能还有 auths 等敏感段，不要整文件 cat。
+docker info | grep -i proxy
+python3 -c 'import json, os; print(json.load(open(os.path.expanduser("~/.docker/config.json"))).get("proxies", "<no proxies section>"))'
+
+# 2) 容器内 NO_PROXY 生效：大小写两个变量都在，且包含 sygnal 与各服务名。
+#    若同时看到 HTTP_PROXY=...127.0.0.1...，说明 docker 注入了环回代理——
+#    栈内流量靠 NO_PROXY 兜底，容器出外网仍需把代理换成 host.docker.internal。
+docker compose -f server/compose/docker-compose.yml --env-file server/compose/.env \
+    -p botville --profile synapse exec -T synapse env | grep -i proxy
+
+# 3) 容器内到 sygnal 真连通（NO_PROXY 生效时直连 compose 内网 DNS，不经代理）
+docker compose -f server/compose/docker-compose.yml --env-file server/compose/.env \
+    -p botville --profile synapse exec -T synapse python -c \
+    "import urllib.request; print(urllib.request.urlopen('http://sygnal:5000/health').status)"
+#    期望 200
+
+# 4) Synapse 日志没有代理连接错误（ProxyConnectionError / 连 7890 被拒之类）
+docker compose -f server/compose/docker-compose.yml --env-file server/compose/.env \
+    -p botville --profile synapse logs --no-color synapse 2>&1 \
+    | grep -iE 'proxy.*(error|refused|failed)|7890' || echo clean
+```
+
+（tuwunel / continuwuity 栈把 `--profile synapse` 换成对应 profile 即可，它们同样
+吃 `x-noproxy-env`。）
+
+QQ/NapCat 不走境外代理的原则不受本方案影响：NapCat 不在 botville 的 compose 内，
+本节只约束本栈容器；若将来 NapCat 容器化，需确保它不继承主机的 7890 代理（在其
+`NO_PROXY` 加 QQ 相关域名，或不注入 `HTTP_PROXY`）。
 
 ---
 
