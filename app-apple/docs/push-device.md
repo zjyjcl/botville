@@ -15,12 +15,12 @@
 
 notify URL 必须无凭据、无 query/fragment，路径严格为 `/_matrix/push/v1/notify`。默认/Release 策略仅允许 HTTPS；DEBUG 显式允许 HTTP。该地址供 **homeserver 访问 Sygnal**，因此 Compose 内部服务名可作 notify URL；iPhone 本身不必能解析该名称。App 不直接向 Sygnal 上传 token。
 
-DEBUG 登录页保留手动 homeserver 输入及局域网 HTTP 开关。开关仅允许本地/私有地址、`.local` 名称和 Compose 单标签主机名；iPhone 连接 homeserver 时仍需使用手机可解析、可到达的地址。Release 不编译手动输入视图，初次使用扫码配对；已有账号软退出时可对固定的已保存服务器/账号重新输入密码。
+DEBUG 登录页保留手动 homeserver 输入及局域网 HTTP 开关。开关仅允许本地/私有地址、`.local` 名称和 Compose 单标签主机名；含字母的单标签主机名可能经设备的 DNS search domain 解析，不能保证仍在局域网内，因此只能在 DEBUG 显式开启后使用。iPhone 连接 homeserver 时仍需使用手机可解析、可到达的地址。Release 不编译手动输入视图，初次使用扫码配对；已有账号软退出时可对固定的已保存服务器/账号重新输入密码。
 
 ## 后续真机验收步骤
 
 1. 在有权限的开发者环境中打开 `Botville.xcodeproj`，选择 `BotvilleApp-iOS` scheme 和 Debug 配置。由设备主人配置开发者账号、开发签名及描述文件，开启对应 App ID 的 Push Notifications；Bundle ID 保持 `com.zjyjcl.botville`。当前仓库保留原签名设置，默认不为真机签名，不能直接当成已签名真机包。
-2. 确认签名后的 entitlement 包含 `aps-environment=development`，描述文件也允许推送。Sygnal 配置使用 app ID `com.zjyjcl.botville.apns`，APNs topic 对应 Bundle ID，使用开发/sandbox 环境。任何私钥、证书、描述文件和 Team 设置仅在受控环境配置，不提交仓库。
+2. 确认签名后的 entitlement 包含 `aps-environment=development`，描述文件也允许推送。Sygnal 配置使用 app ID `com.zjyjcl.botville.apns`，APNs topic 对应 Bundle ID，使用开发/sandbox 环境。任何私钥、证书、描述文件和 Team 设置仅在受控环境配置，不提交仓库。Release 配置不继承这个 development entitlement；归档或分发前，须在受控签名环境另配 `aps-environment=production`，并使用匹配的 App ID、生产描述文件和签名。
 3. 将 Debug 包安装到棉棉霸自己的 iPhone，按系统提示允许本地网络（使用局域网时）和通知。登录测试 Matrix 账号，保存可被 homeserver 访问的 notify URL。
 4. 申请注册，确认 token 非空、pusher 注册成功，再点「核对」确认匹配。请求应包含 `Authorization: Bearer <当前会话>`，`kind=http`、`append=false`、`app_display_name=botville`、设备名称、`lang=zh-CN`，及 `data.format=event_id_only`。检查证据时不得记录真实 access token 或 device token。
 5. 将 App 放到后台，从另一个已授权测试账号发送符合通知规则的消息；检查 homeserver → Sygnal → APNs 的实际投递与手机表现。此步骤需要外部服务和真实设备，不能由 mock 测试代替。
@@ -36,7 +36,7 @@ DEBUG 登录页保留手动 homeserver 输入及局域网 HTTP 开关。开关�
 - HTTP 仅用于开发网络，不能提供传输保密性。`NSAllowsLocalNetworking` 不绕过网络可达性、系统本地网络授权或 TLS 证书校验，也不会让手机自动解析 Compose DNS。
 - macOS 本次不支持 APNs 注册，诊断页明确显示此限制。模拟器可编译与查看 UI；其结果不能替代开发签名真机验收。
 - 这是开发推送链路准备工作，尚未实现通知服务扩展、从 `event_id_only` 获取通知正文、后台事件处理或点击通知跳转。完整可见通知取决于后续服务端 payload 与客户端通知展示实现。
-- Release 不编译诊断页、权限申请控制器或 DEBUG 手动 homeserver 视图；Release plist 无局域网 ATS/用途说明/notify 默认配置。该版本只提供 development entitlement，不代表已具备生产 APNs 发布配置。
+- Release 不编译诊断页、权限申请控制器或 DEBUG 手动 homeserver 视图；Release plist 无局域网 ATS/用途说明/notify 默认配置。工程只为 Debug 配置 development entitlement；Release/分发必须另配 production entitlement 与匹配的生产签名和描述文件，当前仓库不代表已具备生产 APNs 发布配置。
 
 ## 本地验证
 

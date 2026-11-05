@@ -12,10 +12,24 @@ public enum DevicePushToken {
     }
 }
 
+/// A caller's HTTP opt-in only applies to Debug builds. Inject the build flag
+/// to exercise Release behavior in tests without exposing it on MatrixService.
+enum PushHTTPPolicy {
+    static func permitsHTTP(_ allowHTTP: Bool, isDebugBuild: Bool = Self.isDebugBuild) -> Bool {
+        isDebugBuild && allowHTTP
+    }
+
+    #if DEBUG
+    private static let isDebugBuild = true
+    #else
+    private static let isDebugBuild = false
+    #endif
+}
+
 /// The Sygnal endpoint is deliberately narrower than a generic web URL.  It
 /// has no credentials or URL parameters and always receives Matrix notify
-/// requests at this exact path. `allowHTTP` is injected by the app target so
-/// Release policy is testable without relying on compilation conditions.
+/// requests at this exact path. MatrixService gates the caller's `allowHTTP`
+/// opt-in through PushHTTPPolicy before passing it to this URL validator.
 public enum PushNotifyURLPolicy {
     public static let requiredPath = "/_matrix/push/v1/notify"
 

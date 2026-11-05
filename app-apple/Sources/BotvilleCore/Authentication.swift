@@ -37,8 +37,11 @@ public struct HomeserverPolicy: Sendable {
 
         if host.hasSuffix(".local") && isWellFormedDNSHost(host) { return true }
 
-        // Docker Compose service names are deliberately single-label. Reject
-        // labels containing URL delimiters and labels with a public DNS suffix.
+        // Docker Compose service names are deliberately single-label. These
+        // names can resolve through a device DNS search domain and therefore
+        // are not guaranteed to remain on the local network; this DEBUG-only
+        // exception requires explicit opt-in. Reject labels containing URL
+        // delimiters and labels with a public DNS suffix.
         return isWellFormedDNSLabel(host)
             && !host.lowercased().hasPrefix("0x")
             && host.unicodeScalars.contains(where: isASCIIAlpha)

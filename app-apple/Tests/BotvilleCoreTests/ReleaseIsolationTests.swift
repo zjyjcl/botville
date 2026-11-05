@@ -20,6 +20,14 @@ final class ReleaseIsolationTests: XCTestCase {
 
     func testEveryApplicationReleaseTargetUsesShippingPlist() throws {
         let objects = try XCTUnwrap(projectJSON()["objects"] as? [String: Any])
+        let releaseConfigurations = objects.values.compactMap { $0 as? [String: Any] }.filter {
+            $0["isa"] as? String == "XCBuildConfiguration" && $0["name"] as? String == "Release"
+        }
+        XCTAssertFalse(releaseConfigurations.isEmpty)
+        for config in releaseConfigurations {
+            let settings = try XCTUnwrap(config["buildSettings"] as? [String: Any])
+            XCTAssertFalse(settings.keys.contains(where: { $0.hasPrefix("CODE_SIGN_ENTITLEMENTS") }))
+        }
         let apps = objects.values.compactMap { $0 as? [String: Any] }.filter { $0["isa"] as? String == "PBXNativeTarget" && $0["productType"] as? String == "com.apple.product-type.application" }
         XCTAssertFalse(apps.isEmpty)
         var releaseCount = 0
@@ -53,6 +61,10 @@ final class ReleaseIsolationTests: XCTestCase {
             let text = try String(contentsOf: url, encoding: .utf8)
             for token in ["PushDiagnosticsView(", "ManualHomeserverLoginView("] where text.contains(token) { try guarded(token, at: url) }
         }
+        let core = root.appendingPathComponent("Sources/BotvilleCore")
+        try guarded("private static let isDebugBuild = true", at: core.appendingPathComponent("PushRegistrar.swift"))
+        let matrixService = try String(contentsOf: core.appendingPathComponent("MatrixService.swift"), encoding: .utf8)
+        XCTAssertTrue(matrixService.contains("PushHTTPPolicy.permitsHTTP(allowHTTP)"))
     }
 
     private var root: URL { URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent() }

@@ -13,6 +13,11 @@ forbidden = {'NSAppTransportSecurity', 'NSAllowsLocalNetworking', 'NSLocalNetwor
 def json_plutil(path):
     return json.loads(subprocess.check_output(['plutil', '-convert', 'json', '-o', '-', str(path)]))
 objects = json_plutil(root / 'Botville.xcodeproj/project.pbxproj')['objects']
+for config in objects.values():
+    if config.get('isa') != 'XCBuildConfiguration' or config.get('name') != 'Release': continue
+    entitlements = [key for key in config.get('buildSettings', {}) if key.startswith('CODE_SIGN_ENTITLEMENTS')]
+    if entitlements:
+        raise SystemExit('Release configuration contains CODE_SIGN_ENTITLEMENTS: ' + ', '.join(sorted(entitlements)))
 releases = 0
 for target in objects.values():
     if target.get('isa') != 'PBXNativeTarget' or target.get('productType') != 'com.apple.product-type.application': continue
@@ -59,5 +64,9 @@ for source in sources.glob('*.swift'):
     text = source.read_text()
     for token in ('PushDiagnosticsView(', 'ManualHomeserverLoginView('):
         if token in text: guarded(source, token)
+core = root / 'Sources/BotvilleCore'
+guarded(core / 'PushRegistrar.swift', 'private static let isDebugBuild = true')
+if 'PushHTTPPolicy.permitsHTTP(allowHTTP)' not in (core / 'MatrixService.swift').read_text():
+    raise SystemExit('MatrixService must delegate push HTTP policy to PushHTTPPolicy')
 print('Release isolation check passed')
 PY

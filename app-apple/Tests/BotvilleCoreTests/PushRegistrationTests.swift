@@ -183,6 +183,39 @@ final class PushRegistrationTests: XCTestCase {
         XCTAssertEqual(DevicePushToken.hexadecimal(Data([0x00, 0x0A, 0xBE, 0xFF])), "000abeff")
     }
 
+    func testReleasePushHTTPPolicyRejectsHTTPRegardlessOfOptIn() throws {
+        for allowHTTP in [false, true] {
+            let permitsHTTP = PushHTTPPolicy.permitsHTTP(allowHTTP, isDebugBuild: false)
+            XCTAssertThrowsError(try PushNotifyURLPolicy.validatedURL(
+                "http://localhost:5000/_matrix/push/v1/notify", allowHTTP: permitsHTTP
+            )) { error in
+                XCTAssertEqual(error as? PushPusherDataError, .invalidURL)
+            }
+            XCTAssertEqual(try PushNotifyURLPolicy.validatedURL(
+                "https://sygnal.example.invalid/_matrix/push/v1/notify", allowHTTP: permitsHTTP
+            ).scheme, "https")
+        }
+    }
+
+    func testDebugPushHTTPPolicyRequiresExplicitOptIn() throws {
+        let http = "http://localhost:5000/_matrix/push/v1/notify"
+        XCTAssertThrowsError(try PushNotifyURLPolicy.validatedURL(
+            http, allowHTTP: PushHTTPPolicy.permitsHTTP(false, isDebugBuild: true)
+        ))
+        XCTAssertEqual(try PushNotifyURLPolicy.validatedURL(
+            http, allowHTTP: PushHTTPPolicy.permitsHTTP(true, isDebugBuild: true)
+        ).scheme, "http")
+    }
+
+    func testPushHTTPPolicyDefaultsToCurrentBuildConfiguration() {
+        XCTAssertFalse(PushHTTPPolicy.permitsHTTP(false))
+        #if DEBUG
+        XCTAssertTrue(PushHTTPPolicy.permitsHTTP(true))
+        #else
+        XCTAssertFalse(PushHTTPPolicy.permitsHTTP(true))
+        #endif
+    }
+
     func testNotifyURLPolicySeparatesReleaseAndDebugHTTPRules() throws {
         let https = "https://sygnal.example.invalid/_matrix/push/v1/notify"
         XCTAssertEqual(try PushNotifyURLPolicy.validate(https).absoluteString, https)

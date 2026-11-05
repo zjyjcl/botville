@@ -1007,11 +1007,7 @@ public final class MatrixService: ObservableObject {
     /// owns persistence of the non-secret URL; the access token and APNs token
     /// never leave memory except in the authenticated Matrix request.
     public func configurePush(notifyURL: String, deviceDisplayName: String, allowHTTP: Bool = false) async throws {
-        #if DEBUG
-        let permitsHTTP = allowHTTP
-        #else
-        let permitsHTTP = false
-        #endif
+        let permitsHTTP = PushHTTPPolicy.permitsHTTP(allowHTTP)
         let url = try PushNotifyURLPolicy.validatedURL(notifyURL, allowHTTP: permitsHTTP)
         pushConfiguration = (url, deviceDisplayName)
         pushRegistrationError = nil
