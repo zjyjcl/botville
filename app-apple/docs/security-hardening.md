@@ -12,7 +12,7 @@
 
 ## 推送与错误分类（#86 / #87）
 
-`PushPusherData` 的构造与 Codable 解码共用 `URLComponents` 校验：只接受 HTTPS；要求非空 host，`percentEncodedHost` 不含 `%`；拒绝 userinfo、fragment、空白、控制字符和 IPv6 zone。原始 authority 的端口必须是 1–65535 的十进制整数，不能依赖 `components.port == nil` 判定“未指定端口”，从而拒绝空端口和整数溢出。测试覆盖 `%40/%00/%20/%09/%5c/%2f`、超长端口、构造/Codable/嵌套解码，以及合法 wire-format roundtrip 与 Noop 注册。Homeserver 复用相同 authority 校验；旧 HTTP 记录先去除首尾空白再按当前构建策略判定。
+`PushPusherData` 的构造、URL 校验与 Codable 解码共用 `URLComponents` 的语法检查：默认只接受 HTTPS。DEBUG HTTP 例外只适用于调用方在 `PushPusherData(url:allowHTTP:)` 或 `PushNotifyURLPolicy.validatedURL(_:allowHTTP:)` 中显式请求 HTTP 的入口，模型层通过 `PushHTTPPolicy` 放行；Codable 解码始终只接受 HTTPS。Release 的公开模型入口强制拒绝 HTTP，不能依赖 `MatrixService` 调用方门控。要求非空 host，`percentEncodedHost` 不含 `%`；拒绝 userinfo、fragment、空白、控制字符和 IPv6 zone。原始 authority 的端口必须是 1–65535 的十进制整数，不能依赖 `components.port == nil` 判定“未指定端口”，从而拒绝空端口和整数溢出。测试覆盖 `%40/%00/%20/%09/%5c/%2f`、超长端口、构造/Codable/嵌套解码，以及合法 wire-format roundtrip 与 Noop 注册。Homeserver 复用相同 authority 校验；旧 HTTP 记录先去除首尾空白再按当前构建策略判定。
 
 该校验保证 URL 语法和传输协议，不是 SSRF 防火墙：合法私网/loopback IP 仍可作为部署配置，DNS 解析、重绑定和出站网络隔离由 homeserver/网关负责，不能把 URL 模型当作任意用户可选的代理目的地。PR #96 的 `docs/deploy/push-sygnal.md` 仅作接口参考：`app_id` 对应 Sygnal app、`pushkey` 为 APNs device token、`data.url` 为 HTTPS 网关；服务端 CI 的内网 HTTP 示例不放宽 Release 的 HTTPS 策略。当前真机推送接入与测试边界见 `docs/push-device.md`。
 

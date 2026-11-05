@@ -97,7 +97,7 @@ final class ReleaseIsolationTests: XCTestCase {
             for token in ["PushDiagnosticsView(", "ManualHomeserverLoginView("] where text.contains(token) { try guarded(token, at: url) }
         }
         let core = root.appendingPathComponent("Sources/BotvilleCore")
-        try guarded("private static let isDebugBuild = true", at: core.appendingPathComponent("PushRegistrar.swift"))
+        try guarded("static let isDebugBuild = true", at: core.appendingPathComponent("PushRegistrar.swift"))
         let matrixService = try String(contentsOf: core.appendingPathComponent("MatrixService.swift"), encoding: .utf8)
         XCTAssertTrue(matrixService.contains("PushHTTPPolicy.permitsHTTP(allowHTTP)"))
     }

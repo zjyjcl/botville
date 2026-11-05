@@ -20,7 +20,7 @@ swift run BotvilleApp
 
 填写完整 homeserver URL、用户名（或 `@user:server`）和密码。客户端先探测 `/_matrix/client/versions` 和 `/_matrix/client/v3/login` 的密码流；可区分发现失败、网络故障、密码错误和不支持的登录方式。SSO/OIDC 不在本轮范围内。遇到 429 / `M_LIMIT_EXCEEDED` 会显示 `Retry-After`（秒或 HTTP 日期）或 `retry_after_ms` 的等待时长；未提供时长时提示稍后重试并间隔 5 秒重试。等待期间可以取消。登录和恢复共用默认 60 秒的整体超时（可通过 `MatrixService(authenticationTimeout:)` 配置），覆盖探测、请求、SDK 初始化和恢复；超时返回可读错误。
 
-生产默认只接受 HTTPS homeserver。开发时可在 DEBUG 中显式开启本地 HTTP，且仅允许 `http://localhost` 或 `http://127.0.0.1`；默认关闭；Release 核心登录/恢复路径均忽略已保存的开发 HTTP 开关并拒绝非 HTTPS 会话。仅 Debug 的 `Info-Debug.plist` 声明 `NSAllowsLocalNetworking`；Release 的 `Info.plist` 没有 ATS 例外。具体策略及平台验证边界见[安全加固说明](docs/security-hardening.md)。URL 不接受账号密码、查询参数、片段或无效端口，且登录探测重定向必须保持同一 origin。
+生产默认只接受 HTTPS homeserver。开发时可在 DEBUG 中显式开启 HTTP，默认关闭；显式开启后仅允许 `localhost`、规范的 `.local` 名称、带字母的 Compose 单标签名称，以及私网、loopback 或 link-local 地址。Release 核心登录/恢复路径均忽略已保存的开发 HTTP 开关并拒绝非 HTTPS 会话。仅 Debug 的 `Info-Debug.plist` 声明 `NSAllowsLocalNetworking`；Release 的 `Info.plist` 没有 ATS 例外。具体策略及平台验证边界见[安全加固说明](docs/security-hardening.md)。URL 不接受账号密码、查询参数、片段或无效端口，且登录探测重定向必须保持同一 origin。
 
 ### iOS 模拟器
 
@@ -178,7 +178,7 @@ env \
 
 ## 未完成项
 
-- A1.2 完成后接入 Sygnal + APNs，并在真机验证权限、前后台/终止态、深链和换 token；本轮只交付接口与 Noop 实现。
+- Sygnal + APNs 的真实送达验收：当前已实现 APNs token 与 Matrix pusher 注册，仍需在真机验证权限、前后台/终止态、深链和换 token。
 - 非本地 homeserver、macOS UI、iOS 模拟器 UI、真机和进程重启/真实 Keychain 的端到端验收。
 - E2EE 设备验证、密钥备份/恢复和旧加密历史恢复；SSO/OIDC、多账号和设备会话管理。
 - 媒体、搜索、按房间 ID/别名主动加入、已读回执，以及 C11 规定的互操作与性能测量；C2.6 仅新增 MXID 建房和邀请入口。

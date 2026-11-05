@@ -88,7 +88,7 @@ for source in sources.glob('*.swift'):
     for token in ('PushDiagnosticsView(', 'ManualHomeserverLoginView('):
         if token in text: guarded(source, token)
 core = root / 'Sources/BotvilleCore'
-guarded(core / 'PushRegistrar.swift', 'private static let isDebugBuild = true')
+guarded(core / 'PushRegistrar.swift', 'static let isDebugBuild = true')
 if 'PushHTTPPolicy.permitsHTTP(allowHTTP)' not in (core / 'MatrixService.swift').read_text():
     raise SystemExit('MatrixService must delegate push HTTP policy to PushHTTPPolicy')
 print('Release isolation check passed')

@@ -59,12 +59,12 @@ xcodebuild -project Botville.xcodeproj -scheme BotvilleApp-iOS \
 
 | 检查 | 结果 |
 | --- | --- |
-| `swift test`，macOS | 197 项：195 通过、2 跳过、0 失败 |
+| `swift test`，macOS | 0 失败；跳过项随本机环境而定 |
 | Release 隔离脚本 | 通过 |
 | Debug，generic iOS Simulator，`CODE_SIGN_IDENTITY="-"` | BUILD SUCCEEDED |
 | Release，同上 | BUILD SUCCEEDED |
 | Release 产物 Info.plist | 四项禁止键递归检查均不存在，Bundle ID 保持不变 |
 
-两项跳过均为需要显式配置本地 Synapse 的既有集成测试。推送测试覆盖 token 编码、完整请求字段与 Bearer header、删除体 `kind:null`、列表解析/匹配、URL 两种策略、轮换删除顺序、注册响应未返回时退出、删除失败后的保留与重试，以及 Release 文件隔离。未执行 iPhone/APNs/Sygnal 的真实送达验收。
+跳过项取决于本机的 Keychain 与本地 Synapse 配置。推送测试覆盖 token 编码、完整请求字段与 Bearer header、删除体 `kind:null`、列表解析/匹配、URL 两种策略、轮换删除顺序、注册响应未返回时退出、删除失败后的保留与重试，以及 Release 文件隔离。未执行 iPhone/APNs/Sygnal 的真实送达验收。
 
 本地日志在 `.build/validation/swift-test.log`、`xcode-debug.log`、`xcode-release.log`，产物检查结果在 `product-plist-check.json`（构建目录不提交）。构建保留固定 Matrix SDK 的外部 dSYM 路径及最低 macOS 版本警告，本次未验证最低支持系统。Xcode 本轮使用 `-derivedDataPath DerivedData` 和 `-clonedSourcePackagesDirPath .build/xcode-packages`；未使用会导致本机解析出空依赖图的 `-packageCachePath` 参数。

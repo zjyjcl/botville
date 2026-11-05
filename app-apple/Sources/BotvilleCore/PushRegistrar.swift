@@ -13,32 +13,37 @@ public enum DevicePushToken {
 }
 
 /// A caller's HTTP opt-in only applies to Debug builds. Inject the build flag
-/// to exercise Release behavior in tests without exposing it on MatrixService.
+/// to exercise both configurations in tests without exposing it on public APIs.
 enum PushHTTPPolicy {
     static func permitsHTTP(_ allowHTTP: Bool, isDebugBuild: Bool = Self.isDebugBuild) -> Bool {
         isDebugBuild && allowHTTP
     }
 
     #if DEBUG
-    private static let isDebugBuild = true
+    static let isDebugBuild = true
     #else
-    private static let isDebugBuild = false
+    static let isDebugBuild = false
     #endif
 }
 
 /// The Sygnal endpoint is deliberately narrower than a generic web URL.  It
 /// has no credentials or URL parameters and always receives Matrix notify
-/// requests at this exact path. MatrixService gates the caller's `allowHTTP`
-/// opt-in through PushHTTPPolicy before passing it to this URL validator.
+/// requests at this exact path. The validator gates the caller's `allowHTTP`
+/// opt-in through PushHTTPPolicy, including calls made directly by model users.
 public enum PushNotifyURLPolicy {
     public static let requiredPath = "/_matrix/push/v1/notify"
 
     public static func validatedURL(_ value: String, allowHTTP: Bool = false) throws -> URL {
+        try validatedURL(value, allowHTTP: allowHTTP, isDebugBuild: PushHTTPPolicy.isDebugBuild)
+    }
+
+    static func validatedURL(_ value: String, allowHTTP: Bool, isDebugBuild: Bool) throws -> URL {
+        let permitsHTTP = PushHTTPPolicy.permitsHTTP(allowHTTP, isDebugBuild: isDebugBuild)
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: trimmed),
               var components = try? EndpointURLPolicy.validatedComponents(url, originalSource: trimmed),
               let scheme = components.scheme?.lowercased(),
-              scheme == "https" || (allowHTTP && scheme == "http"),
+              scheme == "https" || (permitsHTTP && scheme == "http"),
               components.query == nil, components.fragment == nil,
               components.path == requiredPath,
               components.percentEncodedPath == requiredPath else {
@@ -73,7 +78,11 @@ public struct PushPusherData: Codable, Equatable, Sendable {
     }
 
     public init(url: URL, allowHTTP: Bool, format: PushPusherDataFormat = .eventIDOnly) throws {
-        self.url = try Self.validatedAndNormalizedURL(url, allowHTTP: allowHTTP)
+        try self.init(url: url, allowHTTP: allowHTTP, isDebugBuild: PushHTTPPolicy.isDebugBuild, format: format)
+    }
+
+    init(url: URL, allowHTTP: Bool, isDebugBuild: Bool, format: PushPusherDataFormat = .eventIDOnly) throws {
+        self.url = try Self.validatedAndNormalizedURL(url, allowHTTP: allowHTTP, isDebugBuild: isDebugBuild)
         self.format = format
     }
 
@@ -92,8 +101,15 @@ public struct PushPusherData: Codable, Equatable, Sendable {
         case url, format
     }
 
-    private static func validatedAndNormalizedURL(_ url: URL, originalSource: String? = nil, allowHTTP: Bool) throws -> URL {
-        try PushNotifyURLPolicy.validatedURL(originalSource ?? url.absoluteString, allowHTTP: allowHTTP)
+    private static func validatedAndNormalizedURL(
+        _ url: URL,
+        originalSource: String? = nil,
+        allowHTTP: Bool,
+        isDebugBuild: Bool = PushHTTPPolicy.isDebugBuild
+    ) throws -> URL {
+        try PushNotifyURLPolicy.validatedURL(
+            originalSource ?? url.absoluteString, allowHTTP: allowHTTP, isDebugBuild: isDebugBuild
+        )
     }
 }
 
