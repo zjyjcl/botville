@@ -51,8 +51,8 @@ name: botville
 # fedgate-a/b are federation-stack names, kept here so the same list serves
 # it — see server/tests/test_compose_noproxy.py).
 x-noproxy-env: &noproxy-env
-  NO_PROXY: "localhost,127.0.0.1,::1,sygnal,postgres,synapse,tuwunel,continuwuity,gateway,admin,synapse-a,synapse-b,pairing-a,pairing-b,fedgate-a,fedgate-b,.local,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${BOTVILLE_NO_PROXY_EXTRA:+,${BOTVILLE_NO_PROXY_EXTRA}}"
-  no_proxy: "localhost,127.0.0.1,::1,sygnal,postgres,synapse,tuwunel,continuwuity,gateway,admin,synapse-a,synapse-b,pairing-a,pairing-b,fedgate-a,fedgate-b,.local,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${BOTVILLE_NO_PROXY_EXTRA:+,${BOTVILLE_NO_PROXY_EXTRA}}"
+  NO_PROXY: "localhost,127.0.0.1,::1,sygnal,postgres,synapse,tuwunel,continuwuity,gateway,admin,synapse-a,synapse-b,pairing-a,pairing-b,fedgate-a,fedgate-b,hs-a,hs-b,.local,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${BOTVILLE_NO_PROXY_EXTRA:+,${BOTVILLE_NO_PROXY_EXTRA}}"
+  no_proxy: "localhost,127.0.0.1,::1,sygnal,postgres,synapse,tuwunel,continuwuity,gateway,admin,synapse-a,synapse-b,pairing-a,pairing-b,fedgate-a,fedgate-b,hs-a,hs-b,.local,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${BOTVILLE_NO_PROXY_EXTRA:+,${BOTVILLE_NO_PROXY_EXTRA}}"
 
 services:
   postgres:

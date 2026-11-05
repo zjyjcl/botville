@@ -10,6 +10,9 @@ every run — no secrets or rendered configs ever ship in the repo):
                                                consumed by docker compose
                                                --env-file and server/tests/
                                                federation_e2e.py
+                                               (+ BOTVILLE_NO_PROXY_EXTRA,
+                                               propagated so the federation
+                                               compose sees it — see below)
 
 The Synapse configs deliberately stack CI-only relaxations on top of the
 standard surface (see the header comment in the template below): open
@@ -29,6 +32,16 @@ GENERATED_DIR = os.path.join(
 # Same image pin as server/compose/docker-compose.yml (kept in sync here so
 # the federation stack tests exactly the Synapse the main stack ships).
 INSTANCES = ("hs-a", "hs-b")
+
+# The federation compose interpolates ONLY from generated/federation.env
+# (Makefile FED_COMPOSE passes --env-file), never from server/compose/.env
+# where issue #134 PR1 documents BOTVILLE_NO_PROXY_EXTRA. docker-compose
+# .federation.yml pins NO_PROXY/no_proxy on every service and appends this
+# variable to the fixed list, so it must reach that env file: propagate it
+# from the shell environment first (docker compose lets process env
+# override --env-file values anyway), then server/compose/.env.
+NO_PROXY_EXTRA_KEY = "BOTVILLE_NO_PROXY_EXTRA"
+MAIN_ENV_PATH = os.path.join(SCRIPT_DIR, "..", "compose", ".env")
 
 HOMESERVER_TEMPLATE = """\
 # Rendered by server/scripts/federation-setup.py (A2.1) — throwaway paired-
@@ -77,6 +90,29 @@ def write_private(path, text):
         handle.write(text)
 
 
+def resolve_no_proxy_extra():
+    """BOTVILLE_NO_PROXY_EXTRA value for the federation env file.
+
+    Shell environment first, then the last assignment in
+    server/compose/.env if that file exists (plain KEY=VALUE lines, same
+    shape .env.example ships; surrounding quotes stripped like compose
+    does). Missing file/entry or unset var all resolve to "" — which
+    docker-compose.federation.yml renders as the bare default list.
+    """
+    value = ""
+    try:
+        with open(MAIN_ENV_PATH, encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if line.startswith(NO_PROXY_EXTRA_KEY + "="):
+                    value = line.partition("=")[2].strip()
+    except OSError:
+        pass
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    return os.environ.get(NO_PROXY_EXTRA_KEY, value).strip()
+
+
 def main():
     os.umask(0o077)
     os.makedirs(GENERATED_DIR, exist_ok=True)
@@ -100,9 +136,17 @@ def main():
         "PAIRING_ADMIN_TOKEN_{}={}\n".format(suffix, token)
         for suffix, token in sorted(tokens.items())
     )
+    # Issue #134 PR2: the only other key compose interpolates from this
+    # file; hostnames only, never a secret.
+    no_proxy_extra = resolve_no_proxy_extra()
+    env += "{}={}\n".format(NO_PROXY_EXTRA_KEY, no_proxy_extra)
     write_private(os.path.join(GENERATED_DIR, "federation.env"), env)
     print("federation-setup.py: wrote federation.env with fresh pairing admin"
           " tokens (gitignored; never commit)")
+    if no_proxy_extra:
+        print("federation-setup.py: {}={} propagated (appended to the fixed"
+              " NO_PROXY list by docker-compose.federation.yml)".format(
+                  NO_PROXY_EXTRA_KEY, no_proxy_extra))
 
 
 if __name__ == "__main__":

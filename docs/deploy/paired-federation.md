@@ -165,6 +165,33 @@ fedgate：
 | `FEDGATE_PAIRING_DB` | `pairing.db` | 配对表 SQLite（只读） |
 | `PAIRING_UPSTREAM` | 无 | pairing 服务基址；未设置时 `/_matrix/pairing/*` 返回 404 |
 
+## 主机有代理时（NO_PROXY 同样固化，issue #134）
+
+背景与完整说明见 [`docs/deploy/push-sygnal.md` §11 主机有代理时](push-sygnal.md#主机有代理时no_proxy-固化issue-134)：docker 客户端与 Docker Desktop 会把主机的 `HTTP(S)_PROXY` 注入每个新建容器，而容器内 `127.0.0.1` 是容器自己——主机上的环回代理在容器内不可达。本联邦栈的 `docker-compose.federation.yml` 顶部有**同一个 `x-noproxy-env` 锚点**，六个服务（synapse-a/b、pairing-a/b、fedgate-a/b）全部合并：固定默认名单与主 compose **逐字节相同**（单一名单服务两套栈，`server/tests/test_compose_noproxy.py` 保证不漂移），**不可覆盖**，`BOTVILLE_NO_PROXY_EXTRA` 只做追加，同样不设置/不清空 `HTTP(S)_PROXY`。
+
+- **EXTRA 怎么传进来**：本栈 compose 插值只用 `server/compose/federation/generated/federation.env`（Makefile `FED_COMPOSE` 的 `--env-file`），不读主栈的 `server/compose/.env`。`server/scripts/federation-setup.py` 因此把 `BOTVILLE_NO_PROXY_EXTRA`（shell 环境变量优先，其次 `server/compose/.env` 里的同名项）写进 `federation.env`；`make federation-e2e` 每次先跑 setup，一处配置两套栈共用。
+- **`hs-a,hs-b` 已在默认名单内**：联邦对端按 server_name 解析到 fedgate 的网络别名 `hs-a`/`hs-b`（是别名不是服务名），而 pairing 的对端 key 校验用标准库 `urllib`（遵循 `*_PROXY`），所以这两个别名已固化进默认 NO_PROXY（两份 compose 一致），无需再设 `BOTVILLE_NO_PROXY_EXTRA`。fedgate 自身转发走 `http.client`（不读代理环境变量），不受影响。
+
+主机有代理时的自检（宿主机执行；先 `make federation-e2e` 让 `federation.env` 存在）：
+
+```bash
+# 1) 容器内 NO_PROXY 生效：synapse-a 与 fedgate-a 大小写两个变量都在、含六个服务名；
+#    若同时看到 HTTP_PROXY=...127.0.0.1...，说明 docker 注入了环回代理（处理见 push-sygnal.md §11）。
+docker compose -p botville-fed -f server/compose/federation/docker-compose.federation.yml \
+    --env-file server/compose/federation/generated/federation.env \
+    exec -T synapse-a env | grep -i proxy
+docker compose -p botville-fed -f server/compose/federation/docker-compose.federation.yml \
+    --env-file server/compose/federation/generated/federation.env \
+    exec -T fedgate-a env | grep -i proxy
+
+# 2) fedgate -> synapse 直连可达（FEDGATE_UPSTREAM；NO_PROXY 含 synapse-a 时 urllib 不经代理）
+docker compose -p botville-fed -f server/compose/federation/docker-compose.federation.yml \
+    --env-file server/compose/federation/generated/federation.env \
+    exec -T fedgate-a python -c \
+    "import urllib.request; print(urllib.request.urlopen('http://synapse-a:8008/health', timeout=5).status)"
+#    期望 200
+```
+
 ## 出站硬化（后续，不在本 PR）
 
 切断的**入站**验收语义（对方不能再向我方发消息、不能从我方拉取内容）已由双方入站闸门闭环；「我方 homeserver 主动出站仍会尝试」的硬化（配对变更时重渲染 HS 白名单并编排重启，Tuwunel/continuwuity 用 allowed/forbidden 列表；含对拒不配合对端的出站停推与切断窗口内容栅栏）列为后续任务。同样不在本 PR：App 侧扫码 UI（C2.2）、跨服 AI 关系（A2.3）、公网 TLS 证书的获取与续期流程、媒体端点的签名/令牌校验。
