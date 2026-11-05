@@ -56,6 +56,14 @@ botville://pair?v=1&hs=<https>&gw=<https，可选>&fp=sha256:<base64url，可选
 
 ## TLS 固定与边界
 
+> **语义待对齐（#132）**：下列「系统证书链和 hostname 验证仍须通过」以及按 host
+> （而非 `(scheme, host, port)`）套用 pin 的描述，是 #130 合入时的**旧语义**。
+> 契约真源已改为 `docs/contracts/pairing-qr.md` §3.3.2（有 `fp`：SPKI pin **替代**
+> 系统根 + 叶证自锚的 SAN/有效期/serverAuth EKU；作用域 `(scheme, host, port)`；
+> `gw` 仅同源复用 pin）。App / `PairingTLS` 实现与本文对齐工作见 C 线 #132-PR2；
+> 在此之前以契约文档为准，本文不得覆盖契约。
+
+
 有 `fp` 时，URLSession delegate 对 **hs 主机**的叶证书 SPKI SHA-256 做固定：覆盖兑换及本 App URLSession 发起的同 host 凭证交换和网关请求。系统证书链和 hostname 验证仍须通过；固定失败归类为 `certificateMismatch`，不作为一般网络失败。禁止跨 origin 重定向，不把兑换码或凭证发送到未确认的服务器。
 
 确认页将摘要转换为每 4 个十六进制字符一组显示，并标明 SHA-256。`gw` 与 `hs` 不是同一 host 时不得因指纹而拒绝：网关请求仅在 `gw` host 与 `hs` host 相同才套用该 pin，否则使用系统 TLS。网关 URL 和指纹作为非秘密配置随 Matrix 会话保存在 Keychain，恢复及 soft logout 重新认证时保留；配对码和兑换所得临时 token 不保存。动态页启用已配对网关时复用固定传输，设置页不能将其静默改建为无指纹客户端。这里的网关固定范围为 `HTTPGatewayClient` 的 API 请求；WebKit 模块网页仍遵循现有网页 origin 与系统 TLS 策略。
