@@ -548,10 +548,11 @@ if [[ "$(env_flag BOTVILLE_APNS_ENABLED false)" == "true" ]]; then
     fi
     if [[ -f "${apns_key_file}" ]]; then
         # stat only — the key's contents are never read, hashed or echoed
-        # here (mode/size are metadata, not key material). BSD stat first,
-        # GNU stat as fallback.
-        key_mode="$(stat -f '%Lp' "${apns_key_file}" 2>/dev/null || stat -c '%a' "${apns_key_file}" 2>/dev/null || echo '')"
-        key_size="$(stat -f '%z' "${apns_key_file}" 2>/dev/null || stat -c '%s' "${apns_key_file}" 2>/dev/null || echo 0)"
+        # here (mode/size are metadata, not key material). GNU stat first
+        # (on Linux `stat -f` means filesystem status and would succeed with
+        # the wrong data), BSD stat as fallback.
+        key_mode="$(stat -c '%a' "${apns_key_file}" 2>/dev/null || stat -f '%Lp' "${apns_key_file}" 2>/dev/null || echo '')"
+        key_size="$(stat -c '%s' "${apns_key_file}" 2>/dev/null || stat -f '%z' "${apns_key_file}" 2>/dev/null || echo 0)"
         if [[ "${key_size}" =~ ^[0-9]+$ && "${key_size}" -gt 0 ]]; then
             if [[ "${key_mode}" != "600" && "${key_mode}" != "400" ]]; then
                 echo "init.sh: ${apns_key_file} must have mode 600 or 400 (found ${key_mode}); refusing to continue." >&2
