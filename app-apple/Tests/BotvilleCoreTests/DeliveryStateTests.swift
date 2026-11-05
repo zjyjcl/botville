@@ -73,7 +73,7 @@ final class DeliveryStateTests: XCTestCase {
 
     func testNoopPushRegistrarMakesNoConfigurationAssumptions() async throws {
         let registration = PushRegistration(
-            appID: "org.example.botville",
+            appID: "com.zjyjcl.botville.apns",
             pushKey: "test-key",
             appDisplayName: "botville",
             data: try PushPusherData(url: XCTUnwrap(URL(string: "https://push.example.org/notify")))

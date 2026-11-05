@@ -8,7 +8,7 @@ import XCTest
 final class PushRegistrationTests: XCTestCase {
     func testRegistrationEncodesMatrixPusherWireNames() throws {
         let registration = PushRegistration(
-            appID: "org.example.botville",
+            appID: "com.zjyjcl.botville.apns",
             pushKey: "placeholder-device-key",
             appDisplayName: "botville",
             data: try PushPusherData(url: XCTUnwrap(URL(string: "https://push.example.org/_matrix/push/v1/notify"))),
@@ -18,7 +18,7 @@ final class PushRegistrationTests: XCTestCase {
         )
         let json = try jsonObject(registration)
 
-        XCTAssertEqual(json["app_id"] as? String, "org.example.botville")
+        XCTAssertEqual(json["app_id"] as? String, "com.zjyjcl.botville.apns")
         XCTAssertEqual(json["pushkey"] as? String, "placeholder-device-key")
         XCTAssertEqual(json["app_display_name"] as? String, "botville")
         XCTAssertEqual(json["kind"] as? String, "http")
@@ -31,7 +31,7 @@ final class PushRegistrationTests: XCTestCase {
 
     func testDeletionEncodesNilKindAndNoPusherURL() throws {
         let deletion = PushRegistration.deletion(
-            appID: "org.example.botville",
+            appID: "com.zjyjcl.botville.apns",
             pushKey: "placeholder-device-key",
             appDisplayName: "botville"
         )
@@ -95,7 +95,7 @@ final class PushRegistrationTests: XCTestCase {
     func testPusherDataAndRegistrationRoundTrip() throws {
         let data = try PushPusherData(url: XCTUnwrap(URL(string: "https://push.example.org/notify")), format: .eventIDOnly)
         let registration = PushRegistration(
-            appID: "org.example.botville",
+            appID: "com.zjyjcl.botville.apns",
             pushKey: "placeholder-device-key",
             appDisplayName: "botville",
             data: data
@@ -137,7 +137,7 @@ final class PushRegistrationTests: XCTestCase {
 
     func testRegistrationRejectsNestedUnknownPusherFormat() throws {
         let json = Data("""
-        {"app_id":"org.example.botville","pushkey":"placeholder-device-key","app_display_name":"botville","kind":"http","append":false,"data":{"url":"https://push.example.org/notify","format":"future_format"}}
+        {"app_id":"com.zjyjcl.botville.apns","pushkey":"placeholder-device-key","app_display_name":"botville","kind":"http","append":false,"data":{"url":"https://push.example.org/notify","format":"future_format"}}
         """.utf8)
 
         XCTAssertThrowsError(try JSONDecoder().decode(PushRegistration.self, from: json)) { error in
@@ -155,7 +155,7 @@ final class PushRegistrationTests: XCTestCase {
 
     func testRegistrationRejectsNestedInvalidPusherURL() throws {
         let data = Data("""
-        {"app_id":"org.example.botville","pushkey":"placeholder-device-key","app_display_name":"botville","kind":"http","append":false,"data":{"url":"https://push.example.org%40evil.example/notify"}}
+        {"app_id":"com.zjyjcl.botville.apns","pushkey":"placeholder-device-key","app_display_name":"botville","kind":"http","append":false,"data":{"url":"https://push.example.org%40evil.example/notify"}}
         """.utf8)
 
         XCTAssertThrowsError(try JSONDecoder().decode(PushRegistration.self, from: data)) { error in
@@ -165,7 +165,7 @@ final class PushRegistrationTests: XCTestCase {
 
     func testNoopRegistrarAcceptsValidatedHTTPSRegistration() async throws {
         let registration = PushRegistration(
-            appID: "org.example.botville",
+            appID: "com.zjyjcl.botville.apns",
             pushKey: "placeholder-device-key",
             appDisplayName: "botville",
             data: try PushPusherData(url: XCTUnwrap(URL(string: "https://push.example.org/notify")))
