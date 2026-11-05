@@ -24,8 +24,8 @@ public final class MatrixService: ObservableObject {
     @Published public private(set) var isRestoring = false
     @Published public private(set) var sessionError: String?
     @Published public private(set) var connectionStatus: ConnectionStatus = .idle
-    /// Device token is kept only in process memory. It is intentionally never
-    /// copied to the session store or UserDefaults.
+    /// The Base64 device token is shared by pusher requests and diagnostics.
+    /// It stays in process memory, never in the session store or UserDefaults.
     @Published public private(set) var pushToken: String?
     @Published public private(set) var pushRegistrationStatus = "尚未注册推送。"
     @Published public private(set) var pushRegistrationError: String?
@@ -1017,9 +1017,9 @@ public final class MatrixService: ObservableObject {
     }
 
     /// Called by the iOS application delegate after APNs succeeds. Conversion
-    /// happens before publication so the UI can copy a stable lower-case value.
+    /// happens before publication so diagnostics display and copy the pushkey.
     public func receivePushDeviceToken(_ token: Data) {
-        let value = DevicePushToken.hexadecimal(token)
+        let value = DevicePushToken.base64(token)
         guard !value.isEmpty else { return }
         pushToken = value
         pushRegistrationStatus = "已取得设备令牌，等待注册。"

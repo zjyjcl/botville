@@ -178,9 +178,12 @@ final class PushRegistrationTests: XCTestCase {
         try await NoopPushRegistrar().register(registration)
     }
 
-    func testDeviceTokenUsesLowercaseHexadecimal() {
-        XCTAssertEqual(DevicePushToken.hexadecimal(Data()), "")
-        XCTAssertEqual(DevicePushToken.hexadecimal(Data([0x00, 0x0A, 0xBE, 0xFF])), "000abeff")
+    func testDeviceTokenUsesStandardBase64WithPadding() {
+        XCTAssertEqual(DevicePushToken.base64(Data()), "")
+        XCTAssertEqual(
+            DevicePushToken.base64(Data(0x00...0x1F)),
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+        )
     }
 
     func testReleaseNotifyURLPolicyRejectsHTTPRegardlessOfOptIn() throws {
@@ -290,7 +293,7 @@ final class PushRegistrationTests: XCTestCase {
         RecordingURLProtocol.recorder = recorder
         defer { RecordingURLProtocol.recorder = nil }
         let transport = URLSessionMatrixPusherTransport(session: session)
-        let registration = PushRegistration(appID: "com.zjyjcl.botville.apns", pushKey: "00ab", appDisplayName: "botville",
+        let registration = PushRegistration(appID: "com.zjyjcl.botville.apns", pushKey: "AKs=", appDisplayName: "botville",
                                             data: try PushPusherData(url: XCTUnwrap(URL(string: "https://sygnal.example.invalid/_matrix/push/v1/notify"))),
                                             append: false, deviceDisplayName: "iPhone", language: "zh-CN")
         try await transport.setPusher(homeserver: XCTUnwrap(URL(string: "https://matrix.test/base")), accessToken: "token", registration: registration)
@@ -301,7 +304,7 @@ final class PushRegistrationTests: XCTestCase {
         let body = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any])
         XCTAssertEqual(body["kind"] as? String, "http")
         XCTAssertEqual(body["app_id"] as? String, "com.zjyjcl.botville.apns")
-        XCTAssertEqual(body["pushkey"] as? String, "00ab")
+        XCTAssertEqual(body["pushkey"] as? String, "AKs=")
         XCTAssertEqual(body["app_display_name"] as? String, "botville")
         XCTAssertEqual(body["device_display_name"] as? String, "iPhone")
         XCTAssertEqual(body["lang"] as? String, "zh-CN")

@@ -3,12 +3,12 @@
 
 import Foundation
 
-/// APNs device tokens are an opaque byte sequence.  Matrix expects the stable,
-/// lowercase hexadecimal form; keeping this conversion pure makes it safe to
-/// test without ever logging the token.
+/// APNs device tokens are an opaque byte sequence. The pusher pushkey uses
+/// standard Base64 with padding, matching Element iOS and Sygnal's default.
+/// Keeping this conversion pure makes it safe to test without logging the token.
 public enum DevicePushToken {
-    public static func hexadecimal(_ token: Data) -> String {
-        token.map { String(format: "%02x", $0) }.joined()
+    public static func base64(_ token: Data) -> String {
+        token.base64EncodedString()
     }
 }
 

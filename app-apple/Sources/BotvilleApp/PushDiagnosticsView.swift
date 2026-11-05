@@ -193,12 +193,12 @@ struct PushDiagnosticsView: View {
                 }
                 .disabled(device.isRequesting)
             }
-            Section("Device token") {
+            Section("Device token（Base64 / pushkey）") {
                 if let token = service.pushToken {
                     Text(token)
                         .font(.system(.caption, design: .monospaced))
                         .textSelection(.enabled)
-                    Button(didCopy ? "已复制" : "复制 token") {
+                    Button(didCopy ? "已复制" : "复制 Base64 token") {
                         // Explicit user action only. On iOS keep the clipboard
                         // local to this device, with a short expiration.
 #if os(iOS)
