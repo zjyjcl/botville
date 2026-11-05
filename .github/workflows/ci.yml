@@ -363,6 +363,9 @@ jobs:
               "APNS_PLATFORM": "sandbox",
               # Public push domain for the reverse proxy (docs only).
               "BOTVILLE_PUSH_DOMAIN": "<push-domain>",
+              # Issue #128: push.<domain> stays unexposed by default;
+              # true only for the optional public reverse-proxy mode.
+              "BOTVILLE_PUSH_PUBLIC": "false",
               "COMPOSE_PROJECT_NAME": "botville",
               "BOTVILLE_DOCKER_SUBNET": "172.31.250.0/24",
               # Dynamic-address pool of the compose network; keeps docker's
