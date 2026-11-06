@@ -262,8 +262,16 @@ final class PushNotificationRouteStore: ObservableObject {
 }
 
 final class PushApplicationDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
+    // UNUserNotificationCenter.delegate is weak; keep this object as the
+    // UIApplicationDelegateAdaptor instance and re-assert ownership early and
+    // on every foreground activation so willPresent is not skipped.
+    override init() {
+        super.init()
+        Self.installNotificationDelegate(self)
+    }
+
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
-        UNUserNotificationCenter.current().delegate = self
+        Self.installNotificationDelegate(self)
         if let userInfo = launchOptions?[.remoteNotification] as? [AnyHashable: Any] {
             let route = PushNotificationRoute.parse(userInfo)
             Task { @MainActor in PushNotificationRouteStore.shared.receive(route) }
@@ -271,15 +279,23 @@ final class PushApplicationDelegate: NSObject, UIApplicationDelegate, UNUserNoti
         return true
     }
 
+    func applicationDidBecomeActive(_ application: UIApplication) {
+        Self.installNotificationDelegate(self)
+    }
+
+    private static func installNotificationDelegate(_ delegate: UNUserNotificationCenterDelegate) {
+        UNUserNotificationCenter.current().delegate = delegate
+    }
+
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
                                             withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        let policy = PushNotificationPresentation.foreground
-        var options: UNNotificationPresentationOptions = []
-        if policy.contains(.banner) { options.insert(.banner) }
-        if policy.contains(.list) { options.insert(.list) }
-        if policy.contains(.sound) { options.insert(.sound) }
-        if policy.contains(.badge) { options.insert(.badge) }
-        completionHandler(options)
+        // Map Core policy → UN bits (banner=1<<4, list=1<<3). Call on main; some
+        // iOS 17–27 builds suppress heads-up if the handler races off-main.
+        let options = UNNotificationPresentationOptions(
+            rawValue: PushNotificationPresentation.foreground.unNotificationPresentationRawValue)
+        DispatchQueue.main.async {
+            completionHandler(options)
+        }
     }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,

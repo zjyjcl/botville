@@ -27,7 +27,7 @@ NSE 的角标策略仍是**保留 APNs/default payload 已给出的系统值**�
 
 ## PR3 通知交互
 
-- iOS 主 App 在 Debug 和 Release 都挂载 `UNUserNotificationCenterDelegate`。前台收到通知时请求 [`banner` / `list` / `sound` / `badge`](https://developer.apple.com/documentation/usernotifications/unnotificationpresentationoptions) 展示，实际横幅/声音仍受用户系统通知设置与专注模式控制。APNs token 注册、权限申请及诊断页仍只编译进 Debug。
+- iOS 主 App 在 Debug 和 Release 都挂载 `UNUserNotificationCenterDelegate`。`UNUserNotificationCenter.current().delegate` 在 AppDelegate `init`、`didFinishLaunching` 与 `applicationDidBecomeActive` 重申（该属性为 weak）。前台 `willPresent` 在主线程回传与系统一致的 raw bits：`banner`（1<<4）/`list`（1<<3）/`sound`/`badge`（不是已弃用的单独 `.alert`）。后台/被杀不走 `willPresent`，由系统直接展示 NSE 替换后的内容。实际横幅/声音仍受用户系统通知设置与专注模式控制。APNs token 注册、权限申请及诊断页仍只编译进 Debug。
 - 点击通知使用 Core 中的纯函数解析 `room_id`，接受与事件引用相同的顶层及两层已知包装，不依赖 `event_id` 或 payload 正文。合法 ID 切到「会话」tab 并打开对应会话；无 room 或非法字段则清除会话选择并回房间列表。冷启动点击在根视图就绪前保留待处理路由。
 - NSE 仍为 `event_id_only`，`default_payload` 仍精确为 `{"aps":{"mutable-content":1,"alert":{"body":"…"}}}`；没有改成通用「新消息」alert，没有从 payload 取正文或显示名，没有修改配对 TLS 或 #132 路径。Release 的 APNs entitlement、诊断入口、局域网 HTTP 与手动 homeserver 隔离不变。
 
