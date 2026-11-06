@@ -52,7 +52,7 @@ botville 已有一套二维码配对：A2.1 的 `botville-pair:v1:…`（见
   │                       │ 兑换端点      │ ③ 200：校验 homeserver 与 URI 逐字符一致
   │                       │ 限流(IP+全局) │    （§5.2，不一致即拒绝）
   │                       │ 事务内原子核销 │ ④ 用 auth.token 走 Matrix 注册/登录
-  │                       │ 返回 auth 令牌 │ ⑤ GET features_url 拉取功能清单
+  │                       │ 返回 auth 令牌 │ ⑤ 有网关时 GET features_url 拉取功能清单
 ```
 
 - 兑换端点挂在**二维码中 hs 域名**下（`{hs}/_botville/pair/redeem`）；部署上可由
@@ -73,7 +73,7 @@ botville://pair?v=1&hs=<https-url>[&gw=<https-url>][&fp=<spki-hash>]&code=<b64ur
 |---|---|---|---|
 | `v` | ✅ | 固定字符串 `"1"` | 契约版本。未知值（`2`、`01`、`1.0`…）整体拒绝；旧 App 遇新 `v` 应提示升级 |
 | `hs` | ✅ | `https://` 绝对 URL（§3.2） | homeserver 基址；兑换端点由它拼出 |
-| `gw` | ❌ | `https://` 绝对 URL（§3.2） | AI 网关基址；无网关部署省略（见 §5.1.1「无网关时的行为」）。出现时仍须通过 §3.2 全部校验，空值（`gw=`）按格式错误拒绝 |
+| `gw` | ❌ | `https://` 绝对 URL（§3.2） | AI 网关基址；无网关部署省略——该配对为 **chat-only**（见 §5.1.1「无网关时的行为」）。出现时仍须通过 §3.2 全部校验，空值（`gw=`）按格式错误拒绝 |
 | `fp` | ❌ | `sha256:<base64url-43>`（§3.3） | 叶证 SPKI sha256；有则按 §3.3.2（pin **替代**系统根 + 自锚 SAN/有效期/EKU；作用域 `(scheme,host,port)`）；**仅**自签或私有 CA 部署提供，公网 CA 省略 |
 | `code` | ✅ | 43 字符 base64url 无填充 | 32 字节随机数（§4.2） |
 | `exp` | ✅ | 十进制 Unix 秒 | code 过期时刻 = 签发时刻 + 300s |
@@ -307,7 +307,7 @@ matrix-rust-sdk（当前绑定如 `matrix-rust-components-swift` 26.x）的同�
 | `device_display_name` | ✅ | 1–128 个 Unicode 字符，App 生成的设备名 |
 
 ```json
-// 200 成功
+// 200 成功（有网关；无网关的 chat-only 响应见 §5.1.1）
 {
   "v": "1",
   "homeserver": "https://hs.example.org",
@@ -328,25 +328,33 @@ matrix-rust-sdk（当前绑定如 `matrix-rust-components-swift` 26.x）的同�
 | `gateway` | 签发时保存的 gw 原样返回；签发时无 gw 则为 `null`（字段仍必现，见下） |
 | `auth.type` | `"registration_token"`（App 用 Matrix 注册流程换新账号）或 `"login_token"`（App 用 `m.login.token` 登录已有账号）；由签发时管理面决定，契约只传输 |
 | `auth.token` | 一次性短时令牌；建议 `expires_in_ms` ≤ 600000（10 分钟）；过期未用须重新配对 |
-| `features_url` | 功能清单（capability manifest）拉取地址，`https://` URL；其内容结构不在本契约（见网关契约） |
+| `features_url` | **可选**（总管拍板，不列入 OpenAPI `required`）：功能清单（capability manifest）拉取地址，`https://` URL，内容结构不在本契约（见网关契约）。`gateway` 为 null（签发无 gw，chat-only）的响应**应省略**本字段——即使出现，App 也须忽略、不得据此启用网关功能；`gateway` 非 null 时服务端**应**提供，App 在提供时拉取 |
 
 `registration_token` 与 `login_token` 在 homeserver 侧的具体核销（注册流程 / 登录
 流程）由服务端实现负责，本契约只规定传输格式、短时性与一次性语义。
 
-### 5.1.1 无网关时的行为
+### 5.1.1 无网关时的行为（chat-only，Option A 定稿）
 
 `gw` 是可选参数（§3.1）：无网关部署——App 所需能力全部由 hs 承载——签发时省略
-`gw`。此时：
+`gw`。总管 2026-11-06 拍板（Option A，#128/#132）：**二维码省略 `gw` 的配对是纯
+聊天形态（chat-only）**。此时：
 
 - **App 只使用 `hs`**；兑换端点只挂在 hs 域名下（`POST {hs}/_botville/pair/redeem`），
   **`gw` 从不承载兑换**——无论二维码里有没有 `gw`，App 都不得向任何 gw 地址发
   兑换请求（§2 的"兑换端点挂在二维码中 hs 域名下"对两种部署同样成立）；
 - 签发时无 `gw` 的配对，成功响应的 `gateway` 字段为 **`null`**：字段本身仍必须
   出现（OpenAPI 中 `required` 且 `type: [string, "null"]`），只是值为 null；
-- `features_url` 仍为必填的 `https://` URL（指向该部署实际承载功能清单的服务）。
+- **chat-only 是该配对生命周期内的固定形态**：App **不得**在之后为该配对启用
+  网关功能——即使运维后来给部署加了网关，或某个兑换/后续响应里出现 `gateway`
+  / `features_url`（未请求的网关信息一律忽略，维持 chat-only）；
+- `features_url` 为**可选**字段（不列入 OpenAPI `required`）：`gateway` 为 null 的
+  成功响应**应省略** `features_url`（无网关部署没有功能清单可指；即使出现，App
+  也须忽略、不得据此启用网关功能）；`gateway` 非 null 时服务端**应**提供，App
+  在提供时按现状拉取功能清单。
 
 完整示例：无 `gw` 的有效二维码 `examples/pairing-qr/uri-valid-no-gw.txt`，对应
-`gateway: null` 的成功响应 `examples/pairing-qr/redeem-200-no-gateway.json`。
+`gateway: null` 且**不含** `features_url` 的成功响应
+`examples/pairing-qr/redeem-200-no-gateway.json`。
 
 ### 5.2 hs 一致性规则（防篡改与配置漂移）
 
@@ -389,9 +397,11 @@ matrix-rust-sdk（当前绑定如 `matrix-rust-components-swift` 26.x）的同�
 |---|---|
 | `docs/contracts/pairing-qr.md` | 本文档：人类可读契约（URI、生命周期、兑换、安全） |
 | `docs/contracts/pairing-redeem.openapi.yaml` | OpenAPI 3.1 片段：redeem 请求/响应/全部错误（机器可读，冲突以此为准） |
-| `docs/contracts/examples/pairing-qr/` | mock 示例：3 个有效 URI、8 个无效 URI、兑换请求、3 个 200、5 个错误体 |
+| `docs/contracts/examples/pairing-qr/` | mock 示例：3 个有效 URI（含 `uri-valid-no-gw.txt`）、8 个无效 URI、兑换请求、3 个 200（`redeem-200-no-gateway.json` 无 `features_url`，§5.1.1）、5 个错误体；另含 `README.md`（本目录是 App fixture 的单一来源，见下） |
 | `server/pairing_qr_contract.py` | 标准库参考实现：`parse_pair_uri` / `validate_redeem_response` / `validate_error` |
 | `server/tests/test_pairing_qr_contract.py` | 单测：示例分类、拒绝规则、hs 一致性、429 必带字段、OpenAPI 错误码覆盖、密钥扫描 |
+| `scripts/sync-pairing-qr-fixtures.sh` | 把示例目录同步为 App 测试 fixture（`--check` 供 CI 守卫，漂移即失败） |
+| `app-apple/Tests/BotvilleCoreTests/Fixtures/pairing-qr-contract/` | **生成副本，勿手改**：来源 `docs/contracts/examples/pairing-qr/`，文件集合与内容逐字节一致（CI 校验） |
 
 ## 8. 不在本契约内（后续 PR）
 
@@ -402,3 +412,21 @@ matrix-rust-sdk（当前绑定如 `matrix-rust-components-swift` 26.x）的同�
 - `registration_token` / `login_token` 在 homeserver 侧的核销实现；
 - `features_url` 指向的功能清单内容结构（网关契约）；
 - 管理页对签发记录的列表/筛选/批量作废等运维功能细节。
+
+## 9. C 线落地清单（chat-only 定稿 / features_url 可选）
+
+Option A 定稿（2026-11-06，#128/#132）合入后，C 线（App）须确认与跟进：
+
+1. App 继续把「二维码无 `gw` / 兑换响应 `gateway: null`」的会话按 **chat-only**
+   对待——在该配对的**生命周期内**不得启用网关功能，即使部署后来加了网关
+   （App 侧不存在「后补启用网关」的路径）；
+2. chat-only 时继续丢弃 / 不使用 `features_url`（既有行为，保持不变）；
+3. 二维码带 `gw` 且兑换响应返回非 null `gateway` + `features_url` 时，继续按
+   现状拉取功能清单；
+4. 本 PR 已把 App fixture 同步为与 `docs/contracts/examples/pairing-qr/` 逐字节
+   一致（含新增的 `uri-valid-no-gw.txt` / `uri-invalid-missing-hs.txt` /
+   `redeem-200-no-gateway.json`）；合并后拉取即可，本地 App 测试应以该单一来源
+   通过；
+5. 若 App 侧还有硬编码断言假设「无网关成功响应必带 `features_url`」，只改
+   测试断言，不改运行时行为；
+6. 本契约 PR 不改 PairingTLS / pin 行为（已在 #141 处理）。

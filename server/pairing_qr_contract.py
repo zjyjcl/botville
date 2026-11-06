@@ -14,6 +14,9 @@ Python 标准库 only；无网络、无存储、无副作用。
                                        二维码中的 hs 逐字符一致（失败抛
                                        PairRedeemError），返回仅含已知字段的副本；
                                        gateway 为 null 表示签发时无 gw
+                                       （chat-only 配对）；features_url 可选
+                                       （chat-only 响应应省略，出现时仍须
+                                       https URL）
   validate_error(d)                    校验 {errcode, error[, retry_after_ms]}
                                        错误体；BV_PAIR_RATE_LIMITED 必带
                                        retry_after_ms（失败抛 PairRedeemError）
@@ -191,11 +194,15 @@ def validate_redeem_response(resp, expected_hs):
     homeserver 与它**逐字符**比对（不做任何规范化：多一个斜杠也算不一致），
     不一致抛 PairRedeemError —— 服务端必须返回签发时保存的 hs 原文，不得按
     当前配置重算。gateway 字段必须出现：签发时有 gw 则为该 gw 原文（须 https），
-    无 gw 则为 null。未声明字段按契约忽略（前向兼容），返回仅含已知字段的副本。
+    无 gw 则为 null（chat-only 配对）。features_url **可选**（OpenAPI 不列入
+    required，#128/#132 Option A）：gateway 为 null 的响应应省略（App 须忽略
+    之、不得据此启用网关功能）；出现时仍须 https URL（不可为 null；gateway
+    非 null 时服务端应提供）。未声明字段按契约忽略（前向兼容），返回仅含
+    已知字段的副本。
     """
     if not isinstance(resp, dict):
         raise PairRedeemError("redeem response must be a JSON object")
-    for key in ("v", "homeserver", "gateway", "auth", "features_url"):
+    for key in ("v", "homeserver", "gateway", "auth"):
         if key not in resp:
             raise PairRedeemError("missing field: %s" % key)
     if resp["v"] != URI_VERSION:
@@ -207,9 +214,10 @@ def validate_redeem_response(resp, expected_hs):
             % (hs, expected_hs))
     _check_https_url(hs, "homeserver", PairRedeemError)
     gateway = resp["gateway"]
-    if gateway is not None:  # null = 签发时无 gw（gw 可选，pairing-qr.md §5.1.1）
+    if gateway is not None:  # null = 签发时无 gw（chat-only，pairing-qr.md §5.1.1）
         _check_https_url(gateway, "gateway", PairRedeemError)
-    _check_https_url(resp["features_url"], "features_url", PairRedeemError)
+    if "features_url" in resp:  # 可选；出现时仍须 https URL（值不可为 null）
+        _check_https_url(resp["features_url"], "features_url", PairRedeemError)
 
     auth = resp["auth"]
     if not isinstance(auth, dict):
@@ -225,7 +233,7 @@ def validate_redeem_response(resp, expected_hs):
     if isinstance(expires_in_ms, bool) or not isinstance(expires_in_ms, int) or expires_in_ms < 1:
         raise PairRedeemError("auth.expires_in_ms must be a positive integer (ms)")
 
-    return {
+    result = {
         "v": resp["v"],
         "homeserver": hs,
         "gateway": gateway,
@@ -234,8 +242,10 @@ def validate_redeem_response(resp, expected_hs):
             "token": auth["token"],
             "expires_in_ms": expires_in_ms,
         },
-        "features_url": resp["features_url"],
     }
+    if "features_url" in resp:  # 可选字段：缺省时返回副本也不含它
+        result["features_url"] = resp["features_url"]
+    return result
 
 
 def validate_error(err):

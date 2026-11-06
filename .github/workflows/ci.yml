@@ -35,11 +35,13 @@
 # lint:   compose config for all three profiles (+ the federation stack),
 #         shellcheck, python syntax, stdlib unit tests for the bootstrap/
 #         init scripts and the pairing package (no Docker),
-#         notify/gateway contract validation, a guard that .env.example
-#         only ever contains placeholders, a guard that no .p8 file or PEM
-#         private-key header is ever tracked (issue #4), and a guard that
-#         every image defaults to tag@sha256 digest (no :latest) identically
-#         in compose and .env.example.
+#         notify/gateway contract validation, a guard that the App pairing-qr
+#         fixtures stay a byte-identical copy of
+#         docs/contracts/examples/pairing-qr (#128/#132), a guard that
+#         .env.example only ever contains placeholders, a guard that no .p8
+#         file or PEM private-key header is ever tracked (issue #4), and a
+#         guard that every image defaults to tag@sha256 digest (no :latest)
+#         identically in compose and .env.example.
 name: CI
 
 on:
@@ -309,7 +311,13 @@ jobs:
         run: |
           shellcheck -x server/scripts/init.sh server/scripts/bootstrap-continuwuity.sh \
             server/scripts/lib.sh server/scripts/backup-synapse.sh server/scripts/restore-synapse.sh \
-            server/scripts/federation-certs.sh server/scripts/check_no_secrets.sh
+            server/scripts/federation-certs.sh server/scripts/check_no_secrets.sh \
+            scripts/sync-pairing-qr-fixtures.sh
+
+      # The docs examples dir is the single source of truth for the App-side
+      # pairing-qr test fixtures; the copy must never drift (#128/#132).
+      - name: Pairing QR fixtures in sync (docs == app-apple copy)
+        run: bash scripts/sync-pairing-qr-fixtures.sh --check
 
       - name: Python syntax
         run: |

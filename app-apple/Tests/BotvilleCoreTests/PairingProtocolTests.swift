@@ -116,12 +116,21 @@ final class PairingProtocolTests: XCTestCase {
 
     func testContractRedeemFixturesAndExactHomeserver() throws {
         let pairing = try PairingQRCode.parse("botville://pair?v=1&hs=https://hs.example.org&gw=https://gw.example.org&code=QRPAIREXAMPLECODE0000000000000000000000000A&exp=1791000000", now: Date(timeIntervalSince1970: 1_700_000_000))
+        let chatOnlyPairing = try PairingQRCode.parse(try fixtureText("uri-valid-no-gw.txt"), now: Date(timeIntervalSince1970: 1_700_000_000))
         for name in fixtureNames(prefix: "redeem-") {
             let data = try fixtureData(name)
             if name.hasPrefix("redeem-200-") {
-                let response = try HTTPPairingService.decodeResponse(data, pairing: pairing, redeemHost: pairing.homeserver.host, receivedAt: future)
+                let isChatOnly = name == "redeem-200-no-gateway.json"
+                let qr = isChatOnly ? chatOnlyPairing : pairing
+                let response = try HTTPPairingService.decodeResponse(data, pairing: qr, redeemHost: qr.homeserver.host, receivedAt: future)
                 XCTAssertEqual(response.homeserver.absoluteString, "https://hs.example.org", name)
-                XCTAssertEqual(response.gateway?.absoluteString, "https://gw.example.org", name)
+                if isChatOnly {
+                    // chat-only（契约 §5.1.1）：gateway 为 null，features_url 省略（即便出现也须忽略）
+                    XCTAssertNil(response.gateway, name)
+                    XCTAssertNil(response.featuresURL, name)
+                } else {
+                    XCTAssertEqual(response.gateway?.absoluteString, "https://gw.example.org", name)
+                }
                 XCTAssertEqual(response.auth.type, name.contains("login") ? .loginToken : .registrationToken, name)
             } else {
                 let expected: PairingError
@@ -192,7 +201,7 @@ final class PairingProtocolTests: XCTestCase {
     }
 
     private func fixtureNames(prefix: String) -> [String] {
-        ["uri-valid.txt", "uri-valid-with-fp.txt", "uri-invalid-code-length.txt", "uri-invalid-duplicate-param.txt", "uri-invalid-fp-format.txt", "uri-invalid-http-scheme.txt", "uri-invalid-missing-required.txt", "uri-invalid-unknown-param.txt", "uri-invalid-unknown-v.txt", "redeem-200-login-token.json", "redeem-200-registration-token.json", "redeem-400-bv-pair-invalid.json", "redeem-409-bv-pair-used.json", "redeem-410-bv-pair-expired.json", "redeem-410-bv-pair-revoked.json", "redeem-429-bv-pair-rate-limited.json"].filter { $0.hasPrefix(prefix) }
+        ["uri-valid.txt", "uri-valid-with-fp.txt", "uri-valid-no-gw.txt", "uri-invalid-code-length.txt", "uri-invalid-duplicate-param.txt", "uri-invalid-fp-format.txt", "uri-invalid-http-scheme.txt", "uri-invalid-missing-hs.txt", "uri-invalid-missing-required.txt", "uri-invalid-unknown-param.txt", "uri-invalid-unknown-v.txt", "redeem-200-login-token.json", "redeem-200-no-gateway.json", "redeem-200-registration-token.json", "redeem-400-bv-pair-invalid.json", "redeem-409-bv-pair-used.json", "redeem-410-bv-pair-expired.json", "redeem-410-bv-pair-revoked.json", "redeem-429-bv-pair-rate-limited.json"].filter { $0.hasPrefix(prefix) }
     }
 
     private func fixtureData(_ name: String) throws -> Data {
