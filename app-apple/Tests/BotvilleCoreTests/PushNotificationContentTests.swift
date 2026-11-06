@@ -67,17 +67,87 @@ final class PushNotificationContentTests: XCTestCase {
         let expectedPath = "/base/_matrix/client/v3/rooms/%21room%2F%25%2B%E6%B5%8B%E8%AF%95%3Aexample.test/event/%24event%2F%23%25%2B%E6%B5%8B%E8%AF%95%3Aexample.test"
         URLProtocolStub.handler = { request, protocolStub in
             XCTAssertEqual(request.httpMethod, "GET")
-            XCTAssertEqual(request.url?.path(percentEncoded: true), expectedPath)
             XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "application/json")
             XCTAssertTrue(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-only-value")
             let response = HTTPURLResponse(url: try XCTUnwrap(request.url), statusCode: 200, httpVersion: nil, headerFields: nil)!
-            let event: [String: Any] = ["type": "m.room.message", "sender": "@bob:example.test", "content": ["body": "hello"]]
             protocolStub.client?.urlProtocol(protocolStub, didReceive: response, cacheStoragePolicy: .notAllowed)
-            protocolStub.client?.urlProtocol(protocolStub, didLoad: try JSONSerialization.data(withJSONObject: event))
+            if request.url?.path(percentEncoded: true).contains("/_matrix/client/v3/profile/") == true {
+                protocolStub.client?.urlProtocol(protocolStub, didLoad: Data("{}".utf8))
+            } else {
+                XCTAssertEqual(request.url?.path(percentEncoded: true), expectedPath)
+                let event: [String: Any] = ["type": "m.room.message", "sender": "@bob:example.test", "content": ["body": "hello"]]
+                protocolStub.client?.urlProtocol(protocolStub, didLoad: try JSONSerialization.data(withJSONObject: event))
+            }
             protocolStub.client?.urlProtocolDidFinishLoading(protocolStub)
         }
         let text = try load(reference: reference, store: InMemorySharedPushCredentialsStore(credentials(homeserver: "https://example.test/base")))
         XCTAssertEqual(text, PushNotificationText(title: "@bob:example.test", body: "hello"))
+    }
+
+    func testLoaderUsesEncodedDisplaynameProfileAfterEvent() throws {
+        let reference = PushEventReference(roomID: "!room:example.test", eventID: "$event:example.test")
+        var profileRequests = 0
+        URLProtocolStub.handler = { request, protocolStub in
+            XCTAssertEqual(request.httpMethod, "GET")
+            XCTAssertTrue(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-only-value")
+            let response = HTTPURLResponse(url: try XCTUnwrap(request.url), statusCode: 200, httpVersion: nil, headerFields: nil)!
+            if request.url?.path(percentEncoded: true).contains("/_matrix/client/v3/profile/%40bob%2F%25%2B%E6%B5%8B%E8%AF%95%3Aexample.test") == true {
+                profileRequests += 1
+                protocolStub.client?.urlProtocol(protocolStub, didReceive: response, cacheStoragePolicy: .notAllowed)
+                protocolStub.client?.urlProtocol(protocolStub, didLoad: try JSONSerialization.data(withJSONObject: ["displayname": "  博布  "]))
+            } else {
+                let event: [String: Any] = ["type": "m.room.message", "sender": "@bob/%+测试:example.test", "content": ["body": "hello"]]
+                protocolStub.client?.urlProtocol(protocolStub, didReceive: response, cacheStoragePolicy: .notAllowed)
+                protocolStub.client?.urlProtocol(protocolStub, didLoad: try JSONSerialization.data(withJSONObject: event))
+            }
+            protocolStub.client?.urlProtocolDidFinishLoading(protocolStub)
+        }
+        let text = try load(reference: reference, store: InMemorySharedPushCredentialsStore(credentials()))
+        XCTAssertEqual(profileRequests, 1)
+        XCTAssertEqual(text, PushNotificationText(title: "博布", body: "hello"))
+        let longDisplayname = String(repeating: "名", count: 121)
+        XCTAssertEqual(PushNotificationText(title: "@bob:example.test", body: "hello").replacingTitle(longDisplayname).title?.count, 120)
+    }
+
+    func testLoaderKeepsEventTextWhenProfileFailsOrHasNoDisplayname() throws {
+        let reference = standardReference
+        for profileResponse: (Int, Any?) in [(401, nil), (302, nil), (200, [:]), (200, ["displayname": " \n "]), (200, ["displayname": 3])] {
+            URLProtocolStub.handler = { request, protocolStub in
+                let profile = request.url?.path(percentEncoded: true).contains("/_matrix/client/v3/profile/") == true
+                let response = HTTPURLResponse(url: try XCTUnwrap(request.url), statusCode: profile ? profileResponse.0 : 200, httpVersion: nil, headerFields: nil)!
+                protocolStub.client?.urlProtocol(protocolStub, didReceive: response, cacheStoragePolicy: .notAllowed)
+                if profile {
+                    if let payload = profileResponse.1 {
+                        protocolStub.client?.urlProtocol(protocolStub, didLoad: try JSONSerialization.data(withJSONObject: payload))
+                    }
+                } else {
+                    let event: [String: Any] = ["type": "m.room.message", "sender": "@alice:example.test", "content": ["body": "ready"]]
+                    protocolStub.client?.urlProtocol(protocolStub, didLoad: try JSONSerialization.data(withJSONObject: event))
+                }
+                protocolStub.client?.urlProtocolDidFinishLoading(protocolStub)
+            }
+            XCTAssertEqual(try load(reference: reference, store: InMemorySharedPushCredentialsStore(credentials())), PushNotificationText(title: "@alice:example.test", body: "ready"))
+        }
+    }
+
+    func testLoaderKeepsEventTextWhenProfileTimesOutOrReturnsInvalidJSON() throws {
+        for failure: (URLProtocolStub) -> Void in [
+            { $0.client?.urlProtocol($0, didFailWithError: URLError(.timedOut)) },
+            { $0.client?.urlProtocol($0, didLoad: Data("not-json".utf8)); $0.client?.urlProtocolDidFinishLoading($0) }
+        ] {
+            URLProtocolStub.handler = { request, protocolStub in
+                if request.url?.path(percentEncoded: true).contains("/_matrix/client/v3/profile/") == true {
+                    failure(protocolStub)
+                    return
+                }
+                let response = HTTPURLResponse(url: try XCTUnwrap(request.url), statusCode: 200, httpVersion: nil, headerFields: nil)!
+                let event: [String: Any] = ["type": "m.room.message", "sender": "@alice:example.test", "content": ["body": "ready"]]
+                protocolStub.client?.urlProtocol(protocolStub, didReceive: response, cacheStoragePolicy: .notAllowed)
+                protocolStub.client?.urlProtocol(protocolStub, didLoad: try JSONSerialization.data(withJSONObject: event))
+                protocolStub.client?.urlProtocolDidFinishLoading(protocolStub)
+            }
+            XCTAssertEqual(try load(reference: standardReference, store: InMemorySharedPushCredentialsStore(credentials())), PushNotificationText(title: "@alice:example.test", body: "ready"))
+        }
     }
 
     func testLoaderDegradesForHTTPNetworkInvalidJSONAndRedirect() throws {
@@ -200,6 +270,66 @@ final class PushNotificationContentTests: XCTestCase {
         wait(for: [result], timeout: 1)
         loader.expire()
         XCTAssertEqual(values, [PushNotificationText(title: standardReference.roomID, body: "ready")])
+    }
+
+    func testProfileDeadlineKeepsLoadedEventTextAndDeliversOnce() throws {
+        let profileStarted = expectation(description: "profile started")
+        let noSecondResult = expectation(description: "no second result")
+        noSecondResult.isInverted = true
+        var deferredProfile: URLProtocolStub?
+        URLProtocolStub.handler = { request, protocolStub in
+            if request.url?.path(percentEncoded: true).contains("/_matrix/client/v3/profile/") == true {
+                deferredProfile = protocolStub
+                profileStarted.fulfill()
+                return
+            }
+            let response = HTTPURLResponse(url: try XCTUnwrap(request.url), statusCode: 200, httpVersion: nil, headerFields: nil)!
+            let event: [String: Any] = ["type": "m.room.message", "sender": "@alice:example.test", "content": ["body": "ready"]]
+            protocolStub.client?.urlProtocol(protocolStub, didReceive: response, cacheStoragePolicy: .notAllowed)
+            protocolStub.client?.urlProtocol(protocolStub, didLoad: try JSONSerialization.data(withJSONObject: event))
+            protocolStub.client?.urlProtocolDidFinishLoading(protocolStub)
+        }
+        let loader = PushNotificationLoader(credentialsStore: InMemorySharedPushCredentialsStore(credentials()), configuration: stubConfiguration, timeBudget: 8)
+        let result = expectation(description: "event fallback")
+        var values = [PushNotificationText]()
+        loader.load(userInfo: payload(for: standardReference)) { value in
+            values.append(value)
+            values.count == 1 ? result.fulfill() : noSecondResult.fulfill()
+        }
+        wait(for: [profileStarted], timeout: 1)
+        loader.expire()
+        wait(for: [result], timeout: 1)
+        let profile = try XCTUnwrap(deferredProfile)
+        let response = HTTPURLResponse(url: try XCTUnwrap(profile.request.url), statusCode: 200, httpVersion: nil, headerFields: nil)!
+        profile.client?.urlProtocol(profile, didReceive: response, cacheStoragePolicy: .notAllowed)
+        profile.client?.urlProtocol(profile, didLoad: try JSONSerialization.data(withJSONObject: ["displayname": "Alice"]))
+        profile.client?.urlProtocolDidFinishLoading(profile)
+        wait(for: [noSecondResult], timeout: 0.1)
+        XCTAssertEqual(values, [PushNotificationText(title: "@alice:example.test", body: "ready")])
+    }
+
+    func testNaturalProfileDeadlineKeepsLoadedEventTextWithinRemainingBudget() throws {
+        let profileStarted = expectation(description: "profile started")
+        var profileTimeout: TimeInterval?
+        URLProtocolStub.handler = { request, protocolStub in
+            if request.url?.path(percentEncoded: true).contains("/_matrix/client/v3/profile/") == true {
+                profileTimeout = request.timeoutInterval
+                profileStarted.fulfill()
+                return
+            }
+            let response = HTTPURLResponse(url: try XCTUnwrap(request.url), statusCode: 200, httpVersion: nil, headerFields: nil)!
+            let event: [String: Any] = ["type": "m.room.message", "sender": "@alice:example.test", "content": ["body": "ready"]]
+            protocolStub.client?.urlProtocol(protocolStub, didReceive: response, cacheStoragePolicy: .notAllowed)
+            protocolStub.client?.urlProtocol(protocolStub, didLoad: try JSONSerialization.data(withJSONObject: event))
+            protocolStub.client?.urlProtocolDidFinishLoading(protocolStub)
+        }
+        let loader = PushNotificationLoader(credentialsStore: InMemorySharedPushCredentialsStore(credentials()), configuration: stubConfiguration, requestTimeout: 8, timeBudget: 0.05)
+        let result = expectation(description: "natural event fallback")
+        var received: PushNotificationText?
+        loader.load(userInfo: payload(for: standardReference)) { received = $0; result.fulfill() }
+        wait(for: [profileStarted, result], timeout: 1)
+        XCTAssertLessThanOrEqual(try XCTUnwrap(profileTimeout), 0.05)
+        XCTAssertEqual(received, PushNotificationText(title: "@alice:example.test", body: "ready"))
     }
 
     func testLoaderRejectsInvalidHomeserverAndBoundsTimeout() throws {

@@ -202,6 +202,9 @@ private final class FakeRoom: Room, @unchecked Sendable {
 }
 
 private final class FakeTimeline: Timeline, @unchecked Sendable {
+    // Opening a room now sends a best-effort read receipt. Keep this fake
+    // entirely in Swift instead of invoking the SDK with its noHandle value.
+    override func markAsRead(receiptType: ReceiptType) async throws {}
     private var listener: TimelineListener?
     private(set) var sendCalls = 0
     private(set) var retryArguments: [EventOrTransactionId] = []

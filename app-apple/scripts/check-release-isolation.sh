@@ -136,7 +136,10 @@ guarded(sources / 'LoginView.swift', 'ManualHomeserverLoginView')
 for directory in (sources, root / 'NotificationService'):
     for source in directory.rglob('*.swift'):
         text = source.read_text()
-        for token in ('PushDiagnosticsView(', 'ManualHomeserverLoginView('):
+        for token in ('PushDiagnosticsView(', 'ManualHomeserverLoginView(',
+                      'registerForRemoteNotifications(', 'requestAuthorization(',
+                      'didRegisterForRemoteNotificationsWithDeviceToken',
+                      'didFailToRegisterForRemoteNotificationsWithError'):
             if token in text: guarded(source, token)
 core = root / 'Sources/BotvilleCore'
 guarded(core / 'PushRegistrar.swift', 'static let isDebugBuild = true')
@@ -144,7 +147,8 @@ if 'PushHTTPPolicy.permitsHTTP(allowHTTP)' not in (core / 'MatrixService.swift')
     raise SystemExit('MatrixService must delegate push HTTP policy to PushHTTPPolicy')
 
 # The notification extension is a separate process boundary. It may read the
-# shared keychain item and make exactly the event GET, but must not log tokens
+# shared keychain item and make the event GET plus one best-effort profile GET,
+# but must not log tokens
 # or add plaintext storage. Derive the allowlist from the extension target so
 # new source files cannot silently bypass this boundary.
 nse_target_id = next(identifier for identifier, target in release_targets.items()
@@ -203,14 +207,16 @@ for required in ('URLSession', '/_matrix/client/v3/rooms/', '/event/', 'httpMeth
         raise SystemExit(f'NSE event fetch is missing required boundary {required!r}')
 if content_text.count('/_matrix/client/v3/rooms/') != 1:
     raise SystemExit('NSE may contain only the single authorized Matrix event endpoint')
-if content_text.count('/_matrix/client/') != 1:
-    raise SystemExit('NSE may contain no Matrix endpoint other than the authorized event GET')
-if content_text.count('dataTask(with:') != 1 or content_text.count('URLRequest(url:') != 1:
-    raise SystemExit('NSE must construct and run exactly one event request')
-if content_text.count('httpMethod =') != 1 or 'httpMethod = "GET"' not in content_text:
-    raise SystemExit('NSE event request must use exactly one GET method assignment')
+if content_text.count('/_matrix/client/v3/profile/') != 1 or content_text.count('/_matrix/client/') != 2:
+    raise SystemExit('NSE may contain only the authorized event GET and single profile GET endpoints')
+if content_text.count('dataTask(with:') != 2 or content_text.count('URLRequest(url:') != 2:
+    raise SystemExit('NSE must construct and run only the event and optional profile requests')
+if content_text.count('httpMethod =') != 2 or content_text.count('httpMethod = "GET"') != 2:
+    raise SystemExit('NSE event and profile requests must use exactly two GET method assignments')
 if 'components.percentEncodedPath = base + "/_matrix/client/v3/rooms/" + room + "/event/" + event' not in content_text:
     raise SystemExit('NSE must build only the percent-encoded room/event endpoint path')
+if 'components.percentEncodedPath = base + "/_matrix/client/v3/profile/" + user' not in {line.strip() for line in content_text.splitlines()}:
+    raise SystemExit('NSE profile request must use only the percent-encoded user profile endpoint path')
 
 # Ensure the app embeds the NSE product and declares the matching target
 # dependency; an appex reference string alone is not sufficient.

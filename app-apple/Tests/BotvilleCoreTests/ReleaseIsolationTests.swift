@@ -76,7 +76,12 @@ final class ReleaseIsolationTests: XCTestCase {
         for directory in [sources, root.appendingPathComponent("NotificationService")] {
             for url in try swiftSources(in: directory) {
                 let text = try String(contentsOf: url, encoding: .utf8)
-                for token in ["PushDiagnosticsView(", "ManualHomeserverLoginView("] where text.contains(token) { try guarded(token, at: url) }
+                for token in ["PushDiagnosticsView(", "ManualHomeserverLoginView(",
+                              "registerForRemoteNotifications(", "requestAuthorization(",
+                              "didRegisterForRemoteNotificationsWithDeviceToken",
+                              "didFailToRegisterForRemoteNotificationsWithError"] where text.contains(token) {
+                    try guarded(token, at: url)
+                }
             }
         }
         let core = root.appendingPathComponent("Sources/BotvilleCore")
@@ -196,18 +201,22 @@ final class ReleaseIsolationTests: XCTestCase {
         XCTAssertTrue(content.contains("URLSession"))
         XCTAssertTrue(content.contains("/_matrix/client/v3/rooms/"))
         XCTAssertTrue(content.contains("/event/"))
-        XCTAssertEqual(content.components(separatedBy: "dataTask(with:").count - 1, 1)
-        XCTAssertEqual(content.components(separatedBy: "URLRequest(url:").count - 1, 1)
-        XCTAssertEqual(content.components(separatedBy: "httpMethod =").count - 1, 1)
-        XCTAssertTrue(content.contains("httpMethod = \"GET\""))
+        XCTAssertEqual(content.components(separatedBy: "dataTask(with:").count - 1, 2)
+        XCTAssertEqual(content.components(separatedBy: "URLRequest(url:").count - 1, 2)
+        XCTAssertEqual(content.components(separatedBy: "httpMethod =").count - 1, 2)
+        XCTAssertEqual(content.components(separatedBy: "httpMethod = \"GET\"").count - 1, 2)
         XCTAssertTrue(content.contains("Authorization"))
         XCTAssertTrue(content.contains(".ephemeral"))
         XCTAssertTrue(content.contains("willPerformHTTPRedirection"))
         XCTAssertTrue(content.contains("requestTimeout"))
         XCTAssertTrue(content.contains("timeBudget"))
         XCTAssertEqual(content.components(separatedBy: "/_matrix/client/v3/rooms/").count - 1, 1)
-        XCTAssertEqual(content.components(separatedBy: "/_matrix/client/").count - 1, 1)
+        XCTAssertEqual(content.components(separatedBy: "/_matrix/client/v3/profile/").count - 1, 1)
+        XCTAssertEqual(content.components(separatedBy: "/_matrix/client/").count - 1, 2)
         XCTAssertTrue(content.contains("components.percentEncodedPath = base + \"/_matrix/client/v3/rooms/\" + room + \"/event/\" + event"))
+        XCTAssertTrue(content.split(separator: "\n").contains {
+            $0.trimmingCharacters(in: .whitespaces) == "components.percentEncodedPath = base + \"/_matrix/client/v3/profile/\" + user"
+        })
     }
     private func notificationServiceSources(_ objects: [String: Any]) throws -> [URL] {
         let target = try XCTUnwrap(objects.values.compactMap { $0 as? [String: Any] }.first { $0["isa"] as? String == "PBXNativeTarget" && $0["name"] as? String == "BotvilleNotificationService" })
