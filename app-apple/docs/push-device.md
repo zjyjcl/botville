@@ -134,3 +134,54 @@ xcodebuild -project Botville.xcodeproj -scheme BotvilleApp-iOS \
 | 构建产物 | 两套均嵌入 NSE，Bundle ID 和 ad-hoc 签名校验通过；`-Simulated.xcent` 的 App Group/APNs 配置正确；NSE 无 SDK 链接；Release App/NSE plist 均无 DEBUG 网络配置 |
 
 日志位于 `app-apple/.build/nse-pr3/{swift-test,debug-build,release-build}.log`，产物位于同目录的 `DerivedData/`，均不提交。两项 Synapse 集成测试因未配置 `BOTVILLE_E2E_HOMESERVER` 跳过。构建有 Matrix SDK dSYM/链接等既有警告，以及 `applicationIconBadgeNumber` 在 iOS 17 的弃用警告；本次仍使用该同步 badge API。模拟器的 ad-hoc 签名和 `-Simulated.xcent` 检查不能替代真机开发签名与推送送达验收；未执行 iPhone/APNs/Sygnal 真机验收，合入后必须按 PR3 步骤重装 Debug 并重新执行 `pushers/set`。
+
+## 临时：前台 willPresent 探针（DEBUG-only）
+
+> 仅用于排查「前台无系统横幅」：确认 `UNUserNotificationCenter.delegate` 是否被强持有，以及 `willPresent` 是否被系统调用。合入与否由总管决定；**不进 Release**。
+
+观测点：
+
+1. 每次 `installNotificationDelegate`：写一行 `delegate-install … centerDelegateNonNil=… sameInstance=…`，并用 `Logger(subsystem: com.zjyjcl.botville, category: WillPresentProbe)` 镜像。
+2. 每次 `willPresent`：追加一行 `willPresent … requestID=…`（**不**写 userInfo / token / 正文）。
+3. 文件：App Group `group.com.zjyjcl.botville` 下的 `willpresent-probe.log`。诊断页「前台 willPresent 探针」可刷新/清空。
+
+### 取回容器文件
+
+**模拟器**（App 至少启动过一次）：
+
+```bash
+# 列出 App Group 容器
+xcrun simctl get_app_container booted com.zjyjcl.botville groups
+# 直接读日志（路径随模拟器 UUID 变化）
+GROUP=$(xcrun simctl get_app_container booted com.zjyjcl.botville group.com.zjyjcl.botville)
+cat "$GROUP/willpresent-probe.log"
+```
+
+**真机（推荐 Console.app）**：
+
+1. Mac 上打开 **Console.app** → 选中已连接的 iPhone。
+2. 搜索子系统 / 类别：`com.zjyjcl.botville` / `WillPresentProbe`。
+3. 前台冷启后应至少出现 `delegate-install`；再从前台触发推送，若回调到达应出现 `willPresent`。
+
+**真机（Xcode Devices 窗口）**：
+
+1. Xcode → **Window → Devices and Simulators** → 选中设备 → 选中 `BotvilleApp` → **Download Container…**。
+2. 打开下载的 `.xcappdata`，在 `AppData/Library` 旁查找 App Group 数据，或在诊断页直接刷新「前台 willPresent 探针」读回（同进程可读 App Group 文件）。
+
+**真机（devicectl，Xcode 15+ / 本机已配对设备）**：
+
+```bash
+# 列出已连接设备
+xcrun devicectl list devices
+# 视本机 Xcode 版本，用 Devices 窗口或诊断页读回更稳；
+# 部分版本可用 files 子命令从 App Group 容器拷贝 willpresent-probe.log
+# （勿把含真实 token 的其它文件贴到聊天）。
+```
+
+判读：
+
+| 现象 | 含义 |
+|---|---|
+| 有 `delegate-install` 且 `centerDelegateNonNil=true` / `sameInstance=true`，但无 `willPresent` | 委托在；系统前台路径未回调（或通知未作为可展示远程通知到达） |
+| 有 `willPresent` 仍无系统横幅 | completion / presentation options / 系统策略问题，而不是「没挂上 delegate」 |
+| 连 `delegate-install` 都没有 | Debug 包未含本探针，或未走到 `PushApplicationDelegate` 安装路径 |

@@ -166,6 +166,9 @@ struct PushDiagnosticsView: View {
     @State private var isSaving = false
     @State private var isChecking = false
     @State private var didCopy = false
+#if os(iOS)
+    @State private var probeLog = ""
+#endif
 
     var body: some View {
         Form {
@@ -243,13 +246,32 @@ struct PushDiagnosticsView: View {
                 .disabled(isChecking || !service.isLoggedIn || service.pushToken == nil)
                 Text(service.pushVerificationStatus ?? "尚未核对。")
             }
+#if os(iOS)
+            Section("前台 willPresent 探针") {
+                Text("临时 DEBUG 观测：确认 delegate 是否非 nil，以及前台推送是否进入 willPresent。日志写在 App Group `group.com.zjyjcl.botville/willpresent-probe.log`，不含 token / 正文。")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text(probeLog.isEmpty ? "(尚未读取)" : probeLog)
+                    .font(.system(.caption2, design: .monospaced))
+                    .textSelection(.enabled)
+                Button("刷新探针日志") { probeLog = WillPresentProbe.readLogText() }
+                Button("清空探针日志", role: .destructive) {
+                    WillPresentProbe.clearLog()
+                    probeLog = WillPresentProbe.readLogText()
+                }
+            }
+#endif
             Section {
                 Text("仅用于 DEBUG 真机诊断。token 仅保留在内存并用于 pusher 请求，不写入日志或磁盘。核对成功仅表示服务器存在匹配记录，不代表 APNs 已送达。")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
         .navigationTitle("推送诊断")
-        .onAppear { notifyURL = device.savedNotifyURL }
+        .onAppear {
+            notifyURL = device.savedNotifyURL
+#if os(iOS)
+            probeLog = WillPresentProbe.readLogText()
+#endif
+        }
         .onChange(of: service.pushToken) { _, _ in didCopy = false }
     }
 }

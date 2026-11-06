@@ -6,6 +6,7 @@ import SwiftUI
 #if os(iOS)
 import UIKit
 import UserNotifications
+import OSLog
 #elseif os(macOS)
 import AppKit
 #endif
@@ -285,10 +286,16 @@ final class PushApplicationDelegate: NSObject, UIApplicationDelegate, UNUserNoti
 
     private static func installNotificationDelegate(_ delegate: UNUserNotificationCenterDelegate) {
         UNUserNotificationCenter.current().delegate = delegate
+#if DEBUG
+        WillPresentProbe.recordDelegateInstall(installed: delegate)
+#endif
     }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
                                             withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+#if DEBUG
+        WillPresentProbe.recordWillPresent(notification: notification)
+#endif
         // Map Core policy → UN bits (banner=1<<4, list=1<<3). Call on main; some
         // iOS 17–27 builds suppress heads-up if the handler races off-main.
         let options = UNNotificationPresentationOptions(
@@ -315,4 +322,112 @@ final class PushApplicationDelegate: NSObject, UIApplicationDelegate, UNUserNoti
     }
 #endif
 }
+
+#if DEBUG
+/// Temporary DEBUG-only evidence that `willPresent` actually fires and that
+/// `UNUserNotificationCenter.current().delegate` remains non-nil. Writes an
+/// App Group sidecar file (no tokens / room bodies) and mirrors via os.Logger.
+enum WillPresentProbe {
+    static let appGroupID = "group.com.zjyjcl.botville"
+    static let logFileName = "willpresent-probe.log"
+    private static let logger = Logger(subsystem: "com.zjyjcl.botville", category: "WillPresentProbe")
+
+    static var logFileURL: URL? {
+        FileManager.default
+            .containerURL(forSecurityApplicationGroupIdentifier: appGroupID)?
+            .appendingPathComponent(logFileName, isDirectory: false)
+    }
+
+    static func recordDelegateInstall(installed: UNUserNotificationCenterDelegate) {
+        let center = UNUserNotificationCenter.current()
+        let current = center.delegate
+        let installedType = String(describing: type(of: installed))
+        let currentType = current.map { String(describing: type(of: $0)) } ?? "nil"
+        let currentObject = current as AnyObject?
+        let installedObject = installed as AnyObject
+        let sameInstance = currentObject != nil && currentObject === installedObject
+        let line = [
+            "delegate-install",
+            "ts=\(isoNow())",
+            "installedType=\(installedType)",
+            "centerDelegateType=\(currentType)",
+            "centerDelegateNonNil=\(current != nil)",
+            "sameInstance=\(sameInstance)",
+        ].joined(separator: " ")
+        append(line)
+        logger.info("\(line, privacy: .public)")
+    }
+
+    static func recordWillPresent(notification: UNNotification) {
+        // Identifier only — never dump userInfo / pushkey / tokens.
+        let requestID = notification.request.identifier
+        let hasRoomHint = notification.request.content.userInfo.keys.contains { key in
+            String(describing: key) == "room_id"
+        }
+        let line = [
+            "willPresent",
+            "ts=\(isoNow())",
+            "requestID=\(sanitize(requestID))",
+            "hasTopLevelRoomID=\(hasRoomHint)",
+            "thread=\(Thread.isMainThread ? "main" : "background")",
+        ].joined(separator: " ")
+        append(line)
+        logger.info("\(line, privacy: .public)")
+    }
+
+    @MainActor
+    static func readLogText() -> String {
+        guard let url = logFileURL else {
+            return "(App Group container unavailable for \(appGroupID))"
+        }
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return "(no \(logFileName) yet — cold start then trigger a foreground push)"
+        }
+        do {
+            let text = try String(contentsOf: url, encoding: .utf8)
+            return text.isEmpty ? "(empty log)" : text
+        } catch {
+            return "(failed to read \(logFileName))"
+        }
+    }
+
+    @MainActor
+    static func clearLog() {
+        guard let url = logFileURL else { return }
+        try? FileManager.default.removeItem(at: url)
+        logger.info("cleared \(logFileName, privacy: .public)")
+    }
+
+    private static func append(_ line: String) {
+        guard let url = logFileURL else {
+            logger.error("App Group container missing; cannot write \(logFileName, privacy: .public)")
+            return
+        }
+        let payload = Data((line + "\n").utf8)
+        do {
+            if !FileManager.default.fileExists(atPath: url.path) {
+                try payload.write(to: url, options: .atomic)
+            } else if let handle = try? FileHandle(forWritingTo: url) {
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: payload)
+            } else {
+                try payload.write(to: url, options: .atomic)
+            }
+        } catch {
+            logger.error("failed writing \(logFileName, privacy: .public)")
+        }
+    }
+
+    private static func isoNow() -> String {
+        ISO8601DateFormatter().string(from: Date())
+    }
+
+    private static func sanitize(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.count <= 64 { return trimmed.isEmpty ? "-" : trimmed }
+        return String(trimmed.prefix(61)) + "..."
+    }
+}
+#endif
 #endif
