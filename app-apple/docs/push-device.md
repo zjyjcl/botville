@@ -75,6 +75,8 @@ DEBUG 登录页保留手动 homeserver 输入及局域网 HTTP 开关。开关�
 
 ## 本地验证
 
+GitHub Actions 的 [`app-apple-tests`](../../.github/workflows/ci.yml) job 在 macOS runner 上执行 `cd app-apple && swift test`，自动纳入全部 Swift 单元／集成测试，包括 Pairing、Push*、ReleaseIsolation 及现有前台通知展示策略单测；前台 banner PR 的后续测试合入后也会自动纳入。需要本机 Synapse 的集成用例仍按环境变量门控，默认跳过。CI 不替代真机 APNs 推送验收：APNs 送达、NSE 执行和前台横幅的实际展示仍须按本文步骤人工验证。
+
 在 `app-apple/` 执行：
 
 ```sh

@@ -22,6 +22,9 @@
 #         identity; exclusive-namespace rejections asserted both ways.
 #         continuwuity has no file-based appservice registration yet and is
 #         not covered (see docs/deploy/appservice.md).
+# app-apple-tests: Swift unit/integration tests on a macOS runner, including
+#         Pairing, Push* and ReleaseIsolation. Real-device APNs/NSE delivery
+#         still requires manual acceptance; see app-apple/docs/push-device.md.
 # federation-e2e (A2.1): the standalone botville-fed compose project boots
 #         two Synapse instances (hs-a/hs-b), each behind its own fedgate
 #         gate + pairing service (server/pairing, python:3.12-slim with the
@@ -271,6 +274,29 @@ jobs:
       - name: Teardown
         if: always()
         run: make federation-down
+
+  app-apple-tests:
+    name: app-apple-tests
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: app-apple
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Apple toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      # Run the full suite so new tests are included automatically. Synapse
+      # integration tests skip unless BOTVILLE_E2E_* is explicitly configured.
+      # No signing, simulator or real APNs/NSE delivery is exercised here.
+      - name: Swift unit and integration tests
+        run: swift test
 
   lint:
     name: lint
