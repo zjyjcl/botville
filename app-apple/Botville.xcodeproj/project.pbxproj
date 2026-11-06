@@ -15,6 +15,7 @@
 		A10000000000000000000007 /* ModuleWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000017 /* ModuleWebView.swift */; };
 		A10000000000000000000008 /* PairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000018 /* PairingView.swift */; };
 		A10000000000000000000009 /* PushDiagnosticsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000019 /* PushDiagnosticsView.swift */; };
+		A1000000000000000000000A /* ForegroundInAppBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001C /* ForegroundInAppBanner.swift */; };
 		B10000000000000000000001 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000011 /* NotificationService.swift */; };
 		B10000000000000000000002 /* SharedPushCredentials.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000012 /* SharedPushCredentials.swift */; };
 		B10000000000000000000003 /* BotvilleNotificationService.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = B10000000000000000000010 /* BotvilleNotificationService.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy,); }; };
@@ -56,6 +57,7 @@
 		A10000000000000000000019 /* PushDiagnosticsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PushDiagnosticsView.swift; path = Sources/BotvilleApp/PushDiagnosticsView.swift; sourceTree = SOURCE_ROOT; };
 		A1000000000000000000001A /* BotvilleApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = BotvilleApp/BotvilleApp.entitlements; sourceTree = SOURCE_ROOT; };
 		A1000000000000000000001B /* BotvilleApp-Release.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "BotvilleApp/BotvilleApp-Release.entitlements"; sourceTree = SOURCE_ROOT; };
+		A1000000000000000000001C /* ForegroundInAppBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ForegroundInAppBanner.swift; path = Sources/BotvilleApp/ForegroundInAppBanner.swift; sourceTree = SOURCE_ROOT; };
 		B10000000000000000000010 /* BotvilleNotificationService.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = BotvilleNotificationService.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		B10000000000000000000011 /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
 		B10000000000000000000012 /* SharedPushCredentials.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SharedPushCredentials.swift; path = Sources/BotvilleCore/SharedPushCredentials.swift; sourceTree = SOURCE_ROOT; };
@@ -102,6 +104,7 @@
 				A10000000000000000000018 /* PairingView.swift */,
 				A10000000000000000000016 /* DynamicUI.swift */,
 				A10000000000000000000019 /* PushDiagnosticsView.swift */,
+				A1000000000000000000001C /* ForegroundInAppBanner.swift */,
 				A1000000000000000000001A /* BotvilleApp.entitlements */,
 				A1000000000000000000001B /* BotvilleApp-Release.entitlements */,
 			);
@@ -201,6 +204,7 @@
 				A10000000000000000000006 /* DynamicUI.swift in Sources */,
 				A10000000000000000000008 /* PairingView.swift in Sources */,
 				A10000000000000000000009 /* PushDiagnosticsView.swift in Sources */,
+				A1000000000000000000000A /* ForegroundInAppBanner.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

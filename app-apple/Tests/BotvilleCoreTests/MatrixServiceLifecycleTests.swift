@@ -531,6 +531,38 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(client.lifecycleEvents.prefix(3), ["rooms", "enable-true", "sync"])
     }
 
+    func testRoomRefreshPublishesBannerFromLocalSDKStateAfterBaseline() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let saved = testCredentials(userID: "@banner:matrix.test")
+        _ = try SessionStoreDirectory(baseURL: temporary).create(for: saved.storeID)
+        let room = FakeRoom(id: "!banner:matrix.test", name: "本地房间")
+        func event(_ timestamp: UInt64) -> LatestEventValue {
+            .remote(timestamp: timestamp, sender: "@peer:matrix.test", isOwn: false, profile: .unavailable,
+                    content: .msgLike(content: MsgLikeContent(kind: .message(content: MessageContent(
+                        msgType: .text(content: TextMessageContent(body: "同步消息", formatted: nil)),
+                        body: "同步消息", isEdited: false, mentions: nil)),
+                        inReplyTo: nil, threadRoot: nil, threadSummary: nil)))
+        }
+        room.latest = event(1_000)
+        let client = FakeClient(successfulSync: true, rooms: [room])
+        let service = makeService(sessionStore: InMemorySessionStore(saved), directory: temporary, client: client)
+        var candidates: [ForegroundBannerCandidate] = []
+        let observation = service.foregroundBannerCandidates.sink { candidates.append($0) }
+        defer { observation.cancel() }
+        await service.restoreSession()
+        try await waitUntil { service.connectionStatus == .connected }
+        XCTAssertTrue(candidates.isEmpty)
+
+        room.latest = event(2_000)
+        try await service.sync()
+        try await waitUntil { candidates.count == 1 }
+        XCTAssertEqual(candidates.first?.roomID, room.id())
+        XCTAssertEqual(candidates.first?.preview, "同步消息")
+        XCTAssertEqual(candidates.first?.title, "本地房间")
+        try await service.clearLocalSession()
+    }
+
     func testCancelledRestoreAfterLocalRoomsArePublishedDetachesClientAndKeepsCredentials() async throws {
         let temporary = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: temporary) }
@@ -1272,6 +1304,7 @@ private final class FakeClient: Client, @unchecked Sendable {
 private final class FakeRoom: Room, @unchecked Sendable {
     private let roomID: String
     private let roomName: String
+    var latest: LatestEventValue = .none
 
     init(id: String, name: String) {
         roomID = id
@@ -1289,7 +1322,7 @@ private final class FakeRoom: Room, @unchecked Sendable {
     override func displayName() -> String? { roomName }
     override func membership() -> Membership { .joined }
     override func roomInfo() async throws -> RoomInfo { throw ClientError.Generic(msg: "unused", details: nil) }
-    override func latestEvent() async -> LatestEventValue { .none }
+    override func latestEvent() async -> LatestEventValue { latest }
     override func isDirect() async -> Bool { false }
     override func latestEncryptionState() async throws -> EncryptionState { .unknown }
 }

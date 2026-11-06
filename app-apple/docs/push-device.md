@@ -2,7 +2,7 @@
 
 # DEBUG 真机推送
 
-本次提供 iOS 开发包的 APNs 注册、Matrix HTTP pusher 注册及诊断入口，并在 PR3 接入前台横幅、点通知进房、主 App 未读角标和 NSE 发送者显示名。真机目标为 Mac mini 连接的 iPhone 15；Sygnal/APNs 联调留待后续，模拟器构建和单元测试不能证明真实通知送达。
+iOS 开发包提供 APNs 注册、Matrix HTTP pusher 注册及诊断入口。PR3 接入通知路由、主 App 未读角标和 NSE 发送者显示名；#145 取证显示 `willPresent` 已回调但系统仍未展示横幅，因此前台现在改用 App 内顶部横幅。真机目标为 Mac mini 连接的 iPhone 15；Sygnal/APNs 联调留待后续，模拟器构建和单元测试不能证明真实通知送达。
 
 ## 入口与配置
 
@@ -25,10 +25,15 @@ Sygnal 的实际标准字段是 payload 顶层的 `room_id` 与 `event_id`：其
 
 NSE 的角标策略仍是**保留 APNs/default payload 已给出的系统值**：不读取或累加 App Group 计数，不将 payload 的 `unread_count` 转成角标。PR3 由主 App 将房间列表 `unreadCount` 的总和写入 iOS App 角标，在列表更新、App 恢复活跃、打开会话和成功标记已读时重算；打开房间后 best-effort 发送已读回执，成功才清除该房间的本地未读，失败保留原列表计数且不阻断进房，已关闭房间或更换会话后的旧回调不回写。某个房间已读后仍保留其他房间的未读总数，全部已读为零。后台 App 未运行或尚未同步时不承诺角标即时更新；本 PR 不增加后台 sync。macOS 跳过系统角标写入。
 
-## PR3 通知交互
+## 前台 App 内横幅与系统通知边界
 
-- iOS 主 App 在 Debug 和 Release 都挂载 `UNUserNotificationCenterDelegate`。委托是进程级单例 `PushNotificationCenter.shared`（`UNUserNotificationCenter.delegate` 为 weak，不能只靠 `@UIApplicationDelegateAdaptor` 生命周期）。在 `BotvilleApp.init`、AppDelegate `init`、`didFinishLaunching` 与 `applicationDidBecomeActive` 安装该单例。前台 `willPresent` **同步**回传与系统一致的 raw bits：`banner`（1<<4）/`list`（1<<3）/`sound`/`badge`（不是已弃用的单独 `.alert`），**不再** `DispatchQueue.main.async` 推迟 completion（#144 主线程推迟后真机仍无横幅）。方法带显式 `@objc(userNotificationCenter:willPresentNotification:withCompletionHandler:)`。后台/被杀不走 `willPresent`，由系统直接展示 NSE 替换后的内容。实际横幅/声音仍受用户系统通知设置与专注模式控制。APNs token 注册、权限申请及诊断页仍只编译进 Debug。
-- **DEBUG 前台取证**：`os.Logger` subsystem `com.zjyjcl.botville` category `PushForeground`；同时把 `installNotificationDelegate` / `didFinishLaunching` / `willPresent`（含 `optionsRaw`）追加写入 App Group `group.com.zjyjcl.botville` 下 `Library/Caches/botville-willpresent-probe.log`（不含 token）。Console 过滤 `botville` 或 `PushForeground`；usbmux 空时也可事后从 App Group 容器读该文件。判断：有 `willPresent optionsRaw=27`（badge|sound|list|banner）说明回调命中；仅有 install/didFinishLaunching 而无 willPresent，说明系统未回调（再考虑 App 内自绘横幅，需总管/棉棉霸授权）。
+- **前台可见性以 App 内 UI 为准**：`MatrixService` 每次房间列表 / sync 更新后比较 joined 房间的未读数与最新活动。首次本地快照、新出现的房间先建立基线；后续未读增加或活动变新才发候选，避免启动、排序变化和 sync 重放弹出历史消息。正文、房间名、发送者显示名只取本机 SDK 已同步状态，不解析 APNs/NSE 正文，不新增事件或 profile 请求。
+- `ForegroundInAppBannerStore` 在主线程维护一张卡片，约 3 秒自动消失。同房连发更新为最新内容并重新计时，不堆叠；同一事件重复不会续命。用 room ID + event ID 去重；当前 SDK 的 `latestEvent()` 不提供 event ID，因此实际使用 room ID + latestActivity 时间戳（同房同毫秒事件可能合并）。候选和去重记录只在内存保存，退出清除，不写正文或凭据日志。
+- 卡片位于整个 tab 容器的最外层 top overlay（高于 `NavigationSplitView`），使用 `safeAreaPadding(.top)` 并避让顶部导航操作。显示 initials 头像占位、房间名（私聊优先本地发送者显示名）与正文。点按复用 `.room(roomID)` → `apply(route)`，切到「会话」并打开房间；其他 tab 也能显示和点按。
+- 自己的消息、当前**实际可见**的房间、输入框 focused 或正在 composing 时不弹；手机已返回列表时，即使保留房间选择也允许弹。非 active 状态不显示，进入后台立即清除当前卡片；被抑制事件直接消费，不在离开输入框后补弹。未读列表和角标沿用原逻辑。
+- 加密房间固定显示「加密消息」，即使本机已解密；无法解密事件同样如此。空白或暂不可展示正文显示「…」，本地消息解析失败显示「无法加载」，加密状态优先于失败提示；成员、房名等状态事件及撤回不作为新消息。标题最多 120 个 Character，正文最多 240 个 Character，超出以「…」截断。
+- `UNUserNotificationCenterDelegate` 仍由进程单例安装，`willPresent` 仍**同步**完成，但只回传 `.badge`（`optionsRaw=1`），不再请求系统 banner/list/sound，避免双显。后台/被杀不走此回调，继续由系统展示 NSE 内容，仍受系统通知设置与专注模式控制。前台横幅不依赖 APNs 投递，但需要 Matrix 同步完成；断线期间不能承诺即时显示。
+- **保留 #145 DEBUG 探针与诊断页**：`PushForegroundProbeLog` 和 `os.Logger` 仍记录 delegate 安装、启动及 `willPresent` 的 optionsRaw，不写正文或凭据。历史 `optionsRaw=27` 是旧系统展示策略；此版本预期为 `1`，只能证明回调命中，不能作为 App 内横幅已可见的验收证据。Release 调用路径不写探针。
 - 点击通知使用 Core 中的纯函数解析 `room_id`，接受与事件引用相同的顶层及两层已知包装，不依赖 `event_id` 或 payload 正文。合法 ID 切到「会话」tab 并打开对应会话；无 room 或非法字段则清除会话选择并回房间列表。冷启动点击在根视图就绪前保留待处理路由。
 - NSE 仍为 `event_id_only`，`default_payload` 仍精确为 `{"aps":{"mutable-content":1,"alert":{"body":"…"}}}`；没有改成通用「新消息」alert，没有从 payload 取正文或显示名，没有修改配对 TLS 或 #132 路径。Release 的 APNs entitlement、诊断入口、局域网 HTTP 与手动 homeserver 隔离不变。
 
@@ -51,15 +56,19 @@ DEBUG 登录页保留手动 homeserver 输入及局域网 HTTP 开关。开关�
 7. token 回调发生变化时，应先删除旧 pushkey，再注册新 pushkey；相同 token 的回调也可用于重试注册。APNs token 轮换无法在真机上可靠强制触发，自动化测试覆盖该顺序与失败处理。
 8. 在会话页点击「退出」，先用原 access token 发送 `kind: null` 删除 pusher，再撤销会话。断网导致删除失败时应保留会话、显示错误，恢复网络后重试。需要核查服务器侧清理时，通过受控服务端工具查看结果，勿将 token 写入报告。
 
-## PR3 真机验收（合入后）
+## 真机验收（合入后）
 
-先重新构建并重装 **Debug** App（确认嵌入新的 NSE），重新登录/恢复测试会话，在「推送诊断」重新申请注册以执行 `pushers/set`，再「核对」当前 pusher。确认仍为 `event_id_only` 和上述原样 `default_payload`；不得记录真实凭据或 pushkey。
+重新构建并安装 **Debug** App，登录/恢复两个已授权测试账号。后台推送测试仍需在「推送诊断」注册并核对 pusher，确认 `event_id_only` 和原样 `default_payload`。前台横幅不要求 APNs 回调；不得在截图、日志或工单记录真实凭据。
 
-1. App 停留前台，让另一测试账号向非加密房间发消息；确认横幅、通知中心条目、声音遵循系统权限，显示发送者 displayname 与正文。再使 profile 不可用/无显示名/超时，确认回退 MXID 且正文保留；无 sender 的模拟事件回退房间 ID，长标题最多 120 字符。
-2. 分别从其他 tab、另一会话、后台、终止后冷启动点击含合法 `room_id` 的通知，确认切到「会话」并打开对应房间。无 room / 非法 room 的模拟通知应回到房间列表；已退出账号时先完成登录，再检查待处理路由。
-3. 准备至少两个有未读的房间，待列表更新后检查系统角标等于列表未读总和；打开并读完其中一间后仅扣除该房间，全部已读后为零。切后台再回前台也应重算；不要用 NSE 收到推送时的角标作为此项验收结果。
-4. 对加密房间确认 body 固定「加密消息」。事件失败时分别验证「无法加载」（HTTP/网络/JSON 失败）和「…」（缺字段/凭据或事件未完成即到期）；profile 失败不能触发上述正文降级。
-5. 按下方命令构建 Release 并跑隔离检查，确认没有诊断页、APNs token 注册、局域网 HTTP 或手动 homeserver 入口。Release 当前没有生产推送签名配置，本项不代表可发布或已完成 Release 真机推送验收。
+1. **列表前台**：先等待首次同步完成，停留房间列表，让对端向已有非加密房间发消息。顶部应出现 initials、房间名/发送者显示名和本地正文，约 3 秒消失；导航标题、返回按钮仍可用。重复同一 sync 不再弹。若从 detail 返回列表且仍保留选择，该房间的新消息仍应弹。
+2. **替换与点按**：在 3 秒内向同房连发两条，只保留最新一张，计时从新消息重新开始；在卡片消失前点按，应进入对应房间。另在「动态」或「我」tab 重测，点按应切回「会话」。多房同时更新时仅显示最后一条，不堆叠。
+3. **抑制**：打开该房间 detail 后收消息不弹；在另一房间输入框获得焦点，或输入草稿尚未发送时收消息不弹；自己的消息也不弹。退出输入状态后不补弹之前被抑制的消息。列表未读更新不受影响。
+4. **加密与降级**：加密房间始终显示「加密消息」；本地没有可展示正文显示「…」，消息解析失败显示「无法加载」。这些前台分支不触发 NSE 的 HTTP 拉取；用单测验证无法方便构造的 SDK 解析失败。显示名缺失时回退房间名且保留正文。
+5. **后台 / 被杀回归**：分别将 App 放后台、终止后让对端发消息，继续验证系统 NSE 横幅和正文（加密仍固定提示），点击合法 room 通知能进入对应房间；无 room / 非法 room 回列表，退出账号则登录后处理待路由。NSE 的 profile 回退、HTTP/网络/JSON 失败「无法加载」、到期「…」仍按原路径验收。回到前台后已消费候选不重放。
+6. **角标**：准备两个有未读的房间，列表同步后角标等于总和；读完一间只扣该间，全部已读为零，恢复前台重新计算。NSE 不参与主 App 的计数累加。
+7. **生命周期与隐私**：横幅显示时切后台、开始输入或退出账号，卡片应立即清除；重新登录不显示上一账号内容。DEBUG 诊断仍能查看 willPresent 探针（新值为 `optionsRaw=1`）；Release 隔离脚本仍通过，不新增正文/token 日志。
+
+这些步骤需真机实测。单测与模拟器构建仅证明本地逻辑/编译通过，不代表前台 UI、后台 APNs、终止态或冷启动路由已经验收。
 
 ## 数据与限制
 
@@ -70,7 +79,7 @@ DEBUG 登录页保留手动 homeserver 输入及局域网 HTTP 开关。开关�
 - HTTP 仅用于开发网络，不能提供传输保密性。`NSAllowsLocalNetworking` 不绕过网络可达性、系统本地网络授权或 TLS 证书校验，也不会让手机自动解析 Compose DNS。
 - NSE 请求遵从 iOS 的系统 TLS 信任。自签 homeserver 必须先由系统建立信任链；本 PR 不实现证书例外或 SPKI pin。与 #132 的配对信任/固定策略是不同边界，不能替代此处的系统 TLS 信任。
 - macOS 本次不支持 APNs 注册，诊断页明确显示此限制。模拟器可编译与查看 UI；其结果不能替代开发签名真机验收。
-- PR3 已接入主 App 前台展示、点击路由和角标重算；不实现后台同步重构。真实推送、冷启动路由、显示名回退与已读角标仍需按上述真机步骤验收。
+- 主 App 前台使用本地同步驱动的自绘横幅，后台继续 NSE；点击路由和角标重算沿用 PR3。不实现后台同步重构，真机前台 UI、真实推送与已读角标仍需按上述步骤验收。
 - Release 不编译诊断页、权限申请控制器或 DEBUG 手动 homeserver 视图；Release plist 无局域网 ATS/用途说明/notify 默认配置。工程只为 Debug 配置 development entitlement；Release/分发必须另配 production entitlement 与匹配的生产签名和描述文件，当前仓库不代表已具备生产 APNs 发布配置。
 
 ## 本地验证
@@ -135,3 +144,14 @@ xcodebuild -project Botville.xcodeproj -scheme BotvilleApp-iOS \
 | 构建产物 | 两套均嵌入 NSE，Bundle ID 和 ad-hoc 签名校验通过；`-Simulated.xcent` 的 App Group/APNs 配置正确；NSE 无 SDK 链接；Release App/NSE plist 均无 DEBUG 网络配置 |
 
 日志位于 `app-apple/.build/nse-pr3/{swift-test,debug-build,release-build}.log`，产物位于同目录的 `DerivedData/`，均不提交。两项 Synapse 集成测试因未配置 `BOTVILLE_E2E_HOMESERVER` 跳过。构建有 Matrix SDK dSYM/链接等既有警告，以及 `applicationIconBadgeNumber` 在 iOS 17 的弃用警告；本次仍使用该同步 badge API。模拟器的 ad-hoc 签名和 `-Simulated.xcent` 检查不能替代真机开发签名与推送送达验收；未执行 iPhone/APNs/Sygnal 真机验收，合入后必须按 PR3 步骤重装 Debug 并重新执行 `pushers/set`。
+
+## 前台自绘横幅本地验证（2026-11-06）
+
+| 检查 | 结果 |
+| --- | --- |
+| `swift test` | 289 项：287 通过、2 项 Synapse 集成测试跳过、0 失败 |
+| 本次新增测试 | 19 项：候选基线/去重/抑制/计时/路由 11 项，SDK 本地文案映射 7 项，MatrixService 实际 refresh 发布 1 项 |
+| Debug，generic iOS Simulator，`CODE_SIGN_IDENTITY="-"` | BUILD SUCCEEDED（arm64 + x86_64） |
+| `scripts/check-release-isolation.sh` / `git diff --check` | 通过；#145 DEBUG 探针和诊断页保留 |
+
+日志位于本 worktree 的 `app-apple/.build/fg-banner-{swift-test,debug-build,isolation}.log`，产物位于 `.build/fg-banner-derived-data/`，不提交。运行时未配置 Synapse 集成环境；本轮未执行真机或模拟器 UI 验收。构建仍有既有 Matrix SDK 外部 dSYM 路径、badge API 弃用及 AppIntents 无依赖提示。前台展示、点击与输入抑制以及后台/被杀 NSE 送达，需要按上面的真机步骤验收。
