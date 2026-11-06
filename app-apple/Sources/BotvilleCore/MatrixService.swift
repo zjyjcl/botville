@@ -6,6 +6,9 @@ import Foundation
 import MatrixRustSDK
 import Network
 import OSLog
+#if os(iOS)
+import UIKit
+#endif
 
 /// SDK ownership and all UI-facing state live on the main actor. Async SDK
 /// operations run in Rust; the same client retains the /sync since token.
@@ -576,6 +579,7 @@ public final class MatrixService: ObservableObject {
     }
 
     public func applicationDidBecomeActive() async {
+        updateApplicationBadge()
         if isLoggedIn { try? await sync() }
         else if !requiresPasswordReauthentication { await restoreSession() }
     }
@@ -697,6 +701,7 @@ public final class MatrixService: ObservableObject {
             currentRevisions: roomSecurityRevisions,
             observedEncryptedRooms: observedEncryptedRooms
         ))
+        updateApplicationBadge()
         if rooms.contains(where: { $0.encryption == .encrypted }) { refreshCryptoSafety(from: client) }
         if let activeRoomID, !rooms.contains(where: { $0.id == activeRoomID && $0.membership == .joined }) {
             closeRoom(activeRoomID)
@@ -884,6 +889,7 @@ public final class MatrixService: ObservableObject {
         guard let room = try client.getRoom(roomId: roomID), room.membership() == .joined else {
             throw MatrixServiceError.roomUnavailable
         }
+        updateApplicationBadge()
         let session = sessionGeneration
         clearTimeline()
         activeRoomID = roomID
@@ -911,6 +917,11 @@ public final class MatrixService: ObservableObject {
             }
             timelineHandle = handle
             canLoadOlderMessages = true
+            Task { [weak self] in
+                await self?.markOpenedRoomRead(roomID: roomID, generation: generation, session: session) {
+                    try await newTimeline.markAsRead(receiptType: .read)
+                }
+            }
         } catch {
             if generation == timelineGeneration { clearTimeline() }
             throw await operationFailure(error, session: session)
@@ -938,6 +949,34 @@ public final class MatrixService: ObservableObject {
         paginationGeneration = nil
         sendingGeneration = nil
         messageActions.removeAll()
+    }
+
+    private func updateApplicationBadge() {
+#if os(iOS)
+        UIApplication.shared.applicationIconBadgeNumber = PushBadge.total(unreadCounts: rooms.map(\.unreadCount))
+#endif
+    }
+
+    /// Read receipts are best-effort: an offline receipt failure must not
+    /// prevent opening the room or falsely clear its list/badge state.
+    private func markOpenedRoomRead(roomID: String, generation: UUID, session: UUID,
+                                    operation: @escaping () async throws -> Void) async {
+        guard generation == timelineGeneration, session == sessionGeneration, activeRoomID == roomID, !isLoggingOut else { return }
+        let succeeded: Bool
+        do {
+            try await operation()
+            succeeded = true
+        } catch {
+            succeeded = false
+        }
+        guard generation == timelineGeneration, session == sessionGeneration, activeRoomID == roomID, !isLoggingOut else { return }
+        rooms = Self.roomsAfterReadReceipt(rooms, roomID: roomID, succeeded: succeeded)
+        updateApplicationBadge()
+    }
+
+    static func roomsAfterReadReceipt(_ rooms: [MatrixRoom], roomID: String, succeeded: Bool) -> [MatrixRoom] {
+        guard succeeded else { return rooms }
+        return rooms.map { $0.id == roomID ? $0.withUnreadCount(0) : $0 }
     }
 
     public func loadOlderMessages() async throws {
@@ -1203,6 +1242,7 @@ public final class MatrixService: ObservableObject {
         authTask = nil
         clearTimeline()
         rooms = []
+        updateApplicationBadge()
         userID = nil
         isLoggedIn = false
         isSyncing = false

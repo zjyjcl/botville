@@ -34,6 +34,12 @@ public struct MatrixRoom: Identifiable, Hashable, Sendable {
                    encryption: encryption, participants: participants)
     }
 
+    func withUnreadCount(_ unreadCount: UInt64) -> MatrixRoom {
+        MatrixRoom(id: id, name: name, membership: membership, isDirect: isDirect,
+                   unreadCount: unreadCount, latestActivity: latestActivity,
+                   encryption: encryption, participants: participants)
+    }
+
     static func sortedByActivity(_ rooms: [MatrixRoom]) -> [MatrixRoom] {
         rooms.sorted {
             let lhs = $0.latestActivity ?? .distantPast

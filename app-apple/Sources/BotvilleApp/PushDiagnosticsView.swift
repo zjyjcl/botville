@@ -134,19 +134,6 @@ final class PushDeviceController: ObservableObject {
     }
 }
 
-#if os(iOS)
-@MainActor
-final class PushApplicationDelegate: NSObject, UIApplicationDelegate {
-    func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
-        PushDeviceController.shared.didRegister(deviceToken)
-    }
-
-    func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
-        PushDeviceController.shared.didFailRegistration(error)
-    }
-}
-#endif
-
 @MainActor
 struct PushProfileView: View {
     @ObservedObject var service: MatrixService

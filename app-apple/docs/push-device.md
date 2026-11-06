@@ -2,7 +2,7 @@
 
 # DEBUG 真机推送
 
-本次提供 iOS 开发包的 APNs 注册、Matrix HTTP pusher 注册及诊断入口。真机目标为 Mac mini 连接的 iPhone 15；Sygnal/APNs 联调留待后续，模拟器构建和单元测试不能证明真实通知送达。
+本次提供 iOS 开发包的 APNs 注册、Matrix HTTP pusher 注册及诊断入口，并在 PR3 接入前台横幅、点通知进房、主 App 未读角标和 NSE 发送者显示名。真机目标为 Mac mini 连接的 iPhone 15；Sygnal/APNs 联调留待后续，模拟器构建和单元测试不能证明真实通知送达。
 
 ## 入口与配置
 
@@ -19,11 +19,17 @@ PR1 新增 `BotvilleNotificationService`（iOS Notification Service Extension）
 
 若共享条目删除失败，仅在 UserDefaults 持久保存待清理布尔标记，下次启动恢复流程先重试删除；成功删除或成功写入新凭据后清除标记。此标记与完整主会话的清理状态分开，软退出仍保留主会话和加密数据库。Keychain 故障期间不能保证旧共享条目已消失。
 
-NSE 只读共享凭据，且只使用 homeserver URL 与 access token；NSE 不写任何日志，因此不会记录 token、Authorization header、URL 或响应正文。PR2 从 `event_id_only` payload 取得一对 `room_id` / `event_id` 后，以 Foundation `URLSession` 发起一次无缓存、拒绝重定向的 GET：`/_matrix/client/v3/rooms/{roomId}/event/{eventId}`。路径分段分别正确百分号编码，并带 `Authorization: Bearer <当前会话>`；请求与资源超时均为 8 秒，扩展整体以 10 秒兜底，`serviceExtensionTimeWillExpire` 立即交付当前降级内容。扩展不引入 `matrix-rust-sdk`。
+NSE 只读共享凭据，且只使用 homeserver URL 与 access token；不会记录 token、Authorization header、URL 或响应正文。PR2 的正文路径保持不变：从 `event_id_only` payload 取得一对 `room_id` / `event_id` 后，以 Foundation `URLSession` 发起一次无缓存、拒绝重定向的 GET：`/_matrix/client/v3/rooms/{roomId}/event/{eventId}`。路径分段分别正确百分号编码，并带 `Authorization: Bearer <当前会话>`；单次请求与资源超时最多 8 秒，扩展整体仍以 10 秒兜底。PR3 仅在事件成功且剩余预算允许时，用同一凭据追加至多一次 [`GET /_matrix/client/v3/profile/{userId}`](https://spec.matrix.org/latest/client-server-api/#get_matrixclientv3profileuserid)，userId 按完整路径段百分号编码，同样禁缓存、拒绝重定向，超时受剩余整体预算约束。扩展不引入 `matrix-rust-sdk`。
 
-Sygnal 的实际标准字段是 payload 顶层的 `room_id` 与 `event_id`：其 [`_get_payload_event_id_only`](https://github.com/matrix-org/sygnal/blob/main/sygnal/apnspushkin.py) 直接从 notification 取这两个字段。NSE 也兼容 `notification`、`data`、`notification.data` 和 `data.notification` 内的同一对象字段，不在不同对象之间拼接 room/event；这些包装是兼容处理，尚无真机抓包确认。成功取得 `m.room.message`（如 `m.text`、`m.notice`、媒体说明）或 `m.sticker` 时，title 只使用事件的发送者 ID，缺失时退回房间 ID，最多 120 个字符；不额外查询 profile/displayname。body 使用 `content.body` 并按 Character 截断为最多 240 个字符；发生截断时为前 239 个字符加末尾「…」。`m.room.encrypted`、没有可显示正文或正文无法解析时显示「加密消息」。缺字段、共享凭据不可用和到期时保留占位「…」；HTTP、网络或 JSON 失败显示「无法加载」，均不影响系统投递。
+Sygnal 的实际标准字段是 payload 顶层的 `room_id` 与 `event_id`：其 [`_get_payload_event_id_only`](https://github.com/matrix-org/sygnal/blob/main/sygnal/apnspushkin.py) 直接从 notification 取这两个字段。NSE 也兼容两层以内的 `notification` / `data` 包装（包括交叉或同名嵌套），不在不同对象之间拼接 room/event；这些包装是兼容处理，尚无真机抓包确认。成功取得事件后，title 优先使用 profile 的非空 `displayname`，查询失败、超时、JSON 无效或没有显示名时静默回退事件发送者 MXID，再缺失则回退房间 ID，最多 120 个字符。成功取得 `m.room.message`（如 `m.text`、`m.notice`、媒体说明）或 `m.sticker` 时，body 使用 `content.body` 并按 Character 截断为最多 240 个字符；发生截断时为前 239 个字符加末尾「…」。`m.room.encrypted`、没有可显示正文或正文无法解析时显示「加密消息」。缺字段、共享凭据不可用或事件尚未成功即到期时保留占位「…」；事件 HTTP、网络或 JSON 失败显示「无法加载」。事件已成功后，profile 失败或 `serviceExtensionTimeWillExpire` 只回退显示名，保留已取得的正文。
 
-角标策略是**保留 APNs/default payload 已给出的系统值**：NSE 不自行读取或累加 App Group 计数。当前 default payload 没有 `aps.badge`，Sygnal `event_id_only` 的顶层 `unread_count` 也不会在本 PR 转成角标，因此通常保持已有角标；本 PR 不保证角标反映真实未读数，前台清零和未读数同步留给 PR3。
+NSE 的角标策略仍是**保留 APNs/default payload 已给出的系统值**：不读取或累加 App Group 计数，不将 payload 的 `unread_count` 转成角标。PR3 由主 App 将房间列表 `unreadCount` 的总和写入 iOS App 角标，在列表更新、App 恢复活跃、打开会话和成功标记已读时重算；打开房间后 best-effort 发送已读回执，成功才清除该房间的本地未读，失败保留原列表计数且不阻断进房，已关闭房间或更换会话后的旧回调不回写。某个房间已读后仍保留其他房间的未读总数，全部已读为零。后台 App 未运行或尚未同步时不承诺角标即时更新；本 PR 不增加后台 sync。macOS 跳过系统角标写入。
+
+## PR3 通知交互
+
+- iOS 主 App 在 Debug 和 Release 都挂载 `UNUserNotificationCenterDelegate`。前台收到通知时请求 [`banner` / `list` / `sound` / `badge`](https://developer.apple.com/documentation/usernotifications/unnotificationpresentationoptions) 展示，实际横幅/声音仍受用户系统通知设置与专注模式控制。APNs token 注册、权限申请及诊断页仍只编译进 Debug。
+- 点击通知使用 Core 中的纯函数解析 `room_id`，接受与事件引用相同的顶层及两层已知包装，不依赖 `event_id` 或 payload 正文。合法 ID 切到「会话」tab 并打开对应会话；无 room 或非法字段则清除会话选择并回房间列表。冷启动点击在根视图就绪前保留待处理路由。
+- NSE 仍为 `event_id_only`，`default_payload` 仍精确为 `{"aps":{"mutable-content":1,"alert":{"body":"…"}}}`；没有改成通用「新消息」alert，没有从 payload 取正文或显示名，没有修改配对 TLS 或 #132 路径。Release 的 APNs entitlement、诊断入口、局域网 HTTP 与手动 homeserver 隔离不变。
 
 notify URL 必须无凭据、无 query/fragment，路径严格为 `/_matrix/push/v1/notify`。默认/Release 策略仅允许 HTTPS；DEBUG 显式允许 HTTP。该地址供 **homeserver 访问 Sygnal**，因此 Compose 内部服务名可作 notify URL；iPhone 本身不必能解析该名称。App 不直接向 Sygnal 上传 token。
 
@@ -44,6 +50,16 @@ DEBUG 登录页保留手动 homeserver 输入及局域网 HTTP 开关。开关�
 7. token 回调发生变化时，应先删除旧 pushkey，再注册新 pushkey；相同 token 的回调也可用于重试注册。APNs token 轮换无法在真机上可靠强制触发，自动化测试覆盖该顺序与失败处理。
 8. 在会话页点击「退出」，先用原 access token 发送 `kind: null` 删除 pusher，再撤销会话。断网导致删除失败时应保留会话、显示错误，恢复网络后重试。需要核查服务器侧清理时，通过受控服务端工具查看结果，勿将 token 写入报告。
 
+## PR3 真机验收（合入后）
+
+先重新构建并重装 **Debug** App（确认嵌入新的 NSE），重新登录/恢复测试会话，在「推送诊断」重新申请注册以执行 `pushers/set`，再「核对」当前 pusher。确认仍为 `event_id_only` 和上述原样 `default_payload`；不得记录真实凭据或 pushkey。
+
+1. App 停留前台，让另一测试账号向非加密房间发消息；确认横幅、通知中心条目、声音遵循系统权限，显示发送者 displayname 与正文。再使 profile 不可用/无显示名/超时，确认回退 MXID 且正文保留；无 sender 的模拟事件回退房间 ID，长标题最多 120 字符。
+2. 分别从其他 tab、另一会话、后台、终止后冷启动点击含合法 `room_id` 的通知，确认切到「会话」并打开对应房间。无 room / 非法 room 的模拟通知应回到房间列表；已退出账号时先完成登录，再检查待处理路由。
+3. 准备至少两个有未读的房间，待列表更新后检查系统角标等于列表未读总和；打开并读完其中一间后仅扣除该房间，全部已读后为零。切后台再回前台也应重算；不要用 NSE 收到推送时的角标作为此项验收结果。
+4. 对加密房间确认 body 固定「加密消息」。事件失败时分别验证「无法加载」（HTTP/网络/JSON 失败）和「…」（缺字段/凭据或事件未完成即到期）；profile 失败不能触发上述正文降级。
+5. 按下方命令构建 Release 并跑隔离检查，确认没有诊断页、APNs token 注册、局域网 HTTP 或手动 homeserver 入口。Release 当前没有生产推送签名配置，本项不代表可发布或已完成 Release 真机推送验收。
+
 ## 数据与限制
 
 - APNs device token 和上次注册的 pushkey 仅在内存中，既不写 UserDefaults/文件/日志，也不上传到分析、网关或其他服务；请求仅发往当前 homeserver 的 pusher API。采用内存是为了减少持久化设备标识与凭据生命周期耦合。
@@ -53,7 +69,7 @@ DEBUG 登录页保留手动 homeserver 输入及局域网 HTTP 开关。开关�
 - HTTP 仅用于开发网络，不能提供传输保密性。`NSAllowsLocalNetworking` 不绕过网络可达性、系统本地网络授权或 TLS 证书校验，也不会让手机自动解析 Compose DNS。
 - NSE 请求遵从 iOS 的系统 TLS 信任。自签 homeserver 必须先由系统建立信任链；本 PR 不实现证书例外或 SPKI pin。与 #132 的配对信任/固定策略是不同边界，不能替代此处的系统 TLS 信任。
 - macOS 本次不支持 APNs 注册，诊断页明确显示此限制。模拟器可编译与查看 UI；其结果不能替代开发签名真机验收。
-- PR2 已从 `event_id_only` 按事件 ID 拉取正文；它不实现主 App 前台 delegate、后台同步、点通知进房间或角标未读计数同步，这些保留给 PR3。PR2 的真机正文展示、加密消息和失败降级仍需按上述步骤验收。
+- PR3 已接入主 App 前台展示、点击路由和角标重算；不实现后台同步重构。真实推送、冷启动路由、显示名回退与已读角标仍需按上述真机步骤验收。
 - Release 不编译诊断页、权限申请控制器或 DEBUG 手动 homeserver 视图；Release plist 无局域网 ATS/用途说明/notify 默认配置。工程只为 Debug 配置 development entitlement；Release/分发必须另配 production entitlement 与匹配的生产签名和描述文件，当前仓库不代表已具备生产 APNs 发布配置。
 
 ## 本地验证
@@ -62,6 +78,7 @@ DEBUG 登录页保留手动 homeserver 输入及局域网 HTTP 开关。开关�
 
 ```sh
 export TMPDIR=/tmp
+export GIT_CONFIG_COUNT=0
 swift test
 scripts/check-release-isolation.sh
 xcodebuild -project Botville.xcodeproj -scheme BotvilleApp-iOS \
@@ -105,3 +122,15 @@ xcodebuild -project Botville.xcodeproj -scheme BotvilleApp-iOS \
 正文单测使用假凭据和 `URLProtocol`，涵盖顶层及嵌套字段、无效字段与禁止混配、保留字/Unicode 路径编码、Bearer GET、正文截断、加密与不可展示内容、Keychain 缺失/异常、HTTP/网络/超时/JSON 失败、拒绝重定向，以及整体预算和到期取消后的单次交付。
 
 完整 Swift 日志及 Debug/Release 构建日志在 `app-apple/.build/nse-pr2/`；仓库其他检查日志在 `.build/nse-pr2-checks/`，均不提交。两项 Synapse 集成测试未配置 `BOTVILLE_E2E_HOMESERVER` 而跳过；未启动 Docker 集成环境，未执行 PR2 真机/APNs 验收。构建仍有现有 Matrix SDK dSYM/链接目标版本等警告；本地测试及模拟器构建不代表真机正文送达已验收。
+
+## PR3 本地验证（2026-11-06）
+
+| 检查 | 结果 |
+| --- | --- |
+| `TMPDIR=/tmp GIT_CONFIG_COUNT=0 swift test` | 269 项：267 通过、2 跳过、0 失败 |
+| 通知正文 / UX / Release 隔离单测 | 17 / 6 / 5 项全部通过，包含 profile 成功与失败、自然总预算到期、手动到期单次交付、深链、badge、前台策略及已读成功/失败的列表状态 |
+| `scripts/check-release-isolation.sh` / `sh -n` / `git diff --check` | 全部通过；仅允许原事件 GET 和精确的额外 profile GET，token 注册与权限申请仍要求 DEBUG guard |
+| Debug / Release，generic iOS Simulator，`CODE_SIGN_IDENTITY="-"` | 两套均 BUILD SUCCEEDED |
+| 构建产物 | 两套均嵌入 NSE，Bundle ID 和 ad-hoc 签名校验通过；`-Simulated.xcent` 的 App Group/APNs 配置正确；NSE 无 SDK 链接；Release App/NSE plist 均无 DEBUG 网络配置 |
+
+日志位于 `app-apple/.build/nse-pr3/{swift-test,debug-build,release-build}.log`，产物位于同目录的 `DerivedData/`，均不提交。两项 Synapse 集成测试因未配置 `BOTVILLE_E2E_HOMESERVER` 跳过。构建有 Matrix SDK dSYM/链接等既有警告，以及 `applicationIconBadgeNumber` 在 iOS 17 的弃用警告；本次仍使用该同步 badge API。模拟器的 ad-hoc 签名和 `-Simulated.xcent` 检查不能替代真机开发签名与推送送达验收；未执行 iPhone/APNs/Sygnal 真机验收，合入后必须按 PR3 步骤重装 Debug 并重新执行 `pushers/set`。
