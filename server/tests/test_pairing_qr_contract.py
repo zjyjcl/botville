@@ -11,7 +11,9 @@ examples (docs/contracts/examples/pairing-qr/):
 - duplicate / missing / unknown parameters are rejected, fp format rules hold,
   hs/gw accept https:// only; gw is optional (omittable; empty value rejected);
 - redeem 200 responses must echo the QR's hs byte-for-byte (no normalisation);
-  gateway may be null when issuance carried no gw;
+  gateway may be null when issuance carried no gw (a chat-only pairing,
+  #128/#132 Option A: the app must never enable gateway features for it later);
+  features_url is optional — no-gateway (chat-only) responses omit it;
 - BV_PAIR_RATE_LIMITED error bodies must carry retry_after_ms;
 - the OpenAPI fragment lists all five BV_PAIR_* error codes;
 - every code example in pairing-qr.md and the OpenAPI fragment is a legal
@@ -298,6 +300,9 @@ class ExamplesTest(unittest.TestCase):
                 # gw 可选（B1）：无 gw 签发对应 gateway: null
                 self.assertIsNone(data["gateway"], name)
                 self.assertIsNone(result["gateway"], name)
+                # chat-only（#128/#132 Option A）：无网关成功响应应省略 features_url
+                self.assertNotIn("features_url", data, name)
+                self.assertNotIn("features_url", result, name)
 
     def test_error_examples_cover_all_codes(self):
         files = sorted(EXAMPLES_DIR.glob("redeem-*-bv-pair-*.json"))
@@ -354,7 +359,8 @@ class RedeemResponseTest(unittest.TestCase):
             contract.validate_redeem_response(resp, HS)
 
     def test_missing_and_bad_fields_rejected(self):
-        for key in ("v", "homeserver", "gateway", "auth", "features_url"):
+        # features_url 不在必填里（可选，见 test_features_url_optional）
+        for key in ("v", "homeserver", "gateway", "auth"):
             resp = ok_response()
             del resp[key]
             with self.assertRaises(contract.PairRedeemError, msg=key):
@@ -366,6 +372,28 @@ class RedeemResponseTest(unittest.TestCase):
                 contract.validate_redeem_response(ok_response(gateway=url), HS)
             with self.assertRaises(contract.PairRedeemError, msg=url):
                 contract.validate_redeem_response(ok_response(features_url=url), HS)
+
+    def test_features_url_optional(self):
+        # features_url 可选（#128/#132 Option A，OpenAPI 不列入 required）：
+        # 缺省合法——chat-only（gateway null）响应应省略；带网关响应缺省也合法
+        # （服务端"应"提供，但 schema 层可选）。
+        for gateway in (GW, None):
+            resp = ok_response(gateway=gateway)
+            del resp["features_url"]
+            result = contract.validate_redeem_response(resp, HS)  # must not raise
+            self.assertNotIn("features_url", result)
+        # 出现时（无论 gateway 是否为 null）仍须 https URL；null 值同样拒绝
+        for bad in ("http://gw.example.org", None, 123):
+            with self.assertRaises(contract.PairRedeemError, msg=repr(bad)):
+                contract.validate_redeem_response(ok_response(features_url=bad), HS)
+            with self.assertRaises(contract.PairRedeemError, msg=repr(bad)):
+                contract.validate_redeem_response(
+                    ok_response(gateway=None, features_url=bad), HS)
+        # chat-only 响应带合法 features_url：格式仍须校验通过（契约建议省略；
+        # App 须忽略、不得据此启用网关功能，pairing-qr.md §5.1.1）
+        result = contract.validate_redeem_response(ok_response(gateway=None), HS)
+        self.assertIsNone(result["gateway"])
+        self.assertEqual(result["features_url"], "https://gw.example.org/features.json")
 
     def test_auth_validation(self):
         bad_auths = (
