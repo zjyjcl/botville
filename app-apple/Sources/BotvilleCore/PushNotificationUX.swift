@@ -71,3 +71,61 @@ public enum PushBadge {
         return total > UInt64(Int.max) ? Int.max : Int(total)
     }
 }
+
+
+/// DEBUG foreground willPresent evidence. Writes only event names and option
+/// raw bits into the App Group cache — never tokens, Authorization, or bodies.
+public enum PushForegroundProbeLog {
+    public static let appGroupIdentifier = "group.com.zjyjcl.botville"
+    public static let fileName = "botville-willpresent-probe.log"
+
+    public static func makeLine(event: String, detail: String = "", at date: Date = Date(),
+                                formatter: ISO8601DateFormatter? = nil) -> String {
+        let stamp = (formatter ?? iso8601).string(from: date)
+        if detail.isEmpty { return "\(stamp) \(event)" }
+        return "\(stamp) \(event) \(detail)"
+    }
+
+    public static func logURL(fileManager: FileManager = .default) -> URL? {
+        guard let root = fileManager.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) else {
+            return nil
+        }
+        return root
+            .appendingPathComponent("Library/Caches", isDirectory: true)
+            .appendingPathComponent(fileName)
+    }
+
+    /// Appends one line. Safe to call from any thread; failures are ignored so
+    /// probe I/O never affects presentation.
+    public static func append(event: String, detail: String = "",
+                              fileManager: FileManager = .default) {
+        guard let url = logURL(fileManager: fileManager) else { return }
+        let dir = url.deletingLastPathComponent()
+        try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
+        let line = makeLine(event: event, detail: detail) + "\n"
+        guard let data = line.data(using: .utf8) else { return }
+        if fileManager.fileExists(atPath: url.path) {
+            guard let handle = try? FileHandle(forWritingTo: url) else { return }
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    public static func readTail(maxBytes: Int = 4096,
+                                fileManager: FileManager = .default) -> String? {
+        guard let url = logURL(fileManager: fileManager),
+              fileManager.fileExists(atPath: url.path),
+              let data = try? Data(contentsOf: url) else { return nil }
+        let slice = data.count > maxBytes ? data.suffix(maxBytes) : data
+        return String(data: Data(slice), encoding: .utf8)
+    }
+
+    private static let iso8601: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+}
