@@ -8,8 +8,11 @@ import SwiftUI
 struct RoomView: View {
     @ObservedObject var service: MatrixService
     let room: MatrixRoom
+    @Binding var isInputActive: Bool
+    @Binding var presentedRoomID: String?
 
     @State private var draft = ""
+    @FocusState private var isInputFocused: Bool
     @State private var isSending = false
     @State private var isOpening = false
     @State private var isLoadingOlderMessages = false
@@ -101,6 +104,7 @@ struct RoomView: View {
                 TextField("发送消息", text: $draft, axis: .vertical)
                     .lineLimit(1...5)
                     .textFieldStyle(.roundedBorder)
+                    .focused($isInputFocused)
 
                 Button(action: send) {
                     if isSending {
@@ -142,8 +146,16 @@ struct RoomView: View {
             _ = await (open, security)
         }
         .onDisappear {
+            isInputActive = false
+            if presentedRoomID == room.id { presentedRoomID = nil }
             service.closeRoom(room.id)
         }
+        .onAppear {
+            presentedRoomID = room.id
+            updateInputActivity()
+        }
+        .onChange(of: isInputFocused) { _, _ in updateInputActivity() }
+        .onChange(of: draft) { _, _ in updateInputActivity() }
         .sheet(isPresented: $isPresentingInvite) {
             InviteMemberSheet(service: service, room: currentRoom)
         }
@@ -248,6 +260,10 @@ struct RoomView: View {
                 errorMessage = error.localizedDescription
             }
         }
+    }
+
+    private func updateInputActivity() {
+        isInputActive = isInputFocused || !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func loadOlderMessages() async {

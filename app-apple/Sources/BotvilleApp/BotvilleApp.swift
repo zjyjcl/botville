@@ -15,6 +15,7 @@ import AppKit
 @MainActor
 struct BotvilleApp: App {
     @StateObject private var matrixService = MatrixService()
+    @StateObject private var foregroundBanner = ForegroundInAppBannerStore()
 #if os(iOS)
     @StateObject private var pushRoute = PushNotificationRouteStore.shared
     @UIApplicationDelegateAdaptor(PushApplicationDelegate.self) private var pushDelegate
@@ -24,6 +25,17 @@ struct BotvilleApp: App {
 #endif
     @State private var selectedTab = Self.initialTab
     @State private var debugPairingPresented = Self.opensPairConfirm
+    @State private var foregroundRoute: PushNotificationRoute?
+    @State private var visibleRoomID: String?
+    @State private var isRoomInputActive = false
+    @Environment(\.scenePhase) private var scenePhase
+#if os(iOS)
+    // The top overlay is above NavigationSplitView; leave space for the
+    // standard large title and navigation controls instead of covering them.
+    @ScaledMetric(relativeTo: .body) private var bannerTopClearance: CGFloat = 96
+#else
+    @ScaledMetric(relativeTo: .body) private var bannerTopClearance: CGFloat = 20
+#endif
 
     private static var initialTab: Int {
 #if DEBUG
@@ -79,12 +91,17 @@ struct BotvilleApp: App {
 #if os(iOS)
             AppRootView(
                 service: matrixService,
+                foregroundRoute: $foregroundRoute,
+                visibleRoomID: $visibleRoomID,
+                isRoomInputActive: $isRoomInputActive,
                 pushRoute: pushRoute,
                 onOpenChat: { selectedTab = 0 })
                 .tabItem { Label("会话", systemImage: "bubble.left.and.bubble.right") }
                 .tag(0)
 #else
-            AppRootView(service: matrixService, onOpenChat: { selectedTab = 0 })
+            AppRootView(service: matrixService, foregroundRoute: $foregroundRoute,
+                        visibleRoomID: $visibleRoomID, isRoomInputActive: $isRoomInputActive,
+                        onOpenChat: { selectedTab = 0 })
                 .tabItem { Label("会话", systemImage: "bubble.left.and.bubble.right") }
                 .tag(0)
 #endif
@@ -104,6 +121,31 @@ struct BotvilleApp: App {
         .onChange(of: showsGatewayFeatures) { _, visible in
             if !visible && selectedTab == 1 { selectedTab = 0 }
         }
+        .onReceive(matrixService.foregroundBannerCandidates) { candidate in
+            updateBannerContext()
+            foregroundBanner.receive(candidate)
+        }
+        .overlay(alignment: .top) {
+            ForegroundInAppBannerView(candidate: foregroundBanner.current) {
+                guard let route = foregroundBanner.takeRoute() else { return }
+                selectedTab = 0
+                foregroundRoute = route
+            } dismiss: {
+                foregroundBanner.dismiss()
+            }
+            .safeAreaPadding(.top)
+            .padding(.top, bannerTopClearance)
+        }
+        .onChange(of: scenePhase, initial: true) { _, _ in
+            updateBannerContext()
+        }
+        .onChange(of: selectedTab) { _, _ in updateBannerContext() }
+        .onChange(of: visibleRoomID) { _, _ in updateBannerContext() }
+        .onChange(of: isRoomInputActive) { _, _ in updateBannerContext() }
+        .onChange(of: matrixService.isLoggedIn) { _, loggedIn in
+            if !loggedIn { foregroundBanner.reset() }
+            updateBannerContext()
+        }
 #if os(iOS)
         // This observer belongs to the tab container so a notification can
         // leave the Dynamic tab before its chat child becomes visible.
@@ -122,6 +164,14 @@ struct BotvilleApp: App {
 #endif
         // Missing gateway means absent features: keep only the chat entry.
         return matrixService.hasConfirmedGateway
+    }
+
+    private func updateBannerContext() {
+        let chatVisible = selectedTab == 0
+        foregroundBanner.updateContext(
+            isForeground: scenePhase == .active && matrixService.isLoggedIn,
+            visibleRoomID: chatVisible ? visibleRoomID : nil,
+            isInputActive: chatVisible && isRoomInputActive)
     }
 
     var body: some Scene {
@@ -158,11 +208,16 @@ struct BotvilleApp: App {
 @MainActor
 private struct AppRootView: View {
     @ObservedObject var service: MatrixService
+    @Binding var foregroundRoute: PushNotificationRoute?
+    @Binding var visibleRoomID: String?
+    @Binding var isRoomInputActive: Bool
     @State private var selectedRoomID: String?
+    @State private var presentedRoomID: String?
     @State private var receivedPushRoute = false
     @State private var preferredCompactColumn: NavigationSplitViewColumn = .sidebar
 #if os(iOS)
     @ObservedObject var pushRoute: PushNotificationRouteStore
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 #endif
     let onOpenChat: () -> Void
 
@@ -176,7 +231,8 @@ private struct AppRootView: View {
                     RoomListView(service: service, selection: $selectedRoomID)
                 } detail: {
                     if let selectedRoom = service.rooms.first(where: { $0.id == selectedRoomID && $0.membership == .joined }) {
-                        RoomView(service: service, room: selectedRoom)
+                        RoomView(service: service, room: selectedRoom, isInputActive: $isRoomInputActive,
+                                 presentedRoomID: $presentedRoomID)
                             .id(selectedRoom.id)
                     } else {
                         ContentUnavailableView(
@@ -203,10 +259,26 @@ private struct AppRootView: View {
 #endif
         }
         .onChange(of: service.isLoggedIn) { _, loggedIn in
-            if !loggedIn { selectedRoomID = nil }
+            if !loggedIn {
+                selectedRoomID = nil
+                isRoomInputActive = false
+            }
 #if os(iOS)
             if loggedIn { applyPendingPushRoute() }
 #endif
+        }
+        .onChange(of: selectedRoomID) { _, _ in publishVisibleRoom() }
+        .onChange(of: presentedRoomID) { _, _ in publishVisibleRoom() }
+        .onChange(of: preferredCompactColumn) { _, _ in publishVisibleRoom() }
+        .onChange(of: isRoomInputActive) { _, _ in publishVisibleRoom() }
+#if os(iOS)
+        .onChange(of: horizontalSizeClass) { _, _ in publishVisibleRoom() }
+#endif
+        .onAppear { publishVisibleRoom() }
+        .onChange(of: foregroundRoute, initial: true) { _, route in
+            guard let route else { return }
+            apply(route)
+            foregroundRoute = nil
         }
 #if os(iOS)
         // @Published emits in willSet. Consume only after SwiftUI observes the
@@ -246,6 +318,25 @@ private struct AppRootView: View {
             selectedRoomID = nil
             preferredCompactColumn = .sidebar
         }
+        isRoomInputActive = false
+        publishVisibleRoom()
+    }
+
+    private func publishVisibleRoom() {
+        visibleRoomID = currentVisibleRoomID
+    }
+
+    private var currentVisibleRoomID: String? {
+        guard service.isLoggedIn,
+              let presentedRoomID,
+              selectedRoomID == presentedRoomID,
+              service.rooms.contains(where: { $0.id == presentedRoomID && $0.membership == .joined }) else {
+            return nil
+        }
+#if os(iOS)
+        guard horizontalSizeClass == .regular || preferredCompactColumn == .detail else { return nil }
+#endif
+        return presentedRoomID
     }
 }
 

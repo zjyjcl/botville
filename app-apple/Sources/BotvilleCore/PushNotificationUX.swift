@@ -46,7 +46,9 @@ public struct PushNotificationPresentation: OptionSet, Equatable, Sendable {
     public static let list = Self(rawValue: 1 << 1)
     public static let sound = Self(rawValue: 1 << 2)
     public static let badge = Self(rawValue: 1 << 3)
-    public static let foreground: Self = [.banner, .list, .sound, .badge]
+    // Foreground visibility comes from locally synced in-app banners. Keep
+    // badge updates without requesting a second system banner/list/sound.
+    public static let foreground: Self = [.badge]
 
     /// Bits aligned with `UNNotificationPresentationOptions` (iOS 14+ / SDK 27.2):
     /// badge=1<<0, sound=1<<1, list=1<<3, banner=1<<4. Does not set deprecated `.alert`.
