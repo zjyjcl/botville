@@ -27,6 +27,11 @@ final class PushNotificationUXTests: XCTestCase {
 
     func testForegroundPresentationPolicyIncludesAllVisibleChoices() {
         XCTAssertEqual(PushNotificationPresentation.foreground, [.banner, .list, .sound, .badge])
+        // Match UserNotifications.UNNotificationPresentationOptions raw bits (SDK 27.2).
+        XCTAssertEqual(PushNotificationPresentation.foreground.unNotificationPresentationRawValue,
+                       (1 << 0) | (1 << 1) | (1 << 3) | (1 << 4))
+        XCTAssertEqual(PushNotificationPresentation.banner.unNotificationPresentationRawValue, 1 << 4)
+        XCTAssertEqual(PushNotificationPresentation.list.unNotificationPresentationRawValue, 1 << 3)
     }
 
     func testReadReceiptStateClearsOnlyTheOpenedRoomAfterSuccess() {

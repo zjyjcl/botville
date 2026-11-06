@@ -47,6 +47,17 @@ public struct PushNotificationPresentation: OptionSet, Equatable, Sendable {
     public static let sound = Self(rawValue: 1 << 2)
     public static let badge = Self(rawValue: 1 << 3)
     public static let foreground: Self = [.banner, .list, .sound, .badge]
+
+    /// Bits aligned with `UNNotificationPresentationOptions` (iOS 14+ / SDK 27.2):
+    /// badge=1<<0, sound=1<<1, list=1<<3, banner=1<<4. Does not set deprecated `.alert`.
+    public var unNotificationPresentationRawValue: UInt {
+        var raw: UInt = 0
+        if contains(.badge) { raw |= 1 << 0 }
+        if contains(.sound) { raw |= 1 << 1 }
+        if contains(.list) { raw |= 1 << 3 }
+        if contains(.banner) { raw |= 1 << 4 }
+        return raw
+    }
 }
 
 public enum PushBadge {
