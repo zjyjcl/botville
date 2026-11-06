@@ -166,6 +166,7 @@ struct PushDiagnosticsView: View {
     @State private var isSaving = false
     @State private var isChecking = false
     @State private var didCopy = false
+    @State private var probeTailRefresh = 0
 
     var body: some View {
         Form {
@@ -243,6 +244,24 @@ struct PushDiagnosticsView: View {
                 .disabled(isChecking || !service.isLoggedIn || service.pushToken == nil)
                 Text(service.pushVerificationStatus ?? "尚未核对。")
             }
+#if os(iOS)
+            Section("前台 willPresent 探针") {
+                Text("App Group 日志：Library/Caches/botville-willpresent-probe.log（无 token）。Console 过滤 subsystem com.zjyjcl.botville / PushForeground。")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                if let tail = PushForegroundProbeLog.readTail(), !tail.isEmpty {
+                    Text(tail)
+                        .font(.system(.caption2, design: .monospaced))
+                        .textSelection(.enabled)
+                } else {
+                    Text("尚无探针行。冷启后应先出现 installNotificationDelegate / didFinishLaunching；前台来推后应出现 willPresent optionsRaw=…。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Button("刷新探针尾部") { probeTailRefresh += 1 }
+            }
+            .id(probeTailRefresh)
+#endif
             Section {
                 Text("仅用于 DEBUG 真机诊断。token 仅保留在内存并用于 pusher 请求，不写入日志或磁盘。核对成功仅表示服务器存在匹配记录，不代表 APNs 已送达。")
                     .font(.caption).foregroundStyle(.secondary)

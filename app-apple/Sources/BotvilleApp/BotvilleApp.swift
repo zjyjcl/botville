@@ -6,6 +6,7 @@ import SwiftUI
 #if os(iOS)
 import UIKit
 import UserNotifications
+import os
 #elseif os(macOS)
 import AppKit
 #endif
@@ -45,6 +46,13 @@ struct BotvilleApp: App {
         ProcessInfo.processInfo.arguments.contains("-pair-confirm")
 #else
         false
+#endif
+    }
+
+    init() {
+#if os(iOS)
+        // Process-level singleton outlives Scene/@UIApplicationDelegateAdaptor churn.
+        PushNotificationCenter.shared.install(reason: "BotvilleApp.init")
 #endif
     }
 
@@ -261,17 +269,80 @@ final class PushNotificationRouteStore: ObservableObject {
     }
 }
 
-final class PushApplicationDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
-    // UNUserNotificationCenter.delegate is weak; keep this object as the
-    // UIApplicationDelegateAdaptor instance and re-assert ownership early and
-    // on every foreground activation so willPresent is not skipped.
+/// Process-retained UNUserNotificationCenter delegate. The center keeps only a
+/// weak reference; relying solely on `@UIApplicationDelegateAdaptor` left
+/// foreground `willPresent` unverified after #144, so this singleton is installed
+/// from `BotvilleApp.init`, launch, and every become-active.
+final class PushNotificationCenter: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = PushNotificationCenter()
+
+#if DEBUG
+    private static let logger = Logger(subsystem: "com.zjyjcl.botville", category: "PushForeground")
+#endif
+
+    private override init() {
+        super.init()
+    }
+
+    func install(reason: String) {
+        UNUserNotificationCenter.current().delegate = self
+#if DEBUG
+        Self.probe("installNotificationDelegate", detail: "reason=\(reason)")
+#endif
+    }
+
+    @objc(userNotificationCenter:willPresentNotification:withCompletionHandler:)
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        let options = UNNotificationPresentationOptions(
+            rawValue: PushNotificationPresentation.foreground.unNotificationPresentationRawValue)
+#if DEBUG
+        Self.probe("willPresent", detail: "optionsRaw=\(options.rawValue)")
+#endif
+        // Call immediately on the callback thread. #144 deferred to main.async and
+        // still saw no foreground banner; Apple's docs complete synchronously.
+        completionHandler(options)
+    }
+
+    @objc(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:)
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let route = PushNotificationRoute.parse(response.notification.request.content.userInfo)
+        completionHandler()
+        Task { @MainActor in PushNotificationRouteStore.shared.receive(route) }
+    }
+
+#if DEBUG
+    private static func probe(_ event: String, detail: String = "") {
+        if detail.isEmpty {
+            logger.log("\(event, privacy: .public)")
+        } else {
+            logger.log("\(event, privacy: .public) \(detail, privacy: .public)")
+        }
+        PushForegroundProbeLog.append(event: event, detail: detail)
+    }
+#endif
+}
+
+final class PushApplicationDelegate: NSObject, UIApplicationDelegate {
     override init() {
         super.init()
-        Self.installNotificationDelegate(self)
+        PushNotificationCenter.shared.install(reason: "PushApplicationDelegate.init")
     }
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
-        Self.installNotificationDelegate(self)
+        PushNotificationCenter.shared.install(reason: "didFinishLaunching")
+#if DEBUG
+        PushForegroundProbeLog.append(event: "didFinishLaunching")
+        Logger(subsystem: "com.zjyjcl.botville", category: "PushForeground")
+            .log("didFinishLaunching")
+#endif
         if let userInfo = launchOptions?[.remoteNotification] as? [AnyHashable: Any] {
             let route = PushNotificationRoute.parse(userInfo)
             Task { @MainActor in PushNotificationRouteStore.shared.receive(route) }
@@ -280,29 +351,7 @@ final class PushApplicationDelegate: NSObject, UIApplicationDelegate, UNUserNoti
     }
 
     func applicationDidBecomeActive(_ application: UIApplication) {
-        Self.installNotificationDelegate(self)
-    }
-
-    private static func installNotificationDelegate(_ delegate: UNUserNotificationCenterDelegate) {
-        UNUserNotificationCenter.current().delegate = delegate
-    }
-
-    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
-                                            withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        // Map Core policy → UN bits (banner=1<<4, list=1<<3). Call on main; some
-        // iOS 17–27 builds suppress heads-up if the handler races off-main.
-        let options = UNNotificationPresentationOptions(
-            rawValue: PushNotificationPresentation.foreground.unNotificationPresentationRawValue)
-        DispatchQueue.main.async {
-            completionHandler(options)
-        }
-    }
-
-    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
-                                            withCompletionHandler completionHandler: @escaping () -> Void) {
-        let route = PushNotificationRoute.parse(response.notification.request.content.userInfo)
-        completionHandler()
-        Task { @MainActor in PushNotificationRouteStore.shared.receive(route) }
+        PushNotificationCenter.shared.install(reason: "didBecomeActive")
     }
 
 #if DEBUG
