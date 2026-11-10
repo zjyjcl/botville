@@ -55,7 +55,10 @@ F15（webhook 出口的开放接口语义）的**开源替代语义**；仅取�
 | 1 | 响应侧无 `scheduled_at` | `Card` 响应只有 `deliver_after`；提醒触发时刻仅在创建请求侧用 `scheduled_at` 表达，由服务端转为排程。如需响应侧展示触发时刻，走网关 minor 升级。 |
 | 2 | `DeliveryRetryPolicy` / `DeliveryFailureCode` 未上 wire | 规范建议值，不在 `Card` / `CardDelivery` 字段内，由各渠道实现侧采用。 |
 | 3 | approval 回调签名 | assertion 的算法与字节编码属 D2.1；本模型只固定引用字段（challenge / revision / audit_id）。 |
-| 4 | gateway `CreateCardRequest.description` 静默检查一句 | 该句「`interrupt: false`（默认）时，`priority` 为 `urgent` 可穿透静默」与 contract §4.8 / 本文 §2.5 冲突：**以 contract.md / 本 data-model 为准**——`urgent` 默认穿透静默，显式 `interrupt: false` 时连 `urgent` 也不穿透。gateway YAML 该句留给 B0.1 owner 修订；本 PR 不改网关契约正文。 |
+| 4 | gateway `CreateCardRequest.description` 静默检查一句 | **已关闭**（[#74](https://github.com/zjyjcl/botville/issues/74)，合入 #76）：gateway YAML 已与 contract.md §4.8 对齐——`urgent` 默认穿透静默，显式 `interrupt: false` 时连 `urgent` 也不穿透；`interrupt` 无 `default`。 |
+
+D 线后续契约缺口（授权编码、插件、桥接、开放 API 总文档等）见
+[contract-gaps.md](contract-gaps.md)；其中产品性选择需所有者拍板，本文不自行定论。
 
 ## 2. 核心对象
 
@@ -129,7 +132,7 @@ F15（webhook 出口的开放接口语义）的**开源替代语义**；仅取�
 |---|---|
 | `deliver_after` | 服务端最早投递时间；`null` 表示立即（仍受静默检查） |
 | `scheduled_at` | 期望展示时间（提醒触发时刻），创建时与 `deliver_after` 二选一 |
-| `interrupt` | 是否穿透静默立即打断；默认 `false` |
+| `interrupt` | 是否穿透静默立即打断；**无默认值**（三态：省略 / `true` / `false`），省略时按 `priority` 决定 |
 
 `priority` → 打断级别：
 
@@ -140,7 +143,12 @@ F15（webhook 出口的开放接口语义）的**开源替代语义**；仅取�
 | `normal` | 延后 | 常规 |
 | `low` | 延后 | 静默/摘要里出现 |
 
-`interrupt: false` 显式关闭穿透时，即使 `priority: urgent` 也不打断。
+`interrupt` 是三态字段，与 contract.md §4.8 一致，**不得补默认值**：
+
+- 省略时由 `priority` 决定：`urgent` → 穿透；其余优先级 → 顺延。
+- 显式 `true` → 无论优先级都穿透。
+- 显式 `false` → 即使 `priority: urgent` 也不打断，静默期间顺延到 `deliver_after`。
+
 静默时段规则本体（`SilentHours`：start/end/timezone，跨午夜合法）属网关
 B 线配置，通知域只引用其 timezone 语义，见第 5 章。
 
@@ -168,6 +176,25 @@ GET /audit/{audit_id} → AuditRecord（append-only 审计）
 
 `revision` 贯穿全程用于防 TOCTOU；`audit_id` 是通知模型引用审计记录的
 唯一入口；回执中的 `card` 反映拍板后的最新状态。
+
+`CardAction.payload`、`CardActionRequest.payload` 与回执/审计中的
+`result` 由来源模块定义，通知域 **不**规定全局业务 schema；已有禁令
+仍然适用（不得含密钥或个人敏感信息，命中则拒绝，contract §4.4 / §4.6
+规则 5）。断言的字节编码由 D2.1 定义，本模型只固定绑定字段。
+
+### 2.7 列表展示的默认映射（不新增 API）
+
+通知列表与详情复用 `Card` 与 `GET /v1/cards`（含 `updated_since`），
+**不**另建通知对象或通知列表接口。以下为通知域的默认展示映射，
+供客户端使用既有字段；不新增 wire 字段。通知偏好界面是否单独做 API
+不在本节约定（见 [contract-gaps.md](contract-gaps.md) B2）。
+
+| 展示问题 | 默认映射 |
+|---|---|
+| 未读 | `Card.status == active` 计为未读；`read` / `dismissed` / `expired` / `acted` 不计。未读与 `delivery[].state` 无关。 |
+| 分类 | 按 `type` 与 `source.capability_id` 分组；不另作分类枚举。 |
+| 排序 | 客户端默认按 `priority` 序（`urgent > high > normal > low`），同级按 `updated_at` 降序。服务端列表排序仍以网关契约为准（若未规定则由客户端排序）。 |
+| 折叠 | 同 `group_id` 收成一条摘要入口；同 `collapse_key` 的未读卡由新卡替换旧卡展示（见 §2.4）。折叠只影响展示，不改 `Card.status`。 |
 
 ## 3. 投递状态机
 

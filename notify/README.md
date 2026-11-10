@@ -10,6 +10,7 @@ License: Apache-2.0（与仓库一致）。
 ## 目录布局
 
 - `docs/data-model.md` — 开源通知数据模型规范（D1.1 交付，Schema 评审入口）
+- `docs/contract-gaps.md` — D 线契约缺口清单（A 类已定稿项与 B 类待所有者拍板项）
 - `openapi/notify.v1.yaml` — 通知域 schema：`$ref` 聚合 `gateway.v1.yaml` 的
   `Card*` 等，`allOf` 只增通知域语义（类型、来源键 MUST 约定、失败码、
   重试规范建议值）
