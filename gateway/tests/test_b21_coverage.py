@@ -13,6 +13,7 @@ import datetime
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -305,17 +306,35 @@ class TestHttpEdgeCases(unittest.TestCase):
         self.assertEqual(status, 405)
 
     def test_chunked_transfer_encoding_rejected(self):
+        # 不用 urllib：带 body 的 Request 会被 urllib 自动 chunked 编码，而服务端
+        # 见非 identity 的 Transfer-Encoding 后立即回 400 且不读请求体；urllib 在
+        # sendall 写 chunked 尾部时连接已关，抛 URLError(Broken pipe) 而非
+        # HTTPError，测试因此 ERROR 而非断言 400。改用 raw socket 只发请求行+头
+        #（不发 body），服务端仅凭头即可拒绝，读完整响应再断言。
         with _Fixture(_cfg()) as fixture:
-            req = urllib.request.Request(
-                f"{fixture.base}/v1/conversations/c/messages", data=b"{}", method="POST"
-            )
-            req.add_header("Content-Type", "application/json")
-            req.add_header("Transfer-Encoding", "chunked")
+            host, port = fixture.server.server_address[:2]
+            sock = socket.create_connection((host, port), timeout=5)
             try:
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    status, body = resp.status, resp.read()
-            except urllib.error.HTTPError as exc:
-                status, body = exc.code, exc.read()
+                request = (
+                    "POST /v1/conversations/c/messages HTTP/1.1\r\n"
+                    f"Host: {host}:{port}\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Transfer-Encoding: chunked\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                )
+                sock.sendall(request.encode("ascii"))
+                chunks = []
+                while True:
+                    data = sock.recv(4096)
+                    if not data:
+                        break
+                    chunks.append(data)
+                raw = b"".join(chunks)
+            finally:
+                sock.close()
+        head, _, body = raw.partition(b"\r\n\r\n")
+        status = int(head.splitlines()[0].split()[1])
         self.assertEqual(status, 400)
         self.assertEqual(json.loads(body)["code"], "request.invalid")
 
