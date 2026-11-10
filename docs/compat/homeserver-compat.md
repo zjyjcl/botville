@@ -118,6 +118,7 @@ Conduit (timokoesters/conduit, Rust)
 - botville 的联邦策略是**只与扫码配对过的服务器互通、任一方可单方面切断**（A2.1），配对闸门由 botville 自有组件（配对后端 + 反向代理/网络层）实现，**不依赖各 homeserver 的白名单能力**；
 - 三家都实现标准 Server-Server API（`/_matrix/federation/v1/*`），互联邦本身可用。可作为辅助硬化的选项：Synapse 有 `federation_domain_whitelist`；Tuwunel 有 `allowed_remote_server_names_experimental`（白名单，实验性）与 `forbidden_remote_server_names`（黑名单）；continuwuity 有 `forbidden_remote_server_names` / `allowed_remote_server_names`（可设 `forbidden=[".*"]` 后仅放行配对方）——均不作为 botville 的功能依赖；
 - **A2.1 已落地（2026-11）**：`server/pairing/`（标准库实现：pairing 服务 + fedgate 反代闸门 + SQLite 配对表）与独立 compose 项目 `botville-fed`（Synapse 双实例 hs-a/hs-b）进入 CI `federation-e2e` job，验收「未配对拒绝 / 配对后互发 / 双向切断即断流」；设计与运维细节见 [`docs/deploy/paired-federation.md`](../deploy/paired-federation.md)。Tuwunel/continuwuity 的配对联邦矩阵为后续扩展。
+- **App 扫码配对首版只支持 Synapse（2026-11-10 决策 B3）**：[pairing-qr.md](../contracts/pairing-qr.md) 的一次性注册令牌首版只在 Synapse 上签发；Tuwunel / continuwuity 部署不提供 App 配对二维码，App 用密码登录。以后如要支持，需先核实两家一次性注册令牌的签发途径（目前只见静态 `registration_token` 配置）。
 
 ---
 
