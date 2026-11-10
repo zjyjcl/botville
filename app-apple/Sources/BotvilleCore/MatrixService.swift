@@ -8,7 +8,45 @@ import Network
 import OSLog
 #if os(iOS)
 import UIKit
+import UserNotifications
 #endif
+
+/// Identifies one visible owner of a room timeline. It is process-local and
+/// deliberately carries no Matrix event or credential data.
+public struct RoomTimelineLease: Equatable, Sendable {
+    fileprivate let id: UUID
+}
+
+/// Serializes the UI ownership of the single SDK timeline. A room ID alone is
+/// insufficient: an old SwiftUI view can disappear after another instance has
+/// reopened the same room.
+struct TimelineLeaseOwnership {
+    private(set) var activeRoomID: String?
+    private(set) var activeLease: RoomTimelineLease?
+
+    mutating func open(roomID: String) -> RoomTimelineLease {
+        let lease = RoomTimelineLease(id: UUID())
+        activeRoomID = roomID
+        activeLease = lease
+        return lease
+    }
+
+    mutating func close(roomID: String, lease: RoomTimelineLease) -> Bool {
+        guard activeRoomID == roomID, activeLease == lease else { return false }
+        activeRoomID = nil
+        activeLease = nil
+        return true
+    }
+
+    func isCurrent(roomID: String, lease: RoomTimelineLease) -> Bool {
+        activeRoomID == roomID && activeLease == lease
+    }
+
+    mutating func invalidate() {
+        activeRoomID = nil
+        activeLease = nil
+    }
+}
 
 /// SDK ownership and all UI-facing state live on the main actor. Async SDK
 /// operations run in Rust; the same client retains the /sync since token.
@@ -19,7 +57,20 @@ public final class MatrixService: ObservableObject {
     @Published public private(set) var rooms: [MatrixRoom] = []
     /// Ephemeral local-sync events, never populated from APNs/NSE payloads or logged.
     public let foregroundBannerCandidates = PassthroughSubject<ForegroundBannerCandidate, Never>()
-    private var foregroundBannerDetector = ForegroundBannerDetector()
+    private var bannerResumeState = ForegroundBannerResumeState()
+    private var bannerResumeTask: Task<Void, Never>?
+    private var deliveredBackgroundEvents = [PushEventReference]()
+    private var bannerNotificationListener: ForegroundSyncNotificationBridge?
+    private var bannerNotificationTask: Task<Void, Never>?
+    var deliveredBannerEvents: @Sendable (Date) async -> [PushEventReference] = { activeEdge in
+#if os(iOS)
+        return await UNUserNotificationCenter.current().deliveredNotifications()
+            .filter { $0.date <= activeEdge }
+            .compactMap { PushEventReference.parse($0.request.content.userInfo) }
+#else
+        return []
+#endif
+    }
     @Published public private(set) var messages: [MatrixMessage] = []
     @Published public private(set) var activeRoomID: String?
     @Published public private(set) var userID: String?
@@ -86,6 +137,7 @@ public final class MatrixService: ObservableObject {
     private var timelineTask: Task<Void, Never>?
     private var timelineGeneration = UUID()
     private var timelineState = TimelineState()
+    private var timelineLeaseOwnership = TimelineLeaseOwnership()
     @Published public private(set) var isAuthenticating = false
     @Published public private(set) var authenticationStatus: String?
     @Published public private(set) var canClearLocalSession = false
@@ -152,6 +204,9 @@ public final class MatrixService: ObservableObject {
         pushOperation?.cancel()
         authDelegate?.continuation.finish()
         syncTask?.cancel()
+        bannerResumeTask?.cancel()
+        bannerNotificationListener?.continuation.finish()
+        bannerNotificationTask?.cancel()
         timelineHandle?.cancel()
         timelineListener?.continuation.finish()
         timelineTask?.cancel()
@@ -569,6 +624,27 @@ public final class MatrixService: ObservableObject {
         // restore can render rooms without waiting for its first `/sync`.
         userID = stored.userID
         isLoggedIn = true
+        let (notifications, notificationContinuation) = AsyncStream<ForegroundSyncEvent>.makeStream()
+        let notificationListener = ForegroundSyncNotificationBridge(userID: stored.userID,
+                                                                    continuation: notificationContinuation)
+        notificationListener.setActive(bannerResumeState.isForeground)
+        bannerNotificationListener = notificationListener
+        bannerNotificationTask = Task { [weak self] in
+            for await event in notifications {
+                guard !Task.isCancelled, let self, generation == self.sessionGeneration else { return }
+                // Resume reconciliation can overlap an old long poll/drain. Keep
+                // each live event queued until exact delivered IDs are known.
+                await self.bannerResumeTask?.value
+                guard !Task.isCancelled, generation == self.sessionGeneration,
+                      !self.isLoggingOut, notificationListener.isCurrent(event),
+                      self.bannerResumeState.shouldPresent(event.candidate, suppressedEvents: self.deliveredBackgroundEvents),
+                      self.rooms.contains(where: { $0.id == event.candidate.roomID && $0.membership == .joined }) else { continue }
+                self.foregroundBannerCandidates.send(event.candidate)
+            }
+        }
+        await client.registerNotificationHandler(listener: notificationListener)
+        try Task.checkCancellation()
+        guard generation == sessionGeneration else { throw CancellationError() }
         await refreshRooms(from: client, session: generation)
         try Task.checkCancellation()
         guard generation == sessionGeneration else { throw CancellationError() }
@@ -581,12 +657,40 @@ public final class MatrixService: ObservableObject {
         enqueuePushRegistration()
     }
 
+    public func applicationDidEnterBackground() {
+        bannerResumeState.enteredBackground()
+        bannerNotificationListener?.setActive(false)
+    }
+
+    /// Called synchronously at the scene edge, before scheduling async recovery.
+    public func prepareForForeground() {
+        let activeEdge = Date()
+        bannerNotificationListener?.setActive(true)
+        let resumedFromBackground = bannerResumeState.becameActive()
+        if resumedFromBackground {
+            let session = sessionGeneration
+            bannerResumeTask?.cancel()
+            // Capture the edge before any suspension. Never rebaseline the first
+            // sync after this point: it may contain messages received in foreground.
+            bannerResumeTask = Task { [weak self] in
+                guard let self else { return }
+                let events = await self.deliveredBannerEvents(activeEdge)
+                guard session == self.sessionGeneration, !Task.isCancelled else { return }
+                for event in events where !self.deliveredBackgroundEvents.contains(event) {
+                    self.deliveredBackgroundEvents.append(event)
+                }
+                self.deliveredBackgroundEvents = Array(self.deliveredBackgroundEvents.suffix(2048))
+            }
+        }
+    }
+
     public func applicationDidBecomeActive() async {
+        prepareForForeground()
         updateApplicationBadge()
         if isLoggedIn {
-            // The next committed online snapshot absorbs background catch-up.
-            foregroundBannerDetector.beginCatchUp()
-            try? await sync()
+            // A suspended long poll is still the owner of its response. Replacing
+            // it here discards updates during FFI cancellation/drain.
+            if syncTask == nil { try? await sync() }
         }
         else if !requiresPasswordReauthentication { await restoreSession() }
     }
@@ -621,6 +725,10 @@ public final class MatrixService: ObservableObject {
                     guard !Task.isCancelled, let self, self.syncGeneration == generation else { return }
                     await self.refreshRooms(from: client, session: session, resolveUnknownEncryption: true, onlineSyncGeneration: generation)
                     guard !Task.isCancelled, self.syncGeneration == generation else { return }
+                    // SDK awaits all notification callbacks before sync returns.
+                    // Their eligibility was captured synchronously by the bridge,
+                    // so queued cold-start events remain consumed as history.
+                    self.bannerNotificationListener?.finishInitialSync()
                     self.isSyncing = false
                     self.syncError = nil
                     self.connectionStatus = .connected
@@ -656,11 +764,11 @@ public final class MatrixService: ObservableObject {
 
     private func refreshRooms(from client: Client, session: UUID, resolveUnknownEncryption: Bool = false,
                               onlineSyncGeneration: UUID? = nil) async {
+        if onlineSyncGeneration != nil { await bannerResumeTask?.value }
         let refresh = UUID()
         roomRefreshGeneration = refresh
         let securityRevisionsAtStart = roomSecurityRevisions
         var updated: [MatrixRoom] = []
-        var latestEvents: [String: LatestEventValue] = [:]
         for room in client.rooms() {
             let membership: MatrixRoomMembership
             switch room.membership() {
@@ -670,7 +778,6 @@ public final class MatrixService: ObservableObject {
             }
             let info = try? await room.roomInfo()
             let latest = await room.latestEvent()
-            latestEvents[room.id()] = latest
             let timestamp: UInt64?
             switch latest {
             case .remote(let time, _, _, _, _), .remoteInvite(let time, _, _), .local(let time, _, _, _, _): timestamp = time
@@ -706,22 +813,19 @@ public final class MatrixService: ObservableObject {
         }
         guard session == sessionGeneration, refresh == roomRefreshGeneration, isLoggedIn, !isLoggingOut else { return }
         // A cancelled/replaced sync must not commit or arm the banner baseline.
-        if let onlineSyncGeneration {
-            guard !Task.isCancelled, onlineSyncGeneration == syncGeneration else { return }
+        let committed = RoomRefreshCommitGate.commit(onlineGeneration: onlineSyncGeneration,
+                                     currentGeneration: syncGeneration,
+                                     isCancelled: Task.isCancelled) {
+            rooms = MatrixRoom.sortedByActivity(Self.mergingSecurityUpdates(
+                refreshed: updated, current: rooms,
+                revisionsAtStart: securityRevisionsAtStart,
+                currentRevisions: roomSecurityRevisions,
+                observedEncryptedRooms: observedEncryptedRooms
+            ))
+            // Banner events come only from SyncNotificationListener. A derived
+            // latestEvent readback here can lag this sync and must never replay it.
         }
-        rooms = MatrixRoom.sortedByActivity(Self.mergingSecurityUpdates(
-            refreshed: updated, current: rooms,
-            revisionsAtStart: securityRevisionsAtStart,
-            currentRevisions: roomSecurityRevisions,
-            observedEncryptedRooms: observedEncryptedRooms
-        ))
-        let snapshots = rooms.map { room in
-            ForegroundBannerSnapshot(room: room, candidate: Self.foregroundBannerCandidate(
-                for: room, latest: latestEvents[room.id] ?? .none, currentUserID: userID))
-        }
-        for candidate in foregroundBannerDetector.candidates(in: snapshots, isOnlineSync: onlineSyncGeneration != nil) {
-            foregroundBannerCandidates.send(candidate)
-        }
+        guard committed else { return }
         updateApplicationBadge()
         if rooms.contains(where: { $0.encryption == .encrypted }) { refreshCryptoSafety(from: client) }
         if let activeRoomID, !rooms.contains(where: { $0.id == activeRoomID && $0.membership == .joined }) {
@@ -955,15 +1059,32 @@ public final class MatrixService: ObservableObject {
         }
     }
 
-    public func openRoom(_ roomID: String) async throws {
+    /// Claims timeline ownership before a SwiftUI appearance starts its async
+    /// open. A disappearing older view can then close only its own lease.
+    public func beginRoomOpen(_ roomID: String) -> RoomTimelineLease {
+        let lease = timelineLeaseOwnership.open(roomID: roomID)
+        clearTimeline()
+        activeRoomID = roomID
+        return lease
+    }
+
+    @discardableResult
+    public func openRoom(_ roomID: String) async throws -> RoomTimelineLease {
+        let lease = beginRoomOpen(roomID)
+        return try await openRoom(roomID, lease: lease)
+    }
+
+    @discardableResult
+    public func openRoom(_ roomID: String, lease: RoomTimelineLease) async throws -> RoomTimelineLease {
         guard let client, !isLoggingOut else { throw MatrixServiceError.notLoggedIn }
         guard let room = try client.getRoom(roomId: roomID), room.membership() == .joined else {
             throw MatrixServiceError.roomUnavailable
         }
+        guard timelineLeaseOwnership.isCurrent(roomID: roomID, lease: lease), activeRoomID == roomID else {
+            throw CancellationError()
+        }
         updateApplicationBadge()
         let session = sessionGeneration
-        clearTimeline()
-        activeRoomID = roomID
         let generation = timelineGeneration
         do {
             let newTimeline = try await room.timeline()
@@ -993,14 +1114,24 @@ public final class MatrixService: ObservableObject {
                     try await newTimeline.markAsRead(receiptType: .read)
                 }
             }
+            return lease
         } catch {
-            if generation == timelineGeneration { clearTimeline() }
+            if generation == timelineGeneration,
+               timelineLeaseOwnership.close(roomID: roomID, lease: lease) {
+                clearTimeline()
+            }
             throw await operationFailure(error, session: session)
         }
     }
 
+    public func closeRoom(_ roomID: String, lease: RoomTimelineLease) {
+        guard timelineLeaseOwnership.close(roomID: roomID, lease: lease), activeRoomID == roomID else { return }
+        clearTimeline()
+    }
+
     public func closeRoom(_ roomID: String) {
         guard activeRoomID == roomID else { return }
+        timelineLeaseOwnership.invalidate()
         clearTimeline()
     }
 
@@ -1312,7 +1443,14 @@ public final class MatrixService: ObservableObject {
         authTask?.cancel()
         authTask = nil
         clearTimeline()
-        foregroundBannerDetector.reset()
+        bannerResumeState = ForegroundBannerResumeState()
+        bannerResumeTask?.cancel()
+        bannerResumeTask = nil
+        deliveredBackgroundEvents.removeAll()
+        bannerNotificationListener?.continuation.finish()
+        bannerNotificationListener = nil
+        bannerNotificationTask?.cancel()
+        bannerNotificationTask = nil
         rooms = []
         updateApplicationBadge()
         userID = nil

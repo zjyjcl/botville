@@ -130,14 +130,53 @@ struct ForegroundBannerSnapshot {
     let candidate: ForegroundBannerCandidate?
 }
 
-/// Actual RoomView appearance is authoritative; a split view's preferred column
-/// is a navigation request, not evidence that its detail is hidden.
+/// Navigation owns visibility, independent of retained RoomView lifecycles.
+/// Room-attached sheets retain the room context (and same-room suppression).
 public enum ForegroundBannerVisibility {
     public static func roomID(isLoggedIn: Bool, selectedRoomID: String?,
-                              presentedRoomID: String?, joinedRoomIDs: [String]) -> String? {
-        guard isLoggedIn, let presentedRoomID, selectedRoomID == presentedRoomID,
-              joinedRoomIDs.contains(presentedRoomID) else { return nil }
-        return presentedRoomID
+                              isCompact: Bool, showsDetail: Bool,
+                              isSceneActive: Bool, isChatTab: Bool,
+                              joinedRoomIDs: [String]) -> String? {
+        guard isLoggedIn, isSceneActive, isChatTab, let selectedRoomID,
+              !isCompact || showsDetail,
+              joinedRoomIDs.contains(selectedRoomID) else { return nil }
+        return selectedRoomID
+    }
+}
+
+/// A background edge never invalidates the online baseline. Foreground messages
+/// remain eligible even if a network-driven replacement sync is still draining.
+struct ForegroundBannerResumeState {
+    private var isActive = true
+    var isForeground: Bool { isActive }
+    mutating func enteredBackground() {
+        isActive = false
+    }
+    @discardableResult
+    mutating func becameActive() -> Bool {
+        let wasBackground = !isActive
+        isActive = true
+        return wasBackground
+    }
+    func shouldPresent(_ candidate: ForegroundBannerCandidate,
+                       suppressedEvents: [PushEventReference]) -> Bool {
+        isActive && !suppressedEvents.contains {
+            $0.roomID == candidate.roomID && $0.eventID == candidate.eventID
+        }
+    }
+}
+
+/// The commit closure includes both UI publication and detector mutation.
+/// Keeping them behind one gate prevents rejected snapshots arming the baseline.
+enum RoomRefreshCommitGate {
+    @discardableResult
+    static func commit(onlineGeneration: UUID?, currentGeneration: UUID,
+                       isCancelled: Bool, body: () -> Void) -> Bool {
+        if let onlineGeneration {
+            guard !isCancelled, onlineGeneration == currentGeneration else { return false }
+        }
+        body()
+        return true
     }
 }
 
@@ -158,7 +197,7 @@ struct ForegroundBannerDetector {
     }
 
     mutating func candidates(in snapshots: [ForegroundBannerSnapshot],
-                             isOnlineSync: Bool = true) -> [ForegroundBannerCandidate] {
+                             isOnlineSync: Bool) -> [ForegroundBannerCandidate] {
         // Local refreshes must neither arm nor advance the online baseline.
         guard isOnlineSync else { return [] }
         var next = [String: Baseline]()

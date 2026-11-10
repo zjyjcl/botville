@@ -531,7 +531,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(client.lifecycleEvents.prefix(3), ["rooms", "enable-true", "sync"])
     }
 
-    func testRoomRefreshPublishesBannerFromLocalSDKStateAfterBaseline() async throws {
+    func testRoomRefreshDoesNotPublishBannerWithoutSyncNotification() async throws {
         let temporary = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: temporary) }
         let saved = testCredentials(userID: "@banner:matrix.test")
@@ -556,10 +556,15 @@ final class MatrixServiceLifecycleTests: XCTestCase {
 
         room.latest = event(2_000)
         try await service.sync()
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertTrue(candidates.isEmpty, "latestEvent is room-list state, not a foreground notification source")
+        let listener = try XCTUnwrap(client.notificationListener)
+        client.emit(notification: syncNotification(eventID: "$authoritative", body: "SDK callback", timestamp: 2_000, roomID: room.id()), roomID: room.id())
         try await waitUntil { candidates.count == 1 }
         XCTAssertEqual(candidates.first?.roomID, room.id())
-        XCTAssertEqual(candidates.first?.preview, "同步消息")
-        XCTAssertEqual(candidates.first?.title, "本地房间")
+        XCTAssertEqual(candidates.first?.preview, "SDK callback")
+        XCTAssertEqual(candidates.first?.eventID, "$authoritative")
+        withExtendedLifetime(listener) {}
         try await service.clearLocalSession()
     }
 
@@ -1068,7 +1073,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
 
         await service.applicationDidBecomeActive()
         try await Task.sleep(for: .milliseconds(15))
-        XCTAssertGreaterThan(client.syncCalls, beforeForeground)
+        XCTAssertEqual(client.syncCalls, beforeForeground)
         XCTAssertEqual(client.queueEnableValues.filter { $0 }.count, initialEnableCount)
 
         let beforeNetwork = client.syncCalls
@@ -1077,6 +1082,134 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(15))
         XCTAssertGreaterThan(client.syncCalls, beforeNetwork)
         XCTAssertEqual(client.queueEnableValues.filter { $0 }.count, initialEnableCount)
+        await service.logout()
+    }
+
+    func testSyncNotificationMappingPreservesPrivacyAndIdentity() throws {
+        var notification = syncNotification(eventID: "$private", body: "decrypted text", timestamp: 1_700_000_000_000)
+        notification.roomInfo.isEncrypted = true
+        let candidate = try XCTUnwrap(ForegroundSyncNotificationBridge.candidate(
+            notification: notification, roomID: "!push:matrix.test", userID: "@me:matrix.test"))
+        XCTAssertEqual(candidate.preview, "加密消息")
+        XCTAssertEqual(candidate.eventID, "$private")
+        XCTAssertNil(ForegroundSyncNotificationBridge.candidate(
+            notification: notification, roomID: "!push:matrix.test", userID: "@sender:matrix.test"))
+        XCTAssertNil(ForegroundSyncNotificationBridge.candidate(
+            notification: notification, roomID: "!different:matrix.test", userID: "@me:matrix.test"))
+        notification.event = .invite(sender: "@sender:matrix.test")
+        XCTAssertNil(ForegroundSyncNotificationBridge.candidate(
+            notification: notification, roomID: "!push:matrix.test", userID: "@me:matrix.test"))
+    }
+
+    func testSyncNotificationsEmitEveryCurrentEventWithoutLatestEventReadback() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let credentials = testCredentials(userID: "@me:matrix.test")
+        _ = try SessionStoreDirectory(baseURL: temporary).create(for: credentials.storeID)
+        let room = FakeRoom(id: "!push:matrix.test", name: "Push")
+        let client = FakeClient(session: fakeSession(userID: "@me:matrix.test", deviceID: "C21TEST"), successfulSync: true, rooms: [room])
+        let service = makeService(sessionStore: InMemorySessionStore(credentials), directory: temporary, client: client)
+        await service.restoreSession()
+        let listener = try XCTUnwrap(client.notificationListener, "sync notification handler must be registered during activation")
+        try await waitUntil { service.connectionStatus == .connected }
+        var received = [ForegroundBannerCandidate]()
+        let expected = expectation(description: "six current sync events")
+        expected.expectedFulfillmentCount = 6
+        let observation = service.foregroundBannerCandidates.sink { candidate in
+            received.append(candidate)
+            expected.fulfill()
+        }
+        // Three ten-second gaps, then three events inside two seconds.  These
+        // are Matrix millisecond timestamps, not wall-clock test delays.
+        for (index, offset) in [10_000, 20_000, 30_000, 40_000, 41_000, 41_900].enumerated() {
+            client.emit(notification: syncNotification(eventID: "$event-\(index)", body: "body-\(index)", timestamp: 1_700_000_000_000 + UInt64(offset)),
+                        roomID: "!push:matrix.test")
+        }
+        await fulfillment(of: [expected], timeout: 1)
+        withExtendedLifetime((listener, observation)) {
+            XCTAssertEqual(received.map(\.eventID), (0 ..< 6).map { "$event-\($0)" })
+            XCTAssertEqual(received.map(\.preview), (0 ..< 6).map { "body-\($0)" })
+        }
+        await service.logout()
+    }
+
+    func testInitialSyncNotificationIsHistoryButNextNotificationIsLive() async throws {
+        let temporary = try makeTemporaryDirectory(); defer { try? FileManager.default.removeItem(at: temporary) }
+        let credentials = testCredentials(userID: "@me:matrix.test")
+        _ = try SessionStoreDirectory(baseURL: temporary).create(for: credentials.storeID)
+        let client = FakeClient(session: fakeSession(userID: "@me:matrix.test", deviceID: "C21TEST"), successfulSync: true,
+                                rooms: [FakeRoom(id: "!push:matrix.test", name: "Push")])
+        client.onSync = { [weak client] in
+            client?.emit(notification: syncNotification(eventID: "$history", body: "history", timestamp: 1_700_000_000_000), roomID: "!push:matrix.test")
+            client?.onSync = nil
+        }
+        let service = makeService(sessionStore: InMemorySessionStore(credentials), directory: temporary, client: client)
+        var received = [ForegroundBannerCandidate]()
+        let observation = service.foregroundBannerCandidates.sink { received.append($0) }
+        await service.restoreSession()
+        try await waitUntil { service.connectionStatus == .connected }
+        XCTAssertTrue(received.isEmpty, "first sync notification is history")
+        client.emit(notification: syncNotification(eventID: "$live", body: "live", timestamp: 1_700_000_001_000), roomID: "!push:matrix.test")
+        try await waitUntil { received.count == 1 }
+        withExtendedLifetime(observation) { XCTAssertEqual(received.first?.eventID, "$live") }
+        await service.logout()
+    }
+
+    func testBackgroundSuppressesOnlyDeliveredEventIDsAndAllowsSameTimestampNewEvents() async throws {
+        let temporary = try makeTemporaryDirectory(); defer { try? FileManager.default.removeItem(at: temporary) }
+        let credentials = testCredentials(userID: "@me:matrix.test")
+        _ = try SessionStoreDirectory(baseURL: temporary).create(for: credentials.storeID)
+        let client = FakeClient(session: fakeSession(userID: "@me:matrix.test", deviceID: "C21TEST"), successfulSync: true,
+                                rooms: [FakeRoom(id: "!push:matrix.test", name: "Push")])
+        let service = makeService(sessionStore: InMemorySessionStore(credentials), directory: temporary, client: client)
+        var received = [ForegroundBannerCandidate]()
+        let observation = service.foregroundBannerCandidates.sink { received.append($0) }
+        await service.restoreSession(); try await waitUntil { service.connectionStatus == .connected }
+        service.applicationDidEnterBackground()
+        client.emit(notification: syncNotification(eventID: "$background", body: "background", timestamp: 1_700_000_010_000), roomID: "!push:matrix.test")
+        service.deliveredBannerEvents = { _ in
+            try? await Task.sleep(for: .milliseconds(20))
+            return [PushEventReference(roomID: "!push:matrix.test", eventID: "$delivered-only")]
+        }
+        await service.applicationDidBecomeActive()
+        // This event was delivered by NSE while suspended and has never gone
+        // through the app's bridge. It must await reconciliation and be consumed.
+        client.emit(notification: syncNotification(eventID: "$delivered-only", body: "old", timestamp: 1_700_000_010_000), roomID: "!push:matrix.test")
+        client.emit(notification: syncNotification(eventID: "$new-now", body: "new-now", timestamp: 1_700_000_010_000), roomID: "!push:matrix.test")
+        client.emit(notification: syncNotification(eventID: "$new-later", body: "new-later", timestamp: 1_700_000_020_000), roomID: "!push:matrix.test")
+        try await waitUntil { received.count == 2 }
+        withExtendedLifetime(observation) { XCTAssertEqual(received.map(\.eventID), ["$new-now", "$new-later"]) }
+        let staleListener = try XCTUnwrap(client.notificationListener)
+        await service.logout()
+        staleListener.onNotification(notification: syncNotification(eventID: "$stale", body: "stale", timestamp: 1_700_000_030_000), roomId: "!push:matrix.test")
+        try await Task.sleep(for: .milliseconds(10))
+        XCTAssertEqual(received.count, 2)
+    }
+
+    func testNotificationDuringCancelledLongPollDrainStillPublishes() async throws {
+        let temporary = try makeTemporaryDirectory(); defer { try? FileManager.default.removeItem(at: temporary) }
+        let credentials = testCredentials(userID: "@me:matrix.test")
+        _ = try SessionStoreDirectory(baseURL: temporary).create(for: credentials.storeID)
+        let client = FakeClient(session: fakeSession(userID: "@me:matrix.test", deviceID: "C21TEST"), successfulSync: true,
+                                rooms: [FakeRoom(id: "!push:matrix.test", name: "Push")])
+        let service = makeService(sessionStore: InMemorySessionStore(credentials), directory: temporary, client: client)
+        var received = [ForegroundBannerCandidate]()
+        let observation = service.foregroundBannerCandidates.sink { received.append($0) }
+        await service.restoreSession(); try await waitUntil { service.connectionStatus == .connected }
+        client.blockNextSync = true
+        try await Task.sleep(for: .milliseconds(150))
+        try await waitUntil { client.isSyncBlocked }
+        defer { client.releaseBlockedSync() }
+        service.applicationDidEnterBackground()
+        let replacement = Task { @MainActor in try? await service.sync() }
+        try await waitUntil { client.isBlockedSyncCancelled }
+        XCTAssertTrue(client.isSyncBlocked, "FFI still draining after cancellation")
+        await service.applicationDidBecomeActive()
+        client.emit(notification: syncNotification(eventID: "$during-drain", body: "during-drain", timestamp: 1_700_000_040_000), roomID: "!push:matrix.test")
+        try await waitUntil { received.count == 1 }
+        client.releaseBlockedSync()
+        _ = await replacement.value
+        withExtendedLifetime(observation) { XCTAssertEqual(received.first?.eventID, "$during-drain") }
         await service.logout()
     }
 
@@ -1229,6 +1362,11 @@ private final class FakeClient: Client, @unchecked Sendable {
     private(set) var lifecycleEvents: [String] = []
     private let configuredSession: Session
     private var delegate: ClientDelegate?
+    private(set) var notificationListener: SyncNotificationListener?
+    var onSync: (() -> Void)?
+    var blockNextSync = false
+    private var syncContinuation: CheckedContinuation<Void, Never>?
+    var isSyncBlocked: Bool { syncContinuation != nil }
 
     init(session: Session = fakeSession(userID: "@c21_alpha:matrix.test", deviceID: "C21TEST"), logoutError: Error? = nil, restoreError: Error? = nil, syncError: Error? = nil, successfulSync: Bool = false, probe: QueueProbe? = nil, rooms: [Room] = [], blockQueueEnable: Bool = false, onSetDelegate: (() throws -> Void)? = nil) {
         configuredLogoutError = logoutError
@@ -1293,12 +1431,33 @@ private final class FakeClient: Client, @unchecked Sendable {
     override func syncOnceV2(settings: SyncSettingsV2) async throws -> SyncResponseV2 {
         lifecycleEvents.append("sync")
         syncCalls += 1
+        onSync?()
+        if blockNextSync {
+            blockNextSync = false
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { syncContinuation = $0 }
+            } onCancel: {
+                self.syncBlockLock.withLock { self.blockedSyncCancelled = true }
+            }
+        }
         if let syncError { throw syncError }
         if successfulSync {
             return SyncResponseV2(nextBatch: "test", rooms: SyncResponseRoomsV2(invited: [], joined: [], left: [], knocked: []))
         }
         throw ClientError.Generic(msg: "offline", details: nil)
     }
+
+    override func registerNotificationHandler(listener: SyncNotificationListener) async {
+        notificationListener = listener
+    }
+
+    func emit(notification: NotificationItem, roomID: String) {
+        notificationListener?.onNotification(notification: notification, roomId: roomID)
+    }
+    func releaseBlockedSync() { let continuation = syncContinuation; syncContinuation = nil; continuation?.resume() }
+    private let syncBlockLock = NSLock()
+    private var blockedSyncCancelled = false
+    var isBlockedSyncCancelled: Bool { syncBlockLock.withLock { blockedSyncCancelled } }
 }
 
 private final class FakeRoom: Room, @unchecked Sendable {
@@ -1325,6 +1484,34 @@ private final class FakeRoom: Room, @unchecked Sendable {
     override func latestEvent() async -> LatestEventValue { latest }
     override func isDirect() async -> Bool { false }
     override func latestEncryptionState() async throws -> EncryptionState { .unknown }
+}
+
+private final class FakeTimelineEvent: TimelineEvent, @unchecked Sendable {
+    private let id: String
+    private let sender: String
+    private let time: UInt64
+    init(id: String, sender: String, timestamp: UInt64) {
+        self.id = id
+        self.sender = sender
+        time = timestamp
+        super.init(noHandle: .init())
+    }
+    required init(unsafeFromHandle handle: UInt64) { fatalError("test only") }
+    override func eventId() -> String { id }
+    override func senderId() -> String { sender }
+    override func timestamp() -> Timestamp { time }
+    override func content() throws -> TimelineEventContent { .messageLike(content: .sticker) }
+}
+
+private func syncNotification(eventID: String, body: String, timestamp: UInt64, roomID: String = "!push:matrix.test") -> NotificationItem {
+    let event = FakeTimelineEvent(id: eventID, sender: "@sender:matrix.test", timestamp: timestamp)
+    let raw = "{\"type\":\"m.sticker\",\"event_id\":\"\(eventID)\",\"room_id\":\"\(roomID)\",\"sender\":\"@sender:matrix.test\",\"content\":{\"body\":\"\(body)\"}}"
+    return NotificationItem(event: .timeline(event: event), rawEvent: raw,
+                            senderInfo: NotificationSenderInfo(displayName: "Sender", avatarUrl: nil, isNameAmbiguous: false),
+                            roomInfo: NotificationRoomInfo(displayName: "Push", avatarUrl: nil, canonicalAlias: nil, topic: nil, joinRule: nil,
+                                                           joinedMembersCount: 2, activeServiceMembersCount: 0, serviceMembers: [], isEncrypted: false,
+                                                           isDirect: true, isSpace: false, isDm: true),
+                            isNoisy: true, hasMention: false, threadId: nil, actions: nil)
 }
 
 private final class QueueProbe: @unchecked Sendable { var values: [Bool] = [] }

@@ -94,6 +94,7 @@ struct BotvilleApp: App {
                 foregroundRoute: $foregroundRoute,
                 visibleRoomID: $visibleRoomID,
                 isRoomInputActive: $isRoomInputActive,
+                isChatTab: selectedTab == 0,
                 pushRoute: pushRoute,
                 onOpenChat: { selectedTab = 0 })
                 .tabItem { Label("会话", systemImage: "bubble.left.and.bubble.right") }
@@ -101,6 +102,7 @@ struct BotvilleApp: App {
 #else
             AppRootView(service: matrixService, foregroundRoute: $foregroundRoute,
                         visibleRoomID: $visibleRoomID, isRoomInputActive: $isRoomInputActive,
+                        isChatTab: selectedTab == 0,
                         onOpenChat: { selectedTab = 0 })
                 .tabItem { Label("会话", systemImage: "bubble.left.and.bubble.right") }
                 .tag(0)
@@ -136,7 +138,12 @@ struct BotvilleApp: App {
             .safeAreaPadding(.top)
             .padding(.top, bannerTopClearance)
         }
-        .onChange(of: scenePhase, initial: true) { _, _ in
+        .onChange(of: scenePhase, initial: true) { _, phase in
+            if phase == .background { matrixService.applicationDidEnterBackground() }
+            if phase == .active {
+                matrixService.prepareForForeground()
+                Task { await matrixService.applicationDidBecomeActive() }
+            }
             updateBannerContext()
         }
         .onChange(of: selectedTab) { _, _ in updateBannerContext() }
@@ -170,8 +177,12 @@ struct BotvilleApp: App {
         let chatVisible = selectedTab == 0
         foregroundBanner.updateContext(
             isForeground: scenePhase == .active && matrixService.isLoggedIn,
-            visibleRoomID: chatVisible ? visibleRoomID : nil,
-            isInputActive: chatVisible && isRoomInputActive)
+            visibleRoomID: ForegroundBannerVisibility.roomID(
+                isLoggedIn: matrixService.isLoggedIn, selectedRoomID: visibleRoomID,
+                isCompact: false, showsDetail: true,
+                isSceneActive: scenePhase == .active, isChatTab: chatVisible,
+                joinedRoomIDs: matrixService.rooms.filter { $0.membership == .joined }.map(\.id)),
+            isInputActive: chatVisible && visibleRoomID != nil && isRoomInputActive)
     }
 
     var body: some Scene {
@@ -211,8 +222,8 @@ private struct AppRootView: View {
     @Binding var foregroundRoute: PushNotificationRoute?
     @Binding var visibleRoomID: String?
     @Binding var isRoomInputActive: Bool
+    let isChatTab: Bool
     @State private var selectedRoomID: String?
-    @State private var presentedRoomID: String?
     @State private var receivedPushRoute = false
     @State private var preferredCompactColumn: NavigationSplitViewColumn = .sidebar
 #if os(iOS)
@@ -227,25 +238,15 @@ private struct AppRootView: View {
                 ProgressView("正在恢复会话…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if service.isLoggedIn {
-                NavigationSplitView(preferredCompactColumn: $preferredCompactColumn) {
-                    RoomListView(service: service, selection: $selectedRoomID)
+                NavigationSplitView(preferredCompactColumn: compactColumnBinding) {
+                    RoomListView(service: service, selection: roomSelectionBinding)
                 } detail: {
-                    if let selectedRoom = service.rooms.first(where: { $0.id == selectedRoomID && $0.membership == .joined }) {
-                        RoomView(service: service, room: selectedRoom, isInputActive: $isRoomInputActive,
-                                 presentedRoomID: roomPresentationBinding)
-                            .id(selectedRoom.id)
-                    } else {
-                        ContentUnavailableView(
-                            "选择一个房间",
-                            systemImage: "bubble.left.and.bubble.right",
-                            description: Text("从左侧列表选择 Matrix 房间。")
-                        )
-                    }
+                    roomDetail
                 }
                 .task(id: service.rooms.map(\.id)) {
                     if !receivedPushRoute,
                        (selectedRoomID == nil || !service.rooms.contains(where: { $0.id == selectedRoomID && $0.membership == .joined })) {
-                        selectedRoomID = service.rooms.first(where: { $0.membership == .joined })?.id
+                        roomSelectionBinding.wrappedValue = service.rooms.first(where: { $0.membership == .joined })?.id
                     }
                 }
             } else {
@@ -268,9 +269,6 @@ private struct AppRootView: View {
 #endif
         }
         .onChange(of: selectedRoomID) { _, _ in publishVisibleRoom() }
-        .onChange(of: presentedRoomID) { _, _ in publishVisibleRoom() }
-        .onChange(of: preferredCompactColumn) { _, _ in publishVisibleRoom() }
-        .onChange(of: isRoomInputActive) { _, _ in publishVisibleRoom() }
 #if os(iOS)
         .onChange(of: horizontalSizeClass) { _, _ in publishVisibleRoom() }
 #endif
@@ -288,13 +286,6 @@ private struct AppRootView: View {
         }
         .onChange(of: service.isRestoring) { _, restoring in
             if !restoring { applyPendingPushRoute() }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
-            Task { await service.applicationDidBecomeActive() }
-        }
-#elseif os(macOS)
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            Task { await service.applicationDidBecomeActive() }
         }
 #endif
     }
@@ -326,23 +317,54 @@ private struct AppRootView: View {
         visibleRoomID = currentVisibleRoomID
     }
 
-    // Publish in the appearance callback itself, before candidates can arrive;
-    // waiting for onChange leaves the parent with the preceding render's room.
-    private var roomPresentationBinding: Binding<String?> {
-        Binding(get: { presentedRoomID }, set: { roomID in
-            presentedRoomID = roomID
-            visibleRoomID = ForegroundBannerVisibility.roomID(
-                isLoggedIn: service.isLoggedIn, selectedRoomID: selectedRoomID,
-                presentedRoomID: roomID,
-                joinedRoomIDs: service.rooms.filter { $0.membership == .joined }.map(\.id))
+    private var compactColumnBinding: Binding<NavigationSplitViewColumn> {
+        Binding(get: { preferredCompactColumn }, set: { column in
+            preferredCompactColumn = column
+            if column != .detail { isRoomInputActive = false }
+            publishVisibleRoom()
+        })
+    }
+
+    // Explicitly select detail for every selection, including cold restoration.
+    // SwiftUI writes sidebar back on compact Back; no onDisappear is required.
+    private var roomSelectionBinding: Binding<String?> {
+        Binding(get: { selectedRoomID }, set: { roomID in
+            selectedRoomID = roomID
+            preferredCompactColumn = roomID == nil ? .sidebar : .detail
+            publishVisibleRoom()
         })
     }
 
     private var currentVisibleRoomID: String? {
-        ForegroundBannerVisibility.roomID(
+#if os(iOS)
+        let compact = horizontalSizeClass == .compact
+#else
+        let compact = false
+#endif
+        return ForegroundBannerVisibility.roomID(
             isLoggedIn: service.isLoggedIn, selectedRoomID: selectedRoomID,
-            presentedRoomID: presentedRoomID,
+            isCompact: compact, showsDetail: preferredCompactColumn == .detail,
+            isSceneActive: true, isChatTab: true,
             joinedRoomIDs: service.rooms.filter { $0.membership == .joined }.map(\.id))
+    }
+
+    @ViewBuilder
+    private var roomDetail: some View {
+        if let selectedRoom = selectedJoinedRoom {
+            RoomView(service: service, room: selectedRoom, isInputActive: $isRoomInputActive,
+                     isVisible: isChatTab && currentVisibleRoomID == selectedRoom.id)
+                .id(selectedRoom.id)
+        } else {
+            ContentUnavailableView(
+                "选择一个房间",
+                systemImage: "bubble.left.and.bubble.right",
+                description: Text("从左侧列表选择 Matrix 房间。")
+            )
+        }
+    }
+
+    private var selectedJoinedRoom: MatrixRoom? {
+        service.rooms.first { $0.id == selectedRoomID && $0.membership == .joined }
     }
 }
 

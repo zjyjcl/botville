@@ -165,6 +165,7 @@ private final class FakeClient: Client, @unchecked Sendable {
 
     override func restoreSession(session: Session) async throws {}
     override func setDelegate(delegate: ClientDelegate?) throws -> TaskHandle? { nil }
+    override func registerNotificationHandler(listener: SyncNotificationListener) async {}
     override func rooms() -> [Room] { [room] }
     override func getRoom(roomId: String) throws -> Room? { roomId == room.id() ? room : nil }
     override func enableAllSendQueues(enable: Bool) async {}

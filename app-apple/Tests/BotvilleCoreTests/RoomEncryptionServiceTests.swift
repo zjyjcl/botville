@@ -280,6 +280,7 @@ private final class SecurityClient: Client, @unchecked Sendable {
     required init(unsafeFromHandle handle: UInt64) { fatalError("test fake must use noHandle") }
     override func restoreSession(session: Session) async throws {}
     override func setDelegate(delegate: ClientDelegate?) throws -> TaskHandle? { nil }
+    override func registerNotificationHandler(listener: SyncNotificationListener) async {}
     override func rooms() -> [Room] { room.map { [$0] } ?? [] }
     override func getRoom(roomId: String) throws -> Room? { room?.id() == roomId ? room : nil }
     override func createRoom(request: CreateRoomParameters) async throws -> String { createRequests.append(request); return "!created:matrix.test" }
