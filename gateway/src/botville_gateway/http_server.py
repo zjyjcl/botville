@@ -61,11 +61,22 @@ from .matrix import InMemoryMatrixTransport, MatrixTransport
 from .service import GatewayService
 from .store import UsageStore
 from .timeutil import iso_utc
+from .user_identity import (
+    VERIFY_INVALID,
+    VERIFY_MISSING,
+    VERIFY_OK,
+    VERIFY_SERVER_ERROR,
+    UserIdentityVerifier,
+)
 
 _ROUTE_MESSAGES = re.compile(r"^/v1/conversations/([^/]+)/messages$")
 # 客户端回传的 X-Request-Id 必须短且安全，否则伪造/放大审计 ID。
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 _JSON_MEDIA_TYPE = "application/json"
+
+# `/moments*` 的路径族（契约 §1.2.3 / moments.md §3）：这些请求先做**终端用户**
+# 身份校验（MatrixOpenID / Matrix Bearer），不走 §1.2.2 的 caller/legacy bearer。
+MOMENTS_PREFIX = "/v1/moments"
 
 # 请求体上限：远大于 max_message_chars（8000），同时防止内存拖垮。
 # 契约 §1.1 明确该上限（1 MiB）；超限 → 400 problem.invalid + errors[].code=too_large。
@@ -339,6 +350,57 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         identity = getattr(self, "_caller", None)
         return identity if identity is not None else CallerIdentity()
 
+    def _auth_user_ok(self) -> bool:
+        """终端用户身份校验（`/moments*`，#124 §1.2.3）。
+
+        按 Authorization scheme 分流（`MatrixOpenID` → federation userinfo，
+        `Bearer` → whoami），**不先试 OpenID 再试 whoami**。站点/调用方 bearer
+        （`GATEWAY_AUTH_TOKEN` / caller token）到这里会被 homeserver whoami 拒绝，
+        因此**不会**被当成用户身份放行（`await` 见 `caller_identity` 的语义：
+        `/moments*` 不调用 `CallerAuthenticator`）。
+
+        错误映射（不新增状态码）：
+          - 缺头 → 401 `auth.missing`
+          - 无效 / 过期 / 域不匹配 → 401 `auth.invalid_token`
+          - homeserver 5xx / 超时 / 不可达 → 500 `internal.error`（可重试，
+            **不**当成无效 token 缓存）
+        """
+        verifier: UserIdentityVerifier = self.server.user_verifier  # type: ignore[attr-defined]
+        outcome, user_id = verifier.verify(self.headers.get("Authorization"))
+        if outcome == VERIFY_OK:
+            self._user_id = user_id
+            return True
+        if outcome == VERIFY_MISSING:
+            self._send_problem(401, "auth.missing", "Authorization header required")
+            return False
+        if outcome == VERIFY_INVALID:
+            self._send_problem(401, "auth.invalid_token", "Invalid user token")
+            return False
+        # VERIFY_SERVER_ERROR：homeserver 5xx / 超时 / 连接失败。
+        # 不缓存、不误判为无效 token；返回已有的 500 internal.error（可重试）。
+        self._send_problem(
+            500,
+            "internal.error",
+            "Homeserver unavailable",
+            detail="user identity could not be verified; retry later",
+        )
+        return False
+
+    def _user_identity(self) -> Optional[str]:
+        """当前请求通过校验后的 Matrix user_id（未校验时 None）。"""
+        return getattr(self, "_user_id", None)
+
+    def _handle_moments(self) -> None:
+        """`/moments*` 的请求入口（#124）。
+
+        本 PR 只做**用户身份校验**：校验通过后动态资源尚未实现，按 404 返回
+        （契约路径均已声明，但 CRUD 留待后续 PR）。这样测试可以覆盖「成功通过
+        鉴权」与「鉴权失败的 401」两条路径，而不必实现完整 CRUD。
+        """
+        if not self._auth_user_ok():
+            return
+        self._send_problem(404, "not_found", "Not Found")
+
     # ---------------------------------------------------------------- GET
     def do_GET(self) -> None:
         self._request_id()
@@ -346,6 +408,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             _raw_path, query, path = self._route_path()
             if path in ("/health", "/v1/health"):
                 self._handle_health()
+                return
+            if _is_moments_path(path):
+                self._handle_moments()
                 return
             if not self._auth_ok():
                 return
@@ -370,6 +435,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         self._request_id()
         try:
             _raw_path, _query, path = self._route_path()
+            if _is_moments_path(path):
+                self._handle_moments()
+                return
             if not self._auth_ok():
                 return
             if path == "/v1/policy/evaluate":
@@ -396,10 +464,13 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         )
 
     def do_PUT(self) -> None:
-        """只有 `PUT /v1/limits` 支持 PUT；其余路径 405。"""
+        """只有 `PUT /v1/limits` 支持 PUT；`/moments*` 先做用户鉴权再 404。"""
         self._request_id()
         try:
             _raw_path, _query, path = self._route_path()
+            if _is_moments_path(path):
+                self._handle_moments()
+                return
             if not self._auth_ok():
                 return
             if path != "/v1/limits":
@@ -416,8 +487,34 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         except Exception as exc:  # pragma: no cover - 兜底
             self._internal_error(exc)
 
-    do_PATCH = _method_not_allowed
-    do_DELETE = _method_not_allowed
+    def _moments_method_not_allowed(self) -> None:
+        """PATCH / DELETE 在 `/moments*` 上：先鉴权再 405（本 PR 未实现 CRUD）。"""
+        self._request_id()
+        try:
+            _raw_path, _query, path = self._route_path()
+            if _is_moments_path(path):
+                # 先校验用户身份；鉴权失败已在 _auth_user_ok 里发响应。
+                if not self._auth_user_ok():
+                    return
+                self._send_problem(
+                    405,
+                    "request.invalid",
+                    "Method Not Allowed",
+                    detail=f"{self.command} is not yet supported on {path}",
+                )
+                return
+            self._method_not_allowed()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception as exc:  # pragma: no cover
+            self._internal_error(exc)
+
+    def do_PATCH(self) -> None:  # type: ignore[override]
+        self._moments_method_not_allowed()
+
+    def do_DELETE(self) -> None:  # type: ignore[override]
+        self._moments_method_not_allowed()
+
     do_OPTIONS = _method_not_allowed
     do_TRACE = _method_not_allowed
 
@@ -669,6 +766,16 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         )
 
 
+def _is_moments_path(path: str) -> bool:
+    """`/moments*` 路径族（部署前缀已剥离）：等于前缀或以 `前缀 + "/"` 开头。
+
+    契约 §1.2.3：这些路径用**终端用户**身份（MatrixOpenID / Matrix Bearer），
+    不走 §1.2.2 的 caller/legacy bearer。只匹配整段边界，
+    `/v1/momentsX` 不算。
+    """
+    return path == MOMENTS_PREFIX or path.startswith(MOMENTS_PREFIX + "/")
+
+
 def _single(params: Dict[str, List[str]], name: str) -> Optional[str]:
     values = params.get(name)
     if not values:
@@ -713,6 +820,9 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         self.service = service
         self.transport = transport
         self.authenticator = CallerAuthenticator(config)
+        # #124 §1.2.3：`/moments*` 的终端用户身份校验（MatrixOpenID / Matrix Bearer）。
+        # 与上面的 caller/legacy authenticator 并存但互不替代：`/moments*` 只走这里。
+        self.user_verifier = UserIdentityVerifier(config)
         log_startup_warnings(config)
         super().__init__((config.host, config.port), GatewayHandler)
 

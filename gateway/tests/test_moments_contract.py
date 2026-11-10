@@ -125,6 +125,43 @@ class TestMomentsContract(unittest.TestCase):
                     "%s %s must require matrixUserToken" % (method.upper(), path),
                 )
 
+    def test_moments_operations_accept_matrix_openid_token(self):
+        """#124 阶段 1：#169 契约加法——/moments* 的 security OR 里也必须有
+        matrixOpenIdToken；matrixUserToken 仍必须同时存在（并存期，不许删）。
+        """
+        for path in MOMENT_PATHS:
+            for method in ("get", "post", "put", "patch", "delete"):
+                operation = self.contract["paths"][path].get(method)
+                if operation is None:
+                    continue
+                schemes = operation.get("security") or []
+                names = {name for entry in schemes for name in entry}
+                self.assertIn(
+                    "matrixOpenIdToken",
+                    names,
+                    "%s %s must list matrixOpenIdToken in its OR security"
+                    % (method.upper(), path),
+                )
+                self.assertIn(
+                    "matrixUserToken",
+                    names,
+                    "%s %s must keep matrixUserToken (coexistence, not removed)"
+                    % (method.upper(), path),
+                )
+                # OR 语义：两条各自都是独立的 security 要求项，不能合成 AND。
+                self.assertIn(
+                    {"matrixOpenIdToken": []},
+                    schemes,
+                    "%s %s must list matrixOpenIdToken as its own OR alternative"
+                    % (method.upper(), path),
+                )
+                self.assertIn(
+                    {"matrixUserToken": []},
+                    schemes,
+                    "%s %s must list matrixUserToken as its own OR alternative"
+                    % (method.upper(), path),
+                )
+
     def test_interaction_operations_mention_can_view(self):
         for path, method in INTERACTION_OPERATIONS:
             operation = self.contract["paths"][path][method]

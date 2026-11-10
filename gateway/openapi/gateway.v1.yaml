@@ -2012,6 +2012,11 @@ components:
         - 无效 / 过期 / 域不匹配 → `401 auth.invalid_token`；缺头 → `401 auth.missing`。
           不新增状态码或错误码。
 
+        **校验器提示（N1）**：`MatrixOpenID` 是自定义 http scheme（非 RFC 登记值），
+        部分 OpenAPI 校验器/代码生成器会对其告警。这是有意设计——凭据种类必须由请求头
+        scheme 显式区分，不能复用 `Bearer`（否则无法在「站点 bearer / Matrix access token」
+        之间判定归属）。告警可忽略；不因此改名，也不标 `deprecated`。
+
         **并存（阶段 1）**：本方案与 `matrixUserToken` 在全部 `/moments*` 操作上二者取一
         （OpenAPI OR），语义同为「本服 Matrix user id」。禁止「先试 OpenID 再试 whoami」——
         两者由请求头 scheme 显式区分。`matrixUserToken` 当前**未标 `deprecated`**，
