@@ -198,28 +198,87 @@ App                          网关                        模块网页（WKWebV
 #### 1.2.3 终端用户身份（Matrix OpenID，已拍板）
 
 > 结论来自 2026-11-10 拍板（清单 B2 服务端线）。另见 [§8.4 B 线产品定论](#84-b-线产品定论2026-11-10-已拍板) B2 条。
+> #124 OpenID 契约加法 PR 在本节落实 securitySchemes 加法与 `/moments*` 并存（阶段 1）。
 
 **身份层次**：本节定义**终端用户（Matrix 用户）**向网关证明身份的方式，与
 §1.2.2 的**站点/调用方级** `GATEWAY_CALLER_TOKENS` 层次不同、不互相替代；
-站点级 bearer（`GATEWAY_AUTH_TOKEN`）同样不变。
+站点级 bearer（`GATEWAY_AUTH_TOKEN`）同样不变。三种凭据头形态不重叠：
+
+| 凭据种类 | 请求头 | OpenAPI 方案 | 适用范围 |
+|---|---|---|---|
+| OpenID token（本节） | `Authorization: MatrixOpenID <token>` | `matrixOpenIdToken` | `/moments*` |
+| Matrix access token | `Authorization: Bearer <Matrix access token>` | `matrixUserToken` | `/moments*`（并存期） |
+| 站点/调用方 bearer | `Authorization: Bearer <gateway-token>` | `bearerAuth` | 其他接口；**不得用于 `/moments*`** |
 
 **颁发**：App 经标准 Matrix C-S API
-`POST /_matrix/client/v3/user/{userId}/openid/request_token` 取得短时 OpenID token。
+`POST /_matrix/client/v3/user/{userId}/openid/request_token` 取得短时 OpenID token，
+请求头携带 `Authorization: MatrixOpenID <token>` 发给网关。长期 access token 留在 App，
+不进入网关。
 
-**校验**：网关调用 homeserver 的 `GET /_matrix/federation/v1/openid/userinfo` 核验。
-该请求**不带 X-Matrix 签名**，经 fedgate 会被拒；因此网关须经 compose 内网直连本部署
-homeserver，**不经 fedgate、不走公网**。**OpenID token 不得写入日志。**
+**校验路径（`GET /_matrix/federation/v1/openid/userinfo?access_token=…`）**：
 
-**部署路径前缀**：网关须支持挂载在路径前缀 `/_botville/gateway` 之后——
-对外 URL 形如 `https://<domain>/_botville/gateway/v1/…`，edge 去前缀后反代；
-OpenAPI `servers` 的 `{host}` 可包含该前缀，网关自身**不得假设挂在根路径**
-（例如内部生成的绝对 URL 须考虑前缀）。
+- 该请求**不带 X-Matrix 签名**；经 fedgate 会被拒，**不得经 fedgate、不得走公网**。
+- 网关须通过 compose 内网**直连**本部署 homeserver，地址来自配置项
+  `GATEWAY_HOMESERVER_FEDERATION_URL`（空则回落 `GATEWAY_HOMESERVER_URL`）；
+  不硬编码。
+- **只有这一条 userinfo 走直连**；其余联邦流量仍走 fedgate，该配置项不影响
+  fedgate 对其他路径的防护，不得借此绕过 fedgate 的其他保护。
+- 不将 federation userinfo 端点暴露到公网入口。
+- OpenID token **不得写入日志、不得缓存明文**。
 
-**与现行鉴权的关系**：
-- §1.2.2 的 `GATEWAY_CALLER_TOKENS` 是**站点/调用方级**身份（服务实例之间），
-  本节 OpenID token 是**终端用户（Matrix 用户）**身份；两者层次不同，不互相替代。
-- 现行 `/moments*` 的 `matrixUserToken`（access token → whoami）在 #124 落地前仍有效；
-  迁移/并存方式与请求头格式由 #124 定，本节不改 `securitySchemes`。
+**身份映射**：
+
+- userinfo 返回的 `sub` 即 Matrix `user_id`，作为查看者 / 真人作者 owner，与
+  `matrixUserToken` whoami 的 `user_id` 语义完全一致；不另建映射表。
+- `sub` 的域必须等于本服 `GATEWAY_MATRIX_SERVER_NAME`（按已有大小写归一化规则），
+  否则 **401 `auth.invalid_token`**；不接受他服 OpenID token。
+- `/context/assemble` 本期**不**用 OpenID（owner 仍只来自 §1.2.2 caller token）。
+
+**过期**：以 homeserver 签发的 `expires_in` 为准；userinfo 返回 401/403 视为无效；
+网关不自行延长有效期。
+
+**缓存**：
+
+- 缓存键为 token 的**哈希**（不缓存明文，不写入日志）；缓存值为校验结果（`sub`）。
+- TTL = `min(GATEWAY_OPENID_CACHE_TTL_SECONDS, 60s, 若已知则剩余有效期)`；
+  上限 60 秒，配置项 `GATEWAY_OPENID_CACHE_TTL_SECONDS`（上限 60，默认 60）。
+- 失败缓存（userinfo 4xx）TTL 应远短于成功缓存（数秒量级），避免短暂 HS 故障
+  将有效用户持续锁定。
+- 实现可用 single-flight 合并对同一 token 的并发 userinfo 请求，防止缓存击穿打爆
+  homeserver（本节不要求实现，只要求缓存键用哈希）。
+
+**防重放限制（协议固有，v1 不额外处理）**：
+
+OpenID token 是持有者令牌，在过期前被盗即可重放——这是协议固有限制，网关侧**不另做
+nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不落盘/不入日志、缓存键只用
+哈希。跨服 moments 已有独立的 HMAC + ts + nonce（±300s）防重放（见 `moments.md` §3），
+与用户 OpenID token 无关。
+
+**错误码**：沿用现有 §1.3 语义，**不新增状态码或错误码**：
+
+| 场景 | HTTP | `code` |
+|---|---|---|
+| 请求缺少 `Authorization` 头 | 401 | `auth.missing` |
+| token 无效、已过期、或 `sub` 域不匹配本服 | 401 | `auth.invalid_token` |
+| token 有效但 persona 不归该 owner 所有 | 403 | `persona.not_owned` |
+
+**与 `matrixUserToken` 的并存（阶段 1，本 PR 范围）**：
+
+`/moments*` 的 security 同时列出 `matrixOpenIdToken` 与 `matrixUserToken`（OpenAPI OR
+语义，任一即可，校验结果语义完全相同——均为本服 Matrix user id）。**禁止「先试 OpenID
+再试 whoami」**：两种凭据由请求头 scheme（`MatrixOpenID` vs `Bearer`）显式区分。
+
+**移除 `matrixUserToken` 的条件**（本 PR 不进入阶段 2/3）：
+
+- **阶段 2（标 deprecated）**：App 已全量切换到 OpenID token，观察期（建议 ≥ 一个
+  发布周期）旧凭据占比可接受后，在 OpenAPI 对 `matrixUserToken` 标 `deprecated: true`
+  并写入 changelog；仍接受旧凭据。需**另行公告**，且**必须先报总管**批准。
+- **阶段 3（从 security 去掉）**：再公告最低 App 版本/日期后，从 `/moments*` security
+  数组移除 `matrixUserToken`；这是破坏性契约变更，需另行批准。**移除前必须先报总管**；
+  本 PR 不进入本阶段。
+
+**部署路径前缀**（交叉引用）：路径前缀已在 `GATEWAY_HTTP_PATH_PREFIX` 随 #165 落地
+（见 §5.5 changelog [网关路径前缀] 条目）；本节 userinfo 直连地址与前缀无关。
 
 
 ### 1.3 错误模型（RFC 9457）
@@ -963,6 +1022,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.1.0 | 2026-11-10 | [#124 OpenID 契约加法，**只增不删，不改任何现有字段集合、状态码与错误码行为**] 新增 OpenAPI `securitySchemes.matrixOpenIdToken`（`http` + `scheme: MatrixOpenID`，头为 `Authorization: MatrixOpenID <token>`），与既有 `matrixUserToken`（`Bearer` + whoami）在 `/moments*` 上**并存**：11 个 operation 的 `security` 由 `matrixUserToken` 单项改为 `matrixOpenIdToken` / `matrixUserToken` 二者取一（OR）；`matrixUserToken` **不标 `deprecated`**，仍完全有效。校验路径：网关经 compose 内网直连本部署 homeserver `GET /_matrix/federation/v1/openid/userinfo?access_token=…`（**不带 X-Matrix 签名**，不经 fedgate、不走公网；**只这条 userinfo 直连**，其他联邦流量仍走 fedgate）；直连地址新增部署配置 `GATEWAY_HOMESERVER_FEDERATION_URL`（空则回落 `GATEWAY_HOMESERVER_URL`），不硬编码；新增 `GATEWAY_OPENID_CACHE_TTL_SECONDS`（上限 60，默认 60）。`sub` 即 Matrix `user_id` / owner，域须等于 `GATEWAY_MATRIX_SERVER_NAME` 否则 401，不另建映射表；过期以 `expires_in` 为准、网关不自行延长；缓存只按 token 哈希（不缓存明文、不入日志），TTL ≤ 60s 且不超过剩余有效期。**不做网关侧 nonce 防重放**（持有者令牌在过期前被盗即可重放，属协议固有限制；缓解为短时令牌 / TLS / 不落盘 / 哈希缓存键；跨服 moments 的 HMAC+ts+nonce 与本项无关）。错误码沿用 `401 auth.missing` / `401 auth.invalid_token` / `403 persona.not_owned`，**不新增任何 code**。§1.2.3 扩写为完整契约（scheme、头格式、校验路径、fedgate 边界、缓存、防重放限制、错误码、并存三阶段与移除条件——阶段 2 标 deprecated / 阶段 3 从 security 去掉均须另行公告，**移除前必须先报总管**，本 PR 不进入阶段 2/3）。原则：未来用户向接口默认走 OpenID，但本期只改 `/moments*`；文档级默认 `security` 仍为 `bearerAuth`，`/context/assemble`、发送路径、appservice、跨服 HMAC 的鉴权模型均不变。同步 `docs/moments.md` §3、`README.md` 配置表与 `.env.example`。实现留待下一 PR。 |
 | 0.1.0 | 2026-11-10 | [#124 PR-D] 实现调用方身份：GATEWAY_CALLER_TOKENS、HMAC 等长比较、legacy 开关与启动告警；persona 区 owner 由 token 推出，推不出则区为空且状态码仍 200；不改字段集合、状态码与错误码。 |
 | 0.1.0 | 2026-11-10 | [#114 PR-C 实现] N7：`Config` 新增 4 个 `PLATFORM_*` 字段（`platform_max_consecutive_ai_messages` / `platform_anti_spam_cooldown_seconds` / `platform_max_ai_messages_per_hour` / `platform_ai_loop_on_break`），`limits._strictness_layers` 按 §6.3 写入平台层 `anti_spam` / `ai_loop`（数值项 0 省略键、`on_break` 始终写入），`_check_not_looser` 已覆盖数值底线校验，`on_break` 不进宽松校验（`notify` ≡ `stop`，不报 422）。N8：`policy._ai_loop_view` 改为事件与未超 TTL 在途预留放进同一排序（预留入窗时刻 = `at`），取第 `used − limit + 1` 早的出窗时刻；`limit=0` → `may_clear_at=null`；最终下界 `max(计算值, ceil(now)+1s)`，永不返回过去或当前时刻。#117 N5：`Config.__post_init__` 增加 `usage_retention_seconds >= max(rate_limit_window_seconds, platform_anti_spam_cooldown_seconds)` 硬校验（平台冷却 0 不参与）。 |
 | 0.1.0 | 2026-11-10 | [网关路径前缀] 新增部署配置 `GATEWAY_HTTP_PATH_PREFIX`（默认空 = 现行行为完全不变）：网关整体挂在路径前缀之后（如 `/_botville/gateway`）时填写，请求可带前缀发出；未带前缀的请求仍被接受（兼容已去前缀的反代），前缀只按整段边界匹配。非法前缀（不以 `/` 开头、含 `//` `..` `?` `#` `%` 空白或控制字符）拒绝启动。属部署配置，**不改字段集合、状态码与错误码**，`/v1` 路径模板与路由语义均不变；契约侧仅同步 `servers` 的 `host` 变量描述（host 可含路径前缀）。 |
