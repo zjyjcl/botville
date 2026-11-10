@@ -17,6 +17,7 @@ public enum TimelineTrace {
     public enum Reason: String, CaseIterable {
         case none, success, failed, stale, cancelled, gesture, appearance, superseded
         case loadingTimeout, recoveryTimeout, unmaterialized, locateExhausted
+        case snapshotMissing, snapshotUnchanged
         case awaitingPage, correctionLimit, noCapture, noSurvivor, noGeometry, staleGeometry, invalidViewport
     }
 

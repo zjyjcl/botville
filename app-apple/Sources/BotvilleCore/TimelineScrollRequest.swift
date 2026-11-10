@@ -73,8 +73,18 @@ public struct TimelineScrollState: Sendable {
 
     public mutating func finishPrepend(operation: UUID,
                                       expectedMessageIDs: [String]? = nil,
+                                      unchangedConfirmed: Bool = false,
+                                      completedAt: TimeInterval? = nil,
                                       now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
-        prependAnchor.finished(operation: operation, expectedMessageIDs: expectedMessageIDs, now: now)
+        prependAnchor.finished(operation: operation, expectedMessageIDs: expectedMessageIDs,
+                               unchangedConfirmed: unchangedConfirmed, completedAt: completedAt, now: now)
+    }
+
+    public mutating func completePrepend(operation: UUID, result: TimelinePageCompletion?,
+                                        now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        guard prependAnchor.operation == operation else { return }
+        guard let result else { prependAnchor.cancel(); return }
+        prependAnchor.confirmPage(operation: operation, result: result, now: now)
     }
 
     public mutating func restorePrepend(for input: TimelineScrollInput, generation: UInt,

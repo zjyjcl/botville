@@ -495,7 +495,7 @@ struct RoomView: View {
         guard !isLoadingOlderMessages else { return }
         let operation = UUID()
         let appearance = roomOpenGeneration
-        var expectedMessageIDs: [String]?
+        var pageCompletion: TimelinePageCompletion?
         let input = scrollInput
         let geometry = timelineGeometry.flatMap { $0.input == input ? $0 : nil }
         let capture = anchorGeometryCache.capture(input: input, frames: geometry?.frames ?? [],
@@ -518,12 +518,16 @@ struct RoomView: View {
             if olderMessagesOperation == operation, roomOpenGeneration == appearance {
                 olderMessagesOperation = nil
                 scrollState.update(scrollInput)
-                scrollState.finishPrepend(operation: operation, expectedMessageIDs: expectedMessageIDs)
+                scrollState.completePrepend(operation: operation, result: pageCompletion)
             }
         }
         errorMessage = nil
         do {
-            expectedMessageIDs = try await service.loadOlderMessages(operation: operation)
+            pageCompletion = try await service.loadOlderMessages(operation: operation) { completedAt in
+                guard olderMessagesOperation == operation, roomOpenGeneration == appearance else { return }
+                scrollState.update(scrollInput)
+                scrollState.finishPrepend(operation: operation, completedAt: completedAt, now: completedAt)
+            }
         } catch {
             if olderMessagesOperation == operation, roomOpenGeneration == appearance {
                 errorMessage = error.localizedDescription

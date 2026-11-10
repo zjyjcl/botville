@@ -54,7 +54,7 @@ final class TimelinePrependAnchorTests: XCTestCase {
 
     func testAtMostTwoCorrectionsAfterFreshGeometryIncludingLazyHeightEstimateChange() {
         var state = started()
-        state.finished(operation: operation, expectedMessageIDs: ids)
+        state.finished(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true)
         XCTAssertEqual(layout(&state, ids, [frame("a", 500)]), .restore(id: "a", offset: 60))
         XCTAssertEqual(layout(&state, ids, [frame("a", 65)]), .restore(id: "a", offset: 60))
         XCTAssertNil(layout(&state, ids, [frame("a", 61)]))
@@ -64,7 +64,7 @@ final class TimelinePrependAnchorTests: XCTestCase {
 
     func testPartiallyVisibleLongMessageKeepsNegativeOffsetEvenWhenTallerThanViewport() {
         var state = started(offset: -240, height: 900)
-        state.finished(operation: operation, expectedMessageIDs: ids)
+        state.finished(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true)
         XCTAssertEqual(state.targetID, "a")
         XCTAssertEqual(state.targetOffset, -240)
         XCTAssertEqual(layout(&state, ids, [frame("a", 0, 900)]), .restore(id: "a", offset: -240))
@@ -74,7 +74,7 @@ final class TimelinePrependAnchorTests: XCTestCase {
 
     func testRowExactlyViewportHeightNeedsNoDivisionByZero() {
         var state = started(offset: -80, height: 600)
-        state.finished(operation: operation, expectedMessageIDs: ids)
+        state.finished(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true)
         XCTAssertEqual(layout(&state, ids, [frame("a", 20, 600)]), .restore(id: "a", offset: -80))
         XCTAssertNil(layout(&state, ids, [frame("a", -80, 600)]))
     }
@@ -107,7 +107,7 @@ final class TimelinePrependAnchorTests: XCTestCase {
         state.begin(operation: second, input: input(page1), frames: [frame("older", 50), frame("a", 162)],
                     viewportHeight: 600)
         XCTAssertEqual(state.targetID, "older")
-        state.finished(operation: operation, expectedMessageIDs: ids)
+        state.finished(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true)
         XCTAssertTrue(state.blocksFollowing)
         let page2 = ["oldest"] + page1
         state.update(input(page2))
@@ -125,14 +125,14 @@ final class TimelinePrependAnchorTests: XCTestCase {
         XCTAssertEqual(state.targetID, "a")
         XCTAssertEqual(state.targetOffset, 60)
         XCTAssertNil(state.layout(input: input(ids), generation: oldGeneration, frames: [frame("a", 1000)]))
-        state.finished(operation: operation, expectedMessageIDs: ids)
+        state.finished(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true)
         XCTAssertEqual(state.operation, second)
         XCTAssertTrue(state.blocksFollowing)
     }
 
     func testReachingStartRemovingButtonRestoresOffsetEvenWithoutNewTextRows() {
         var state = started()
-        state.finished(operation: operation, expectedMessageIDs: ids)
+        state.finished(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true)
         XCTAssertEqual(layout(&state, ids, [frame("a", 16)]), .restore(id: "a", offset: 60))
         XCTAssertNil(layout(&state, ids, [frame()]))
         XCTAssertFalse(state.blocksFollowing)
@@ -154,7 +154,7 @@ final class TimelinePrependAnchorTests: XCTestCase {
 
     func testQueuedActionRequiresExecutionBeforeAnotherLayoutCanCorrect() {
         var state = started()
-        state.finished(operation: operation, expectedMessageIDs: ids)
+        state.finished(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true)
         XCTAssertNil(state.layout(input: input(ids), generation: state.layoutGeneration, frames: []))
         let action = state.layout(input: input(ids), generation: state.layoutGeneration, frames: [])
         XCTAssertEqual(action, .locate("a"))
@@ -186,7 +186,7 @@ final class TimelinePrependAnchorTests: XCTestCase {
         for next in [input(ids, visible: false), input(ids, appearance: UUID())] {
             var state = started()
             state.update(next)
-            state.finished(operation: operation, expectedMessageIDs: ids)
+            state.finished(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true)
             XCTAssertNil(state.targetID)
             XCTAssertFalse(state.blocksFollowing)
             XCTAssertNil(layout(&state, ids, [frame("a", 900)]))
@@ -255,7 +255,7 @@ final class TimelinePrependAnchorTests: XCTestCase {
         var state = try opened(nearBottom: false)
         let reopened = UUID()
         state.update(input(ids, appearance: reopened))
-        state.finishPrepend(operation: operation, expectedMessageIDs: ids)
+        state.finishPrepend(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true)
         XCTAssertNil(state.prependAnchor.targetID)
         XCTAssertEqual(state.followDecision?.reason, .appearance)
         XCTAssertEqual(state.followDecision?.request.appearanceID, reopened)
@@ -265,7 +265,7 @@ final class TimelinePrependAnchorTests: XCTestCase {
         var state = try opened(nearBottom: true)
         state.update(input(ids + ["new"]))
         state.userBeganDragging()
-        state.finishPrepend(operation: operation, expectedMessageIDs: ids)
+        state.finishPrepend(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true)
         XCTAssertNil(state.prependAnchor.targetID)
         XCTAssertNil(state.followDecision)
         XCTAssertFalse(state.isNearBottom)
@@ -296,7 +296,7 @@ final class TimelinePrependAnchorTests: XCTestCase {
         XCTAssertTrue(state.blocksFollowing)
         state.expire(now: 15)
         XCTAssertFalse(state.blocksFollowing)
-        state.finished(operation: operation, expectedMessageIDs: ids)
+        state.finished(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true)
         state.update(input(["late"] + next))
         XCTAssertNil(layout(&state, ["late"] + next, [frame("a", 0)]))
         XCTAssertNil(state.targetID)
@@ -306,7 +306,7 @@ final class TimelinePrependAnchorTests: XCTestCase {
         for execute in [false, true] {
             var state = TimelinePrependAnchor()
             state.begin(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
-            state.finished(operation: operation, expectedMessageIDs: ids, now: 10.1)
+            state.finished(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true, now: 10.1)
             let action = state.layout(input: input(ids), generation: state.layoutGeneration, frames: [frame("a", 900)])
             XCTAssertNotNil(action)
             if execute { state.didExecute(generation: state.layoutGeneration) }
@@ -320,7 +320,7 @@ final class TimelinePrependAnchorTests: XCTestCase {
     func testCompletionNearDeadlineGetsOneBoundedRecoveryWindow() {
         var state = TimelinePrependAnchor()
         state.begin(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
-        state.finished(operation: operation, expectedMessageIDs: ids, now: 14.9)
+        state.finished(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true, now: 14.9)
         XCTAssertEqual(state.deadline, 16.9)
         // Button disappeared without any new text rows. The target is seven
         // screens away and is absent from the first post-completion packets.
@@ -331,7 +331,7 @@ final class TimelinePrependAnchorTests: XCTestCase {
         XCTAssertEqual(layout(&state, ids, [frame("a", 0)]), .restore(id: "a", offset: 60))
         XCTAssertNil(layout(&state, ids, [frame()]))
         XCTAssertFalse(state.blocksFollowing)
-        state.finished(operation: operation, expectedMessageIDs: ids, now: 16)
+        state.finished(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true, now: 16)
         state.update(input(["late"] + ids))
         XCTAssertEqual(state.deadline, 16.9)
         state.expire(now: 16.9)
@@ -341,14 +341,14 @@ final class TimelinePrependAnchorTests: XCTestCase {
     func testMissingTargetRetriesRegistrationButCannotRestoreAfterCompletionDeadline() {
         var state = TimelinePrependAnchor()
         state.begin(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
-        state.finished(operation: operation, expectedMessageIDs: ids, now: 10.5)
+        state.finished(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true, now: 10.5)
         var actions = 0
         for _ in 0..<20 {
             if layout(&state, ids, []) == .locate("a") { actions += 1 }
         }
         XCTAssertEqual(actions, 3)
         state.expire(now: 12.5)
-        state.finished(operation: operation, expectedMessageIDs: ids, now: 12.6)
+        state.finished(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true, now: 12.6)
         XCTAssertNil(layout(&state, ids, [frame("a", 900)]))
         XCTAssertNil(state.operation)
     }
@@ -356,7 +356,7 @@ final class TimelinePrependAnchorTests: XCTestCase {
     func testCompletionExactlyAtLoadingDeadlineCannotRevive() {
         var state = TimelinePrependAnchor()
         state.begin(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
-        state.finished(operation: operation, expectedMessageIDs: ids, now: 15)
+        state.finished(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true, now: 15)
         XCTAssertNil(state.operation)
         XCTAssertNil(state.deadline)
         XCTAssertNil(layout(&state, ids, [frame("a", 900)]))
@@ -365,7 +365,7 @@ final class TimelinePrependAnchorTests: XCTestCase {
     func testMaterializationAfterLocateBudgetCanStillRestoreWithinWindow() {
         var state = TimelinePrependAnchor()
         state.begin(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
-        state.finished(operation: operation, expectedMessageIDs: ids, now: 11)
+        state.finished(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true, now: 11)
         for _ in 0..<20 { _ = layout(&state, ids, []) }
         state.expire(now: 12.9)
         XCTAssertEqual(layout(&state, ids, [frame("a", 900)]), .restore(id: "a", offset: 60))
@@ -377,7 +377,7 @@ final class TimelinePrependAnchorTests: XCTestCase {
     func testCompletionAfterLoadingDeadlineCannotReviveEvenWithoutDriverTick() {
         var state = TimelinePrependAnchor()
         state.begin(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
-        state.finished(operation: operation, expectedMessageIDs: ids, now: 15.01)
+        state.finished(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true, now: 15.01)
         XCTAssertNil(state.operation)
     }
 
@@ -387,7 +387,7 @@ final class TimelinePrependAnchorTests: XCTestCase {
         state.userBeganDragging()
         let late = input(["late"] + ids + ["new"])
         state.update(late)
-        state.finishPrepend(operation: operation, expectedMessageIDs: ids)
+        state.finishPrepend(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true)
         XCTAssertNil(state.restorePrepend(for: late, generation: state.prependAnchor.layoutGeneration,
                                           frames: [frame("a", 900)]))
         XCTAssertNil(state.followDecision)
@@ -440,7 +440,7 @@ final class TimelinePrependAnchorTests: XCTestCase {
             var state = started()
             let oldGeneration = state.layoutGeneration
             if statusDiff { state.update(input(ids)) }
-            state.finished(operation: operation, expectedMessageIDs: ids)
+            state.finished(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true)
             XCTAssertTrue(state.pageRevisionApplied)
             XCTAssertNil(state.layout(input: input(ids), generation: oldGeneration, frames: [frame()]))
             XCTAssertTrue(state.blocksFollowing)
@@ -522,7 +522,7 @@ final class TimelinePrependAnchorTests: XCTestCase {
             header.record(height: value, buttonVisible: false)
         }
         var state = started(offset: original)
-        state.finished(operation: operation, expectedMessageIDs: ids)
+        state.finished(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true)
         XCTAssertNil(layout(&state, ids, [frame("a", paddingAndSpacing + header.height)]))
         XCTAssertFalse(state.blocksFollowing)
         state.expire(now: .infinity)
@@ -548,7 +548,7 @@ final class TimelinePrependAnchorTests: XCTestCase {
 
     func testLocateAndRevisionChangesCannotResetTwoCorrectionBudget() {
         var state = started()
-        state.finished(operation: operation, expectedMessageIDs: ids)
+        state.finished(operation: operation, expectedMessageIDs: ids, unchangedConfirmed: true)
         XCTAssertEqual(layout(&state, ids, [frame("a", 500)]), .restore(id: "a", offset: 60))
         for _ in 0..<2 { XCTAssertNil(state.missingGeometry()) }
         XCTAssertEqual(state.missingGeometry(), .locate("a"))
@@ -574,6 +574,260 @@ final class TimelinePrependAnchorTests: XCTestCase {
         XCTAssertEqual(layout(&state, removed, [frame("b", 800)]), .restore(id: "b", offset: 172))
         XCTAssertNil(layout(&state, removed, [frame("b", 172)]))
         XCTAssertFalse(state.blocksFollowing)
+    }
+
+    func testOldSnapshotAndZeroDeltaCannotSettleBeforeDelayedPrepend() throws {
+        // c1p9 plus the five old-reset / late-inc-diff orderings, through pageEnd.
+        for delay in [0.0817, 0.0739, 0.08, 0.09, 0.07, 0.0677] {
+            var state = TimelineScrollState()
+            state.beginPrepend(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
+            state.finishPrepend(operation: operation, completedAt: 10.035, now: 10.035)
+            var confirmation = TimelinePageConfirmation(original: ids, completedAt: 10.035)
+            XCTAssertNil(confirmation.observe(snapshot: ids, live: ids, now: 10.058))
+            let oldGeneration = state.prependAnchor.layoutGeneration
+            XCTAssertFalse(state.prependAnchor.pageRevisionApplied)
+            XCTAssertNil(state.restorePrepend(for: input(ids), generation: oldGeneration, frames: [frame()]))
+            XCTAssertTrue(state.prependAnchor.blocksFollowing)
+            for _ in 0..<3 { XCTAssertNil(state.recoverMissingPrependGeometry()) }
+            let next = ["older"] + ids
+            state.update(input(next))
+            XCTAssertFalse(state.prependAnchor.pageRevisionApplied)
+            let result = try XCTUnwrap(confirmation.observe(snapshot: ids, live: next, now: 10 + delay))
+            state.completePrepend(operation: operation, result: result, now: 10 + delay)
+            XCTAssertTrue(state.prependAnchor.pageRevisionApplied)
+            XCTAssertEqual(state.prependAnchor.deadline, 12.035)
+            XCTAssertNil(state.restorePrepend(for: input(ids), generation: oldGeneration, frames: [frame()]))
+            XCTAssertTrue(state.prependAnchor.blocksFollowing)
+            XCTAssertEqual(state.restorePrepend(for: input(next), generation: state.prependAnchor.layoutGeneration,
+                                                frames: [frame("a", 500)]), .restore(id: "a", offset: 60))
+            state.didExecutePrepend(generation: state.prependAnchor.layoutGeneration)
+            XCTAssertNil(state.restorePrepend(for: input(next), generation: state.prependAnchor.layoutGeneration,
+                                              frames: [frame()]))
+            XCTAssertFalse(state.prependAnchor.blocksFollowing)
+        }
+    }
+
+    func testUnchangedSnapshotDoesNotOpenOnUnrelatedLiveAppend() {
+        var state = TimelineScrollState()
+        state.beginPrepend(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
+        state.finishPrepend(operation: operation, completedAt: 10.035, now: 10.035)
+        let next = ids + ["live"]
+        state.update(input(next))
+        var confirmation = TimelinePageConfirmation(original: ids, completedAt: 10.035)
+        XCTAssertNil(confirmation.observe(snapshot: ids, live: next, now: 10.058))
+        // Defend even against an unconfirmed old completion passed by a caller.
+        state.completePrepend(operation: operation,
+                              result: .init(expectedMessageIDs: ids, unchangedConfirmed: false, completedAt: 10.035),
+                              now: 10.058)
+        XCTAssertFalse(state.prependAnchor.pageRevisionApplied)
+        XCTAssertNil(state.restorePrepend(for: input(next), generation: state.prependAnchor.layoutGeneration,
+                                          frames: [frame()]))
+        XCTAssertTrue(state.prependAnchor.blocksFollowing)
+    }
+
+    func testTailSnapshotWaitsAndLaterPrependReleasesDeferredOwnMessage() throws {
+        var state = TimelineScrollState()
+        state.update(input(ids))
+        state.didScroll(try XCTUnwrap(state.followDecision))
+        state.recordGeometry(for: input(ids), distanceFromBottom: 900, viewportHeight: 600)
+        state.beginPrepend(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
+        state.finishPrepend(operation: operation, completedAt: 10.035, now: 10.035)
+        var confirmation = TimelinePageConfirmation(original: ids, completedAt: 10.035)
+        let tail = ids + ["tail"]
+        state.update(input(tail, own: true))
+        XCTAssertEqual(state.pending?.reason, .ownMessage)
+        XCTAssertNil(confirmation.observe(snapshot: tail, live: tail, now: 10.058))
+        XCTAssertNil(confirmation.observe(snapshot: tail, live: tail, now: 10.10))
+        XCTAssertFalse(state.prependAnchor.pageRevisionApplied)
+        XCTAssertNil(state.restorePrepend(for: input(tail, own: true), generation: state.prependAnchor.layoutGeneration,
+                                          frames: [frame()])) // Fresh geometry with zero delta is still fenced.
+        XCTAssertTrue(state.prependAnchor.blocksFollowing)
+        XCTAssertNil(state.followDecision)
+        let next = ["older"] + tail
+        let result = try XCTUnwrap(confirmation.observe(snapshot: next, live: tail, now: 10.12))
+        XCTAssertFalse(result.unchangedConfirmed)
+        state.completePrepend(operation: operation, result: result, now: 10.12)
+        XCTAssertFalse(state.prependAnchor.pageRevisionApplied) // Snapshot alone is not main-stream application.
+        state.update(input(next, own: true))
+        XCTAssertTrue(state.prependAnchor.pageRevisionApplied)
+        XCTAssertEqual(state.prependAnchor.deadline, 12.035)
+        XCTAssertEqual(state.restorePrepend(for: input(next, own: true), generation: state.prependAnchor.layoutGeneration,
+                                            frames: [frame("a", 500)]), .restore(id: "a", offset: 60))
+        XCTAssertNil(state.followDecision)
+        state.didExecutePrepend(generation: state.prependAnchor.layoutGeneration)
+        XCTAssertNil(state.restorePrepend(for: input(next, own: true), generation: state.prependAnchor.layoutGeneration,
+                                          frames: [frame()]))
+        XCTAssertFalse(state.prependAnchor.blocksFollowing)
+        XCTAssertEqual(state.followDecision?.reason, .ownMessage)
+    }
+
+    func testUnconfirmedTailCompletionCannotOpenEitherAnchorEntryPoint() {
+        let tail = ids + ["tail"]
+        XCTAssertFalse(TimelinePrependAnchor.containsPageRevision(tail, in: tail, replacing: ids))
+        for finishedFirst in [false, true] {
+            var state = TimelinePrependAnchor()
+            state.begin(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
+            if finishedFirst { state.finished(operation: operation, completedAt: 10.035, now: 10.035) }
+            state.update(input(tail))
+            state.confirmPage(operation: operation,
+                              result: .init(expectedMessageIDs: tail, unchangedConfirmed: false, completedAt: 10.035),
+                              now: 10.058)
+            XCTAssertFalse(state.pageRevisionApplied)
+            XCTAssertNil(layout(&state, tail, [frame()]))
+            XCTAssertTrue(state.blocksFollowing)
+            state.update(input(tail + ["tail-2"]))
+            XCTAssertFalse(state.pageRevisionApplied)
+            let next = ["older"] + tail
+            state.update(input(next))
+            XCTAssertTrue(state.pageRevisionApplied)
+            XCTAssertNil(layout(&state, next, [frame()]))
+            XCTAssertFalse(state.blocksFollowing)
+        }
+    }
+
+    func testZeroTextConfirmationIgnoresIndependentTailAppends() throws {
+        for reachedStart in [false, true] {
+            var state = TimelineScrollState()
+            state.beginPrepend(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
+            state.finishPrepend(operation: operation, completedAt: 10.035, now: 10.035)
+            var confirmation = TimelinePageConfirmation(original: ids, completedAt: 10.035)
+            let tail = ids + ["tail"]
+            state.update(input(tail))
+            XCTAssertNil(confirmation.observe(snapshot: tail, live: tail, now: 10.058))
+            XCTAssertNil(confirmation.observe(snapshot: ids, live: tail, now: 10.10))
+            let next = tail + ["tail-2"]
+            state.update(input(next))
+            XCTAssertNil(confirmation.observe(snapshot: next, live: next, now: 10.20)) // < 150ms
+            let result = try XCTUnwrap(confirmation.observe(snapshot: tail, live: next, now: 10.21))
+            XCTAssertTrue(result.unchangedConfirmed, "reachedStart=\(reachedStart)")
+            XCTAssertEqual(result.expectedMessageIDs, ids) // Fence only the unchanged front.
+            let oldGeneration = state.prependAnchor.layoutGeneration
+            state.completePrepend(operation: operation, result: result, now: 10.21)
+            XCTAssertTrue(state.prependAnchor.pageRevisionApplied)
+            XCTAssertEqual(state.prependAnchor.deadline, 12.035)
+            XCTAssertNil(state.restorePrepend(for: input(next), generation: oldGeneration, frames: [frame()]))
+            XCTAssertTrue(state.prependAnchor.blocksFollowing)
+            XCTAssertNil(state.restorePrepend(for: input(next), generation: state.prependAnchor.layoutGeneration,
+                                              frames: [frame()]))
+            XCTAssertFalse(state.prependAnchor.blocksFollowing)
+        }
+    }
+
+    func testMissingSnapshotAcceptsLivePrependButNotTail() throws {
+        var confirmation = TimelinePageConfirmation(original: ids, completedAt: 10)
+        let tail = ids + ["tail"]
+        XCTAssertNil(confirmation.observe(snapshot: nil, live: tail, now: 10.05))
+        let next = ["older"] + tail
+        let result = try XCTUnwrap(confirmation.observe(snapshot: nil, live: next, now: 10.10))
+        XCTAssertEqual(result.expectedMessageIDs, next)
+        XCTAssertFalse(result.unchangedConfirmed)
+        XCTAssertEqual(result.completedAt, 10)
+    }
+
+    func testUnchangedFrontRequiresContinuousLiveAgreementAndFreshSnapshots() throws {
+        var confirmation = TimelinePageConfirmation(original: ids, completedAt: 10)
+        let tail = ids + ["tail"]
+        XCTAssertNil(confirmation.observe(snapshot: tail, live: tail, now: 10.01))
+        XCTAssertNil(confirmation.observe(snapshot: tail, live: ["a", "replacement", "c"], now: 10.10))
+        XCTAssertNil(confirmation.observe(snapshot: tail, live: tail, now: 10.20))
+        XCTAssertNil(confirmation.observe(snapshot: nil, live: tail, now: 10.36))
+        XCTAssertNil(confirmation.observe(snapshot: ids, live: tail, now: 10.40))
+        XCTAssertNil(confirmation.observe(snapshot: tail, live: tail, now: 10.54))
+        XCTAssertTrue(try XCTUnwrap(confirmation.observe(snapshot: tail, live: tail, now: 10.56)).unchangedConfirmed)
+    }
+
+    func testP11AndP12RequireRepeatedUnchangedSnapshotsAndFinishedGeometry() {
+        // The same confirmation applies whether reachedStart is false or true.
+        for reachedStart in [false, true] {
+            var confirmation = TimelinePageConfirmation(original: ids, completedAt: 10.035)
+            XCTAssertNil(confirmation.observe(snapshot: ids, live: ids, now: 10.058))
+            XCTAssertNil(confirmation.observe(snapshot: ids, live: ids, now: 10.10))
+            let result = confirmation.observe(snapshot: ids, live: ids, now: 10.21)
+            XCTAssertEqual(result?.unchangedConfirmed, true, "reachedStart=\(reachedStart)")
+            var state = TimelinePrependAnchor()
+            state.begin(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
+            let oldGeneration = state.layoutGeneration
+            state.finished(operation: operation, expectedMessageIDs: result?.expectedMessageIDs,
+                           unchangedConfirmed: result?.unchangedConfirmed == true,
+                           completedAt: result?.completedAt, now: 10.21)
+            XCTAssertEqual(state.deadline, 12.035)
+            XCTAssertNil(state.layout(input: input(ids), generation: oldGeneration, frames: [frame()]))
+            XCTAssertTrue(state.blocksFollowing)
+            XCTAssertNil(layout(&state, ids, [frame()]))
+            XCTAssertFalse(state.blocksFollowing)
+        }
+    }
+
+    func testSnapshotRetryReplacesOldFenceAndMissingIsNeverEmpty() {
+        var confirmation = TimelinePageConfirmation(original: ids, completedAt: 10)
+        XCTAssertNil(confirmation.observe(snapshot: nil, live: ids, now: 10))
+        XCTAssertNil(confirmation.observe(snapshot: ids, live: ids, now: 10.05))
+        let next = ["older"] + ids
+        let result = confirmation.observe(snapshot: ids, live: next, now: 10.08)
+        XCTAssertEqual(result?.expectedMessageIDs, next)
+        XCTAssertEqual(result?.unchangedConfirmed, false)
+        // Production order: finish immediately, then confirm the retried view.
+        var state = TimelinePrependAnchor()
+        state.begin(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 9.9)
+        state.finished(operation: operation, now: 10)
+        XCTAssertNil(layout(&state, ids, [frame()]))
+        state.update(input(next))
+        let preConfirmation = state.layoutGeneration
+        XCTAssertFalse(state.pageRevisionApplied)
+        state.confirmPage(operation: operation, result: result!, now: 10.08)
+        XCTAssertTrue(state.pageRevisionApplied)
+        XCTAssertEqual(state.deadline, 12)
+        XCTAssertNil(state.layout(input: input(next), generation: preConfirmation, frames: [frame()]))
+        XCTAssertTrue(state.blocksFollowing)
+        XCTAssertEqual(layout(&state, next, [frame("a", 500)]), .restore(id: "a", offset: 60))
+        XCTAssertNil(layout(&state, next, [frame()]))
+        XCTAssertFalse(state.blocksFollowing)
+        confirmation = TimelinePageConfirmation(original: ids, completedAt: 10)
+        XCTAssertNil(confirmation.observe(snapshot: ids, live: ids, now: 10))
+        XCTAssertNil(confirmation.observe(snapshot: nil, live: ids, now: 10.2))
+        XCTAssertNil(confirmation.observe(snapshot: ids, live: ids, now: 10.25))
+        XCTAssertEqual(confirmation.observe(snapshot: ["a", "b", "replacement"], live: ids, now: 10.3)?.expectedMessageIDs,
+                       ["a", "b", "replacement"]) // Same count, genuinely changed IDs.
+    }
+
+    func testFailedPaginationCancelsImmediatelyButMissingSnapshotRetainsRecovery() {
+        var state = TimelineScrollState()
+        state.beginPrepend(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
+        state.completePrepend(operation: UUID(), result: nil, now: 10.1)
+        XCTAssertTrue(state.prependAnchor.blocksFollowing) // stale failure
+        state.completePrepend(operation: operation, result: nil, now: 10.1)
+        XCTAssertFalse(state.prependAnchor.blocksFollowing)
+        state.beginPrepend(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 11)
+        state.completePrepend(operation: operation,
+                              result: .init(expectedMessageIDs: nil, unchangedConfirmed: false, completedAt: 11.1), now: 11.6)
+        XCTAssertTrue(state.prependAnchor.blocksFollowing)
+        XCTAssertFalse(state.prependAnchor.pageRevisionApplied)
+        XCTAssertEqual(state.prependAnchor.deadline, 13.1)
+        state.cancelPrepend()
+        state.completePrepend(operation: operation,
+                              result: .init(expectedMessageIDs: ["older"] + ids, unchangedConfirmed: false, completedAt: 11.1), now: 11.7)
+        XCTAssertFalse(state.prependAnchor.blocksFollowing)
+    }
+
+    func testRetryAfterFiveSecondLoadingBoundaryUsesOriginalCompletionDeadline() {
+        var state = TimelinePrependAnchor()
+        state.begin(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
+        state.finished(operation: operation, completedAt: 14.9, now: 14.9)
+        state.expire(now: 15.05)
+        XCTAssertNotNil(state.operation)
+        let oldGeneration = state.layoutGeneration
+        state.confirmPage(operation: operation,
+                          result: .init(expectedMessageIDs: ids, unchangedConfirmed: true, completedAt: 14.9), now: 15.1)
+        XCTAssertEqual(state.deadline, 16.9)
+        XCTAssertTrue(state.pageRevisionApplied)
+        XCTAssertNil(state.layout(input: input(ids), generation: oldGeneration, frames: [frame()]))
+        XCTAssertTrue(state.blocksFollowing)
+        XCTAssertNil(layout(&state, ids, [frame()]))
+        XCTAssertFalse(state.blocksFollowing)
+        state.expire(now: 17)
+        state.confirmPage(operation: operation,
+                          result: .init(expectedMessageIDs: ids, unchangedConfirmed: true, completedAt: 14.9), now: 17.1)
+        XCTAssertNil(state.operation)
     }
 
 }
