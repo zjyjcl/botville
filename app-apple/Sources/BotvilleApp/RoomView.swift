@@ -274,12 +274,12 @@ struct RoomView: View {
                                                viewportHeight: geometry.viewportHeight ?? 0)
                     recordTimelineGeometry()
                 }
-                .task(id: TimelineScrollWork(prepend: scrollState.prependAnchor.operation,
-                                             bottom: scrollState.bottomSettlement.decision)) {
+                .task(id: scrollWork) {
+                    let work = scrollWork
                     // One bounded driver per operation, not a task cancelled by
                     // every geometry frame. It also expires when no frames arrive.
                     for _ in 0..<65 {
-                        guard !Task.isCancelled, !isDraggingTimeline, isVisible else { return }
+                        guard !Task.isCancelled, work == scrollWork, !isDraggingTimeline, isVisible else { return }
                         let now = ProcessInfo.processInfo.systemUptime
                         scrollState.expireScrollWork(now: now)
                         guard scrollState.prependAnchor.operation != nil ||
@@ -320,7 +320,7 @@ struct RoomView: View {
                         catch { return }
                     }
                     // Defensive iteration cap, independent of clock/geometry.
-                    scrollState.expireScrollWork(now: .infinity)
+                    if work == scrollWork { scrollState.expireScrollWork(now: .infinity) }
                 }
                 .task(id: scrollState.followDecision) {
                     guard let decision = scrollState.followDecision else { return }
@@ -337,6 +337,10 @@ struct RoomView: View {
                 }
             }
         }
+    }
+
+    private var scrollWork: TimelineScrollWork {
+        .init(prepend: scrollState.prependAnchor.operation, bottom: scrollState.bottomSettlement.decision)
     }
 
     private func recordTimelineGeometry() {
