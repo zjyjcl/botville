@@ -13,12 +13,13 @@ final class TimelineTraceTests: XCTestCase {
         for event in TimelineTrace.Event.allCases {
             for reason in TimelineTrace.Reason.allCases {
                 let line = TimelineTrace.format(event, reason: reason, scope: scope,
-                                                targetID: id, count: 30, now: 12.5)
+                                                targetID: id, count: 30, pageApplied: true, now: 12.5)
                 XCTAssertFalse(line.contains(id))
                 XCTAssertFalse(line.contains("synthetic"))
                 XCTAssertFalse(line.contains(scope.uuidString))
                 XCTAssertFalse(line.contains("\n"))
                 XCTAssertTrue(line.contains("t=12.5"))
+                XCTAssertTrue(line.contains("page_applied=true"))
                 XCTAssertTrue(line.contains("event=\(event.rawValue)"))
                 XCTAssertTrue(line.contains("target=\(TimelineTrace.fingerprint(id))"))
                 XCTAssertTrue(line.contains("elapsed=- reached_start=- visible=- offset=-"))

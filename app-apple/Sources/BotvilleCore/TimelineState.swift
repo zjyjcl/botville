@@ -110,3 +110,30 @@ final class TimelineListenerBridge: TimelineListener, Sendable {
         continuation.yield(diff)
     }
 }
+
+/// A one-shot, read-only fence. addListener delivers its initial reset before
+/// returning its handle. Never applies this snapshot to the live diff stream:
+/// its IDs only acknowledge which page revision that stream must have consumed.
+final class TimelinePageSnapshot: TimelineListener, @unchecked Sendable {
+    private let lock = NSLock()
+    private var snapshot: [TimelineItem]?
+
+    func onUpdate(diff: [TimelineDiff]) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard snapshot == nil else { return }
+        for update in diff {
+            if case .reset(let values) = update { snapshot = values; return }
+        }
+    }
+
+    func messageIDs() -> [String]? {
+        lock.lock()
+        let items = snapshot
+        lock.unlock()
+        guard let items else { return nil }
+        var state = TimelineState()
+        state.apply([.reset(values: items)])
+        return state.messages.map(\.id)
+    }
+}

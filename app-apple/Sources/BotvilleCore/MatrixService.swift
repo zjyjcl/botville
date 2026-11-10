@@ -1203,8 +1203,9 @@ public final class MatrixService: ObservableObject {
         return rooms.map { $0.id == roomID ? $0.withUnreadCount(0) : $0 }
     }
 
-    public func loadOlderMessages(operation: UUID = UUID()) async throws {
-        guard let timeline, canLoadOlderMessages else { return }
+    @discardableResult
+    public func loadOlderMessages(operation: UUID = UUID()) async throws -> [String]? {
+        guard let timeline, canLoadOlderMessages else { return nil }
         guard paginationGeneration == nil else { throw MatrixServiceError.busy }
         let generation = timelineGeneration
         paginationGeneration = generation
@@ -1213,6 +1214,7 @@ public final class MatrixService: ObservableObject {
 #if DEBUG
         let started = ProcessInfo.processInfo.systemUptime
         let before = messages.count
+        let beforeIDs = messages.map(\.id)
         TimelineTrace.record(.pageBegin, scope: operation, context: generation, count: before)
 #endif
         do {
@@ -1227,6 +1229,23 @@ public final class MatrixService: ObservableObject {
                                  previousCount: before, elapsed: ProcessInfo.processInfo.systemUptime - started,
                                  reachedStart: reachedStart)
 #endif
+            guard generation == timelineGeneration else { throw CancellationError() }
+            // paginateBackwards can return before the existing listener's queued
+            // diffs reach MainActor. A local SDK snapshot fences this exact page,
+            // including status-only/empty pages; sleeping or a count cannot.
+            let snapshot = TimelinePageSnapshot()
+            let handle = await timeline.addListener(listener: snapshot)
+            handle.cancel()
+            try Task.checkCancellation()
+            guard generation == timelineGeneration else { throw CancellationError() }
+            let expected = snapshot.messageIDs()
+#if DEBUG
+            TimelineTrace.record(.pageRevision, scope: operation, context: generation,
+                                 count: expected?.count, pageApplied: expected.map {
+                                     TimelinePrependAnchor.containsPageRevision($0, in: messages.map(\.id), replacing: beforeIDs)
+                                 })
+#endif
+            return expected
         } catch {
 #if DEBUG
             TimelineTrace.record(.pageEnd, reason: error is CancellationError ? .cancelled : .failed,

@@ -11,13 +11,13 @@ import os
 public enum TimelineTrace {
     public enum Event: String, CaseIterable {
         case listenerRegister, listenerReady, firstSnapshot, diffApplied
-        case pageBegin, pageEnd, anchorBegin, anchorFinished, anchorLocate
+        case pageBegin, pageEnd, pageRevision, headerLayout, anchorBegin, anchorFinished, anchorLocate
         case anchorRestore, anchorResult, anchorMissing, anchorExecuted, anchorWaiting, lastRow
     }
     public enum Reason: String, CaseIterable {
         case none, success, failed, stale, cancelled, gesture, appearance, superseded
         case loadingTimeout, recoveryTimeout, unmaterialized, locateExhausted
-        case correctionLimit, noCapture, noSurvivor, noGeometry, staleGeometry, invalidViewport
+        case awaitingPage, correctionLimit, noCapture, noSurvivor, noGeometry, staleGeometry, invalidViewport
     }
 
     private static let logger = Logger(subsystem: "com.zjyjcl.botville", category: "TimelineTrace")
@@ -33,24 +33,24 @@ public enum TimelineTrace {
                        context: UUID? = nil, targetID: String? = nil, count: Int? = nil,
                        previousCount: Int? = nil, generation: UInt? = nil,
                        attempt: Int? = nil, elapsed: Double? = nil, reachedStart: Bool? = nil,
-                       visible: Bool? = nil, offset: Double? = nil,
+                       visible: Bool? = nil, offset: Double? = nil, pageApplied: Bool? = nil,
                        now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> String {
         func number<T>(_ value: T?) -> String { value.map { String(describing: $0) } ?? "-" }
         return "timeline_trace t=\(now) event=\(event.rawValue) reason=\(reason.rawValue)"
             + " scope=\(fingerprint(scope?.uuidString)) context=\(fingerprint(context?.uuidString)) target=\(fingerprint(targetID))"
             + " count=\(number(count)) before=\(number(previousCount)) gen=\(number(generation)) attempt=\(number(attempt))"
-            + " elapsed=\(number(elapsed)) reached_start=\(number(reachedStart)) visible=\(number(visible)) offset=\(number(offset))"
+            + " elapsed=\(number(elapsed)) reached_start=\(number(reachedStart)) visible=\(number(visible)) offset=\(number(offset)) page_applied=\(number(pageApplied))"
     }
 
     public static func record(_ event: Event, reason: Reason = .none, scope: UUID? = nil,
                               context: UUID? = nil, targetID: String? = nil, count: Int? = nil,
                               previousCount: Int? = nil, generation: UInt? = nil,
                               attempt: Int? = nil, elapsed: Double? = nil, reachedStart: Bool? = nil,
-                              visible: Bool? = nil, offset: Double? = nil) {
+                              visible: Bool? = nil, offset: Double? = nil, pageApplied: Bool? = nil) {
         let line = format(event, reason: reason, scope: scope, context: context, targetID: targetID,
                           count: count, previousCount: previousCount, generation: generation,
                           attempt: attempt, elapsed: elapsed, reachedStart: reachedStart,
-                          visible: visible, offset: offset)
+                          visible: visible, offset: offset, pageApplied: pageApplied)
         logger.debug("\(line, privacy: .public)")
     }
 }
