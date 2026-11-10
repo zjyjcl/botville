@@ -248,8 +248,9 @@ App                          网关                        模块网页（WKWebV
 - 缓存键为 token 的**哈希**（不缓存明文，不写入日志）；缓存值为校验结果（`sub`）。
 - TTL = `min(GATEWAY_OPENID_CACHE_TTL_SECONDS, 60s, 若已知则剩余有效期)`；
   上限 60 秒，配置项 `GATEWAY_OPENID_CACHE_TTL_SECONDS`（上限 60，默认 60）。
-- 失败缓存（userinfo 4xx）TTL 应远短于成功缓存（数秒量级），避免短暂 HS 故障
-  将有效用户持续锁定。
+- 失败负缓存**仅对 401/403（及域不匹配）**生效，TTL 应远短于成功缓存（数秒量级），
+  避免短暂 HS 故障将有效用户持续锁定；其他 4xx / 5xx / 超时 / 不可达**不缓存**，
+  调用方可重试（返回 500 `internal.error`）。
 - 实现可用 single-flight 合并对同一 token 的并发 userinfo 请求，防止缓存击穿打爆
   homeserver（本节不要求实现，只要求缓存键用哈希）。
 
