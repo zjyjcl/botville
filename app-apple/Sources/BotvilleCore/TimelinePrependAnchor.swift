@@ -11,8 +11,8 @@ public struct TimelinePageCompletion: Sendable {
 }
 
 /// Re-read the SDK view after completion: one unchanged reset can be stale.
-/// No-change confirmation requires repeated fresh snapshots AND unchanged live
-/// text across a short observation interval, regardless of reachedStart.
+/// No-change confirmation requires repeated fresh snapshots AND an unchanged
+/// live prefix across a short interval; unrelated tail appends do not count.
 struct TimelinePageConfirmation {
     static let unchangedInterval: TimeInterval = 0.15
     let original: [String]
@@ -25,18 +25,20 @@ struct TimelinePageConfirmation {
     }
 
     mutating func observe(snapshot: [String]?, live: [String], now: TimeInterval) -> TimelinePageCompletion? {
-        guard let snapshot else { unchangedSince = nil; return nil }
-        if snapshot != original {
-            return .init(expectedMessageIDs: snapshot, unchangedConfirmed: false, completedAt: completedAt)
-        }
         // A main-listener prepend is also positive evidence, unlike an unrelated
-        // live append/status update. Never retain the old subset as the fence.
+        // live append/status update, even when the independent reset is missing.
         if let first = original.first, let index = live.firstIndex(of: first), index > 0 {
             return .init(expectedMessageIDs: live, unchangedConfirmed: false, completedAt: completedAt)
         }
-        guard live == original else { unchangedSince = nil; return nil }
+        guard let snapshot else { unchangedSince = nil; return nil }
+        // Equality and pure tail extension both leave the paginated front
+        // unchanged. Neither is immediate evidence that the page has arrived.
+        if !snapshot.starts(with: original) {
+            return .init(expectedMessageIDs: snapshot, unchangedConfirmed: false, completedAt: completedAt)
+        }
+        guard live.starts(with: original) else { unchangedSince = nil; return nil }
         if let since = unchangedSince, now - since >= Self.unchangedInterval {
-            return .init(expectedMessageIDs: snapshot, unchangedConfirmed: true, completedAt: completedAt)
+            return .init(expectedMessageIDs: original, unchangedConfirmed: true, completedAt: completedAt)
         }
         if unchangedSince == nil { unchangedSince = now }
         return nil
@@ -139,6 +141,12 @@ public struct TimelinePrependAnchor: Sendable {
     /// Preserve ordering, rather than accepting an unrelated count/status change.
     public static func containsPageRevision(_ expected: [String], in actual: [String],
                                            replacing original: [String] = []) -> Bool {
+        // A tail-only snapshot can be fully present without any page revision.
+        // Empty original is the default for callers checking ordering alone;
+        // a captured prepend always has at least its visible anchor row.
+        if !original.isEmpty, expected.count > original.count, expected.starts(with: original) {
+            return false
+        }
         // A snapshot can also remove a prior row. Seeing its surviving IDs is
         // insufficient until that removal has reached the live input too.
         let removed = Set(original).subtracting(expected)
@@ -225,7 +233,7 @@ public struct TimelinePrependAnchor: Sendable {
         if !current.loading, let expected = current.expectedMessageIDs {
             // Once observed, later live removals must not close the page fence
             // again. Their geometry still gets its own generation below.
-            if expected == current.pageStartIDs, !current.unchangedConfirmed,
+            if expected.starts(with: current.pageStartIDs), !current.unchangedConfirmed,
                let first = current.pageStartIDs.first,
                let index = next.messageIDs.firstIndex(of: first), index > 0 {
                 current.expectedMessageIDs = next.messageIDs

@@ -1250,7 +1250,8 @@ public final class MatrixService: ObservableObject {
                 let result = confirmation.observe(snapshot: expected, live: messages.map(\.id), now: now)
 #if DEBUG
                 TimelineTrace.record(.pageRevision,
-                                     reason: expected == nil ? .snapshotMissing : (result == nil ? .snapshotUnchanged : .none),
+                                     reason: result?.unchangedConfirmed == true ? .snapshotUnchanged
+                                         : (result != nil ? .none : (expected == nil ? .snapshotMissing : .snapshotUnchanged)),
                                      scope: operation, context: generation,
                                      count: result?.expectedMessageIDs?.count ?? expected?.count,
                                      previousCount: beforeIDs.count, attempt: attempt,
