@@ -72,6 +72,105 @@ final class TimelineLeaseOwnershipTests: XCTestCase {
         try await fixture.service.clearLocalSession()
     }
 
+    func testSnapshotReadinessIgnoresNoOpsButAcceptsNonTextAndEmptyReset() {
+        var state = TimelineState()
+        state.apply([])
+        state.apply([.append(values: []), .remove(index: 9), .popFront, .popBack, .truncate(length: 0)])
+        XCTAssertFalse(state.hasReceivedSnapshot)
+        state.apply([.pushBack(value: LeaseNonTextItem())])
+        XCTAssertTrue(state.hasReceivedSnapshot)
+        XCTAssertTrue(state.messages.isEmpty)
+        state = TimelineState()
+        state.apply([.reset(values: [])])
+        XCTAssertTrue(state.hasReceivedSnapshot)
+        state = TimelineState()
+        state.apply([.clear])
+        XCTAssertTrue(state.hasReceivedSnapshot)
+    }
+
+    @MainActor
+    func testSynchronousLookupErrorAlsoClearsCurrentLease() async throws {
+        let fixture = try await LeaseFixture.make()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let roomID = "!lookup-error:matrix.test"
+        do {
+            _ = try await fixture.service.openRoom(roomID)
+            XCTFail("Expected lookup error")
+        } catch MatrixServiceError.operationFailed {}
+        XCTAssertNil(fixture.service.activeRoomID)
+        XCTAssertFalse(fixture.service.hasReceivedTimelineSnapshot)
+        try await fixture.service.clearLocalSession()
+    }
+
+    @MainActor
+    func testEmptyDiffAndEmptyAppendDoNotEndSnapshotWait() async throws {
+        let fixture = try await LeaseFixture.make()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        _ = try await fixture.service.openRoom(fixture.room.id())
+        fixture.timeline.listeners[0].onUpdate(diff: [])
+        fixture.timeline.listeners[0].onUpdate(diff: [.append(values: [])])
+        // Let the stream consume both callbacks before checking readiness.
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertFalse(fixture.service.hasReceivedTimelineSnapshot)
+        fixture.timeline.listeners[0].onUpdate(diff: [.reset(values: [])])
+        for _ in 0..<100 where !fixture.service.hasReceivedTimelineSnapshot {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(fixture.service.hasReceivedTimelineSnapshot)
+        try await fixture.service.clearLocalSession()
+    }
+
+    @MainActor
+    func testUnavailableRoomEarlyThrowClearsCurrentLease() async throws {
+        let fixture = try await LeaseFixture.make()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let missing = "!missing:matrix.test"
+        let lease = fixture.service.beginRoomOpen(missing)
+        do {
+            _ = try await fixture.service.openRoom(missing, lease: lease)
+            XCTFail("Expected unavailable room")
+        } catch MatrixServiceError.roomUnavailable {}
+        XCTAssertNil(fixture.service.activeRoomID)
+        XCTAssertFalse(fixture.service.hasReceivedTimelineSnapshot)
+        XCTAssertFalse(fixture.service.canLoadOlderMessages)
+        try await fixture.service.clearLocalSession()
+    }
+
+    @MainActor
+    func testNotLoggedInEarlyThrowClearsCurrentLease() async throws {
+        let fixture = try await LeaseFixture.make()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        try await fixture.service.clearLocalSession()
+        let lease = fixture.service.beginRoomOpen(fixture.room.id())
+        do {
+            _ = try await fixture.service.openRoom(fixture.room.id(), lease: lease)
+            XCTFail("Expected logged out error")
+        } catch MatrixServiceError.notLoggedIn {}
+        XCTAssertNil(fixture.service.activeRoomID)
+        XCTAssertFalse(fixture.service.hasReceivedTimelineSnapshot)
+    }
+
+    @MainActor
+    func testStaleOpenEarlyThrowPreservesNewSnapshotAndLease() async throws {
+        let fixture = try await LeaseFixture.make()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let old = fixture.service.beginRoomOpen(fixture.room.id())
+        let current = try await fixture.service.openRoom(fixture.room.id())
+        fixture.timeline.listeners[0].onUpdate(diff: [.reset(values: [])])
+        for _ in 0..<100 where !fixture.service.hasReceivedTimelineSnapshot {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        do {
+            _ = try await fixture.service.openRoom(fixture.room.id(), lease: old)
+            XCTFail("Expected stale lease cancellation")
+        } catch is CancellationError {}
+        XCTAssertEqual(fixture.service.activeRoomID, fixture.room.id())
+        XCTAssertTrue(fixture.service.hasReceivedTimelineSnapshot)
+        fixture.service.closeRoom(fixture.room.id(), lease: current)
+        XCTAssertNil(fixture.service.activeRoomID)
+        try await fixture.service.clearLocalSession()
+    }
+
     @MainActor
     func testOldListenerAndStaleCloseCannotChangeReopenedSnapshotReadiness() async throws {
         let fixture = try await LeaseFixture.make()
@@ -145,7 +244,10 @@ private final class LeaseFakeClient: Client, @unchecked Sendable {
     override func setDelegate(delegate: ClientDelegate?) throws -> TaskHandle? { nil }
     override func registerNotificationHandler(listener: SyncNotificationListener) async {}
     override func rooms() -> [Room] { [room] }
-    override func getRoom(roomId: String) throws -> Room? { roomId == room.id() ? room : nil }
+    override func getRoom(roomId: String) throws -> Room? {
+        if roomId == "!lookup-error:matrix.test" { throw ClientError.Generic(msg: "lookup failed", details: nil) }
+        return roomId == room.id() ? room : nil
+    }
     override func enableAllSendQueues(enable: Bool) async {}
     override func syncOnceV2(settings: SyncSettingsV2) async throws -> SyncResponseV2 {
         SyncResponseV2(nextBatch: "lease", rooms: SyncResponseRoomsV2(invited: [], joined: [], left: [], knocked: []))
@@ -187,4 +289,10 @@ private final class LeaseFakeTaskHandle: TaskHandle, @unchecked Sendable {
     init() { super.init(noHandle: .init()) }
     required init(unsafeFromHandle handle: UInt64) { fatalError("test fake") }
     override func cancel() {}
+}
+
+private final class LeaseNonTextItem: TimelineItem, @unchecked Sendable {
+    init() { super.init(noHandle: .init()) }
+    required init(unsafeFromHandle handle: UInt64) { fatalError("test fake") }
+    override func asEvent() -> EventTimelineItem? { nil }
 }

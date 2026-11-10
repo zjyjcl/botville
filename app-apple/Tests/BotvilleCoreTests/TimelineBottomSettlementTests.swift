@@ -89,6 +89,22 @@ final class TimelineBottomSettlementTests: XCTestCase {
         XCTAssertNil(state.followDecision)
     }
 
+    func testShorterReplacementDoesNotRetargetOrQueueFollow() throws {
+        var state = try opened(input())
+        state.update(input(["replacement"]))
+        XCTAssertNil(state.bottomSettlement.decision)
+        XCTAssertNil(state.followDecision)
+    }
+
+    func testReplacementEndingInOwnMessageDoesNotImplyNewSend() throws {
+        var state = try opened(input())
+        // A replaced snapshot ending in our historical row is not an append.
+        // Preserve the existing policy: cancel settling, do not invent a send.
+        state.update(input(["replacement", "historical-own"], own: true))
+        XCTAssertNil(state.bottomSettlement.decision)
+        XCTAssertNil(state.followDecision)
+    }
+
     func testNewMessageAfterOldSnapshotLandingStillFollows() throws {
         var state = try opened(input())
         XCTAssertNil(correct(&state, input(), frame(500), now: 10.2))

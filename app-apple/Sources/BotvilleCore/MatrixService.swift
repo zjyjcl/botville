@@ -1077,17 +1077,19 @@ public final class MatrixService: ObservableObject {
 
     @discardableResult
     public func openRoom(_ roomID: String, lease: RoomTimelineLease) async throws -> RoomTimelineLease {
-        guard let client, !isLoggingOut else { throw MatrixServiceError.notLoggedIn }
-        guard let room = try client.getRoom(roomId: roomID), room.membership() == .joined else {
-            throw MatrixServiceError.roomUnavailable
-        }
-        guard timelineLeaseOwnership.isCurrent(roomID: roomID, lease: lease), activeRoomID == roomID else {
-            throw CancellationError()
-        }
-        updateApplicationBadge()
         let session = sessionGeneration
         let generation = timelineGeneration
         do {
+            // All failures use lease-scoped cleanup, including synchronous SDK
+            // lookup errors. A stale lease must never clear a newer appearance.
+            guard timelineLeaseOwnership.isCurrent(roomID: roomID, lease: lease), activeRoomID == roomID else {
+                throw CancellationError()
+            }
+            guard let client, !isLoggingOut else { throw MatrixServiceError.notLoggedIn }
+            guard let room = try client.getRoom(roomId: roomID), room.membership() == .joined else {
+                throw MatrixServiceError.roomUnavailable
+            }
+            updateApplicationBadge()
             let newTimeline = try await room.timeline()
             try Task.checkCancellation()
             guard generation == timelineGeneration else { throw CancellationError() }
@@ -1098,17 +1100,34 @@ public final class MatrixService: ObservableObject {
             timelineTask = Task { [weak self] in
                 for await updates in stream {
                     guard !Task.isCancelled, let self, self.timelineGeneration == generation else { return }
+#if DEBUG
+                    let previousCount = self.messages.count
+                    let wasReady = self.hasReceivedTimelineSnapshot
+#endif
                     self.timelineState.apply(updates)
                     self.messages = self.timelineState.messages
-                    self.hasReceivedTimelineSnapshot = true
+                    self.hasReceivedTimelineSnapshot = self.timelineState.hasReceivedSnapshot
+#if DEBUG
+                    TimelineTrace.record(.diffApplied, scope: generation, count: self.messages.count,
+                                         previousCount: previousCount, attempt: updates.count)
+                    if !wasReady && self.hasReceivedTimelineSnapshot {
+                        TimelineTrace.record(.firstSnapshot, scope: generation, count: self.messages.count)
+                    }
+#endif
                 }
             }
+#if DEBUG
+            TimelineTrace.record(.listenerRegister, scope: generation)
+#endif
             let handle = await newTimeline.addListener(listener: listener)
             guard !Task.isCancelled, generation == timelineGeneration else {
                 handle.cancel()
                 continuation.finish()
                 throw CancellationError()
             }
+#if DEBUG
+            TimelineTrace.record(.listenerReady, scope: generation)
+#endif
             timelineHandle = handle
             canLoadOlderMessages = true
             Task { [weak self] in
@@ -1184,17 +1203,38 @@ public final class MatrixService: ObservableObject {
         return rooms.map { $0.id == roomID ? $0.withUnreadCount(0) : $0 }
     }
 
-    public func loadOlderMessages() async throws {
+    public func loadOlderMessages(operation: UUID = UUID()) async throws {
         guard let timeline, canLoadOlderMessages else { return }
         guard paginationGeneration == nil else { throw MatrixServiceError.busy }
         let generation = timelineGeneration
         paginationGeneration = generation
         defer { if paginationGeneration == generation { paginationGeneration = nil } }
         let session = sessionGeneration
+#if DEBUG
+        let started = ProcessInfo.processInfo.systemUptime
+        let before = messages.count
+        TimelineTrace.record(.pageBegin, scope: operation, context: generation, count: before)
+#endif
         do {
             let reachedStart = try await timeline.paginateBackwards(numEvents: 30)
             if generation == timelineGeneration { canLoadOlderMessages = !reachedStart }
-        } catch { throw await operationFailure(error, session: session) }
+#if DEBUG
+            // Counts are delivered text rows, not SDK fetched events. Listener
+            // batches can arrive after this await; diffApplied records those.
+            TimelineTrace.record(.pageEnd, reason: generation == timelineGeneration ? .success : .stale,
+                                 scope: operation, context: generation,
+                                 count: generation == timelineGeneration ? messages.count : nil,
+                                 previousCount: before, elapsed: ProcessInfo.processInfo.systemUptime - started,
+                                 reachedStart: reachedStart)
+#endif
+        } catch {
+#if DEBUG
+            TimelineTrace.record(.pageEnd, reason: error is CancellationError ? .cancelled : .failed,
+                                 scope: operation, context: generation, previousCount: before,
+                                 elapsed: ProcessInfo.processInfo.systemUptime - started)
+#endif
+            throw await operationFailure(error, session: session)
+        }
     }
 
     /// Completion only acknowledges SDK queue insertion, never server delivery.

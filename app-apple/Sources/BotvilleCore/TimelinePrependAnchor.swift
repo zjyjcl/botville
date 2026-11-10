@@ -44,6 +44,7 @@ public struct TimelinePrependAnchor: Sendable {
     public static let timeout: TimeInterval = 5
     public static let recoveryWindow: TimeInterval = 2
     public private(set) var deadline: TimeInterval?
+    // Absolute ceiling from begin; completion can never extend beyond it.
     private var hardDeadline: TimeInterval?
     private var missingFrameSamples = 0
     private var locateAttempts = 0
@@ -76,6 +77,11 @@ public struct TimelinePrependAnchor: Sendable {
                                frames: [TimelineMessageFrame], viewportHeight: Double,
                                now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
         let chained = blocksFollowing && capture?.appearance == input.request?.appearanceID ? capture : nil
+#if DEBUG
+        if let capture {
+            TimelineTrace.record(.anchorResult, reason: .superseded, scope: capture.operation)
+        }
+#endif
         cancel()
         self.input = input
         guard let appearance = input.request?.appearanceID else { return }
@@ -87,6 +93,10 @@ public struct TimelinePrependAnchor: Sendable {
         capture = Capture(operation: operation, appearance: appearance,
                           originalIDs: chained?.originalIDs ?? input.messageIDs,
                           visibleFrames: chained?.visibleFrames ?? visible, target: target)
+#if DEBUG
+        TimelineTrace.record(.anchorBegin, scope: operation, context: appearance, targetID: target.id,
+                             count: input.messageIDs.count, offset: target.minY)
+#endif
     }
 
     public mutating func cancel() {
@@ -101,14 +111,34 @@ public struct TimelinePrependAnchor: Sendable {
 
     /// Cancelling also forgets the capture: late SDK diffs cannot resurrect it.
     public mutating func expire(now: TimeInterval) {
-        if let deadline, now >= deadline { cancel() }
+        if let deadline, now >= deadline {
+#if DEBUG
+            if let current = capture {
+                let settled: Bool
+                if case .settled = current.phase { settled = true } else { settled = false }
+                // A settled result has already been logged, including residual
+                // error at the correction cap. Expiry is not another failure.
+                if !settled {
+                    TimelineTrace.record(.anchorResult, reason: current.loading ? .loadingTimeout : .recoveryTimeout,
+                                         scope: current.operation, targetID: current.target.id,
+                                         generation: layoutGeneration, attempt: locateAttempts)
+                }
+            }
+#endif
+            cancel()
+        }
     }
 
     public mutating func update(_ next: TimelineScrollInput) {
         let previous = input
         input = next
         guard var current = capture else { return }
-        guard next.request?.appearanceID == current.appearance else { cancel(); return }
+        guard next.request?.appearanceID == current.appearance else {
+#if DEBUG
+            TimelineTrace.record(.anchorResult, reason: .appearance, scope: current.operation)
+#endif
+            cancel(); return
+        }
         guard previous?.messageIDs != next.messageIDs else { return }
         let oldIDs = previous?.messageIDs ?? []
         // Also detects prepend+append and late SDK listener delivery after the
@@ -124,6 +154,9 @@ public struct TimelinePrependAnchor: Sendable {
                 current.target = .init(id: successor, minY: 0, height: 1)
             } else {
                 // No surviving reading context: leave the viewport alone.
+#if DEBUG
+                TimelineTrace.record(.anchorResult, reason: .noSurvivor, scope: current.operation)
+#endif
                 cancel()
                 return
             }
@@ -147,6 +180,10 @@ public struct TimelinePrependAnchor: Sendable {
         deadline = min(now + Self.recoveryWindow, hardDeadline ?? now)
         missingFrameSamples = 0
         locateAttempts = 0
+#if DEBUG
+        TimelineTrace.record(.anchorFinished, scope: operation, targetID: current.target.id,
+                             generation: layoutGeneration)
+#endif
         current.loading = false
         current.phase = .layout // Includes spinner/button removal and empty pages.
         awaitingExecution = false
@@ -158,6 +195,9 @@ public struct TimelinePrependAnchor: Sendable {
     /// registered the rendered lazy targets. Only then request a fresh sample.
     public mutating func didExecute(generation: UInt) {
         guard generation == layoutGeneration, awaitingExecution else { return }
+#if DEBUG
+        TimelineTrace.record(.anchorExecuted, scope: capture?.operation, generation: generation)
+#endif
         awaitingExecution = false
         layoutGeneration &+= 1
     }
@@ -177,8 +217,17 @@ public struct TimelinePrependAnchor: Sendable {
             let corrections: Int
             if case .corrected(let count) = current.phase { corrections = count } else { corrections = 0 }
             if abs(delta) <= 0.5 || corrections >= 2 {
+#if DEBUG
+                TimelineTrace.record(.anchorResult, reason: abs(delta) <= 0.5 ? .success : .correctionLimit,
+                                     scope: current.operation, targetID: current.target.id,
+                                     generation: layoutGeneration, attempt: corrections, offset: delta)
+#endif
                 current.phase = .settled
             } else {
+#if DEBUG
+                TimelineTrace.record(.anchorRestore, scope: current.operation, targetID: current.target.id,
+                                     generation: layoutGeneration, attempt: corrections + 1, offset: delta)
+#endif
                 action = .restore(id: current.target.id, offset: current.target.minY)
                 current.phase = .corrected(corrections + 1)
             }
@@ -187,9 +236,20 @@ public struct TimelinePrependAnchor: Sendable {
             // reader. Give row preferences a turn before moving a visible row
             // to .top and back. The bounded driver retries even without events.
             missingFrameSamples += 1
+#if DEBUG
+            if missingFrameSamples == 1 {
+                TimelineTrace.record(.anchorMissing, reason: locateAttempts < 3 ? .unmaterialized : .locateExhausted,
+                                     scope: current.operation, targetID: current.target.id,
+                                     generation: layoutGeneration, attempt: locateAttempts)
+            }
+#endif
             guard missingFrameSamples >= (locateAttempts == 0 ? 2 : 4), locateAttempts < 3 else { return nil }
             missingFrameSamples = 0
             locateAttempts += 1
+#if DEBUG
+            TimelineTrace.record(.anchorLocate, scope: current.operation, targetID: current.target.id,
+                                 generation: layoutGeneration, attempt: locateAttempts)
+#endif
             action = .locate(current.target.id)
             current.phase = .located
         }

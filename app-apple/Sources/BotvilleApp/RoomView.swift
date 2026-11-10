@@ -13,6 +13,9 @@ struct RoomView: View {
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var scrollState = TimelineScrollState()
+#if DEBUG
+    @State private var tracedLastRow: TimelineLastRowTrace?
+#endif
     @StateObject private var layoutVersion = TimelineLayoutVersion()
     @State private var timelineGeometry: TimelineGeometry?
     @State private var anchorGeometryCache = TimelineAnchorGeometryCache()
@@ -264,6 +267,11 @@ struct RoomView: View {
                 // scrollPosition binding would compete with the pixel correction.
                 .simultaneousGesture(DragGesture()
                     .onChanged { _ in
+#if DEBUG
+                        if !isDraggingTimeline, let operation = scrollState.prependAnchor.operation {
+                            TimelineTrace.record(.anchorResult, reason: .gesture, scope: operation)
+                        }
+#endif
                         isDraggingTimeline = true
                         scrollState.userBeganDragging()
                     }
@@ -274,12 +282,28 @@ struct RoomView: View {
                 .onPreferenceChange(TimelineGeometryKey.self) { geometry in
                     guard let geometry, geometry.input == scrollInput else { return }
                     timelineGeometry = geometry
+#if DEBUG
+                    let last = geometry.frames.first { $0.id == geometry.input.request?.latestMessageID }
+                    let visible = last?.intersects(viewportHeight: geometry.viewportHeight ?? 0) == true
+                    let trace = TimelineLastRowTrace(id: geometry.input.request?.latestMessageID,
+                                                     materialized: last != nil, visible: visible)
+                    if trace != tracedLastRow {
+                        tracedLastRow = trace
+                        TimelineTrace.record(.lastRow, reason: last == nil ? .unmaterialized : .none,
+                                             scope: roomOpenGeneration, targetID: trace.id,
+                                             count: geometry.input.messageIDs.count, generation: geometry.generation,
+                                             visible: visible, offset: last?.minY)
+                    }
+#endif
                     anchorGeometryCache.record(input: geometry.input, frames: geometry.frames,
                                                viewportHeight: geometry.viewportHeight ?? 0)
                     recordTimelineGeometry()
                 }
                 .task(id: scrollWork) {
                     let work = scrollWork
+#if DEBUG
+                    var lastTraceGate: TimelineTrace.Reason?
+#endif
                     // One bounded driver per operation, not a task cancelled by
                     // every geometry frame. It also expires when no frames arrive.
                     for _ in 0..<160 {
@@ -291,6 +315,24 @@ struct RoomView: View {
                             recordTimelineGeometry()
                             return
                         }
+#if DEBUG
+                        if let operation = scrollState.prependAnchor.operation {
+                            let gate: TimelineTrace.Reason
+                            if let geometry = timelineGeometry {
+                                if geometry.input != scrollInput || geometry.generation != scrollState.prependAnchor.layoutGeneration {
+                                    gate = .staleGeometry
+                                } else if let height = geometry.viewportHeight, height.isFinite, height > 0 {
+                                    gate = .none
+                                } else { gate = .invalidViewport }
+                            } else { gate = .noGeometry }
+                            if gate != lastTraceGate {
+                                lastTraceGate = gate
+                                TimelineTrace.record(.anchorWaiting, reason: gate, scope: operation,
+                                                     count: timelineGeometry?.frames.count,
+                                                     generation: scrollState.prependAnchor.layoutGeneration)
+                            }
+                        }
+#endif
                         if let geometry = timelineGeometry, geometry.input == scrollInput,
                            geometry.generation == scrollState.prependAnchor.layoutGeneration,
                            let height = geometry.viewportHeight, height.isFinite, height > 0 {
@@ -431,6 +473,9 @@ struct RoomView: View {
         // after layout, instead of performing an unanchored prepend.
         guard input.messageIDs.isEmpty || (input.request != nil &&
               (!capture.frames.isEmpty || scrollState.prependAnchor.blocksFollowing)) else {
+#if DEBUG
+            TimelineTrace.record(.anchorResult, reason: .noCapture, scope: operation, context: appearance)
+#endif
             olderMessagesLayoutError = "消息布局尚未就绪，请重试加载更早的消息。"
             return
         }
@@ -447,7 +492,7 @@ struct RoomView: View {
         }
         errorMessage = nil
         do {
-            try await service.loadOlderMessages()
+            try await service.loadOlderMessages(operation: operation)
         } catch {
             if olderMessagesOperation == operation, roomOpenGeneration == appearance {
                 errorMessage = error.localizedDescription
@@ -479,6 +524,12 @@ struct RoomView: View {
 
     private func openRoomForCurrentAppearance() {
         guard isVisible else { return }
+#if DEBUG
+        if let operation = scrollState.prependAnchor.operation {
+            TimelineTrace.record(.anchorResult, reason: .appearance, scope: operation)
+        }
+        tracedLastRow = nil
+#endif
         roomOpenTask?.cancel()
         let generation = UUID()
         roomOpenGeneration = generation
@@ -501,6 +552,12 @@ struct RoomView: View {
 
     private func releaseRoomForCurrentAppearance() {
         isInputActive = false
+#if DEBUG
+        if let operation = scrollState.prependAnchor.operation {
+            TimelineTrace.record(.anchorResult, reason: .appearance, scope: operation)
+        }
+        tracedLastRow = nil
+#endif
         scrollState.cancelScrollWork()
         olderMessagesOperation = nil
         olderMessagesLayoutError = nil
@@ -725,3 +782,11 @@ private struct InviteMemberSheet: View {
         }
     }
 }
+
+#if DEBUG
+private struct TimelineLastRowTrace: Equatable {
+    let id: String?
+    let materialized: Bool
+    let visible: Bool
+}
+#endif

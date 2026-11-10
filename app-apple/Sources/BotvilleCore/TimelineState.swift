@@ -7,6 +7,7 @@ import MatrixRustSDK
 /// Keep virtual/non-text items too: SDK diff indices address the entire timeline.
 struct TimelineState {
     private(set) var items: [TimelineItem] = []
+    private(set) var hasReceivedSnapshot = false
 
     mutating func apply(_ updates: [TimelineDiff]) {
         for update in updates {
@@ -25,6 +26,12 @@ struct TimelineState {
                 if items.indices.contains(Int(index)) { items.remove(at: Int(index)) }
             case .truncate(let length): items = Array(items.prefix(Int(length)))
             case .reset(let values): items = values
+            }
+            // Empty callback/append and invalid index edits are not snapshots.
+            // Explicit reset/clear still establish a genuinely empty timeline.
+            switch update {
+            case .reset, .clear: hasReceivedSnapshot = true
+            default: if !items.isEmpty { hasReceivedSnapshot = true }
             }
         }
     }
