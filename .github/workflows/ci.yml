@@ -312,12 +312,17 @@ jobs:
           shellcheck -x server/scripts/init.sh server/scripts/bootstrap-continuwuity.sh \
             server/scripts/lib.sh server/scripts/backup-synapse.sh server/scripts/restore-synapse.sh \
             server/scripts/federation-certs.sh server/scripts/check_no_secrets.sh \
-            scripts/sync-pairing-qr-fixtures.sh
+            scripts/sync-pairing-qr-fixtures.sh scripts/test-sync-pairing-qr-fixtures.sh
 
       # The docs examples dir is the single source of truth for the App-side
       # pairing-qr test fixtures; the copy must never drift (#128/#132).
+      # README.md is docs-only (relative links break on the App side): it is
+      # not synced and must not exist in the App-side copy.
       - name: Pairing QR fixtures in sync (docs == app-apple copy)
         run: bash scripts/sync-pairing-qr-fixtures.sh --check
+
+      - name: Pairing QR fixtures sync self-test
+        run: bash scripts/test-sync-pairing-qr-fixtures.sh
 
       - name: Python syntax
         run: |
