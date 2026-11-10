@@ -3,6 +3,46 @@
 
 import Foundation
 
+/// Successful pagination is distinct from a missing/unconfirmed text snapshot.
+public struct TimelinePageCompletion: Sendable {
+    public let expectedMessageIDs: [String]?
+    public let unchangedConfirmed: Bool
+    public let completedAt: TimeInterval
+}
+
+/// Re-read the SDK view after completion: one unchanged reset can be stale.
+/// No-change confirmation requires repeated fresh snapshots AND unchanged live
+/// text across a short observation interval, regardless of reachedStart.
+struct TimelinePageConfirmation {
+    static let unchangedInterval: TimeInterval = 0.15
+    let original: [String]
+    let completedAt: TimeInterval
+    private var unchangedSince: TimeInterval?
+
+    init(original: [String], completedAt: TimeInterval) {
+        self.original = original
+        self.completedAt = completedAt
+    }
+
+    mutating func observe(snapshot: [String]?, live: [String], now: TimeInterval) -> TimelinePageCompletion? {
+        guard let snapshot else { unchangedSince = nil; return nil }
+        if snapshot != original {
+            return .init(expectedMessageIDs: snapshot, unchangedConfirmed: false, completedAt: completedAt)
+        }
+        // A main-listener prepend is also positive evidence, unlike an unrelated
+        // live append/status update. Never retain the old subset as the fence.
+        if let first = original.first, let index = live.firstIndex(of: first), index > 0 {
+            return .init(expectedMessageIDs: live, unchangedConfirmed: false, completedAt: completedAt)
+        }
+        guard live == original else { unchangedSince = nil; return nil }
+        if let since = unchangedSince, now - since >= Self.unchangedInterval {
+            return .init(expectedMessageIDs: snapshot, unchangedConfirmed: true, completedAt: completedAt)
+        }
+        if unchangedSince == nil { unchangedSince = now }
+        return nil
+    }
+}
+
 /// Keep the measured pagination header footprint after its button disappears.
 /// At content offset zero, removing it makes the former first-row offset
 /// unreachable by scrollTo (negative content offset is clamped). Keep the slot
@@ -56,6 +96,7 @@ public struct TimelinePrependAnchor: Sendable {
         // arbitrary status/append diff. nil means the page is not acknowledged.
         var expectedMessageIDs: [String]?
         var revisionApplied = false
+        var unchangedConfirmed = false
         var phase: Phase = .layout
     }
 
@@ -184,8 +225,15 @@ public struct TimelinePrependAnchor: Sendable {
         if !current.loading, let expected = current.expectedMessageIDs {
             // Once observed, later live removals must not close the page fence
             // again. Their geometry still gets its own generation below.
-            current.revisionApplied = current.revisionApplied
-                || Self.containsPageRevision(expected, in: next.messageIDs, replacing: current.pageStartIDs)
+            if expected == current.pageStartIDs, !current.unchangedConfirmed,
+               let first = current.pageStartIDs.first,
+               let index = next.messageIDs.firstIndex(of: first), index > 0 {
+                current.expectedMessageIDs = next.messageIDs
+                current.revisionApplied = true
+            } else if expected != current.pageStartIDs || current.unchangedConfirmed {
+                current.revisionApplied = current.revisionApplied
+                    || Self.containsPageRevision(expected, in: next.messageIDs, replacing: current.pageStartIDs)
+            }
         }
         let oldIDs = previous?.messageIDs ?? []
         // Also detects prepend+append and late SDK listener delivery after the
@@ -220,27 +268,54 @@ public struct TimelinePrependAnchor: Sendable {
 
     public mutating func finished(operation: UUID,
                                  expectedMessageIDs: [String]? = nil,
+                                 unchangedConfirmed: Bool = false,
+                                 completedAt: TimeInterval? = nil,
                                  now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
         expire(now: now)
         guard var current = capture, current.operation == operation, current.loading else { return }
         // One completion grace period, never renewed by geometry, data or a
         // duplicate completion. A cancelled/expired capture cannot resurrect.
-        deadline = min(now + Self.recoveryWindow, hardDeadline ?? now)
+        deadline = min((completedAt ?? now) + Self.recoveryWindow, hardDeadline ?? now)
         missingFrameSamples = 0
         staleGeometrySamples = 0
         current.loading = false
         current.expectedMessageIDs = expectedMessageIDs
+        current.unchangedConfirmed = unchangedConfirmed
         current.revisionApplied = expectedMessageIDs.map {
-            Self.containsPageRevision($0, in: input?.messageIDs ?? [], replacing: current.pageStartIDs)
+            ($0 != current.pageStartIDs || unchangedConfirmed)
+                && Self.containsPageRevision($0, in: input?.messageIDs ?? [], replacing: current.pageStartIDs)
         } ?? false
         current.phase = .layout // Includes spinner/button removal and empty pages.
         awaitingExecution = false
         capture = current
         layoutGeneration &+= 1
+        expire(now: now)
 #if DEBUG
         TimelineTrace.record(.anchorFinished, scope: operation, targetID: current.target.id,
                              generation: layoutGeneration, pageApplied: pageRevisionApplied)
 #endif
+    }
+
+    /// A retried observation can open the existing fence but never renew its
+    /// deadline. Cancelled, expired and replaced operations stay forgotten.
+    public mutating func confirmPage(operation: UUID, result: TimelinePageCompletion,
+                                     now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        expire(now: now)
+        guard var current = capture, current.operation == operation else { return }
+        if current.loading {
+            finished(operation: operation, expectedMessageIDs: result.expectedMessageIDs,
+                     unchangedConfirmed: result.unchangedConfirmed, completedAt: result.completedAt, now: now)
+            return
+        }
+        current.expectedMessageIDs = result.expectedMessageIDs
+        current.unchangedConfirmed = result.unchangedConfirmed
+        current.revisionApplied = result.expectedMessageIDs.map {
+            ($0 != current.pageStartIDs || result.unchangedConfirmed)
+                && Self.containsPageRevision($0, in: input?.messageIDs ?? [], replacing: current.pageStartIDs)
+        } ?? false
+        capture = current
+        // Confirmation must not consume geometry from before the observation.
+        layoutGeneration &+= 1
     }
 
     /// The view executes outside the preference callback, after SwiftUI has
@@ -258,9 +333,9 @@ public struct TimelinePrependAnchor: Sendable {
     /// Share the SAME three-locate budget with missing-row recovery, never reset
     /// it on status/data updates. No stale frame is used for pixel correction.
     public mutating func missingGeometry() -> Action? {
-        guard needsLayout, pageRevisionApplied, correctionAttempts < 2,
+        guard needsLayout, pageRevisionApplied, correctionAttempts < 2, locateAttempts < 3,
               var current = capture else { return nil }
-        staleGeometrySamples += 1
+        staleGeometrySamples = min(staleGeometrySamples + 1, 3)
         guard staleGeometrySamples >= 3, locateAttempts < 3 else { return nil }
         staleGeometrySamples = 0
         locateAttempts += 1
@@ -310,7 +385,7 @@ public struct TimelinePrependAnchor: Sendable {
             // The first new-generation preference can contain only the content
             // reader. Give row preferences a turn before moving a visible row
             // to .top and back. The bounded driver retries even without events.
-            missingFrameSamples += 1
+            missingFrameSamples = min(missingFrameSamples + 1, 4)
 #if DEBUG
             if missingFrameSamples == 1 {
                 TimelineTrace.record(.anchorMissing, reason: locateAttempts < 3 ? .unmaterialized : .locateExhausted,

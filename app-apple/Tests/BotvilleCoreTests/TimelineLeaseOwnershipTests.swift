@@ -106,9 +106,10 @@ final class TimelineLeaseOwnershipTests: XCTestCase {
         _ = try await fixture.service.openRoom(fixture.room.id())
         fixture.timeline.pageSnapshot = []
         let expected = try await fixture.service.loadOlderMessages()
-        XCTAssertEqual(expected, []) // Explicitly acknowledged no text, no inc diff.
+        XCTAssertEqual(expected?.expectedMessageIDs, [])
+        XCTAssertEqual(expected?.unchangedConfirmed, true) // Explicitly acknowledged no text, no inc diff.
         XCTAssertEqual(fixture.timeline.paginationCalls, 1)
-        XCTAssertEqual(fixture.timeline.listeners.count, 2)
+        XCTAssertGreaterThan(fixture.timeline.listeners.count, 2)
         XCTAssertFalse(fixture.timeline.handles[0].cancelled)
         XCTAssertTrue(fixture.timeline.handles[1].cancelled)
         // A fence must not overwrite or reset the primary stream's state.
@@ -127,9 +128,33 @@ final class TimelineLeaseOwnershipTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
         _ = try await fixture.service.openRoom(fixture.room.id())
         let expected = try await fixture.service.loadOlderMessages()
-        XCTAssertNil(expected)
+        XCTAssertNotNil(expected) // Pagination succeeded, but no snapshot was confirmed.
+        XCTAssertNil(expected?.expectedMessageIDs)
+        XCTAssertEqual(expected?.unchangedConfirmed, false)
         XCTAssertTrue(fixture.timeline.handles[1].cancelled)
         try await fixture.service.clearLocalSession()
+    }
+
+    @MainActor
+    func testDelayedResetRetriesAndZeroTextPageDoesNotRequireReachedStart() async throws {
+        let fixture = try await LeaseFixture.make()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        _ = try await fixture.service.openRoom(fixture.room.id())
+        fixture.timeline.pageSnapshot = []
+        fixture.timeline.snapshotRegistrationDelay = 1
+        fixture.timeline.reachedStart = false
+        var completionTimes: [TimeInterval] = []
+        let result = try await fixture.service.loadOlderMessages { completionTimes.append($0) }
+        XCTAssertEqual(result?.expectedMessageIDs, [])
+        XCTAssertEqual(result?.unchangedConfirmed, true)
+        XCTAssertEqual(completionTimes, [try XCTUnwrap(result).completedAt])
+        XCTAssertTrue(fixture.service.canLoadOlderMessages)
+        XCTAssertGreaterThan(fixture.timeline.listeners.count, 3)
+        XCTAssertFalse(fixture.timeline.handles[0].cancelled)
+        XCTAssertTrue(fixture.timeline.handles.dropFirst().allSatisfy(\.cancelled))
+        try await fixture.service.clearLocalSession()
+        let unavailable = try await fixture.service.loadOlderMessages()
+        XCTAssertNil(unavailable)
     }
 
     @MainActor
@@ -323,16 +348,18 @@ private final class LeaseFakeTimeline: Timeline, @unchecked Sendable {
     private(set) var handles: [LeaseFakeTaskHandle] = []
     private(set) var paginationCalls = 0
     var pageSnapshot: [TimelineItem]?
+    var snapshotRegistrationDelay = 0
+    var reachedStart = true
     init() { super.init(noHandle: .init()) }
     required init(unsafeFromHandle handle: UInt64) { fatalError("test fake") }
     override func markAsRead(receiptType: ReceiptType) async throws { markReadCalls += 1 }
     override func paginateBackwards(numEvents: UInt16) async throws -> Bool {
         paginationCalls += 1
-        return true
+        return reachedStart
     }
     override func addListener(listener: TimelineListener) async -> TaskHandle {
         listeners.append(listener)
-        if listeners.count > 1, let pageSnapshot { listener.onUpdate(diff: [.reset(values: pageSnapshot)]) }
+        if listeners.count > 1 + snapshotRegistrationDelay, let pageSnapshot { listener.onUpdate(diff: [.reset(values: pageSnapshot)]) }
         let handle = LeaseFakeTaskHandle()
         handles.append(handle)
         return handle
