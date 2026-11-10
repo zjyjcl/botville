@@ -11,6 +11,11 @@ struct RoomView: View {
     @Binding var isInputActive: Bool
     let isVisible: Bool
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var scrollState = TimelineScrollState()
+    @State private var visibleMessageID: String?
+    @State private var timelineGeometry: TimelineGeometry?
+    @State private var isDraggingTimeline = false
     @State private var draft = ""
     @FocusState private var isInputFocused: Bool
     @State private var isSending = false
@@ -53,6 +58,12 @@ struct RoomView: View {
         )
     }
 
+    private var scrollInput: TimelineScrollInput {
+        TimelineScrollInput(request: latestScrollRequest,
+                            messageIDs: service.messages.map(\.id),
+                            latestMessageIsOwn: service.messages.last?.isOwn == true)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             roomSecurityCard
@@ -72,33 +83,7 @@ struct RoomView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 12) {
-                            if service.canLoadOlderMessages {
-                                olderMessagesButton
-                            }
-
-                            ForEach(service.messages) { message in
-                                MessageBubble(message: message, retry: {
-                                    Task { await actOnMessage(message.id, retry: true) }
-                                }, cancel: {
-                                    Task { await actOnMessage(message.id, retry: false) }
-                                })
-                                    .id(message.id)
-                            }
-                        }
-                        .padding()
-                    }
-                    .defaultScrollAnchor(.bottom)
-                    .task(id: latestScrollRequest) {
-                        guard let request = latestScrollRequest else { return }
-                        // Wait for the loaded LazyVStack to participate in layout.
-                        await Task.yield()
-                        guard !Task.isCancelled, latestScrollRequest == request else { return }
-                        proxy.scrollTo(request.latestMessageID, anchor: .bottom)
-                    }
-                }
+                timeline
             }
 
             if let errorMessage {
@@ -138,6 +123,7 @@ struct RoomView: View {
             }
             .padding()
         }
+        .onChange(of: scrollInput, initial: true) { _, next in scrollState.update(next) }
         .navigationTitle(room.name)
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
@@ -227,6 +213,76 @@ struct RoomView: View {
         .background(.thinMaterial)
     }
 
+    private var timeline: some View {
+        // Capture one revision so geometry and decisions refer to the same data.
+        let input = scrollInput
+        return GeometryReader { viewport in
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        if service.canLoadOlderMessages {
+                            olderMessagesButton
+                        }
+                        ForEach(service.messages) { message in
+                            MessageBubble(message: message, retry: {
+                                Task { await actOnMessage(message.id, retry: true) }
+                            }, cancel: {
+                                Task { await actOnMessage(message.id, retry: false) }
+                            })
+                            .id(message.id)
+                        }
+                    }
+                    .scrollTargetLayout()
+                    .padding()
+                    .background {
+                        GeometryReader { content in
+                            Color.clear.preference(key: TimelineGeometryKey.self, value: TimelineGeometry(
+                                input: input,
+                                distanceFromBottom: content.frame(in: .named("roomTimeline")).maxY - viewport.size.height,
+                                viewportHeight: viewport.size.height))
+                        }
+                    }
+                }
+                .coordinateSpace(name: "roomTimeline")
+                // No defaultScrollAnchor: its size-change behavior can pull history
+                // to the bottom. The top visible ID is maintained through prepend.
+                .scrollPosition(id: $visibleMessageID)
+                .simultaneousGesture(DragGesture()
+                    .onChanged { _ in
+                        isDraggingTimeline = true
+                        scrollState.userBeganDragging()
+                    }
+                    .onEnded { _ in
+                        isDraggingTimeline = false
+                        recordTimelineGeometry()
+                    })
+                .onPreferenceChange(TimelineGeometryKey.self) { geometry in
+                    timelineGeometry = geometry
+                    recordTimelineGeometry()
+                }
+                .task(id: scrollState.pending) {
+                    guard let decision = scrollState.pending else { return }
+                    await Task.yield()
+                    guard !Task.isCancelled, scrollState.pending == decision,
+                          latestScrollRequest == decision.request else { return }
+                    withAnimation(decision.animated && !reduceMotion ? .easeOut(duration: 0.2) : nil) {
+                        proxy.scrollTo(decision.request.latestMessageID, anchor: .bottom)
+                    } completion: {
+                        scrollState.didScroll(decision)
+                        recordTimelineGeometry()
+                    }
+                }
+            }
+        }
+    }
+
+    private func recordTimelineGeometry() {
+        guard !isDraggingTimeline, let geometry = timelineGeometry else { return }
+        scrollState.recordGeometry(for: geometry.input,
+                                   distanceFromBottom: geometry.distanceFromBottom,
+                                   viewportHeight: geometry.viewportHeight)
+    }
+
     private func refreshSecurity() async {
         guard !isRefreshingSecurity else { return }
         isRefreshingSecurity = true
@@ -295,7 +351,7 @@ struct RoomView: View {
         }
     }
 
-    private func openRoom(lease: RoomTimelineLease) async {
+    private func openRoom(lease: RoomTimelineLease, generation: UUID) async {
         guard !Task.isCancelled else { return }
         isOpening = true
         errorMessage = nil
@@ -308,7 +364,7 @@ struct RoomView: View {
             guard roomTimelineLease == lease, !Task.isCancelled else { return }
             await loadOlderMessages()
             guard roomTimelineLease == lease, !Task.isCancelled else { return }
-            completedRoomOpenGeneration = roomOpenGeneration
+            completedRoomOpenGeneration = generation
         } catch is CancellationError {
             return
         } catch {
@@ -321,10 +377,14 @@ struct RoomView: View {
         roomOpenTask?.cancel()
         let generation = UUID()
         roomOpenGeneration = generation
+        scrollState = TimelineScrollState()
+        visibleMessageID = nil
+        timelineGeometry = nil
+        isDraggingTimeline = false
         let lease = service.beginRoomOpen(room.id)
         roomTimelineLease = lease
         roomOpenTask = Task {
-            await openRoom(lease: lease)
+            await openRoom(lease: lease, generation: generation)
             guard roomOpenGeneration == generation else { return }
             roomOpenTask = nil
         }
@@ -356,6 +416,19 @@ struct RoomView: View {
         .frame(maxWidth: .infinity)
     }
 
+}
+
+private struct TimelineGeometry: Equatable {
+    let input: TimelineScrollInput
+    let distanceFromBottom: Double
+    let viewportHeight: Double
+}
+
+private struct TimelineGeometryKey: PreferenceKey {
+    static let defaultValue: TimelineGeometry? = nil
+    static func reduce(value: inout TimelineGeometry?, nextValue: () -> TimelineGeometry?) {
+        value = nextValue() ?? value
+    }
 }
 
 @MainActor
