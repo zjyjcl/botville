@@ -33,6 +33,8 @@ final class ReleaseIsolationTests: XCTestCase {
                 XCTAssertNotEqual(value as? String, "NO", key)
             }
         }
+        let teams = configurations.compactMap { ($0["buildSettings"] as? [String: Any])?["DEVELOPMENT_TEAM"] as? String }
+        XCTAssertTrue(Set(teams).count == 1, "App and extension must use the same signing team")
         try assertEveryNativeReleaseTargetIsIsolated(objects)
         try assertTarget(
             objects: objects,
@@ -120,7 +122,10 @@ final class ReleaseIsolationTests: XCTestCase {
             let name = try XCTUnwrap(config["name"] as? String)
             let settings = try XCTUnwrap(config["buildSettings"] as? [String: Any])
             XCTAssertEqual(settings["CODE_SIGN_STYLE"] as? String, "Automatic", name)
-            XCTAssertEqual(settings["DEVELOPMENT_TEAM"] as? String, "3Z8WP6U6F7", name)
+            // Check device signing without embedding or printing a developer's team.
+            let team = settings["DEVELOPMENT_TEAM"] as? String ?? ""
+            XCTAssertTrue(team.range(of: "^[A-Z0-9]{10}$", options: .regularExpression) != nil,
+                          "Device signing requires a configured team")
             XCTAssertEqual(settings["CODE_SIGN_IDENTITY[sdk=iphonesimulator*]"] as? String, "-", name)
             XCTAssertEqual(settings["PRODUCT_BUNDLE_IDENTIFIER"] as? String, bundleID, name)
             XCTAssertEqual(settings["CODE_SIGN_ENTITLEMENTS"] as? String, entitlements[name], name)

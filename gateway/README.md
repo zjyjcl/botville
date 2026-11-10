@@ -234,6 +234,7 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 |---|---|---|
 | `GATEWAY_HOST` | `127.0.0.1` | 监听地址 |
 | `GATEWAY_PORT` | `8080` | 监听端口（1–65535；环境变量给 0 或超范围会启动失败） |
+| `GATEWAY_HTTP_PATH_PREFIX` | *(空)* | 部署路径前缀（如 `/_botville/gateway`）：网关整体挂在某前缀之后时填写，请求可带前缀发出。默认空 = 现行行为不变。必须以 `/` 开头，不含 `//` `..` `?` `#` `%` 空白与控制字符，尾部 `/` 归一、单独 `/` 视为空；非法值拒绝启动。**未带前缀的请求仍被接受**（兼容已去前缀的反代），按整段边界匹配（`/_botville/gatewayX` 不算） |
 | `GATEWAY_AUTH_TOKEN` | *(空)* | **必填**（`GATEWAY_LEGACY_TOKEN_ENABLED=false` 时除外）：留空或仍为 `<change-me>` 时**拒绝启动**（fail closed）；生产设为随机值，请求需 `Authorization: Bearer <token>`；进程内对 token 做 HMAC-SHA256 后等长 `hmac.compare_digest` 比较 |
 | `GATEWAY_CALLER_TOKENS` | *(空)* | #124 §1.2.2：per-caller 凭据表，每条形如 `caller_id:token:owner_id`（token ≥32 字节随机值），多条用 `;` **或换行**分隔（可混用）。命中后 `owner_id` 用于 `/v1/context/assemble` 的 persona 区鉴权。字段缺/空/数不为 3/含 `:` `;` 换行 → 拒绝启动；token 短于 32 字节或重复 → 非 dev 拒绝、dev 仅 WARNING；caller token 等于 `GATEWAY_AUTH_TOKEN`、或 `caller_id` 重复 → 一律拒绝启动。留空 = 不启用 |
 | `GATEWAY_LEGACY_TOKEN_ENABLED` | `true` | 是否仍接受站点级 `GATEWAY_AUTH_TOKEN`。配置了 caller token 后建议设为 `false`（否则启动打 WARNING：旧 token 仍可绕过 per-caller 边界）；设为 `false` 且 caller token 为空时，需鉴权的请求一律 `401 auth.invalid_token`（启动 WARNING），且不再要求 `GATEWAY_AUTH_TOKEN` |
@@ -248,6 +249,11 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `MAX_MESSAGE_CHARS` | `8000` | 单条正文上限（超限 → 400，不是 blocked） |
 | `PLATFORM_TOKEN_BUDGET` | `200000` | 平台层 token 预算（窗口同 `RATE_LIMIT_WINDOW_SECONDS`）；`0` = 平台不设该限额 |
 | `PLATFORM_PROACTIVE_PER_DAY` | `6` | 平台层主动发言/日上限；`0` = 平台不设该限额 |
+| `PLATFORM_MAX_CONSECUTIVE_AI_MESSAGES` | `0` | 平台层 `anti_spam.max_consecutive_ai_messages`（N7）；`0` = 平台不设该项，非 0 取 **1–50**，owner/peer 更宽松 → `422 limit.out_of_range` |
+| `PLATFORM_ANTI_SPAM_COOLDOWN_SECONDS` | `0` | 平台层 `anti_spam.cooldown_seconds`；`0` = 平台不设该项，非 0 取 **1–86400**（越大越严） |
+| `PLATFORM_MAX_AI_MESSAGES_PER_HOUR` | `0` | 平台层 `ai_loop.max_ai_messages_per_hour`；`0` = 平台不设该项（**不是** API 的「一条都不允许」），非 0 取 **1–1000** |
+| `PLATFORM_AI_LOOP_ON_BREAK` | `stop` | 平台层 `ai_loop.on_break`（`stop`/`notify`，大小写不敏感）；枚举**无**「不设」语义，默认 `stop` 即平台底线。`notify` 当前等价 `stop`，故平台 `stop` 时 owner/peer 写 `notify` 不报 422 |
+| `USAGE_RETENTION_SECONDS` | `2592000` | 用量事件保留期（秒，≥3600）。启动校验必须 **≥ `max(RATE_LIMIT_WINDOW_SECONDS, PLATFORM_ANTI_SPAM_COOLDOWN_SECONDS)`**（平台冷却 0 不参与），否则拒绝启动（N5：保留期短于窗口/冷却会静默 fail-open） |
 | `MAX_USAGE_EVENTS` | `10000` | 内存用量事件条数上限（超出按最旧优先淘汰，≥1） |
 | `MAX_IDEMPOTENCY_ENTRIES` | `2000` | 幂等缓存条目上限（LRU 淘汰，≥1） |
 | `IDEMPOTENCY_TTL_SECONDS` | `86400` | 幂等缓存保留时长（秒，`0` = 不过期） |

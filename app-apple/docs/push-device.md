@@ -13,7 +13,7 @@ iOS 开发包提供 APNs 注册、Matrix HTTP pusher 注册及诊断入口。PR3
 3. 页面显示标准 Base64（含 `=` 填充）的 device token、APNs 注册状态和安全化错误。显示值、复制值和 pusher `pushkey` 是同一份 Base64；32 字节 APNs token 通常为 44 个字符。iOS 剪贴板只在本机可用，120 秒后过期。不要将 token 贴到日志、工单或聊天中。
 4. 使用当前 Matrix 会话自动注册 pusher。点击「核对」读取 `GET /_matrix/client/v3/pushers`，检查 `app_id + pushkey` 是否同时匹配。显示匹配仅代表服务端有记录，不能替代送达验证。
 
-PR1 新增 `BotvilleNotificationService`（iOS Notification Service Extension），通过主 App 的 **Embed Foundation Extensions** 嵌入。主 App 与扩展都使用 App Group `group.com.zjyjcl.botville`，并共享 Keychain access group `$(AppIdentifierPrefix)com.zjyjcl.botville.shared`；主 App ID `com.zjyjcl.botville` 与 NSE App ID `com.zjyjcl.botville.notification` 必须在真机签名能力中同时启用该 App Group 和 Keychain 共享。两个 target 均使用团队 `3Z8WP6U6F7` 和 Automatic signing。仓库不提交证书、描述文件或真实凭据。
+PR1 新增 `BotvilleNotificationService`（iOS Notification Service Extension），通过主 App 的 **Embed Foundation Extensions** 嵌入。主 App 与扩展都使用 App Group `group.com.zjyjcl.botville`，并共享 Keychain access group `$(AppIdentifierPrefix)com.zjyjcl.botville.shared`；主 App ID `com.zjyjcl.botville` 与 NSE App ID `com.zjyjcl.botville.notification` 必须在真机签名能力中同时启用该 App Group 和 Keychain 共享。两个 target 均使用团队 `<YOUR_TEAM_ID>` 和 Automatic signing。仓库不提交证书、描述文件或真实凭据。
 
 主 App 在登录/恢复成功后，仅向共享 Keychain 写入 homeserver URL、userId、accessToken 和 deviceId，不共享 refreshToken；退出、清除本地会话或软退出时清除。每个 target 的私有 Keychain group 保留为第一项，完整主会话和本地加密库密钥仍在私有组。共享条目使用 `AfterFirstUnlockThisDeviceOnly`；不将 token 写入 App Group 文件或 UserDefaults。共享 Keychain 不可用时记录固定诊断且不阻断主会话；本 PR 没有任何 DEBUG 或 Release 私有组/明文回退。凭据的字符串及调试描述固定脱敏；单测通过可注入的 Keychain backend 验证存取失败分支。
 
@@ -47,7 +47,7 @@ DEBUG 登录页保留手动 homeserver 输入及局域网 HTTP 开关。开关�
 
 ## 后续真机验收步骤
 
-1. 在有权限的开发者环境中打开 `Botville.xcodeproj`，选择 `BotvilleApp-iOS` scheme 和 Debug 配置。App target 的 Debug 与 Release 都使用 Automatic signing，开发团队为 `3Z8WP6U6F7`；由 Xcode 为 Mac mini 连接的 iPhone 15 解析受控的开发签名。Bundle ID 保持 `com.zjyjcl.botville`。仓库不提交证书、描述文件或 provisioning profile。
+1. 在有权限的开发者环境中打开 `Botville.xcodeproj`，选择 `BotvilleApp-iOS` scheme 和 Debug 配置。App target 的 Debug 与 Release 都使用 Automatic signing，开发团队为 `<YOUR_TEAM_ID>`；由 Xcode 为 Mac mini 连接的 iPhone 15 解析受控的开发签名。Bundle ID 保持 `com.zjyjcl.botville`。仓库不提交证书、描述文件或 provisioning profile。
 2. 确认对应 App ID 已开启 Push Notifications、Xcode 管理的开发描述文件允许推送，且签名后的 entitlement 包含 `aps-environment=development`。Sygnal 配置使用 app ID `com.zjyjcl.botville.apns`，APNs topic 对应 Bundle ID，使用开发/sandbox 环境。Release 配置不继承这个 development entitlement；归档或分发前，须在受控签名环境另配 `aps-environment=production` 与匹配的生产签名。
 3. 将 Debug 包安装到 Mac mini 连接的 iPhone 15，按系统提示允许本地网络（使用局域网时）和通知。登录测试 Matrix 账号，默认 notify URL 为 Compose 内网地址 `http://sygnal:5000/_matrix/push/v1/notify`；诊断页可按实际 homeserver 可达地址修改。
 4. 申请注册，确认 token 非空、pusher 注册成功，再点「核对」确认匹配。请求应包含 `Authorization: Bearer <当前会话>`，`kind=http`、`append=false`、`app_display_name=botville`、设备名称、`lang=zh-CN`，以及 `data.format=event_id_only` 与精确的 `data.default_payload={"aps":{"mutable-content":1,"alert":{"body":"…"}}}`。检查证据时不得记录真实 access token 或 device token。
