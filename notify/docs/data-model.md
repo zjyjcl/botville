@@ -52,13 +52,14 @@ F15（webhook 出口的开放接口语义）的**开源替代语义**；仅取�
 
 | # | 项 | 现状与归属 |
 |---|---|---|
-| 1 | 响应侧无 `scheduled_at` | `Card` 响应只有 `deliver_after`；提醒触发时刻仅在创建请求侧用 `scheduled_at` 表达，由服务端转为排程。如需响应侧展示触发时刻，走网关 minor 升级。 |
-| 2 | `DeliveryRetryPolicy` / `DeliveryFailureCode` 未上 wire | 规范建议值，不在 `Card` / `CardDelivery` 字段内，由各渠道实现侧采用。 |
-| 3 | approval 回调签名 | assertion 的算法与字节编码属 D2.1；本模型只固定引用字段（challenge / revision / audit_id）。 |
+| 1 | 响应侧无 `scheduled_at` | **已定**（所有者 2026-11-10 拍板，[contract-gaps.md](contract-gaps.md) B9）：暂不改 wire；客户端用 `deliver_after`（及可选 `context.metadata`）展示。若日后必须区分「期望触发时刻」与「最早投递时刻」，再走网关 minor 给 `Card` 增加可选 `scheduled_at`。 |
+| 2 | `DeliveryRetryPolicy` / `DeliveryFailureCode` 未上 wire | **已定**（所有者 2026-11-10 拍板，[contract-gaps.md](contract-gaps.md) B10）：保持实现侧建议值（总尝试 ≤ 3 含首次、间隔 ≥ 300 秒、仅 `failed`），不上卡片 wire。 |
+| 3 | approval 回调签名 | 绑定字段已定。字节编码与设备密钥注册接口为**已定方向、待 D2.1 专门 PR 落地**（不在本文改网关 YAML），见 [contract-gaps.md](contract-gaps.md) A6、B4 与下文 §2.6。 |
 | 4 | gateway `CreateCardRequest.description` 静默检查一句 | **已关闭**（[#74](https://github.com/zjyjcl/botville/issues/74)，合入 #76）：gateway YAML 已与 contract.md §4.8 对齐——`urgent` 默认穿透静默，显式 `interrupt: false` 时连 `urgent` 也不穿透；`interrupt` 无 `default`。 |
 
-D 线后续契约缺口（授权编码、插件、桥接、开放 API 总文档等）见
-[contract-gaps.md](contract-gaps.md)；其中产品性选择需所有者拍板，本文不自行定论。
+D 线契约缺口清单见 [contract-gaps.md](contract-gaps.md)。B1–B10 已于 2026-11-10
+由所有者按推荐拍板，定论写在本文对应章节；A6 与 B4 为已定方向、待 D2.1
+专门 PR 落地（本文只记录方向，不改网关 YAML）。
 
 ## 2. 核心对象
 
@@ -181,21 +182,61 @@ GET /audit/{audit_id} → AuditRecord（append-only 审计）
 的模块定义。`payload` 与 `context.metadata` 适用既有禁令（不得含密钥或个人
 敏感信息，服务端扫描、命中拒绝，contract §4.4 / §4.6 规则 5）。回执/审计中的
 `result` 同样**建议**不要放密钥或个人敏感信息，但网关目前没有对应扫描规则，
-责任在来源模块与 D2.1，本文不把「命中则拒绝」扩到 `result`。断言的字节编码
-由 D2.1 定义，本模型只固定绑定字段。
+责任在来源模块与 D2.1，本文不把「命中则拒绝」扩到 `result`。
+
+有效 risk=high 时，设备上生物识别不可用必须 **fail-closed**（所有者
+2026-11-10 拍板，[contract-gaps.md](contract-gaps.md) B3）：不降级为仅点按
+或密码代替签名，不提交操作；提示改用已登记生物识别的设备，或取消。
+
+断言字节编码与设备密钥注册为**已定方向、待 D2.1 专门 PR 落地**（本次不改
+网关 YAML，[contract-gaps.md](contract-gaps.md) A6、B4）：
+
+- 签名输入为四个绑定字段的规范 JSON 对象（键序固定为 `card_id`、
+  `action_id`、`revision`、`challenge`；`revision` 为 JSON 数字，字符串
+  按 UTF-8，无无意义空白），整体 UTF-8 编码后签名。
+- `assertion` 为 **base64url（无填充）**，内容是 P-256 ECDSA 的 raw
+  `r || s`（各 32 字节，共 64 字节）；算法标识继续用已有 `p256`。
+- 设备密钥：用网关 minor 增加「注册 / 列举 / 吊销本所有者设备签名公钥」
+  接口；每台设备各自注册，吊销后该设备 assertion 立即失败；密钥物料不得
+  进仓库或日志。接口路径与请求体由 D2.1 PR 写入 gateway 契约。
 
 ### 2.7 列表展示的默认映射（不新增 API）
 
 通知列表与详情复用 `Card` 与 `GET /cards`（基路径 `/v1`，含 `updated_since`），
-**不**另建通知对象或通知列表接口。下列两项可由既有 wire 语义直接推出，
-作为通知域的展示约定，不新增字段：
+**不**另建通知对象或通知列表接口。未读与折叠可由既有 wire 语义推出；分类、
+排序与偏好默认由所有者于 2026-11-10 拍板（[contract-gaps.md](contract-gaps.md)
+B2）。下列均为客户端展示约定，不新增 wire 字段；`GET /cards` 仍只规定过滤、
+不规定服务端排序。
 
 | 展示问题 | 默认映射 |
 |---|---|
 | 未读 | `Card.status == active` 计为未读；`read` / `dismissed` / `expired` / `acted` 不计。未读与 `delivery[].state` 无关。 |
 | 折叠 | 同 `group_id` 收成一条摘要入口；同 `collapse_key` 的未读卡由新卡替换旧卡展示（见 §2.4）。折叠只影响展示，不改 `Card.status`。 |
+| 分类 | 按 `type` 与 `source.capability_id` 分组；不另作分类枚举。 |
+| 排序 | 客户端按 `priority` 序（`urgent > high > normal > low`），同级按 `updated_at` 降序。 |
+| 偏好 | M2/M3 **不**做独立通知偏好 API。系统级打扰交给操作系统通知设置与已有 `SilentHours`。若日后要做每能力开关，再走网关 minor。 |
 
-分类、排序与通知偏好界面仍为产品性选择，见 [contract-gaps.md](contract-gaps.md) B2，本文不写成定论。
+### 2.8 评论事件到通知卡（已定）
+
+所有者 2026-11-10 拍板（[contract-gaps.md](contract-gaps.md) B1）。不新增通知
+对象或专用关联字段：
+
+- 仅当评论对接收者**可见之后**才创建卡片（遵守动态可见性，不可见者不通知）。
+- `type=notification`，`source.capability_id` 使用已有 `notify.inbox`
+  （不必为此先新增 `notify.moments`）。若社交域日后希望能力归 moments 模块，
+  再单开网关 minor 增加能力 ID。
+- 关联放在已有 `context.metadata`（如 `moment_id` / `comment_id`）与
+  `context.deep_link`；推送打开走该 deep link，由 C 线映射到动态详情。
+
+### 2.9 与消息推送的边界（已定）
+
+所有者 2026-11-10 拍板（[contract-gaps.md](contract-gaps.md) B5），回应
+`contract.md` §8.3 第 2 条：
+
+- **不另建**一条 D 线推送通道。会话消息的到达继续走 Matrix 推送（A1.2
+  Sygnal + App NSE）。
+- `queued` / `deferred` 的客户端行为不变：拿 `queue_id` 等待，不自行重试。
+- 仅当需要可操作的应用内卡片（授权、结果、提醒）时，再按本模型创建 `Card`。
 
 ## 3. 投递状态机
 
@@ -269,6 +310,35 @@ manifest 的 minor 升级）：
    编码进去，**同一业务事实必须复用同一键**。
 3. 同一 `capability_id` 内键空间独立；不同 capability 的键即使相同也互不冲突。
 
+### 4.1 完成事件与派工授权（已定方向，接口细节随 D2.2）
+
+所有者 2026-11-10 拍板（[contract-gaps.md](contract-gaps.md) B7）。开源侧
+App 内闭环（不涉及已搁置的中枢迁移）：
+
+- 完成/失败事件 → `type=notification` + `notify.inbox`。
+- 需要所有者批准的派工 → `type=approval` + `notify.approvals`，走既有
+  challenge / assertion 链。
+- `payload` 只放不透明业务句柄（如 `run_id`），不设全局派工 schema（见 §2.6）。
+- 订阅方式（事件推入优先，轮询仅作兜底）在 D2.2 实现 PR 中写明。
+
+### 4.2 桥接能力 ID（已定，属 `bridge` 模块）
+
+所有者 2026-11-10 拍板（[contract-gaps.md](contract-gaps.md) B8）。下列 ID
+预留给桥接模块，**不**进入 `notify.*` 枚举：`bridge.feishu`、
+`bridge.telegram`、`bridge.qq`。开源默认支持飞书与 Telegram；QQ/NapCat 为
+可选桥，须直连、不走境外代理（验收含代理检查）。私人渠道实现不进开源仓库。
+先做进/出站消息与 Matrix 会话映射；只有需要拍板或摘要时才创建 `Card`。
+入口映射的实现细节随 D2.3。
+
+### 4.3 外部通知插件（已定方向，接口细节随 D2.5）
+
+所有者 2026-11-10 拍板（[contract-gaps.md](contract-gaps.md) B6）。v1 只做
+出站 webhook：对已投递或状态变化的 `Card` 快照 POST 到所有者配置的 URL。
+鉴权使用部署侧密钥**引用**（真实密钥不得写入仓库或开源示例）。重试遵循
+§3.2（仅 `failed` 可同渠道重试，`unconfirmed` 不重放）。示例插件保持中性，
+不含具体私人渠道；入站私人渠道不进开源仓库。`source.module` /
+`capability_id` 足以区分来源，注册与鉴权的请求体由 D2.5 PR 补充。
+
 ## 5. 时区与时间
 
 - **wire 一律 UTC**：所有 `date-time` 字段为 RFC 3339、带 `Z` 后缀
@@ -314,6 +384,8 @@ python3 gateway/scripts/validate_openapi.py   # 网关契约（D1.1 未改动，
 
 ## 8. 非目标
 
-- 不实现通知发送服务 / 推送 SDK 对接。
-- 不做 D1.2（并行期）的任何内容；D2.1 签名实现、D2.5 插件实现不在本任务。
-- 不含中枢路径、私人渠道、私有部署细节。
+- 不实现通知发送服务 / 推送 SDK 对接（消息推送边界见 §2.9）。
+- 不做 D1.2（并行期）的任何内容。
+- D2.1 的 YAML/实现、D2.2 / D2.3 / D2.5 的接口细节与实现不在本文展开；
+  已定方向见 §2.6、§4.1–4.3。
+- 不含中枢路径、私人渠道实现、私有部署细节。

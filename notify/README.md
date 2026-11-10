@@ -5,12 +5,13 @@ License: Apache-2.0（与仓库一致）。
 - 通知数据模型、投递状态机、优先级与合并、提醒卡片（D1.1，见下）
 - 授权回调：签名、有效期、防重放、审计（衔接 B0.1 契约 §4.4，实现属 D2.1）
 - 完成通知 / 摘要的开放接口（D2.2 完成监听、D2.5 可选外部通知插件在其上扩展）
-- 桥接模块：飞书、Telegram（QQ/NapCat 直连，不走境外代理）
+- 桥接模块：开源默认飞书、Telegram；QQ/NapCat 可选且直连、不走境外代理（D2.3，见 `docs/data-model.md` §4.2）
+- 可选外部通知插件：v1 仅出站 webhook（D2.5 方向已定，接口细节随实现 PR，见 `docs/data-model.md` §4.3）
 
 ## 目录布局
 
 - `docs/data-model.md` — 开源通知数据模型规范（D1.1 交付，Schema 评审入口）
-- `docs/contract-gaps.md` — D 线契约缺口清单（A 类已定稿项与 B 类待所有者拍板项）
+- `docs/contract-gaps.md` — D 线契约缺口清单（A 类已定稿；B1–B10 已于 2026-11-10 由所有者拍板；A6/B4 待 D2.1 PR 落地）
 - `openapi/notify.v1.yaml` — 通知域 schema：`$ref` 聚合 `gateway.v1.yaml` 的
   `Card*` 等，`allOf` 只增通知域语义（类型、来源键 MUST 约定、失败码、
   重试规范建议值）
@@ -37,7 +38,7 @@ python3 gateway/scripts/validate_openapi.py   # 网关契约（D1.1 未改动，
   `push` / `in_app` / `email` / `webhook` 开放枚举。
 - 不做 D1.2（并行期双发与对账已搁置归档，见
   [docs/migration/deferred.md](../docs/migration/deferred.md)）；本模型不依赖它。
-- D2.1 签名实现、D2.5 插件实现不在本目录。
+- D2.1 签名实现与设备密钥接口、D2.5 插件实现不在本目录；方向已定，见 `docs/data-model.md` §2.6、§4.3。
 - 不含中枢路径、私人渠道实现、私有部署细节（个人部署事项不进本仓库）。
 
 ## 迁移盘点（历史）

@@ -174,6 +174,8 @@
 | 20 | 朋友圈、角色、桥接的能力 ID / 入口映射，以及小镇启用后的路由；全模块目标目前不可当成真实清单 | 08 |
 | 21 | 字号缩放、无障碍读屏标识、交互热区、键盘弹出等实现与适配验收 | 全部；静态稿只验证所示尺寸 |
 
+与 D 线相关的待定项已于 2026-11-10 由所有者拍板，定论见 [notify/docs/contract-gaps.md](../../notify/docs/contract-gaps.md)（B1–B10）与 [notify/docs/data-model.md](../../notify/docs/data-model.md)：14→§2.8，15→§2.7（未读/折叠/分类/排序/偏好），16→§2.6（`payload`/`result` 不设全局 schema；操作影响与回滚属业务模块），17→§2.6（生物识别 fail-closed；断言编码与设备密钥注册为已定方向、待 D2.1 PR），20 的桥接能力 ID→§4.2（`bridge.feishu` / `bridge.telegram` / `bridge.qq`）。朋友圈、角色、小镇入口仍由相应线定稿，不在上述定论内。
+
 ## 来源
 
 - [gateway.v1.yaml](../../gateway/openapi/gateway.v1.yaml)：机器可读唯一事实源。重点为 `CapabilityManifest / Capability / CapabilityEntry`、`Card / CardAction / CardActionChallenge / CardActionRequest / CardActionReceipt / CardDelivery`、`Conversation / MessageContent / Persona / PersonaState / Relation`、`Visibility / Moment / MomentComment / MomentLike`。

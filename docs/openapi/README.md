@@ -18,4 +18,4 @@ License: Apache-2.0（与仓库一致）。
 
 版本规则沿用 [contract.md §5](../../gateway/docs/contract.md)：只增不删，弃用走公告流程。
 
-D 线仍开放的契约缺口见 [notify/docs/contract-gaps.md](../../notify/docs/contract-gaps.md)。
+D 线契约缺口清单见 [notify/docs/contract-gaps.md](../../notify/docs/contract-gaps.md)。B1–B10 已于 2026-11-10 由所有者拍板；A6 断言编码与 B4 设备密钥接口为已定方向，待 D2.1 专门 PR 写入网关 YAML。工程项 #75（CI 显式安装 PyYAML）仍待另开 PR。
