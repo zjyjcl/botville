@@ -28,6 +28,13 @@ homeserver whoami 不认识它，会返回 401，网关转为 ``auth.invalid_tok
 **Single-flight**：同一 token（以哈希为键）的并发校验合并为一次 HS 请求，
 leader 完成后结果广播给所有等待者，防止缓存击穿打爆 homeserver
 （参考 matrix_appservice.py 里 healthy() 的 single-flight 思路）。
+
+leader 意外异常时 follower 看到的是 **leader 的分类结果**，不是异常：
+
+- HS 调用抛普通 ``Exception`` → leader 归为 ``VERIFY_SERVER_ERROR``（不缓存），
+  写进 ``flight.result`` 广播给 follower；follower 不自行重试。
+- HS 调用期间抛 ``BaseException``（如 ``KeyboardInterrupt``）→ ``finally`` 清
+  inflight 并给 follower 补 ``VERIFY_SERVER_ERROR``，leader 仍把原异常重新抛出。
 """
 
 from __future__ import annotations
@@ -186,22 +193,33 @@ class UserIdentityVerifier:
                 return VERIFY_SERVER_ERROR, None
             return flight.result
 
-        # ── 3. Leader 执行 HS 调用 ───────────────────────────────────────────
+        # ── 3. Leader 执行 HS 调用 + 写缓存 ─────────────────────────────────
+        #
+        # follower 看到什么（本段语义，勿破坏）：
+        #   - HS 调用抛普通 ``Exception`` → 归为 ``VERIFY_SERVER_ERROR``（不缓存），
+        #     该元组随后写进 ``flight.result``；follower 拿到的是 **leader 的
+        #     分类结果**，既不自己重试，也吃不到异常。
+        #   - HS 调用期间抛 ``BaseException``（如 ``KeyboardInterrupt``）→ 不做
+        #     分类，``finally`` 里补一个 ``VERIFY_SERVER_ERROR`` 给 follower；
+        #     leader 自己仍把原异常重新抛出（不吞掉 ``KeyboardInterrupt``）。
+        #
+        # ``try/finally`` 必须包住「HS 调用 + 写缓存」整段。若只包写缓存段，
+        # HS 调用期间被 ``BaseException`` 打断时 inflight 会残留：follower 既
+        # 拿不到结果，也等不到唤醒，只能干等到 ``HS_TIMEOUT + 2`` 超时。
+        result: Optional[Tuple[str, Optional[str]]] = None
+        expires_in: Optional[int] = None
         try:
-            if scheme == "openid":
-                result, expires_in = self._do_userinfo(token)
-            else:
-                result, expires_in = self._do_whoami(token)
-        except Exception:  # 意外异常：不缓存，可重试
-            logger.debug("user identity lookup raised unexpectedly")
-            result, expires_in = (VERIFY_SERVER_ERROR, None), None
+            try:
+                if scheme == "openid":
+                    result, expires_in = self._do_userinfo(token)
+                else:
+                    result, expires_in = self._do_whoami(token)
+            except Exception:  # 意外异常：不缓存，可重试
+                logger.debug("user identity lookup raised unexpectedly")
+                result, expires_in = (VERIFY_SERVER_ERROR, None), None
 
-        # ── 4 & 5. 写缓存、清 inflight、通知 followers ───────────────────────
-        # inflight 必须在 finally 里清除并 set()，否则：
-        #   - 写缓存或其他路径抛异常 → inflight 残留 → follower 永远等到超时；
-        #   - 新的同 token 请求无法成为 leader，直到超时才降级 server_error。
-        code, user_id = result
-        try:
+            # ── 4. 写缓存 ───────────────────────────────────────────────────
+            code, user_id = result
             if self._ttl > 0:
                 now = _monotonic()
                 if code == VERIFY_OK and user_id is not None:
@@ -221,6 +239,15 @@ class UserIdentityVerifier:
                                 key, _CacheEntry(None, False, now + fail_ttl)
                             )
         finally:
+            # ── 5. 清 inflight + 通知 followers（任何退出路径都要执行）───────
+            # inflight 必须在 finally 里清除并 set()，否则：
+            #   - 写缓存或其他路径抛异常 → inflight 残留 → follower 永远等到超时；
+            #   - 新的同 token 请求无法成为 leader，直到超时才降级 server_error。
+            if result is None:
+                # 还没有分类结果（HS 调用被 BaseException 打断）：给 follower
+                # 一个已分类的结果，别让它们等到超时或吃到异常。异常本身仍由
+                # leader 在 finally 返回后继续向上抛出。
+                result = (VERIFY_SERVER_ERROR, None)
             flight.result = result
             with self._lock:
                 if self._inflight.get(key) is flight:

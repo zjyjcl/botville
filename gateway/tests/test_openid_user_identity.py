@@ -9,7 +9,8 @@
   2. Bearer → CS whoami 成功 / 无效；
   3. homeserver 5xx / 超时 / 不可达 → 500 internal.error，且**不缓存**；
   4. 成功缓存命中与过期；`expires_in` 收紧；配置 0 = 不缓存；
-  5. 失败负缓存 5 秒（仅 4xx），5xx 不缓存；
+  5. 失败负缓存 5 秒，**仅 401/403（及域不匹配）**；其他 4xx / 5xx / 超时 /
+     不可达不缓存，可重试；
   6. single-flight：并发同一 token 只打一次 HS；
   7. 两种 scheme 分流，禁止「先试 OpenID 再试 whoami」；
   8. 网关 / legacy token 不能当 /moments* 的用户身份；
@@ -19,6 +20,11 @@
  13. 带端口的 server_name（如 `example.invalid:8448`）在 OpenID 与 Bearer
      两条路径上都正确解析，不被误判 401 / 不进负缓存；非法 user_id 仍无效。
  14. 缓存条目数上限（插入时清过期项、超限淘汰最旧）与 inflight 异常路径必删。
+ 15. localpart 大小写不被改动（只对 server name 归一比较，返回 HS 原始字符串）。
+ 16. 畸形 user_id（缺 `@`、缺 `:`、空 localpart）在两条 scheme 上端到端 401。
+ 17. leader 抛普通 Exception / BaseException 时，并发 follower 拿到 leader 的
+     分类结果（VERIFY_SERVER_ERROR），不吃异常、不自重试；BaseException 仍向
+     leader 重新抛出，且 inflight 已清。
 
 全部使用本地假 HTTPServer 与明显假 token，不含真实密钥。
 运行：PYTHONPATH=gateway/src python3 -m unittest gateway.tests.test_openid_user_identity -v
@@ -32,6 +38,7 @@ import os
 import socket
 import sys
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -1029,4 +1036,266 @@ class TestInflightCleanupOnError(VerifierTestBase):
         # 不再 mock：同 token 重新校验能正常打 HS（inflight 未残留）
         self.assertEqual(
             verifier.verify("MatrixOpenID " + OPENID_TOKEN), (VERIFY_OK, USER_ID)
+        )
+
+
+# ============================================================================
+# 6. #124 N1 补充：localpart 大小写不被改动
+# ============================================================================
+class TestLocalpartPreserved(VerifierTestBase):
+    """_check_domain 只对 server_name 做大小写归一，localpart 保持 HS 原样。
+
+    契约 §1.2.3：返回的 user_id 是 HS 给的原始字符串；网关只验域、不改写。
+    """
+
+    # -- OpenID 路径 -----------------------------------------------------------
+    def test_openid_uppercase_localpart_preserved(self):
+        """userinfo sub 中 Alice 的大写 A 不得被改成 alice。"""
+        self.hs.userinfo_body = {"sub": "@Alice:localhost"}
+        verifier = self.make()
+        code, uid = verifier.verify("MatrixOpenID " + OPENID_TOKEN)
+        self.assertEqual(code, VERIFY_OK)
+        self.assertEqual(uid, "@Alice:localhost",
+                         "localpart must not be lowercased")
+
+    def test_openid_uppercase_localpart_with_port_preserved(self):
+        """带端口的 server_name：localpart 仍保持原样。"""
+        self.hs.userinfo_body = {"sub": "@Alice:example.invalid:8448"}
+        verifier = self.make(matrix_server_name="example.invalid:8448")
+        code, uid = verifier.verify("MatrixOpenID " + OPENID_TOKEN)
+        self.assertEqual(code, VERIFY_OK)
+        self.assertEqual(uid, "@Alice:example.invalid:8448",
+                         "localpart must not be lowercased")
+
+    # -- Bearer 路径 -----------------------------------------------------------
+    def test_bearer_uppercase_localpart_preserved(self):
+        """whoami user_id 中的大写 localpart 不得被改写。"""
+        self.hs.whoami_tokens = {MATRIX_TOKEN: "@Alice:localhost"}
+        verifier = self.make()
+        code, uid = verifier.verify("Bearer " + MATRIX_TOKEN)
+        self.assertEqual(code, VERIFY_OK)
+        self.assertEqual(uid, "@Alice:localhost",
+                         "localpart must not be lowercased")
+
+    def test_bearer_uppercase_localpart_with_port_preserved(self):
+        """带端口 server_name + 大写 localpart：whoami 路径同样保持。"""
+        self.hs.whoami_tokens = {MATRIX_TOKEN: "@Alice:example.invalid:8448"}
+        verifier = self.make(matrix_server_name="example.invalid:8448")
+        code, uid = verifier.verify("Bearer " + MATRIX_TOKEN)
+        self.assertEqual(code, VERIFY_OK)
+        self.assertEqual(uid, "@Alice:example.invalid:8448",
+                         "localpart must not be lowercased")
+
+
+# ============================================================================
+# 7. #124 N1 补充：畸形 user_id 在两条 scheme 上端到端均为 VERIFY_INVALID
+# ============================================================================
+class TestMalformedUserIdEndToEnd(VerifierTestBase):
+    """HS 返回畸形 user_id 时，两条 scheme 均应得到 VERIFY_INVALID（不崩溃）。
+
+    通过端到端路径（verify()）测试，而非只测 _check_domain 单元，确保解析
+    逻辑在实际调用链里也生效。
+    """
+
+    # -- OpenID 路径 (userinfo 返回畸形 sub) -----------------------------------
+    def test_openid_no_at_sign_is_invalid(self):
+        self.hs.userinfo_body = {"sub": "example.invalid"}
+        verifier = self.make()
+        self.assertEqual(
+            verifier.verify("MatrixOpenID " + OPENID_TOKEN),
+            (VERIFY_INVALID, None),
+        )
+
+    def test_openid_no_colon_is_invalid(self):
+        self.hs.userinfo_body = {"sub": "@onlylocalpart"}
+        verifier = self.make()
+        self.assertEqual(
+            verifier.verify("MatrixOpenID " + OPENID_TOKEN),
+            (VERIFY_INVALID, None),
+        )
+
+    def test_openid_empty_localpart_is_invalid(self):
+        """@:example.invalid — localpart 空，§1.2.3 拒绝。"""
+        self.hs.userinfo_body = {"sub": "@:{}".format(SERVER_NAME)}
+        verifier = self.make()
+        self.assertEqual(
+            verifier.verify("MatrixOpenID " + OPENID_TOKEN),
+            (VERIFY_INVALID, None),
+        )
+
+    # -- Bearer/whoami 路径 (whoami 返回畸形 user_id) -------------------------
+    def test_bearer_no_at_sign_is_invalid(self):
+        self.hs.whoami_tokens = {MATRIX_TOKEN: "example.invalid"}
+        verifier = self.make()
+        self.assertEqual(
+            verifier.verify("Bearer " + MATRIX_TOKEN),
+            (VERIFY_INVALID, None),
+        )
+
+    def test_bearer_no_colon_is_invalid(self):
+        self.hs.whoami_tokens = {MATRIX_TOKEN: "@onlylocalpart"}
+        verifier = self.make()
+        self.assertEqual(
+            verifier.verify("Bearer " + MATRIX_TOKEN),
+            (VERIFY_INVALID, None),
+        )
+
+    def test_bearer_empty_localpart_is_invalid(self):
+        self.hs.whoami_tokens = {MATRIX_TOKEN: "@:{}".format(SERVER_NAME)}
+        verifier = self.make()
+        self.assertEqual(
+            verifier.verify("Bearer " + MATRIX_TOKEN),
+            (VERIFY_INVALID, None),
+        )
+
+
+# ============================================================================
+# 8. #124 任务 3：leader 普通 Exception → follower 拿 leader 的分类结果
+# ============================================================================
+class TestFollowerGetsLeaderResult(VerifierTestBase):
+    """并发测试：leader 路径抛 Exception 时，follower 拿到 VERIFY_SERVER_ERROR
+    而不是自己吃到异常，也不自行重试。
+
+    语义（改前 → 改后）：
+    - 改前：try/finally 仅包写缓存段；HS 调用期间若被 BaseException 打断，
+      inflight 残留，follower 等到超时才降级；普通 Exception 在 except 里
+      已分类，flight.result 被设好，follower 能拿到结果——但 finally 范围太
+      窄，BaseException 路径不安全。
+    - 改后：try/finally 包住「HS 调用 + 写缓存」整段；BaseException 时
+      finally 也给 follower 补 VERIFY_SERVER_ERROR 并清 inflight；leader 仍
+      把原异常重新抛出（不吞掉 KeyboardInterrupt）。
+    """
+
+    def _make_blocking_verifier(self):
+        """返回 verifier 和一个可从外部控制 _do_userinfo 阻塞/放行的工具。"""
+        verifier = self.make(openid_cache_ttl_seconds=60)
+        return verifier
+
+    def test_follower_gets_server_error_when_leader_raises_exception(self):
+        """leader _do_userinfo 抛 Exception → 所有 follower 收到 VERIFY_SERVER_ERROR。"""
+        verifier = self._make_blocking_verifier()
+
+        # 用 Barrier 保证 leader 还在 HS 调用阶段时，follower 已等在 inflight。
+        hs_start = threading.Barrier(2)   # leader + main-thread signal
+        hs_raise = threading.Event()       # 通知 _do_userinfo 可以抛了
+
+        def _slow_raise(_token):
+            hs_start.wait(timeout=5)       # 通知 "我进 HS 调用了"
+            hs_raise.wait(timeout=5)       # 等外部说可以抛
+            raise RuntimeError("simulated HS failure in leader")
+
+        follower_results: list = []
+        follower_errors: list = []
+
+        def follower():
+            try:
+                follower_results.append(
+                    verifier.verify("MatrixOpenID " + OPENID_TOKEN)
+                )
+            except BaseException as exc:
+                follower_errors.append(exc)
+
+        with mock.patch.object(verifier, "_do_userinfo", side_effect=_slow_raise):
+            leader_t = threading.Thread(
+                target=lambda: verifier.verify("MatrixOpenID " + OPENID_TOKEN)
+            )
+            leader_t.start()
+            hs_start.wait(timeout=5)       # leader 已进入 _do_userinfo
+
+            f = threading.Thread(target=follower)
+            f.start()
+            time.sleep(0.05)               # 让 follower 进入 inflight 等待
+            hs_raise.set()                 # 放行 leader 抛异常
+            leader_t.join(timeout=5)
+            f.join(timeout=5)
+
+        # follower 必须拿到 leader 的分类结果，不能自己抛
+        self.assertEqual(follower_errors, [],
+                         "follower must not raise an exception")
+        self.assertEqual(len(follower_results), 1)
+        self.assertEqual(follower_results[0][0], VERIFY_SERVER_ERROR,
+                         "follower must get VERIFY_SERVER_ERROR from leader")
+
+        # inflight 已清除
+        self.assertNotIn(
+            verifier._token_hash(OPENID_TOKEN),  # noqa: SLF001
+            verifier._inflight,                   # noqa: SLF001
+            "inflight must be cleared after leader exception",
+        )
+
+
+# ============================================================================
+# 9. #124 任务 4：leader BaseException → inflight 清、follower 有结果、leader 重抛
+# ============================================================================
+class TestFollowerGetsResultOnBaseException(VerifierTestBase):
+    """leader 在 HS 调用期间遭遇 BaseException（如 KeyboardInterrupt）时：
+    - inflight 必须被清除并 set()；
+    - 并发 follower 拿到 VERIFY_SERVER_ERROR（已分类结果），不等到超时、不吃异常；
+    - leader 线程仍看到该 BaseException（finally 不吞掉它）。
+    """
+
+    class _CustomBase(BaseException):
+        """自定义 BaseException 子类，避免在测试进程里真正触发 KeyboardInterrupt。"""
+
+    def test_base_exception_clears_inflight_and_follower_gets_result(self):
+        verifier = self.make(openid_cache_ttl_seconds=60)
+
+        hs_start = threading.Barrier(2)
+        hs_raise = threading.Event()
+
+        def _raise_base(_token):
+            hs_start.wait(timeout=5)
+            hs_raise.wait(timeout=5)
+            raise TestFollowerGetsResultOnBaseException._CustomBase(
+                "simulated BaseException in leader"
+            )
+
+        follower_results: list = []
+        follower_errors: list = []
+
+        def follower():
+            try:
+                follower_results.append(
+                    verifier.verify("MatrixOpenID " + OPENID_TOKEN)
+                )
+            except BaseException as exc:
+                follower_errors.append(exc)
+
+        leader_raised: list = []
+
+        def leader():
+            try:
+                verifier.verify("MatrixOpenID " + OPENID_TOKEN)
+            except TestFollowerGetsResultOnBaseException._CustomBase as exc:
+                leader_raised.append(exc)
+
+        with mock.patch.object(verifier, "_do_userinfo", side_effect=_raise_base):
+            lt = threading.Thread(target=leader)
+            ft = threading.Thread(target=follower)
+            lt.start()
+            hs_start.wait(timeout=5)       # leader 已进入 _do_userinfo
+
+            ft.start()
+            time.sleep(0.05)              # 让 follower 进入 inflight 等待
+
+            hs_raise.set()
+            lt.join(timeout=5)
+            ft.join(timeout=5)
+
+        # leader 必须看到 BaseException
+        self.assertEqual(len(leader_raised), 1,
+                         "leader must re-raise the BaseException")
+
+        # follower 不能自己抛，必须拿到分类结果
+        self.assertEqual(follower_errors, [],
+                         "follower must not raise an exception")
+        self.assertEqual(len(follower_results), 1)
+        self.assertEqual(follower_results[0][0], VERIFY_SERVER_ERROR,
+                         "follower must get VERIFY_SERVER_ERROR")
+
+        # inflight 必须已清除
+        self.assertNotIn(
+            verifier._token_hash(OPENID_TOKEN),  # noqa: SLF001
+            verifier._inflight,                   # noqa: SLF001
+            "inflight must be cleared after BaseException",
         )
