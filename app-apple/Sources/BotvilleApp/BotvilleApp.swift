@@ -232,7 +232,7 @@ private struct AppRootView: View {
                 } detail: {
                     if let selectedRoom = service.rooms.first(where: { $0.id == selectedRoomID && $0.membership == .joined }) {
                         RoomView(service: service, room: selectedRoom, isInputActive: $isRoomInputActive,
-                                 presentedRoomID: $presentedRoomID)
+                                 presentedRoomID: roomPresentationBinding)
                             .id(selectedRoom.id)
                     } else {
                         ContentUnavailableView(
@@ -326,17 +326,23 @@ private struct AppRootView: View {
         visibleRoomID = currentVisibleRoomID
     }
 
+    // Publish in the appearance callback itself, before candidates can arrive;
+    // waiting for onChange leaves the parent with the preceding render's room.
+    private var roomPresentationBinding: Binding<String?> {
+        Binding(get: { presentedRoomID }, set: { roomID in
+            presentedRoomID = roomID
+            visibleRoomID = ForegroundBannerVisibility.roomID(
+                isLoggedIn: service.isLoggedIn, selectedRoomID: selectedRoomID,
+                presentedRoomID: roomID,
+                joinedRoomIDs: service.rooms.filter { $0.membership == .joined }.map(\.id))
+        })
+    }
+
     private var currentVisibleRoomID: String? {
-        guard service.isLoggedIn,
-              let presentedRoomID,
-              selectedRoomID == presentedRoomID,
-              service.rooms.contains(where: { $0.id == presentedRoomID && $0.membership == .joined }) else {
-            return nil
-        }
-#if os(iOS)
-        guard horizontalSizeClass == .regular || preferredCompactColumn == .detail else { return nil }
-#endif
-        return presentedRoomID
+        ForegroundBannerVisibility.roomID(
+            isLoggedIn: service.isLoggedIn, selectedRoomID: selectedRoomID,
+            presentedRoomID: presentedRoomID,
+            joinedRoomIDs: service.rooms.filter { $0.membership == .joined }.map(\.id))
     }
 }
 

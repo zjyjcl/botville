@@ -153,6 +153,77 @@ final class ForegroundInAppBannerTests: XCTestCase {
         XCTAssertEqual(store.current, value)
     }
 
+    func testCachedRestoreWaitsForFirstOnlineSnapshotIncludingEmptyCache() {
+        for cached in [[], [snapshot()]] {
+            var detector = ForegroundBannerDetector()
+            XCTAssertTrue(detector.candidates(in: cached, isOnlineSync: false).isEmpty)
+            let offline = candidate(eventID: "$offline", date: date.addingTimeInterval(10))
+            let catchUp = snapshot(candidate: offline, unread: 1)
+            XCTAssertTrue(detector.candidates(in: [catchUp], isOnlineSync: false).isEmpty)
+            XCTAssertTrue(detector.candidates(in: [catchUp]).isEmpty)
+            let live = candidate(eventID: "$live", date: date.addingTimeInterval(11))
+            // A local refresh racing ahead must not consume the live online change.
+            XCTAssertTrue(detector.candidates(in: [snapshot(candidate: live, unread: 2)], isOnlineSync: false).isEmpty)
+            XCTAssertEqual(detector.candidates(in: [snapshot(candidate: live, unread: 2)]), [live])
+        }
+    }
+
+    func testForegroundCatchUpAbsorbsBackgroundHistoryThenEmitsLiveMessages() {
+        var detector = ForegroundBannerDetector()
+        _ = detector.candidates(in: [snapshot()])
+        detector.beginCatchUp()
+        let background = candidate(eventID: "$background", date: date.addingTimeInterval(20))
+        XCTAssertTrue(detector.candidates(in: [snapshot(candidate: background, unread: 1)]).isEmpty)
+        let live = candidate(eventID: "$live", date: date.addingTimeInterval(21))
+        XCTAssertEqual(detector.candidates(in: [snapshot(candidate: live, unread: 2)]), [live])
+    }
+
+    func testRestoredVisibleRoomSuppressesSameRoomButAllowsOtherRoom() {
+        let room = "!room:test"
+        let visible = ForegroundBannerVisibility.roomID(
+            isLoggedIn: true, selectedRoomID: room, presentedRoomID: room, joinedRoomIDs: [room])
+        XCTAssertEqual(visible, room) // Also applies when compact preference remains sidebar.
+        let store = ForegroundInAppBannerStore(displayDuration: .seconds(100), sleep: { _ in })
+        store.updateContext(isForeground: true, visibleRoomID: visible, isInputActive: false)
+        store.receive(candidate())
+        XCTAssertNil(store.current)
+        let other = candidate(roomID: "!other:test")
+        store.receive(other)
+        XCTAssertEqual(store.current, other)
+        XCTAssertNil(ForegroundBannerVisibility.roomID(
+            isLoggedIn: true, selectedRoomID: room, presentedRoomID: nil, joinedRoomIDs: [room]))
+        XCTAssertNil(ForegroundBannerVisibility.roomID(
+            isLoggedIn: true, selectedRoomID: "!other:test", presentedRoomID: room, joinedRoomIDs: [room]))
+        XCTAssertNil(ForegroundBannerVisibility.roomID(
+            isLoggedIn: false, selectedRoomID: room, presentedRoomID: room, joinedRoomIDs: [room]))
+        XCTAssertNil(ForegroundBannerVisibility.roomID(
+            isLoggedIn: true, selectedRoomID: room, presentedRoomID: room, joinedRoomIDs: []))
+    }
+
+    func testUnreadArrivingBeforeLatestEventDoesNotLoseLaterCandidate() {
+        var detector = ForegroundBannerDetector()
+        let old = candidate()
+        _ = detector.candidates(in: [snapshot(candidate: old)])
+        XCTAssertTrue(detector.candidates(in: [snapshot(candidate: old, unread: 1)]).isEmpty)
+        let live = candidate(eventID: "$live", date: date.addingTimeInterval(10))
+        XCTAssertEqual(detector.candidates(in: [snapshot(candidate: live, unread: 1)]), [live])
+    }
+
+    func testConsecutiveTimestampCandidatesAtTenAndTwoSecondIntervals() {
+        var detector = ForegroundBannerDetector()
+        _ = detector.candidates(in: [snapshot()])
+        let store = ForegroundInAppBannerStore(displayDuration: .seconds(100), sleep: { _ in })
+        store.updateContext(isForeground: true, visibleRoomID: nil, isInputActive: false)
+        for offset in [10.0, 20.0, 22.0, 23.0, 33.0] {
+            let live = ForegroundBannerCandidate(roomID: "!room:test", latestActivity: date.addingTimeInterval(offset),
+                                                title: "Room", preview: "Body")
+            let candidates = detector.candidates(in: [snapshot(candidate: live, unread: 1)])
+            XCTAssertEqual(candidates, [live])
+            candidates.forEach { store.receive($0) }
+            XCTAssertEqual(store.current, live)
+        }
+    }
+
     private func candidate(roomID: String = "!room:test", eventID: String = "$one", date: Date? = nil, own: Bool = false) -> ForegroundBannerCandidate {
         ForegroundBannerCandidate(roomID: roomID, eventID: eventID, latestActivity: date ?? self.date,
                                   title: "Room", preview: "Body", isOwn: own)

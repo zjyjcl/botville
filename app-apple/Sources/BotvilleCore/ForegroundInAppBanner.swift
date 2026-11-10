@@ -130,8 +130,19 @@ struct ForegroundBannerSnapshot {
     let candidate: ForegroundBannerCandidate?
 }
 
-/// Converts room-list changes into new-message candidates. The first snapshot
-/// establishes a baseline so restoring an existing account never replays history.
+/// Actual RoomView appearance is authoritative; a split view's preferred column
+/// is a navigation request, not evidence that its detail is hidden.
+public enum ForegroundBannerVisibility {
+    public static func roomID(isLoggedIn: Bool, selectedRoomID: String?,
+                              presentedRoomID: String?, joinedRoomIDs: [String]) -> String? {
+        guard isLoggedIn, let presentedRoomID, selectedRoomID == presentedRoomID,
+              joinedRoomIDs.contains(presentedRoomID) else { return nil }
+        return presentedRoomID
+    }
+}
+
+/// Only a committed online snapshot can establish the notification baseline.
+/// Cached rooms remain available to the UI without arming history replay.
 struct ForegroundBannerDetector {
     private struct Baseline: Equatable {
         let unreadCount: UInt64
@@ -142,7 +153,14 @@ struct ForegroundBannerDetector {
     private var baselines = [String: Baseline]()
     private var hasBaseline = false
 
-    mutating func candidates(in snapshots: [ForegroundBannerSnapshot]) -> [ForegroundBannerCandidate] {
+    mutating func beginCatchUp() {
+        hasBaseline = false
+    }
+
+    mutating func candidates(in snapshots: [ForegroundBannerSnapshot],
+                             isOnlineSync: Bool = true) -> [ForegroundBannerCandidate] {
+        // Local refreshes must neither arm nor advance the online baseline.
+        guard isOnlineSync else { return [] }
         var next = [String: Baseline]()
         var result = [ForegroundBannerCandidate]()
         for snapshot in snapshots {
