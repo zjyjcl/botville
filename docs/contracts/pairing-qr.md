@@ -58,12 +58,15 @@ botville 已有一套二维码配对：A2.1 的 `botville-pair:v1:…`（见
 - 兑换端点挂在**二维码中 hs 域名**下（`{hs}/_botville/pair/redeem`）；部署上可由
   反向代理转发到配对后端（同 A2.1 的 `/_matrix/pairing` 转发方式），契约只规定 App
   可见的地址 = `hs` + 固定路径。
-- **兑换地址拼接（定稿）**：兑换 URL = `hs` 去掉**末尾所有** `/` 后接
-  `/_botville/pair/redeem`。例：`https://hs.example.org` 与
-  `https://hs.example.org/` 都得到
+- **兑换地址拼接（定稿）**：兑换 URL = `hs` 去掉**末尾一个** `/`（如有）后接
+  `/_botville/pair/redeem`（与 App 现用的 Foundation `appendingPathComponent`
+  行为一致）。例：`https://hs.example.org` 与 `https://hs.example.org/` 都得到
   `https://hs.example.org/_botville/pair/redeem`；hs 带路径前缀如
   `https://example.org/matrix` 时为
   `https://example.org/matrix/_botville/pair/redeem`，反向代理须在该前缀下转发。
+  `hs` 以两个及以上 `/` 结尾时（如 `https://hs.example.org//`）结果会保留 `//`
+  （`https://hs.example.org//_botville/pair/redeem`），行为依赖反代对空路径段的
+  处理——**签发端不得签发以 `//` 结尾的 `hs`**（URI 解析层不因此拒绝）。
   这只是 URL 拼接；§5.2 的 homeserver 逐字符比对仍用二维码原文、不做规范化。
 - App 的本地校验（§3）在发任何网络请求**之前**完成：格式不合法的二维码绝不产生
   兑换请求。
@@ -287,14 +290,18 @@ matrix-rust-sdk（当前绑定如 `matrix-rust-components-swift` 26.x）的同�
 
 **契约外响应（定稿）**：
 
-- 请求体超过 64 KiB、非 JSON、`Content-Type` 不是 `application/json`、JSON 顶层
-  不是对象 → 一律 `400 BV_PAIR_INVALID`（属"请求结构非法"，不新增错误码）；
+- 请求体超过 64 KiB、非 JSON、`Content-Type` 媒体类型不是 `application/json`、
+  JSON 顶层不是对象 → 一律 `400 BV_PAIR_INVALID`（属"请求结构非法"，不新增错误码）。
+  `Content-Type` 只比较媒体类型（大小写不敏感），**忽略** `; charset=utf-8` 等
+  参数（`application/json; charset=utf-8` 合法）；
 - 非 POST 方法：服务端可回 405（或反代默认 404/405），这些响应**不保证**是
   PairingError 结构；
 - 5xx（含反代 502/503/504）与无法解析的响应体：服务端保证**未提交**的兑换不会
-  核销 code（事务回滚）；App 视为暂时性故障，可在 exp 之前本地退避重试，**不得**
-  把它当成功或展示 token。注意若服务端已提交但响应丢失，重试会得到 409
-  `BV_PAIR_USED`，App 按 §5.3 提示重新签发；
+  核销 code（事务回滚）；App **不得**把它当成功或展示 token。**建议**（非强制）
+  App 视为暂时性故障、在 exp 之前允许用户/本地退避重试同一码；App 现状是除
+  `429` 外一律提示重新扫码（不重试），也符合本契约。若服务端已提交但响应丢失，
+  重试会得到 409 `BV_PAIR_USED`，App 按 §5.3 的 409 行处理（停止，请管理员
+  重新签发）；
 - 未知 errcode（将来可能新增）：App 按不可重试的服务端错误处理（前向兼容），
   不得崩溃。
 
@@ -365,7 +372,7 @@ matrix-rust-sdk（当前绑定如 `matrix-rust-components-swift` 26.x）的同�
 | `gateway` | 签发时保存的 gw 原样返回；签发时无 gw 则为 `null`（字段仍必现，见下） |
 | `auth.type` | `"registration_token"`（App 用 Matrix 注册流程换新账号）或 `"login_token"`（App 用 `m.login.token` 登录已有账号）；由签发时管理面决定，契约只传输 |
 | `auth.token` | 一次性短时令牌；建议 `expires_in_ms` ≤ 600000（10 分钟）；过期未用须重新配对 |
-| `features_url` | **可选**（总管拍板，不列入 OpenAPI `required`）：功能清单（capability manifest）拉取地址，`https://` URL，内容结构不在本契约（见网关契约）。`gateway` 为 null（签发无 gw，chat-only）的响应**应省略**本字段——即使出现，App 也须忽略、不得据此启用网关功能；`gateway` 非 null 时服务端**应**提供，App 在提供时拉取。网关部署时**建议**指向网关功能清单接口 `{gateway}/v1/capabilities`（`GET /capabilities`，`gateway/openapi/gateway.v1.yaml`）；示例 JSON 里的 `features.json` 仅是占位路径。拉取该接口的 App→网关鉴权方式尚未定（网关当前为 bearer 占位，见 `gateway/docs/contract.md` §1.2 与 issue #124），不在本契约 |
+| `features_url` | **可选**（总管拍板，不列入 OpenAPI `required`）：功能清单（capability manifest）拉取地址，`https://` URL，内容结构不在本契约（见网关契约）。`gateway` 为 null（签发无 gw，chat-only）的响应**应省略**本字段——即使出现，App 也须忽略、不得据此启用网关功能；`gateway` 非 null 时服务端**应**提供。**App 现状**：解析并保存 `features_url`（校验为 https），但**不请求该 URL**；功能清单直接请求 `{gateway}/v1/capabilities`（`GET /capabilities`，`gateway/openapi/gateway.v1.yaml`）。因此网关部署时服务端**应**让 `features_url` 等于 `{gateway}/v1/capabilities`，两者指向同一资源；示例 JSON 里的 `features.json` 仅是占位路径。拉取该接口的 App→网关鉴权方式尚未定（网关当前为 bearer 占位，见 `gateway/docs/contract.md` §1.2 与 issue #124），不在本契约 |
 
 `registration_token` 与 `login_token` 在 homeserver 侧的具体核销（注册流程 / 登录
 流程）由服务端实现负责，本契约只规定传输格式、短时性与一次性语义。
@@ -386,8 +393,8 @@ matrix-rust-sdk（当前绑定如 `matrix-rust-components-swift` 26.x）的同�
   / `features_url`（未请求的网关信息一律忽略，维持 chat-only）；
 - `features_url` 为**可选**字段（不列入 OpenAPI `required`）：`gateway` 为 null 的
   成功响应**应省略** `features_url`（无网关部署没有功能清单可指；即使出现，App
-  也须忽略、不得据此启用网关功能）；`gateway` 非 null 时服务端**应**提供，App
-  在提供时按现状拉取功能清单。
+  也须忽略、不得据此启用网关功能）；`gateway` 非 null 时服务端**应**提供；App 现状
+  从 `{gateway}/v1/capabilities` 拉取功能清单（不直接请求 `features_url`，见 §5.1）。
 
 完整示例：无 `gw` 的有效二维码 `examples/pairing-qr/uri-valid-no-gw.txt`，对应
 `gateway: null` 且**不含** `features_url` 的成功响应
@@ -411,10 +418,10 @@ matrix-rust-sdk（当前绑定如 `matrix-rust-components-swift` 26.x）的同�
 | 200 + hs 不一致 | 拒绝（§5.2），提示管理员重新签发 |
 | 证书指纹 / 主机名（SAN）/ 有效期 / EKU 校验失败 | **App 端**证书错误（如 `certificateMismatch`；**不是** §4.4 的 `BV_PAIR_*`）：提示证书不匹配，**不重试、不绕过、不当作一般网络失败** |
 | 400 `BV_PAIR_INVALID` | 提示码无效，停止（不重试） |
-| 409 `BV_PAIR_USED` | 提示码已被使用（可能是别人扫了），停止 |
+| 409 `BV_PAIR_USED` | 提示码已被使用（可能是别人扫了，或上次请求已成功但响应丢失），停止，请管理员重新签发 |
 | 410 `BV_PAIR_EXPIRED` / `BV_PAIR_REVOKED` | 提示过期/已作废，请管理员重新签发 |
 | 429 `BV_PAIR_RATE_LIMITED` | 按 `retry_after_ms` 等待后可重试（缺 `retry_after_ms` 视为服务端 bug，按本地退避） |
-| 5xx / 网络错误 / 非契约响应（含未知 errcode） | 按 §4.4「契约外响应」处理：视为暂时性故障，可在 exp 之前本地退避重试（未知 errcode 按不可重试的服务端错误处理）；不得当成功或展示 token，重试遇 409 按上一行提示重新签发 |
+| 5xx / 网络错误 / 非契约响应（含未知 errcode） | 按 §4.4「契约外响应」处理：不得当成功或展示 token；未知 errcode 不重试。5xx/网络错误**建议**允许在 exp 前退避重试（App 现状为提示重新扫码，亦合规）；重试遇 409 按 409 行处理 |
 
 ## 6. 安全说明（汇总）
 
@@ -463,8 +470,8 @@ Option A 定稿（2026-11-06，#128/#132）合入后，C 线（App）须确认�
    对待——在该配对的**生命周期内**不得启用网关功能，即使部署后来加了网关
    （App 侧不存在「后补启用网关」的路径）；
 2. chat-only 时继续丢弃 / 不使用 `features_url`（既有行为，保持不变）；
-3. 二维码带 `gw` 且兑换响应返回非 null `gateway` + `features_url` 时，继续按
-   现状拉取功能清单；
+3. 二维码带 `gw` 且兑换响应返回非 null `gateway` 时，继续按现状从
+   `{gateway}/v1/capabilities` 拉取功能清单（`features_url` 仅保存，不直接请求）；
 4. 本 PR 已把 App fixture 同步为与 `docs/contracts/examples/pairing-qr/` 逐字节
    一致（含新增的 `uri-valid-no-gw.txt` / `uri-invalid-missing-hs.txt` /
    `redeem-200-no-gateway.json`）；合并后拉取即可，本地 App 测试应以该单一来源
@@ -477,4 +484,5 @@ Option A 定稿（2026-11-06，#128/#132）合入后，C 线（App）须确认�
 
 | 日期 | 变更 |
 |---|---|
+| 2026-11-10 | #155 r1：兑换地址改为「去掉末尾一个 `/`」与 App 一致并禁止签发 `//` 结尾的 hs；5xx 重试改为建议（App 现状合规）；409 行理顺；`features_url` 按 App 现状描述（App 请求 `{gateway}/v1/capabilities`）；`Content-Type` 忽略参数。 |
 | 2026-11-10 | A 线契约缺口小修（仅澄清、向后兼容）：兑换地址拼接、gw 基址不含 /v1、exp 以服务端为准、限流默认值定稿、契约外响应处理、`device_display_name` 用途、`features_url` 建议指向 `/v1/capabilities`；不改 errcode/状态码/schema/示例。 |

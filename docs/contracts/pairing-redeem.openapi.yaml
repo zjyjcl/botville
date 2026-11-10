@@ -18,7 +18,7 @@ info:
 
     要点（详见 pairing-qr.md）：
 
-    - 兑换地址 = 二维码中 `hs` 去掉末尾所有 `/` 后接 `/_botville/pair/redeem`
+    - 兑换地址 = 二维码中 `hs` 去掉末尾一个 `/`（如有）后接 `/_botville/pair/redeem`
       （拼接规则见 pairing-qr.md §2「兑换地址拼接」）；仅 HTTPS。二维码的
       `gw` 为可选参数：无网关部署省略之，兑换端点只挂在 `hs` 下（`gw` 从不
       承载兑换），此时成功响应的 `gateway` 为 `null`（字段仍必现）。二维码
@@ -63,8 +63,8 @@ paths:
         → ④ 状态判定 used → revoked → expired → ⑤ 单事务内原子核销并签发 auth
         token。请求体上限 64 KiB；未知请求字段拒绝；`BV_PAIR_RATE_LIMITED` 响应
         可另带 `Retry-After` 头（秒，向下取整），客户端以 body 中
-        `retry_after_ms` 为准。请求体超 64 KiB / 非 JSON / Content-Type 非
-        application/json → 400 BV_PAIR_INVALID；5xx 时服务端保证未提交的兑换
+        `retry_after_ms` 为准。请求体超 64 KiB / 非 JSON / Content-Type 媒体类型非
+        application/json（忽略 charset 等参数）→ 400 BV_PAIR_INVALID；5xx 时服务端保证未提交的兑换
         不核销 code（详见 pairing-qr.md §4.4 契约外响应）。
       requestBody:
         required: true
@@ -198,7 +198,8 @@ components:
         二维码省略 `gw` 的配对是 chat-only：App 在该配对生命周期内不得为其启用
         网关功能（pairing-qr.md §5.1.1，Option A 定稿）。`features_url` **可选**
         （不列入 required）：`gateway` 为 null 的响应应省略，App 忽略之、不得
-        据此启用网关功能；`gateway` 非 null 时服务端应提供，App 在提供时拉取。
+        据此启用网关功能；`gateway` 非 null 时服务端应提供（App 现状从
+        {gateway}/v1/capabilities 拉取功能清单，不直接请求 features_url）。
         客户端必须忽略未声明字段（前向兼容）。
       required: [v, homeserver, gateway, auth]
       properties:
@@ -234,9 +235,10 @@ components:
             可选（不在 required 中）。功能清单（capability manifest）拉取地址；
             内容结构不在本契约。`gateway` 为 null（签发无 gw，chat-only）的响应
             **应省略**本字段——即使出现，App 也须忽略、不得据此启用网关功能；
-            `gateway` 非 null 时服务端应提供，App 在提供时拉取。网关部署时建议
-            指向 {gateway}/v1/capabilities（GET /capabilities，
-            gateway/openapi/gateway.v1.yaml）。
+            `gateway` 非 null 时服务端应提供，且应等于
+            {gateway}/v1/capabilities（GET /capabilities，
+            gateway/openapi/gateway.v1.yaml）；App 现状保存但不直接请求本字段，
+            功能清单从 {gateway}/v1/capabilities 拉取。
           examples:
             - https://gw.example.org/features.json
 

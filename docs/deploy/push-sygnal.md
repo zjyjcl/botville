@@ -3,7 +3,7 @@
 任务 A1.2（issue #4）· iOS 推送到达目标 **< 5s**。
 
 > **验证状态与当前卡点**：homeserver → Sygnal → mock pushkin 链路的时延验收
-> （< 5s）已由 CI 的 `push-e2e (synapse)` / `push-e2e (tuwunel)` job 在每次提交时
+> （< 5s）已由 CI 的 `push-e2e (synapse)` / `push-e2e (tuwunel)` / `push-e2e (continuwuity)` job 在每次提交时
 > 自动执行（`make push-e2e`，本地同样可跑）。**真实 APNs 送达尚未验证**：
 > 已有 Apple 开发者账号与 APNs Auth Key（.p8），密钥只存放在部署侧、不进仓库
 > （仓库内 APNs 值仍一律占位，`BOTVILLE_APNS_ENABLED` 默认 false）。真实端到端
