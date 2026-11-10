@@ -131,9 +131,10 @@ curl -s -X POST localhost:8080/v1/conversations/conv_demo/messages \
 但 `POST /cards` 不在本 PR 范围）、真正的 deferred 定时投递（目前只登记排程，
 `service.pending_queue()` 可查；B1.2 接入调度器前 deferred 会一直停留在 `deferred`）。
 
-**安全边界（已知，待 B2.x）**：当前为单 token 设备级鉴权——任何持有该 token 者都可以
-冒充任意 `sender_persona_id` 向任意 conversation 发送。按 persona 所有权的
-`persona.not_owned`（403）校验留待 B2.x 会话/令牌模型。
+**安全边界（已知，待 B2.x）**：`/v1/context/assemble` 的 persona 区按 caller token 携带的
+`owner_id` 鉴权（#124）：非 owner 或未证明 owner 时 persona 区为空，状态码仍 `200`（不改
+任何字段集合与状态码，见契约 §1.2.2）。`persona.not_owned`（403）只用于 assemble 以外的
+persona 写操作，发送路径 `sender_persona_id` 的所有权校验不在本期，留待 B2.x。
 
 ### 策略算法
 
@@ -234,7 +235,9 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_HOST` | `127.0.0.1` | 监听地址 |
 | `GATEWAY_PORT` | `8080` | 监听端口（1–65535；环境变量给 0 或超范围会启动失败） |
 | `GATEWAY_HTTP_PATH_PREFIX` | *(空)* | 部署路径前缀（如 `/_botville/gateway`）：网关整体挂在某前缀之后时填写，请求可带前缀发出。默认空 = 现行行为不变。必须以 `/` 开头，不含 `//` `..` `?` `#` `%` 空白与控制字符，尾部 `/` 归一、单独 `/` 视为空；非法值拒绝启动。**未带前缀的请求仍被接受**（兼容已去前缀的反代），按整段边界匹配（`/_botville/gatewayX` 不算） |
-| `GATEWAY_AUTH_TOKEN` | *(空)* | **必填**：留空或仍为 `<change-me>` 时**拒绝启动**（fail closed）；生产设为随机值，请求需 `Authorization: Bearer <token>`；用 `hmac.compare_digest` 常数时间比较 |
+| `GATEWAY_AUTH_TOKEN` | *(空)* | **必填**（`GATEWAY_LEGACY_TOKEN_ENABLED=false` 时除外）：留空或仍为 `<change-me>` 时**拒绝启动**（fail closed）；生产设为随机值，请求需 `Authorization: Bearer <token>`；进程内对 token 做 HMAC-SHA256 后等长 `hmac.compare_digest` 比较 |
+| `GATEWAY_CALLER_TOKENS` | *(空)* | #124 §1.2.2：per-caller 凭据表，每条形如 `caller_id:token:owner_id`（token ≥32 字节随机值），多条用 `;` **或换行**分隔（可混用）。命中后 `owner_id` 用于 `/v1/context/assemble` 的 persona 区鉴权。字段缺/空/数不为 3/含 `:` `;` 换行 → 拒绝启动；token 短于 32 字节或重复 → 非 dev 拒绝、dev 仅 WARNING；caller token 等于 `GATEWAY_AUTH_TOKEN`、或 `caller_id` 重复 → 一律拒绝启动。留空 = 不启用 |
+| `GATEWAY_LEGACY_TOKEN_ENABLED` | `true` | 是否仍接受站点级 `GATEWAY_AUTH_TOKEN`。配置了 caller token 后建议设为 `false`（否则启动打 WARNING：旧 token 仍可绕过 per-caller 边界）；设为 `false` 且 caller token 为空时，需鉴权的请求一律 `401 auth.invalid_token`（启动 WARNING），且不再要求 `GATEWAY_AUTH_TOKEN` |
 | `GATEWAY_HMAC_SECRET` | *(空)* | **必填**（#114 PR-a / N10）：**只接受十六进制**，至少 **64 个 hex 字符**（= 32 字节），拒绝全零；用于 txnId 与 `text_sha256` 的 HMAC。非 dev 模式留空或为 `<change-me>` 时拒绝启动，dev 模式未设置则每进程随机生成。生成：`python3 -c 'import secrets;print(secrets.token_hex(32))'` **（破坏性变更：以前接受任意字符串）** |
 | `GATEWAY_DEV_MODE` | `false` | 仅本地开发：`true` 时允许无 token 启动并免鉴权（启动横幅打 WARNING）；设了真实 token 永远优先 |
 | `RATE_LIMIT_MESSAGES` | `60` | 窗口内每个 persona 最多消息数；`0` = 关闭限速 |

@@ -39,6 +39,15 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from .config import Config, load_config
+from .caller_identity import (
+    AUTH_INVALID,
+    AUTH_MISSING,
+    AUTH_OK,
+    AUTH_PASS_THROUGH,
+    CallerAuthenticator,
+    CallerIdentity,
+    log_startup_warnings,
+)
 from .errors import (
     GatewayDeliveryError,
     IdempotencyConflict,
@@ -304,21 +313,31 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         return body, None
 
     def _auth_ok(self) -> bool:
-        cfg: Config = self.server.config  # type: ignore[attr-defined]
-        if cfg.auth_token is None:
+        """鉴权（契约 §1.2 / §1.2.2）。
+
+        由一个进程内的 `CallerAuthenticator` 判定 caller token / legacy 站点级
+        token；命中 caller token 时把 `caller_id` / `owner_id` 记到 `self._caller`，
+        供 `/context/assemble` 推导 persona 区（legacy 与 dev 放行时 owner 为 None）。
+        401 的错误码保持不变：缺头 `auth.missing`，其余 `auth.invalid_token`。
+        """
+        authenticator: CallerAuthenticator = self.server.authenticator  # type: ignore[attr-defined]
+        outcome, identity = authenticator.authenticate(self.headers.get("Authorization"))
+        if outcome == AUTH_PASS_THROUGH:
             return True
-        header = self.headers.get("Authorization", "")
-        if not header.startswith("Bearer "):
-            self._send_problem(
-                401, "auth.missing", "Authorization header required"
-            )
+        self._caller = identity
+        if outcome == AUTH_OK:
+            return True
+        if outcome == AUTH_MISSING:
+            self._send_problem(401, "auth.missing", "Authorization header required")
             return False
-        token = header.removeprefix("Bearer ").strip()
-        # 常数时间比较，避免按字节短路泄漏 token 前缀。
-        if not hmac.compare_digest(token.encode("utf-8"), cfg.auth_token.encode("utf-8")):
-            self._send_problem(401, "auth.invalid_token", "Invalid bearer token")
-            return False
-        return True
+        # AUTH_INVALID：错 token，或 legacy 关闭且无 caller token 命中。
+        self._send_problem(401, "auth.invalid_token", "Invalid bearer token")
+        return False
+
+    def _caller_identity(self) -> CallerIdentity:
+        """当前请求的调用方身份；未经鉴权（如 /health）时为空身份。"""
+        identity = getattr(self, "_caller", None)
+        return identity if identity is not None else CallerIdentity()
 
     # ---------------------------------------------------------------- GET
     def do_GET(self) -> None:
@@ -447,7 +466,11 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         assert body is not None
         try:
             idempotency_key = self._idempotency_key()
-            result = svc.assemble_context(body)
+            # #124 §1.2.2：owner 由鉴权后的调用方身份推出（legacy / dev 放行时为 None
+            # → persona 区 fail-closed 为空，状态码仍 200）。
+            result = svc.assemble_context(
+                body, owner_id=self._caller_identity().owner_id
+            )
         except ValidationError as exc:
             errors = None
             if exc.field:
@@ -689,6 +712,8 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         self.config = config
         self.service = service
         self.transport = transport
+        self.authenticator = CallerAuthenticator(config)
+        log_startup_warnings(config)
         super().__init__((config.host, config.port), GatewayHandler)
 
 
