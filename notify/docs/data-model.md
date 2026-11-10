@@ -204,7 +204,7 @@ GET /audit/{audit_id} → AuditRecord（append-only 审计）
 
 通知列表与详情复用 `Card` 与 `GET /cards`（基路径 `/v1`，含 `updated_since`），
 **不**另建通知对象或通知列表接口。未读与折叠可由既有 wire 语义推出；分类、
-排序与偏好默认由所有者于 2026-11-10 拍板（[contract-gaps.md](contract-gaps.md)
+排序与偏好的默认值由所有者于 2026-11-10 拍板（[contract-gaps.md](contract-gaps.md)
 B2）。下列均为客户端展示约定，不新增 wire 字段；`GET /cards` 仍只规定过滤、
 不规定服务端排序。
 

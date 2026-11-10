@@ -95,7 +95,7 @@
 - **谁依赖**：C 线通知列表与推送打开；A/B 线动态评论写入；D 线通知生产者约定。
 - **已定方案**：评论在对接收者**可见之后**才建卡（遵守动态可见性，不可见者不通知）；`type=notification`；`capability_id` 用已有 `notify.inbox`（不必先新增 `notify.moments`）；关联放在已有 `context.metadata`（如 `moment_id` / `comment_id`）与 `context.deep_link`，不新增通知对象或关联字段；推送打开走该 deep link，由 C 线映射到动态详情。若社交域希望能力归 moments 模块，再单开 minor 增加能力 ID。
 - **落笔**：`notify/docs/data-model.md` §2.8。
-- **出处**：`docs/design/README.md` 待定 14、流程一；`docs/design/05-notifications-cards.html`；`notify/docs/data-model.md` §4。
+- **出处**：`docs/design/README.md` 待定 14、流程一；`docs/design/05-notifications-cards.html`；落笔见 `notify/docs/data-model.md` §2.8（capability 约定见 §4）。
 
 ### B2. 通知分类、排序与偏好的产品形态
 
