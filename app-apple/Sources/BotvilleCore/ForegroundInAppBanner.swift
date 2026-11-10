@@ -144,19 +144,25 @@ public enum ForegroundBannerVisibility {
     }
 }
 
-/// A background edge is consumed only after the previous sync has stopped.
+/// A background edge never invalidates the online baseline. Foreground messages
+/// remain eligible even if a network-driven replacement sync is still draining.
 struct ForegroundBannerResumeState {
-    private var needsCatchUp = false
     private var isActive = true
+    var isForeground: Bool { isActive }
     mutating func enteredBackground() {
-        needsCatchUp = true
         isActive = false
     }
-    mutating func becameActive() { isActive = true }
-    mutating func syncWillStart() -> Bool {
-        guard isActive else { return false }
-        defer { needsCatchUp = false }
-        return needsCatchUp
+    @discardableResult
+    mutating func becameActive() -> Bool {
+        let wasBackground = !isActive
+        isActive = true
+        return wasBackground
+    }
+    func shouldPresent(_ candidate: ForegroundBannerCandidate,
+                       suppressedEvents: [PushEventReference]) -> Bool {
+        isActive && !suppressedEvents.contains {
+            $0.roomID == candidate.roomID && $0.eventID == candidate.eventID
+        }
     }
 }
 

@@ -9,11 +9,18 @@ struct RoomView: View {
     @ObservedObject var service: MatrixService
     let room: MatrixRoom
     @Binding var isInputActive: Bool
+    let isVisible: Bool
 
     @State private var draft = ""
     @FocusState private var isInputFocused: Bool
     @State private var isSending = false
     @State private var isOpening = false
+    // TabView can keep this detail view alive while it is off-screen. Keep the
+    // open operation tied to every appearance instead of relying on `.task(id:)`
+    // being recreated when the user returns to the chat tab.
+    @State private var roomOpenTask: Task<Void, Never>?
+    @State private var roomOpenGeneration = UUID()
+    @State private var roomTimelineLease: RoomTimelineLease?
     @State private var isLoadingOlderMessages = false
     @State private var errorMessage: String?
     @State private var isRefreshingSecurity = false
@@ -89,7 +96,7 @@ struct RoomView: View {
                         .foregroundStyle(.red)
                     Spacer()
                     Button("重试") {
-                        Task { await openRoom() }
+                        openRoomForCurrentAppearance()
                     }
                     .font(.footnote)
                     .disabled(isOpening)
@@ -139,17 +146,17 @@ struct RoomView: View {
                 }
             }
         }
-        .task(id: room.id) {
-            async let open: Void = openRoom()
-            async let security: Void = refreshSecurity()
-            _ = await (open, security)
-        }
+        .task(id: room.id) { await refreshSecurity() }
         .onDisappear {
-            isInputActive = false
-            service.closeRoom(room.id)
+            releaseRoomForCurrentAppearance()
         }
         .onAppear {
             updateInputActivity()
+            if isVisible { openRoomForCurrentAppearance() }
+        }
+        .onChange(of: isVisible) { _, visible in
+            if visible { openRoomForCurrentAppearance() }
+            else { releaseRoomForCurrentAppearance() }
         }
         .onChange(of: isInputFocused) { _, _ in updateInputActivity() }
         .onChange(of: draft) { _, _ in updateInputActivity() }
@@ -260,7 +267,8 @@ struct RoomView: View {
     }
 
     private func updateInputActivity() {
-        isInputActive = isInputFocused || !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        isInputActive = isVisible
+            && (isInputFocused || !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 
     private func loadOlderMessages() async {
@@ -275,18 +283,47 @@ struct RoomView: View {
         }
     }
 
-    private func openRoom() async {
+    private func openRoom(lease: RoomTimelineLease) async {
+        guard !Task.isCancelled else { return }
         isOpening = true
         errorMessage = nil
-        defer { isOpening = false }
+        defer {
+            if roomTimelineLease == lease { isOpening = false }
+        }
 
         do {
-            try await service.openRoom(room.id)
+            _ = try await service.openRoom(room.id, lease: lease)
+            guard roomTimelineLease == lease, !Task.isCancelled else { return }
             await loadOlderMessages()
         } catch is CancellationError {
             return
         } catch {
-            errorMessage = error.localizedDescription
+            if roomTimelineLease == lease { errorMessage = error.localizedDescription }
+        }
+    }
+
+    private func openRoomForCurrentAppearance() {
+        guard isVisible else { return }
+        roomOpenTask?.cancel()
+        let generation = UUID()
+        roomOpenGeneration = generation
+        let lease = service.beginRoomOpen(room.id)
+        roomTimelineLease = lease
+        roomOpenTask = Task {
+            await openRoom(lease: lease)
+            guard roomOpenGeneration == generation else { return }
+            roomOpenTask = nil
+        }
+    }
+
+    private func releaseRoomForCurrentAppearance() {
+        isInputActive = false
+        roomOpenGeneration = UUID()
+        roomOpenTask?.cancel()
+        roomOpenTask = nil
+        if let roomTimelineLease {
+            service.closeRoom(room.id, lease: roomTimelineLease)
+            self.roomTimelineLease = nil
         }
     }
 

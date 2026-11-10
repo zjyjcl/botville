@@ -231,12 +231,12 @@ final class ForegroundInAppBannerTests: XCTestCase {
         var resume = ForegroundBannerResumeState()
         var detector = ForegroundBannerDetector()
         _ = detector.candidates(in: [snapshot()], isOnlineSync: true)
-        if resume.syncWillStart() { detector.beginCatchUp() }
+        XCTAssertFalse(resume.becameActive())
         let live = candidate(eventID: "$live", date: date.addingTimeInterval(1))
         XCTAssertEqual(detector.candidates(in: [snapshot(candidate: live)], isOnlineSync: true), [live])
     }
 
-    func testBackgroundRearmsOnlyAtReplacementSyncStart() {
+    func testBackgroundResumePreservesBaselineAndSuppressesOnlyDeliveredEvents() {
         var resume = ForegroundBannerResumeState()
         var detector = ForegroundBannerDetector()
         _ = detector.candidates(in: [snapshot()], isOnlineSync: true)
@@ -244,16 +244,15 @@ final class ForegroundInAppBannerTests: XCTestCase {
         // Merely marking background must not reset the detector while old sync drains.
         let first = candidate(eventID: "$first", date: date.addingTimeInterval(1))
         XCTAssertEqual(detector.candidates(in: [snapshot(candidate: first)], isOnlineSync: true), [first])
-        // A network restart while still backgrounded must not consume the edge.
-        XCTAssertFalse(resume.syncWillStart())
-        resume.becameActive()
-        XCTAssertTrue(resume.syncWillStart())
-        detector.beginCatchUp()
+        XCTAssertFalse(resume.shouldPresent(first, suppressedEvents: []))
+        XCTAssertTrue(resume.becameActive())
         let background = candidate(eventID: "$background", date: date.addingTimeInterval(2))
-        XCTAssertTrue(detector.candidates(in: [snapshot(candidate: background)], isOnlineSync: true).isEmpty)
-        XCTAssertFalse(resume.syncWillStart())
+        let delivered = [PushEventReference(roomID: background.roomID, eventID: "$background")]
+        XCTAssertFalse(resume.shouldPresent(background, suppressedEvents: delivered))
+        XCTAssertFalse(resume.becameActive())
         let live = candidate(eventID: "$live", date: date.addingTimeInterval(3))
         XCTAssertEqual(detector.candidates(in: [snapshot(candidate: live)], isOnlineSync: true), [live])
+        XCTAssertTrue(resume.shouldPresent(live, suppressedEvents: delivered))
     }
 
     func testRejectedSyncCannotPublishOrEstablishOrAdvanceBaseline() {
