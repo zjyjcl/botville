@@ -350,6 +350,27 @@ final class TimelinePrependAnchorTests: XCTestCase {
         XCTAssertNil(state.operation)
     }
 
+    func testCompletionExactlyAtLoadingDeadlineCannotRevive() {
+        var state = TimelinePrependAnchor()
+        state.begin(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
+        state.finished(operation: operation, now: 15)
+        XCTAssertNil(state.operation)
+        XCTAssertNil(state.deadline)
+        XCTAssertNil(layout(&state, ids, [frame("a", 900)]))
+    }
+
+    func testMaterializationAfterLocateBudgetCanStillRestoreWithinWindow() {
+        var state = TimelinePrependAnchor()
+        state.begin(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
+        state.finished(operation: operation, now: 11)
+        for _ in 0..<20 { _ = layout(&state, ids, []) }
+        state.expire(now: 12.9)
+        XCTAssertEqual(layout(&state, ids, [frame("a", 900)]), .restore(id: "a", offset: 60))
+        XCTAssertNil(layout(&state, ids, [frame()]))
+        XCTAssertFalse(state.blocksFollowing)
+        XCTAssertEqual(state.deadline, 13)
+    }
+
     func testCompletionAfterLoadingDeadlineCannotReviveEvenWithoutDriverTick() {
         var state = TimelinePrependAnchor()
         state.begin(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)

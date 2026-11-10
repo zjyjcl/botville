@@ -12,6 +12,7 @@ public struct TimelineBottomSettlement: Sendable {
     public static let stabilityWindow: TimeInterval = 0.35
     public private(set) var decision: TimelineScrollDecision?
     public private(set) var deadline: TimeInterval?
+    // Diagnostic count only; elapsed time, not this count, bounds recovery.
     public private(set) var corrections = 0
     public private(set) var isConfirmed = false
     private var nextCorrection: TimeInterval = 0
