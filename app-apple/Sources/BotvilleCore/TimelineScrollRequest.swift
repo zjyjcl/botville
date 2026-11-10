@@ -47,13 +47,38 @@ public struct TimelineScrollDecision: Equatable, Sendable {
     public var animated: Bool { reason != .appearance }
 }
 
-/// Owns decisions, not SwiftUI positions. Prepend leaves the top visible ID binding
-/// alone; scrollPosition(id:) keeps that item visible as the data changes.
+/// Owns follow decisions and prepend restoration arbitration; the view only
+/// measures frames and executes the resulting scroll actions.
 public struct TimelineScrollState: Sendable {
     public enum Change: Equatable, Sendable { case unchanged, prepend, append, replacement }
 
     public private(set) var pending: TimelineScrollDecision?
     public private(set) var isNearBottom = false
+    public private(set) var prependAnchor = TimelinePrependAnchor()
+    public var followDecision: TimelineScrollDecision? {
+        prependAnchor.blocksFollowing ? nil : pending
+    }
+
+    public mutating func beginPrepend(operation: UUID, input: TimelineScrollInput,
+                                      frames: [TimelineMessageFrame], viewportHeight: Double) {
+        update(input)
+        prependAnchor.begin(operation: operation, input: input, frames: frames, viewportHeight: viewportHeight)
+    }
+
+    public mutating func finishPrepend(operation: UUID) {
+        prependAnchor.finished(operation: operation)
+    }
+
+    public mutating func restorePrepend(for input: TimelineScrollInput, generation: UInt,
+                                        frames: [TimelineMessageFrame]) -> TimelinePrependAnchor.Action? {
+        prependAnchor.layout(input: input, generation: generation, frames: frames)
+    }
+
+    public mutating func didExecutePrepend(generation: UInt) {
+        prependAnchor.didExecute(generation: generation)
+    }
+
+    public mutating func cancelPrepend() { prependAnchor.cancel() }
     private var input: TimelineScrollInput?
     private var scrolledAppearanceID: UUID?
 
@@ -68,9 +93,12 @@ public struct TimelineScrollState: Sendable {
         return .replacement
     }
 
+    public func hasInput(_ expected: TimelineScrollInput) -> Bool { input == expected }
+
     public mutating func update(_ next: TimelineScrollInput) {
         let previous = input
         input = next
+        prependAnchor.update(next)
         guard let request = next.request else {
             pending = nil
             return
@@ -81,9 +109,8 @@ public struct TimelineScrollState: Sendable {
         }
         let change = Self.change(from: previous?.messageIDs ?? [], to: next.messageIDs)
         guard change == .append else {
-            // A prepend must not replay a pending bottom scroll; the bound visible
-            // ID preserves the reader's position without an animated restoration.
-            if change != .unchanged { pending = nil }
+            // Keep an append follow deferred until active restoration completes.
+            if change != .unchanged && !prependAnchor.blocksFollowing { pending = nil }
             return
         }
         if next.latestMessageIsOwn {
@@ -99,19 +126,21 @@ public struct TimelineScrollState: Sendable {
     /// post-append layout must not overwrite proximity BEFORE its append decision.
     public mutating func recordGeometry(for measuredInput: TimelineScrollInput,
                                         distanceFromBottom: Double, viewportHeight: Double) {
-        guard measuredInput == input, pending == nil else { return }
+        guard measuredInput == input, pending == nil, !prependAnchor.blocksFollowing else { return }
         isNearBottom = TimelineBottomProximity.isNearBottom(
             distanceFromBottom: distanceFromBottom, viewportHeight: viewportHeight)
     }
 
     public mutating func didScroll(_ decision: TimelineScrollDecision) {
-        guard pending == decision else { return }
+        guard pending == decision, !prependAnchor.blocksFollowing else { return }
+        prependAnchor.cancel()
         scrolledAppearanceID = decision.request.appearanceID
         isNearBottom = true
         pending = nil
     }
 
     public mutating func userBeganDragging() {
+        prependAnchor.cancel()
         // A gesture wins over a queued animated follow. Opening still lands at latest.
         if pending?.animated == true { pending = nil }
         isNearBottom = false
