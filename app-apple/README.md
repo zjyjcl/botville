@@ -36,7 +36,7 @@ xcodebuild -project Botville.xcodeproj \
   -sdk iphonesimulator CODE_SIGN_IDENTITY="-" build
 ```
 
-也可用 Xcode 打开 `Botville.xcodeproj`，选择 `BotvilleApp-iOS` 和一个已安装的 iPhone 模拟器，点击 Run。App target 的 Debug 与 Release 都使用 Automatic signing，开发团队由部署者/开发者在本地 Xcode 的 Signing & Capabilities 中选择（`<YOUR_TEAM_ID>`），App 与扩展应选择同一团队。本仓库目前没有本地 xcconfig 接入机制；不要提交本地团队选择产生的工程差异。两种配置均以 `CODE_SIGN_IDENTITY[sdk=iphonesimulator*]="-"` 保留模拟器默认 ad-hoc 签名；命令行仍可用 `CODE_SIGN_IDENTITY="-"` 覆盖。不要传 `CODE_SIGNING_ALLOWED=NO`：这会丢失 Keychain 所需的应用标识 entitlement，导致新安装后 `SecItemCopyMatching` 返回 `errSecMissingEntitlement (-34018)`。Debug 才挂 development 推送 entitlement；仓库没有加入证书、描述文件或 provisioning profile。
+也可用 Xcode 打开 `Botville.xcodeproj`，选择 `BotvilleApp-iOS` 和一个已安装的 iPhone 模拟器，点击 Run。App target 的 Debug 与 Release 都使用 Automatic signing，开发团队由部署者/开发者在本地 Xcode 的 Signing & Capabilities 中选择（`<YOUR_TEAM_ID>`），App 与扩展应选择同一团队。已提交的工程文件仍带有开发团队值，克隆后需在本地 Xcode 中改成自己的团队，不要提交这类改动。本仓库目前没有本地 xcconfig 接入机制；不要提交本地团队选择产生的工程差异。两种配置均以 `CODE_SIGN_IDENTITY[sdk=iphonesimulator*]="-"` 保留模拟器默认 ad-hoc 签名；命令行仍可用 `CODE_SIGN_IDENTITY="-"` 覆盖。不要传 `CODE_SIGNING_ALLOWED=NO`：这会丢失 Keychain 所需的应用标识 entitlement，导致新安装后 `SecItemCopyMatching` 返回 `errSecMissingEntitlement (-34018)`。Debug 才挂 development 推送 entitlement；仓库没有加入证书、描述文件或 provisioning profile。
 
 Keychain 诊断只记录 Security 操作名和数值 OSStatus，不记录查询、账号、令牌、密码或会话数据。用目标模拟器的 UDID 替换下方 `<UDID>`：
 
