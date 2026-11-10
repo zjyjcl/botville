@@ -505,10 +505,10 @@ class GatewayService:
     ) -> Dict[str, Any]:
         """POST /context/assemble 实现（§7.2）。
 
-        owner_id 是调用方 persona 的所有者（用于 persona 区鉴权）；由 HTTP 层在
-        鉴权后注入。当前 HTTP 层只有站点级 bearer token、没有 per-caller 身份，因此
-        HTTP 路径不会注入 owner_id —— 即无法证明 owner，persona 区 fail-closed 为空。
-        测试或内部调用方需要 persona 区时，显式传 `owner_id=` 即可。
+        owner_id 是调用方 persona 的所有者（用于 persona 区鉴权）。HTTP 层在鉴权后
+        注入：caller token 命中时由 token 配置推出 owner_id；legacy 站点级 token
+        （或 dev 免鉴权）推不出 owner，传 None —— persona 区 fail-closed 为空，
+        状态码仍 200（§1.2.2 / §7.2）。测试或内部调用方也可显式传 `owner_id=`。
         """
         # ---- 1. 结构校验（400 request.invalid）----
         # additionalProperties: false（ContextAssembleRequest）

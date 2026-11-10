@@ -134,7 +134,7 @@ App                          网关                        模块网页（WKWebV
 `sender_persona_id` 发言，没有 per-caller 身份，也没有所有权边界。本节定义可选的
 **调用方身份**（caller identity）层，让网关能区分「哪个调用方在以哪个 owner 的 persona
 发言」，用于 `/context/assemble` 的 persona 区鉴权与后续 per-caller 审计。**本节只定义
-契约；实现见 PR-D。**
+契约；实现已随 PR-D 落地。**
 
 **配置（环境变量，均为占位符，不得写入真实密钥）**：
 
@@ -153,8 +153,8 @@ App                          网关                        模块网页（WKWebV
 - **`GATEWAY_LEGACY_TOKEN_ENABLED` 默认 `true`**：兼容现有部署。**文档建议**：一旦配置了
   `GATEWAY_CALLER_TOKENS`，把 `GATEWAY_LEGACY_TOKEN_ENABLED` 改为 `false`，避免站点级
   token 绕过 per-caller 所有权。**配置了 `GATEWAY_CALLER_TOKENS` 而 `GATEWAY_LEGACY_TOKEN_ENABLED`
-  仍为 `true` 时，启动打一条 WARNING**（提示旧 token 仍可绕过 per-caller 边界）；该 WARNING 的
-  实现留给后续 PR，契约先行声明。
+  仍为 `true` 时，启动打一条 WARNING**（提示旧 token 仍可绕过 per-caller 边界）；该 WARNING
+  已在本实现落地（`caller_identity.log_startup_warnings`，随 PR-D）。
 - **caller token 与 legacy token 冲突**：某个 caller token **等于** `GATEWAY_AUTH_TOKEN`
   → **拒绝启动**（否则无法判定该请求的身份边界；两套语义不可重载同一值）。
 - **legacy 关闭且 caller token 为空**：`GATEWAY_LEGACY_TOKEN_ENABLED=false` 而
@@ -916,6 +916,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.1.0 | 2026-11-10 | [#124 PR-D] 实现调用方身份：GATEWAY_CALLER_TOKENS、HMAC 等长比较、legacy 开关与启动告警；persona 区 owner 由 token 推出，推不出则区为空且状态码仍 200；不改字段集合、状态码与错误码。 |
 | 0.1.0 | 2026-11-10 | [B 线缺口 A1–A6，**纯文档对齐，不改字段与状态码**] 只同步已合入结论与仓库现状，不含产品或 schema 变更。**(1) A1 鉴权措辞同步 #125**：§0「不归本契约管」与 §1.2 去除「占位」说法，明确 `bearerAuth` 仍是站点级不透明 bearer（`GATEWAY_AUTH_TOKEN`）、调用方身份已在 §1.2.2 定义、面向终端用户的签发/轮换/OAuth 式 scope 管理仍不在 v1；§8.3.1 改为指向 §1.2.2 与 #124，删去「需在 B1.1 前后补」。**(2) A2 补动态总览**：§2 表补 `GET/POST /moments`、`GET/PATCH/DELETE /moments/{moment_id}`、评论与点赞路径（主要使用方 App / A2.2，指向 `moments.md`）；「附：文件清单」按仓库现状补 `docs/moments.md`、`context-assemble-*`、`moment*`/`comment-page`/`usage-event` 等示例与 `migrations/moments`、`coverage_check.py`。**(3) A3 里程碑笔误**：§6.1 `proactive.per_day` 的执行里程碑由 B2.2 更正为 B2.5（主动发言调度），并补「小镇预算执行留待 B4.2」。**(4) A4 会话登记口径**：新增 §2.2，写明网关只登记至少含一个 persona 的会话（与 `persona_ids` `minItems: 1` 一致），纯人类 Matrix 房间不走 `/v1/conversations`、由 App 直接对 Matrix 展示；`minItems` 不变。**(5) A5 关系快照**：新增 §2.3，写明 `Conversation.relation` 是该会话上的关系快照、Persona 资源没有也不应有 `relation` 字段，跨会话汇总仍待拍板（B2.8 / 清单 B6）。**(6) A6 内部评论边界**：新增 §2.0 交叉引用 `moments.md` §3——公开评论/点赞路径行为者恒为 human、不接受 `author_persona_id`，AI 评论/点赞只经 appservice 内部调用写入，不新造任何路径。**(7) B 类保持未决**：§8.3 第 2–5 条补「待棉棉霸拍板」与清单编号 B1–B4 及 issue #21 #24 #22，删除「待 M2 评估」等会被读成已定的表述；B5–B12 不写入契约正文。**(8)** OpenAPI 仅给 `CreateConversationRequest.persona_ids` 补一句 description 说明同一口径，未改 `minItems` 或任何约束。 |
 | 0.1.0 | 2026-11-05 | [#124 契约 r3] 修 r2 审查 B1 与 nit。**(1) B1**：删除 OpenAPI `POST /context/assemble` 的 path 级 `403`（描述「身份有效但无权限（如 persona 不属于调用方）」）——该接口只返回 `200` / `400` / `401` / `422`，persona 归属只体现为 persona 区为空，与 `http_server.py` 及 #123 信任隔离测试一致。**(2) 措辞收敛**：§1.2.2 与 OpenAPI bearerAuth 描述的「`/context/assemble` 一律 `200`」改为「persona 归属不改变状态码（`200`）」，并注明请求本身非法仍按 `400` / `401` / `422` 返回。**(3) nit**：§6.3 「事故排序」→「出窗排序」；预留离场路径由两条补为三条（提交 `sent` / TTL 回收 / 投递失败回滚 `_rollback` → `release`）；`notify` 段改写为「`notify` 目前等价 `stop`，故平台为 `stop` 时 owner / peer 设 `notify` 不报 `422`」；在 N8 处定义 `ceil_to_second` = 按整秒向上取整（非截断）；预留 TTL 出处改为「#114 PR-b（#126）实现、PR-C 消费」。 |
 | 0.1.0 | 2026-11-05 | [#124 契约 r2] §1.2.2 修 B1 矛盾：`/context/assemble` persona 归属不改变状态码（`200`），推不出 owner 或非 owner → persona 区为空（与 §7.2、#123 测试一致）；`403` 只用于 `/context/assemble` 以外的 persona 写操作，错误码统一为 `persona.not_owned`，删除 `auth.insufficient_scope`。补 nit5：多条用分号 `;` 或换行分隔（两种等价），`caller_id` / `token` / `owner_id` 不得含 `:` `;` 换行，缺/空字段拒绝启动，caller token 等于 legacy token 时拒绝启动，legacy 关闭且无 caller token 时所有请求 `401`（启动 WARNING）。补 nit6：v1 只约束 `/context/assemble` 的 persona 区，发送路径 `sender_persona_id` 所有权校验不在本期。`.env.example` 同步分隔符说明。OpenAPI bearerAuth 描述同步。 |

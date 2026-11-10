@@ -9,13 +9,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import secrets as _secrets
 import sys
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Mapping, Optional
+from typing import Mapping, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 GATEWAY_VERSION = "0.1.0"
@@ -87,6 +88,17 @@ DEFAULT_USAGE_RETENTION_SECONDS = 2_592_000
 DEFAULT_MAX_IDEMPOTENCY_ENTRIES = 2_000
 DEFAULT_IDEMPOTENCY_TTL = 86_400
 DEFAULT_MAX_QUEUE_ENTRIES = 1_000
+
+
+# 调用方身份（#124 / 契约 §1.2.2）。
+# caller token 的最低强度：32 字节随机值。
+CALLER_TOKEN_MIN_BYTES = 32
+# caller token 条目里的字段分隔符与条目分隔符（条目分隔符 `;` 或换行等价，可混用）。
+_CALLER_ENTRY_SEP = ";"
+_CALLER_FIELD_SEP = ":"
+# §1.2.2：字段值不得含 `:`（字段分隔符）、`;`（条目分隔符）或换行；缺字段、空字段、
+# 字段数不为 3 → 拒绝启动（dev 也拒绝）。
+_CALLER_FIELD_FORBIDDEN_RE = re.compile(r"[:;\r\n]")
 
 
 class ConfigError(ValueError):
@@ -228,6 +240,64 @@ def parse_hhmm(value: str) -> int:
 
 
 @dataclass(frozen=True)
+class CallerToken:
+    """一条 per-caller 凭据（`GATEWAY_CALLER_TOKENS` 的一项，#124 §1.2.2）。
+
+    - `caller_id`：日志标识（不可逆），日志里只出现它；
+    - `token`：≥32 字节随机值，**不进 repr**（日志/断言消息不泄露）；
+    - `owner_id`：该调用方拥有的 persona 集合的所有者 ID，用于
+      `/context/assemble` 的 persona 区鉴权。
+    """
+
+    caller_id: str
+    token: str = field(repr=False)
+    owner_id: str
+
+
+def parse_caller_tokens(raw: str) -> Tuple[CallerToken, ...]:
+    """解析 `GATEWAY_CALLER_TOKENS`（#124 §1.2.2）。
+
+    条目用 `;` **或换行**分隔（两种等价，可混用）；空条目/纯空白条目忽略。
+    每条按 `:` 切分必须**恰好 3 段**，各段 trim 后非空，且任何字段都不得含
+    `:` / `;` / 换行；否则抛 `ConfigError`（**dev 模式也拒绝启动**——这是结构性
+    错误，不是强度问题）。错误信息不含 token 值。
+    """
+    entries: Tuple[CallerToken, ...] = ()
+    parsed = []
+    # 先按 `;` 与换行统一切分（二者等价）。
+    for chunk in re.split(r"[;\r\n]", raw):
+        entry = chunk.strip()
+        if not entry:
+            continue
+        parts = entry.split(_CALLER_FIELD_SEP)
+        if len(parts) != 3:
+            raise ConfigError(
+                "GATEWAY_CALLER_TOKENS entry must have exactly 3 ':'-separated fields "
+                f"(caller_id:token:owner_id), got {len(parts)} field(s)"
+            )
+        caller_id, token, owner_id = (part.strip() for part in parts)
+        for name, value in (
+            ("caller_id", caller_id),
+            ("token", token),
+            ("owner_id", owner_id),
+        ):
+            if not value:
+                raise ConfigError(
+                    f"GATEWAY_CALLER_TOKENS entry has an empty '{name}' field "
+                    "(all of caller_id:token:owner_id are required)"
+                )
+            # trim 之后仍含分隔符 = 字段里藏了分隔符（如 token 内含 ':'），拒绝。
+            if _CALLER_FIELD_FORBIDDEN_RE.search(value):
+                raise ConfigError(
+                    f"GATEWAY_CALLER_TOKENS field '{name}' must not contain ':', ';' "
+                    "or a newline (they separate entries/fields)"
+                )
+        parsed.append(CallerToken(caller_id=caller_id, token=token, owner_id=owner_id))
+    entries = tuple(parsed)
+    return entries
+
+
+@dataclass(frozen=True)
 class Config:
     """网关运行配置（不可变，便于测试构造）。"""
 
@@ -272,6 +342,10 @@ class Config:
     max_idempotency_entries: int = DEFAULT_MAX_IDEMPOTENCY_ENTRIES
     idempotency_ttl_seconds: int = DEFAULT_IDEMPOTENCY_TTL
     max_queue_entries: int = DEFAULT_MAX_QUEUE_ENTRIES
+    # #124 调用方身份（契约 §1.2.2）。token 值不进 repr（日志不泄露）。
+    caller_tokens: Tuple[CallerToken, ...] = field(default=(), repr=False)
+    # 是否仍接受站点级 GATEWAY_AUTH_TOKEN；关闭后只有 caller token 可用。
+    legacy_token_enabled: bool = True
 
     def __post_init__(self) -> None:
         # 构造时校验，避免明显错误的配置拖到第一次请求才炸。
@@ -304,6 +378,9 @@ class Config:
             raise ConfigError("idempotency_ttl_seconds must be >= 0")
         if self.max_queue_entries < 1:
             raise ConfigError("max_queue_entries must be >= 1")
+        # #124 调用方身份（契约 §1.2.2）。校验放在这里（而非只在 load_config），
+        # 保证直接构造 Config 的调用方（测试/嵌入）也走同一套规则。
+        self._validate_caller_tokens()
         try:
             ZoneInfo(self.silent_hours_timezone)
         except (ZoneInfoNotFoundError, ValueError) as exc:
@@ -311,14 +388,19 @@ class Config:
                 f"unknown timezone {self.silent_hours_timezone!r} "
                 "(install tzdata on platforms without a system tz database)"
             ) from exc
-        # B7/建议7: 默认/空/<change-me> token 必须拒绝启动，除非显式 dev 模式
-        if self.auth_token is None or self.auth_token in _INSECURE_TOKENS:
-            if not self.dev_mode:
-                raise ConfigError(
-                    "GATEWAY_AUTH_TOKEN is unset or uses the default placeholder '<change-me>'. "
-                    "Set a strong random token, or set GATEWAY_DEV_MODE=true to run without auth "
-                    "(dev mode only; prints a WARNING on startup)."
-                )
+        # B7/建议7: 默认/空/<change-me> token 必须拒绝启动，除非显式 dev 模式。
+        # #124 §1.2.2：legacy 关闭时不要求 GATEWAY_AUTH_TOKEN（凭据只由 caller token
+        # 提供）；此时「没有任何可用凭据」只是 401 + 启动 WARNING，不拒绝启动。
+        if self.legacy_token_enabled:
+            if self.auth_token is None or self.auth_token in _INSECURE_TOKENS:
+                if not self.dev_mode:
+                    raise ConfigError(
+                        "GATEWAY_AUTH_TOKEN is unset or uses the default placeholder '<change-me>'. "
+                        "Set a strong random token, or set GATEWAY_DEV_MODE=true to run without auth "
+                        "(dev mode only; prints a WARNING on startup). Alternatively configure "
+                        "per-caller credentials in GATEWAY_CALLER_TOKENS and set "
+                        "GATEWAY_LEGACY_TOKEN_ENABLED=false."
+                    )
         # #92: dev 模式只允许绑定 loopback；绑定非 loopback 时拒绝启动（ConfigError）。
         if self.dev_mode and self.host not in LOOPBACK_HOSTS:
             raise ConfigError(
@@ -450,10 +532,100 @@ class Config:
                 f"{self.room_alias_cache_ttl_seconds}"
             )
 
+    def _validate_caller_tokens(self) -> None:
+        """#124 / 契约 §1.2.2：caller token 表的结构与强度校验。
+
+        分两类：
+
+        - **任何模式都拒绝启动**（结构性/语义冲突，dev 也不例外）：caller token 与
+          `GATEWAY_AUTH_TOKEN` 相同（两套语义不可重载同一值）、`caller_id` 重复。
+        - **非 dev 拒绝启动、dev 仅 WARNING**：token 短于 32 字节、token 重复
+          （强度问题，本地开发允许放宽）。
+
+        错误信息与日志**不含 token 值**（只出现 caller_id / 位置 / 长度）。
+        """
+        tokens = self.caller_tokens
+        seen_ids = set()
+        for index, entry in enumerate(tokens):
+            if entry.caller_id in seen_ids:
+                raise ConfigError(
+                    f"GATEWAY_CALLER_TOKENS has a duplicate caller_id "
+                    f"{entry.caller_id!r} (entries must be unique per caller)"
+                )
+            seen_ids.add(entry.caller_id)
+            if not entry.caller_id or not entry.token or not entry.owner_id:
+                raise ConfigError(
+                    "GATEWAY_CALLER_TOKENS entry must have non-empty "
+                    "caller_id / token / owner_id"
+                )
+            for name, value in (
+                ("caller_id", entry.caller_id),
+                ("token", entry.token),
+                ("owner_id", entry.owner_id),
+            ):
+                if _CALLER_FIELD_FORBIDDEN_RE.search(value):
+                    raise ConfigError(
+                        f"GATEWAY_CALLER_TOKENS field '{name}' (entry #{index + 1}) "
+                        "must not contain ':', ';' or a newline"
+                    )
+            if self.auth_token is not None and entry.token == self.auth_token:
+                # §1.2.2：同一值不能既是 caller token 又是站点级 token，
+                # 否则无法判定该请求的身份边界。dev 模式也拒绝。
+                raise ConfigError(
+                    f"GATEWAY_CALLER_TOKENS entry #{index + 1} ({entry.caller_id!r}) "
+                    "uses the same token value as GATEWAY_AUTH_TOKEN; the site-wide and "
+                    "per-caller credentials must be distinct. Issue the caller its own "
+                    "random token (>= 32 bytes)."
+                )
+
+        weak: list = []
+        dupes: list = []
+        seen_tokens = set()
+        for index, entry in enumerate(tokens):
+            if len(entry.token.encode("utf-8")) < CALLER_TOKEN_MIN_BYTES:
+                weak.append(index)
+            if entry.token in seen_tokens:
+                dupes.append(index)
+            seen_tokens.add(entry.token)
+
+        for problem_kind, problem in (("weak", weak), ("dupe", dupes)):
+            if not problem:
+                continue
+            if self.dev_mode:
+                # dev：仅警告，不拒绝（本地开发允许放宽强度）。
+                for index in problem:
+                    detail = (
+                        f"has a token shorter than {CALLER_TOKEN_MIN_BYTES} bytes"
+                        if problem_kind == "weak"
+                        else "reuses the token of an earlier entry"
+                    )
+                    logging.getLogger(__name__).warning(
+                        "GATEWAY_CALLER_TOKENS entry #%d (%s) %s — accepted only because "
+                        "GATEWAY_DEV_MODE=true; a production deployment would refuse to start",
+                        index + 1,
+                        tokens[index].caller_id,
+                        detail,
+                    )
+                continue
+            if problem_kind == "weak":
+                raise ConfigError(
+                    "GATEWAY_CALLER_TOKENS entry #"
+                    f"{problem[0] + 1} ({tokens[problem[0]].caller_id!r}) has a token "
+                    f"shorter than {CALLER_TOKEN_MIN_BYTES} bytes; use a random value of "
+                    "at least 32 bytes (python3 -c 'import secrets;"
+                    "print(secrets.token_urlsafe(32))'). Set GATEWAY_DEV_MODE=true only "
+                    "for local development."
+                )
+            raise ConfigError(
+                "GATEWAY_CALLER_TOKENS entry #"
+                f"{problem[0] + 1} ({tokens[problem[0]].caller_id!r}) reuses the token of "
+                "an earlier entry; every caller must have its own token. Set "
+                "GATEWAY_DEV_MODE=true only for local development."
+            )
+
     @property
     def silent_start_minute(self) -> int:
         return parse_hhmm(self.silent_hours_start)
-
     @property
     def silent_end_minute(self) -> int:
         return parse_hhmm(self.silent_hours_end)
@@ -560,4 +732,8 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         max_queue_entries=_env_int(
             source, "MAX_QUEUE_ENTRIES", DEFAULT_MAX_QUEUE_ENTRIES, minimum=1
         ),
+        # #124 §1.2.2：结构错误（字段数/空字段/含分隔符）在解析时就拒绝启动，
+        # dev 也拒绝；强度（短/重复）由 Config.__post_init__ 决定 dev 警告。
+        caller_tokens=parse_caller_tokens(_env_str(source, "GATEWAY_CALLER_TOKENS", "")),
+        legacy_token_enabled=_env_bool(source, "GATEWAY_LEGACY_TOKEN_ENABLED", True),
     )
