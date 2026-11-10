@@ -15,6 +15,7 @@ struct RoomView: View {
     @State private var scrollState = TimelineScrollState()
     @StateObject private var layoutVersion = TimelineLayoutVersion()
     @State private var timelineGeometry: TimelineGeometry?
+    @State private var anchorGeometryCache = TimelineAnchorGeometryCache()
     @State private var isDraggingTimeline = false
     @State private var draft = ""
     @FocusState private var isInputFocused: Bool
@@ -28,6 +29,7 @@ struct RoomView: View {
     @State private var completedRoomOpenGeneration: UUID?
     @State private var roomTimelineLease: RoomTimelineLease?
     @State private var olderMessagesOperation: UUID?
+    @State private var olderMessagesLayoutError: String?
     private var isLoadingOlderMessages: Bool { olderMessagesOperation != nil }
     @State private var errorMessage: String?
     @State private var isRefreshingSecurity = false
@@ -127,7 +129,7 @@ struct RoomView: View {
         .onChange(of: scrollInput, initial: true) { _, next in scrollState.update(next) }
         .onChange(of: TimelineLayoutSnapshot(input: scrollInput,
                      generation: scrollState.prependAnchor.layoutGeneration), initial: true) { _, snapshot in
-            layoutVersion.snapshot = snapshot
+            layoutVersion.update(snapshot)
         }
         .navigationTitle(room.name)
         .toolbar {
@@ -225,6 +227,9 @@ struct RoomView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
+                        if let olderMessagesLayoutError {
+                            Text(olderMessagesLayoutError).font(.footnote).foregroundStyle(.secondary)
+                        }
                         if service.canLoadOlderMessages {
                             olderMessagesButton
                         }
@@ -265,42 +270,65 @@ struct RoomView: View {
                 .onPreferenceChange(TimelineGeometryKey.self) { geometry in
                     guard let geometry, geometry.input == scrollInput else { return }
                     timelineGeometry = geometry
+                    anchorGeometryCache.record(input: geometry.input, frames: geometry.frames,
+                                               viewportHeight: geometry.viewportHeight ?? 0)
+                    recordTimelineGeometry()
                 }
-                .task(id: timelineGeometry) {
-                    // Act after the matched layout, outside preference reduction.
-                    // New data/appearance cancels this task and invalidates its sample.
-                    guard let geometry = timelineGeometry else { return }
-                    await Task.yield()
-                    guard !Task.isCancelled, geometry == timelineGeometry,
-                          geometry.input == scrollInput else { return }
-                    if !scrollState.hasInput(geometry.input) { scrollState.update(geometry.input) }
-                    if scrollState.prependAnchor.needsLayout,
-                       let height = geometry.viewportHeight, height.isFinite, height > 0,
-                       let action = scrollState.restorePrepend(for: geometry.input, generation: geometry.generation,
-                                                               frames: geometry.frames) {
-                        let generation = scrollState.prependAnchor.layoutGeneration
-                        var transaction = Transaction(animation: nil)
-                        transaction.disablesAnimations = true
-                        withTransaction(transaction) {
-                            switch action {
-                            case .locate(let id): proxy.scrollTo(id, anchor: .top)
-                            case .restore(let id, let offset):
-                                proxy.scrollTo(TimelinePrependPoint(messageID: id),
-                                               anchor: UnitPoint(x: 0.5, y: offset / height))
+                .task(id: scrollWork) {
+                    let work = scrollWork
+                    // One bounded driver per operation, not a task cancelled by
+                    // every geometry frame. It also expires when no frames arrive.
+                    for _ in 0..<65 {
+                        guard !Task.isCancelled, work == scrollWork, !isDraggingTimeline, isVisible else { return }
+                        let now = ProcessInfo.processInfo.systemUptime
+                        scrollState.expireScrollWork(now: now)
+                        guard scrollState.prependAnchor.operation != nil ||
+                                scrollState.bottomSettlement.decision != nil else {
+                            recordTimelineGeometry()
+                            return
+                        }
+                        if let geometry = timelineGeometry, geometry.input == scrollInput,
+                           geometry.generation == scrollState.prependAnchor.layoutGeneration,
+                           let height = geometry.viewportHeight, height.isFinite, height > 0 {
+                            if scrollState.prependAnchor.needsLayout,
+                               let action = scrollState.restorePrepend(for: geometry.input,
+                                   generation: geometry.generation, frames: geometry.frames) {
+                                let generation = scrollState.prependAnchor.layoutGeneration
+                                var transaction = Transaction(animation: nil)
+                                transaction.disablesAnimations = true
+                                withTransaction(transaction) {
+                                    switch action {
+                                    case .locate(let id): proxy.scrollTo(id, anchor: .top)
+                                    case .restore(let id, let offset):
+                                        proxy.scrollTo(TimelinePrependPoint(messageID: id),
+                                                       anchor: UnitPoint(x: 0.5, y: offset / height))
+                                    }
+                                }
+                                scrollState.didExecutePrepend(generation: generation)
+                            } else if let decision = scrollState.correctBottom(for: geometry.input,
+                                frames: geometry.frames, viewportHeight: height, now: now) {
+                                let duration = decision.animationDuration(reduceMotion: reduceMotion)
+                                withAnimation(duration.map { .easeOut(duration: $0) }) {
+                                    proxy.scrollTo(decision.request.latestMessageID, anchor: .bottom)
+                                }
                             }
                         }
-                        scrollState.didExecutePrepend(generation: generation)
+                        layoutVersion.update(.init(input: scrollInput,
+                                                   generation: scrollState.prependAnchor.layoutGeneration))
+                        recordTimelineGeometry()
+                        do { try await Task.sleep(for: .milliseconds(50)) }
+                        catch { return }
                     }
-                    layoutVersion.snapshot = .init(input: scrollInput,
-                                                   generation: scrollState.prependAnchor.layoutGeneration)
-                    recordTimelineGeometry()
+                    // Defensive iteration cap, independent of clock/geometry.
+                    if work == scrollWork { scrollState.expireScrollWork(now: .infinity) }
                 }
                 .task(id: scrollState.followDecision) {
                     guard let decision = scrollState.followDecision else { return }
                     await Task.yield()
                     guard !Task.isCancelled, scrollState.followDecision == decision,
                           latestScrollRequest == decision.request else { return }
-                    withAnimation(decision.animated && !reduceMotion ? .easeOut(duration: 0.2) : nil) {
+                    let duration = decision.animationDuration(reduceMotion: reduceMotion)
+                    withAnimation(duration.map { .easeOut(duration: $0) }) {
                         proxy.scrollTo(decision.request.latestMessageID, anchor: .bottom)
                     } completion: {
                         scrollState.didScroll(decision)
@@ -311,8 +339,12 @@ struct RoomView: View {
         }
     }
 
+    private var scrollWork: TimelineScrollWork {
+        .init(prepend: scrollState.prependAnchor.operation, bottom: scrollState.bottomSettlement.decision)
+    }
+
     private func recordTimelineGeometry() {
-        guard !isDraggingTimeline, let geometry = timelineGeometry,
+        guard !isDraggingTimeline, scrollState.bottomSettlement.decision == nil, let geometry = timelineGeometry,
               geometry.generation == scrollState.prependAnchor.layoutGeneration,
               let distance = geometry.distanceFromBottom, let height = geometry.viewportHeight else { return }
         scrollState.recordGeometry(for: geometry.input,
@@ -382,8 +414,17 @@ struct RoomView: View {
         let appearance = roomOpenGeneration
         let input = scrollInput
         let geometry = timelineGeometry.flatMap { $0.input == input ? $0 : nil }
+        let capture = anchorGeometryCache.capture(input: input, frames: geometry?.frames ?? [],
+                                                  viewportHeight: geometry?.viewportHeight ?? 0)
+        // No valid capture has ever arrived: keep the page intact and allow retry
+        // after layout, instead of performing an unanchored prepend.
+        guard input.request == nil || !capture.frames.isEmpty || scrollState.prependAnchor.blocksFollowing else {
+            olderMessagesLayoutError = "消息布局尚未就绪，请重试加载更早的消息。"
+            return
+        }
+        olderMessagesLayoutError = nil
         scrollState.beginPrepend(operation: operation, input: input,
-                                 frames: geometry?.frames ?? [], viewportHeight: geometry?.viewportHeight ?? 0)
+                                 frames: capture.frames, viewportHeight: capture.viewportHeight)
         olderMessagesOperation = operation
         defer {
             if olderMessagesOperation == operation, roomOpenGeneration == appearance {
@@ -430,7 +471,9 @@ struct RoomView: View {
         roomOpenGeneration = generation
         scrollState = TimelineScrollState()
         olderMessagesOperation = nil
+        olderMessagesLayoutError = nil
         timelineGeometry = nil
+        anchorGeometryCache = TimelineAnchorGeometryCache()
         isDraggingTimeline = false
         let lease = service.beginRoomOpen(room.id)
         roomTimelineLease = lease
@@ -443,9 +486,11 @@ struct RoomView: View {
 
     private func releaseRoomForCurrentAppearance() {
         isInputActive = false
-        scrollState.cancelPrepend()
+        scrollState.cancelScrollWork()
         olderMessagesOperation = nil
+        olderMessagesLayoutError = nil
         timelineGeometry = nil
+        anchorGeometryCache = TimelineAnchorGeometryCache()
         roomOpenGeneration = UUID()
         roomOpenTask?.cancel()
         roomOpenTask = nil
@@ -459,12 +504,12 @@ struct RoomView: View {
         Button {
             Task { await loadOlderMessages() }
         } label: {
-            if isLoadingOlderMessages {
-                ProgressView()
-                    .controlSize(.small)
-            } else {
-                Text("加载更早的消息")
-            }
+            Text("加载更早的消息")
+                .opacity(isLoadingOlderMessages ? 0 : 1)
+                .overlay {
+                    if isLoadingOlderMessages { ProgressView().controlSize(.small) }
+                }
+                .accessibilityLabel(isLoadingOlderMessages ? "正在加载更早的消息" : "加载更早的消息")
         }
         .disabled(isLoadingOlderMessages)
         .frame(maxWidth: .infinity)
@@ -474,9 +519,17 @@ struct RoomView: View {
 
 @MainActor
 private final class TimelineLayoutVersion: ObservableObject {
-    @Published var snapshot: TimelineLayoutSnapshot?
+    @Published private(set) var snapshot: TimelineLayoutSnapshot?
+    func update(_ next: TimelineLayoutSnapshot) {
+        if snapshot != next { snapshot = next }
+    }
     var generation: UInt { snapshot?.generation ?? 0 }
     var input: TimelineScrollInput? { snapshot?.input }
+}
+
+private struct TimelineScrollWork: Equatable {
+    let prepend: UUID?
+    let bottom: TimelineScrollDecision?
 }
 
 private struct TimelineLayoutSnapshot: Equatable {

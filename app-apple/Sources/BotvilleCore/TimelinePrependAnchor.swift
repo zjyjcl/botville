@@ -22,7 +22,8 @@ public struct TimelineMessageFrame: Equatable, Sendable {
 }
 
 /// Two-stage restoration: materialize the original row, then correct its measured
-/// offset. Each action requires a fresh layout acknowledgement, never a timer.
+/// offset. Each action requires a fresh layout acknowledgement. A monotonic
+/// deadline also releases follow arbitration if no usable geometry ever arrives.
 public struct TimelinePrependAnchor: Sendable {
     public enum Action: Equatable, Sendable {
         case locate(String)
@@ -40,6 +41,9 @@ public struct TimelinePrependAnchor: Sendable {
         var phase: Phase = .layout
     }
 
+    public static let timeout: TimeInterval = 3
+    public private(set) var deadline: TimeInterval?
+    private var missingFrameSamples = 0
     public private(set) var layoutGeneration: UInt = 0
     private var capture: Capture?
     private var input: TimelineScrollInput?
@@ -66,7 +70,8 @@ public struct TimelinePrependAnchor: Sendable {
     /// Beginning another page while correction is in flight chains the intended
     /// anchor, rather than capturing the transient top of the inserted batch.
     public mutating func begin(operation: UUID, input: TimelineScrollInput,
-                               frames: [TimelineMessageFrame], viewportHeight: Double) {
+                               frames: [TimelineMessageFrame], viewportHeight: Double,
+                               now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
         let chained = blocksFollowing && capture?.appearance == input.request?.appearanceID ? capture : nil
         cancel()
         self.input = input
@@ -74,6 +79,7 @@ public struct TimelinePrependAnchor: Sendable {
         let visible = input.messageIDs.compactMap { id in frames.first { $0.id == id } }
             .filter { $0.intersects(viewportHeight: viewportHeight) }
         guard let target = chained?.target ?? visible.first else { return }
+        deadline = now + Self.timeout
         capture = Capture(operation: operation, appearance: appearance,
                           originalIDs: chained?.originalIDs ?? input.messageIDs,
                           visibleFrames: chained?.visibleFrames ?? visible, target: target)
@@ -81,8 +87,15 @@ public struct TimelinePrependAnchor: Sendable {
 
     public mutating func cancel() {
         capture = nil
+        deadline = nil
+        missingFrameSamples = 0
         awaitingExecution = false
         layoutGeneration &+= 1
+    }
+
+    /// Cancelling also forgets the capture: late SDK diffs cannot resurrect it.
+    public mutating func expire(now: TimeInterval) {
+        if let deadline, now >= deadline { cancel() }
     }
 
     public mutating func update(_ next: TimelineScrollInput) {
@@ -113,12 +126,14 @@ public struct TimelinePrependAnchor: Sendable {
             current.phase = .layout
         }
         capture = current
+        missingFrameSamples = 0
         awaitingExecution = false
         layoutGeneration &+= 1
     }
 
     public mutating func finished(operation: UUID) {
         guard var current = capture, current.operation == operation else { return }
+        missingFrameSamples = 0
         current.loading = false
         current.phase = .layout // Includes spinner/button removal and empty pages.
         awaitingExecution = false
@@ -144,6 +159,7 @@ public struct TimelinePrependAnchor: Sendable {
         let frame = frames.first { $0.id == current.target.id && $0.minY.isFinite }
         var action: Action?
         if let frame {
+            missingFrameSamples = 0
             let delta = frame.minY - current.target.minY
             let corrections: Int
             if case .corrected(let count) = current.phase { corrections = count } else { corrections = 0 }
@@ -154,6 +170,11 @@ public struct TimelinePrependAnchor: Sendable {
                 current.phase = .corrected(corrections + 1)
             }
         } else if case .layout = current.phase {
+            // The first new-generation preference can contain only the content
+            // reader. Give row preferences a turn before moving a visible row
+            // to .top and back. The bounded driver retries even without events.
+            missingFrameSamples += 1
+            guard missingFrameSamples >= 2 else { return nil }
             action = .locate(current.target.id)
             current.phase = .located
         } else {
