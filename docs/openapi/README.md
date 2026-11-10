@@ -14,7 +14,7 @@ License: Apache-2.0（与仓库一致）。
 | [notify/openapi/notify.v1.yaml](../../notify/openapi/notify.v1.yaml) 与 [notify/docs/data-model.md](../../notify/docs/data-model.md) | 通知域对网关 `Card*` 的只增语义 |
 | [docs/contracts/pairing-redeem.openapi.yaml](../contracts/pairing-redeem.openapi.yaml) 与 [docs/contracts/pairing-qr.md](../contracts/pairing-qr.md) | 扫码配对（A/C 线） |
 
-小镇模块的开放 API 尚未纳入网关契约（见 contract.md §8.3 第 5 条），随 A4.1 / A4.2 在 M4 由 D4.2 写入本目录，并做与实现一致的 CI 校验。
+小镇模块的开放 API 尚未纳入网关契约（contract.md §8.3 第 5 条写作「A4.1/B4.2」，任务编号以 [roadmap.md](../roadmap.md) 为准：依赖 A4.1 / A4.2，由 D4.2 在 M4 写入本目录），并做与实现一致的 CI 校验。`usage_events` 与小镇账单口径已由 contract.md §6.2 定义，D4.2 只做文档汇聚，不另定口径。
 
 版本规则沿用 [contract.md §5](../../gateway/docs/contract.md)：只增不删，弃用走公告流程。
 

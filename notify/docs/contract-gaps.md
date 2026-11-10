@@ -18,74 +18,67 @@
 
 分类：
 
-- **A 类**：可由 D 线直接定稿的小缺口。本 PR 已把其中文档不一致与「不新增 API 的默认映射」写成正式文字。
+- **A 类**：可由 D 线直接定稿的小缺口。本次改动已把其中文档不一致、以及可由既有 wire 推出的展示约定写成正式文字；仅写推荐、尚未落笔的项会单独标明。
 - **B 类**：产品性选择，需所有者拍板。本文件只列推荐与理由，**不在契约里写成定论**。
 
 ## 1. 已关闭或不纳入
 
 | 项 | 说明 |
 |---|---|
-| [#74](https://github.com/zjyjcl/botville/issues/74) | **已关闭**（completed，2026-11-03）。B 线在 `54b89ac` / `2d3f5dc` 修正 `CreateCardRequest.description`，经 #76 合入。gateway YAML 已与 `contract.md` §4.8 对齐。属 B 线，本清单只引用；`notify/docs/data-model.md` §1.5 第 4 条在本 PR 改为「已关闭」。 |
-| [#75](https://github.com/zjyjcl/botville/issues/75) | **仍开放**。见下方 A6。本 PR 为保持纯文档/契约，不改 CI workflow；建议另开小 PR 修。 |
+| [#74](https://github.com/zjyjcl/botville/issues/74) | **已关闭**（GitHub `closed_at` 为 2026-11-03 20:26 UTC，即 2026-11-04 04:26 Asia/Shanghai）。main 上的合入证据是 `591535b`（#76）。属 B 线，本清单只引用；`notify/docs/data-model.md` §1.5 第 4 条在本次改动中改为「已关闭」。 |
+| [#75](https://github.com/zjyjcl/botville/issues/75) | **仍开放**。见第 5 节工程后续。本次改动为保持纯文档/契约，不改 CI workflow；建议另开小 PR 修。 |
 | `docs/contracts/` | 仅有配对契约（`pairing-qr.md` / `pairing-redeem.openapi.yaml`），检索到的「占位」均为示例域名与 token 占位，**无 D 线待定项**。 |
 | 设计稿待定 01–13、18、19、21 | 会话未读/搜索、人类资料、动态发布、manifest 导航、恢复界面文案、无障碍等，属 A/B/C 线，不在本清单展开。18 的安全边界与幂等规则已在契约定稿，只剩 C 线文案/界面。 |
 | D1.2 / D2.4 / D3.1 及 deferred.md | 并行期双发、授权派工从中枢迁走、中枢下线与回滚：按所有者决定搁置，不作为本轮契约缺口推进。 |
+| D4.1 小镇网页版 | 属 D 线任务，但是实现/前端工作，**不是契约缺口**，不在本清单展开。 |
+| `usage_events` 与小镇账单口径（contract §8.2 D 线第 4 条） | 口径已由 `contract.md` §6.2 定义；D4.2 只做开放文档汇聚，当前无新的契约缺口。 |
 
 ## 2. A 类：可由 D 线直接定稿
 
 ### A1. `interrupt` 在通知数据模型中的错误默认值
 
-- **缺什么**：`notify/docs/data-model.md` §2.5 将 `interrupt` 写成「默认 `false`」，与同一文档 §1.5 / 优先级表、以及权威来源 `contract.md` §4.8（三态、**无默认值**）冲突。
+- **缺什么**（修正前）：`notify/docs/data-model.md` §2.5 将 `interrupt` 写成「默认 `false`」，与同一文档 §1.5 / 优先级表、以及权威来源 `contract.md` §4.8（三态、**无默认值**）冲突。
 - **谁依赖**：D1.1 通知模型、B 线静默检查、C 线通知展示与打断。
-- **建议的默认方案（本 PR 已落笔）**：与 §4.8 对齐——`interrupt` 为省略 / `true` / `false` 三态，schema 与文档都不得补 `default: false`；省略时 `urgent` 穿透，其余优先级顺延；显式 `false` 时连 `urgent` 也不穿透。
+- **建议的默认方案（本次已落笔）**：与 §4.8 对齐——`interrupt` 为省略 / `true` / `false` 三态，schema 与文档都不得补 `default: false`；省略时 `urgent` 穿透，其余优先级顺延；显式 `false` 时连 `urgent` 也不穿透。
 - **出处**：`notify/docs/data-model.md` §2.5（原文「默认 `false`」）；`gateway/docs/contract.md` §4.8「静默、优先级与合并」；`gateway/openapi/gateway.v1.yaml` 中 `Card.interrupt` / `CreateCardRequest.interrupt` 的 description（#74 修复后）。
 
 ### A2. §1.5 第 4 条仍把 #74 写成未修分歧
 
-- **缺什么**：D1.1 缺口表仍写「gateway YAML 该句留给 B0.1 owner 修订」，与仓库现状不符。
+- **缺什么**（修正前）：D1.1 缺口表仍写「gateway YAML 该句留给 B0.1 owner 修订」，与当时已合入的 #74/#76 不符。
 - **谁依赖**：后续评审与 D/B 线对齐，避免重复开 issue。
-- **建议的默认方案（本 PR 已落笔）**：将该行改为「已关闭（#74 / #76）」，并保留正确语义摘要。
-- **出处**：`notify/docs/data-model.md` §1.5 第 4 条；issue #74；commit `54b89ac`、`2d3f5dc`、`591535b`（#76）。
+- **建议的默认方案（本次已落笔）**：将该行改为「已关闭（#74 / #76）」，并保留正确语义摘要。
+- **出处**：`notify/docs/data-model.md` §1.5 第 4 条；issue #74；main 合入 commit `591535b`（#76）。
 
-### A3. 通知列表展示：不新增对象或接口的默认映射
+### A3. 通知列表展示：不新增对象或接口（仅未读与折叠）
 
 - **缺什么**：设计稿写「没有独立通知对象或通知列表 API」，同时把未读数、分类、排序、折叠列表组织标为待定（设计待定 15；`collapse_key / group_id` 的「具体列表组织待定」）。
-- **谁依赖**：C3.1 通知列表（`GET /v1/cards`）、C 线角标；D1.1 已有字段足够表达。
-- **建议的默认方案（本 PR 已写入 `data-model.md` §2.7，作为通知域默认映射，不新增字段）**：
-  - 列表与详情继续复用 `Card` 与 `GET /v1/cards`（含 `updated_since`），不另建通知资源。
+- **谁依赖**：C3.1 通知列表（`GET /cards`）、C 线角标；D1.1 已有字段足够表达。
+- **建议的默认方案（本次已写入 `data-model.md` §2.7；仅包含可由既有 wire 推出的两项）**：
+  - 列表与详情继续复用 `Card` 与 `GET /cards`（基路径 `/v1`，含 `updated_since`），不另建通知资源。
   - **未读**：`Card.status == active` 计为未读；`read` / `dismissed` / `expired` / `acted` 不计。未读不是 `delivery[].state`。
-  - **分类**：按 `type` 与 `source.capability_id` 分组展示，不另作分类枚举。
-  - **排序**：默认 `priority` 序（`urgent > high > normal > low`），同级按 `updated_at` 降序；`GET /v1/cards` 的服务端排序未在网关契约规定，本映射约束客户端默认展示。
   - **折叠**：同 `group_id` 收成一条摘要入口；同 `collapse_key` 的未读卡由新卡替换旧卡展示（已有 §2.4）。折叠只影响展示。
-- **出处**：`docs/design/README.md` 待定 15、通知模型节（约第 108、138、151–153 行）；`docs/design/05-notifications-cards.html` 脚注；`notify/docs/data-model.md` §2.3–2.4；`contract.md` §4.8。
-- **边界**：通知偏好界面 / 是否另做偏好 API 属 **B2**，本条不拍板。
+- **出处**：`docs/design/README.md` 待定 15、通知模型节（约第 108、138、169 行）；`docs/design/05-notifications-cards.html` 脚注；`notify/docs/data-model.md` §2.3–2.4、§2.7；`contract.md` §4.8。
+- **边界**：分类、排序、通知偏好界面 / 是否另做偏好 API 属 **B2**，不在 §2.7 写成定论。
 
 ### A4. 授权 `payload` / `result` 不设全局 schema
 
-- **缺什么**：设计待定 16 把「授权业务 `payload`、模块结果 `result` 结构」列为待定。网关已把二者定义为由来源模块解释的不透明对象。
+- **缺什么**：设计待定 16 把「授权业务 `payload`、模块结果 `result` 结构」以及「操作真实影响/回滚范围」列为待定。网关已把 `payload` / `result` 定义为由来源模块解释的不透明对象。
 - **谁依赖**：C3.1 按钮回传、D2.1 审计快照、D2.2 派工、B 线模块回调。
-- **建议的默认方案（本 PR 已在 `data-model.md` §2.6 补写）**：v1 **不**规定全局业务 `payload` / `result` schema；结构由发出该卡的模块定义；必须遵守已有禁令（不得含密钥或个人敏感信息，命中则拒绝）。演示卡的字段仅为虚构，不构成契约。
+- **建议的默认方案（本次已在 `data-model.md` §2.6 补写）**：v1 **不**规定全局业务 `payload` / `result` schema；结构由发出该卡的模块定义。`payload` 与 `context.metadata` 遵守已有禁令（不得含密钥或个人敏感信息，服务端扫描、命中拒绝，contract §4.4 / §4.6 规则 5）。`result` **建议**同样不放密钥或个人敏感信息，但网关暂无扫描规则，责任在来源模块/D2.1。演示卡的字段仅为虚构，不构成契约。设计待定 16 中的「操作真实影响/回滚范围」属各业务模块的产品语义，**不在 D 线通知契约范围**，由 D2.2 等模块文档自行说明。
 - **出处**：`gateway/docs/contract.md` §4.4 `payload`、§4.6 规则 5；`gateway.v1.yaml` `CardAction.payload`、`CardActionRequest.payload`、`CardActionReceipt.result`、`AuditRecord.result`；`docs/design/README.md` 待定 16 与流程二说明。
 
 ### A5. 开放 API 总文档与现有契约的对应关系
 
-- **缺什么**：`contract.md` §8.2 要求「本契约与未来 `docs/openapi/` 的对应关系清晰（D 线负责总文档）」，但仓库中不存在 `docs/openapi/`。D4.2（小镇开放 API 文档）在 M4，现在就写小镇 API 会超前。
+- **缺什么**：`contract.md` §8.2 要求「本契约与未来 `docs/openapi/` 的对应关系清晰（D 线负责总文档）」，但仓库中原先不存在 `docs/openapi/`。D4.2（小镇开放 API 文档）在 M4，现在就写小镇 API 会超前。§8.3 第 5 条也指出小镇接口尚未纳入网关契约。
 - **谁依赖**：对外开源承诺、D4.2、各线评审。
-- **建议的默认方案（本 PR 已新增 `docs/openapi/README.md`）**：本目录先作为索引，声明当前事实源仍是分域文件（网关 / 通知 / 配对），小镇 API 待 A4.1/A4.2 之后由 D4.2 汇入；现阶段不平行维护一份易漂移的拷贝。版本规则沿用 `contract.md` §5。
-- **出处**：`gateway/docs/contract.md` §8.2 D 线清单末两条；`docs/roadmap.md` D4.2；`docs/README.md` 原 OpenAPI 索引段。
+- **建议的默认方案（本次已新增 `docs/openapi/README.md`）**：本目录先作为索引，声明当前事实源仍是分域文件（网关 / 通知 / 配对）；小镇 API 尚未纳入（§8.3 第 5 条），待 A4.1/A4.2 之后由 D4.2 汇入（任务编号以 roadmap 为准；contract 该条写作「A4.1/B4.2」）。`usage_events` 与小镇账单口径已由 `contract.md` §6.2 定义，D4.2 只做文档汇聚，不另定口径。现阶段不平行维护一份易漂移的拷贝。版本规则沿用 `contract.md` §5。
+- **出处**：`gateway/docs/contract.md` §8.2 D 线清单、§8.3 第 5 条、§6.2；`docs/roadmap.md` D4.2；`docs/README.md` 原 OpenAPI 索引段。
 
-### A6. CI 为 notify/gateway 校验显式安装 PyYAML（#75，本 PR 不改 workflow）
-
-- **缺什么**：`notify/scripts/validate_examples.py` 与 `gateway/scripts/validate_openapi.py` 都依赖 PyYAML。lint job 里「Notify examples + gateway contract validation」一步直接调用二者，未先安装；同 job 的「Gateway unit tests」才 `pip install pyyaml`，且在校验步**之后**。当前能绿是因为 runner 镜像碰巧预装，与 #75 描述一致。
-- **谁依赖**：D1.1 契约校验、全部 PR 的 lint job。
-- **建议的默认方案**：在「Notify examples + gateway contract validation」步开头增加钉选安装（建议 `python3 -m pip install 'pyyaml>=6,<7'`，与现有 gateway 测试步的安装合并或前置）；保持实现代码不动。请另开小 PR 关 #75。
-- **出处**：issue #75；`.github/workflows/ci.yml` 中上述两个 step；两份校验脚本的文件头说明。
-
-### A7. D2.1 断言字节编码（本 PR 只写推荐，不改网关 schema）
+### A6. D2.1 断言字节编码（推荐、本次未落笔）
 
 - **缺什么**：高风险授权的绑定字段、算法枚举（仅 `p256`）、challenge 默认 120 秒且单次使用、无 `/sign` API，均已在网关契约定稿。**尚未定义** `assertion` 的字节编码与设备密钥如何注册/吊销。contract 与 OpenAPI 明确把编码留给 D2.1。
 - **谁依赖**：D2.1、C3.1（Face ID + 本地签名）、B 线校验 assertion。
-- **建议的默认方案**（技术默认，供 D2.1 专门 PR 定稿，不在本 PR 写入网关 YAML，以免未经实现评审就改 wire）：
+- **建议的默认方案**（技术推荐，**本次未写入**网关 YAML 或数据模型正文，供 D2.1 专门 PR 定稿，以免未经实现评审就改 wire）：
   - 签名输入为四个绑定字段的规范 UTF-8 拼接，推荐固定顺序的 JSON 对象（键序：`card_id`、`action_id`、`revision`、`challenge`），`revision` 为 JSON 数字，字符串字段按 UTF-8，无无意义空白。
   - `assertion` 传 **base64url（无填充）**，内容为 P-256 ECDSA 签名的 raw `r || s`（各 32 字节，共 64 字节），与 Secure Enclave 常见输出对齐；算法标识继续用已有 `p256`。
   - 设备密钥注册 / 多设备 / 吊销接口见 **B4**，需所有者拍板产品范围后再增网关 endpoint（属后续 minor）。
@@ -101,13 +94,13 @@
 - **理由**：符合「通知复用 Card、不为待定项创造 API 字段」；`notify.inbox` 已在 D1.1 留给收件/完成类通知。
 - **出处**：`docs/design/README.md` 待定 14、流程一说明；`docs/design/05-notifications-cards.html`「评论通知的 source.capability_id 在契约中未定义」；`notify/docs/data-model.md` §4。
 
-### B2. 通知偏好与分类的产品形态
+### B2. 通知分类、排序与偏好的产品形态
 
-- **缺什么**：设计待定 15 中的「通知偏好界面」以及是否要做可配置的分类/免打扰偏好 API（静默时段已有 `SilentHours`，属网关配置）。
-- **谁依赖**：C 线设置页；D 线若要新 API 需写入开放文档。
-- **推荐**：M2/M3 先**不**做独立通知偏好 API；分类只按 A3 的 `type` / `capability_id` 展示；系统级打扰交给 OS 通知设置 + 已有静默时段。若日后要做每能力开关，再走网关 minor。
-- **理由**：避免在 C3.1 之前膨胀设置面；现有字段已能做列表。
-- **出处**：`docs/design/README.md` 待定 15；`contract.md` §4.8；`SilentHours` schema。
+- **缺什么**：设计待定 15 中的「分类、排序、通知偏好界面」，以及是否要做可配置的分类/免打扰偏好 API（静默时段已有 `SilentHours`，属网关配置）。这些没有 wire 依据（`GET /cards` 只定义过滤，不规定排序）。
+- **谁依赖**：C 线通知列表与设置页；D 线若要新 API 需写入开放文档。
+- **推荐**：M2/M3 先**不**做独立通知偏好 API；系统级打扰交给 OS 通知设置 + 已有静默时段。分类可先按 `type` 与 `source.capability_id` 分组、不另作枚举；客户端排序可先按 `priority` 序（`urgent > high > normal > low`），同级按 `updated_at` 降序——均为推荐默认，待 C 线/所有者确认，客户端可以不同实现。若日后要做每能力开关，再走网关 minor。
+- **理由**：避免把尚未拍板的展示策略写成 MUST；也不在 C3.1 之前膨胀设置面。
+- **出处**：`docs/design/README.md` 待定 15（约第 169 行）；`contract.md` §4.8；`GET /cards` 参数定义；`SilentHours` schema。
 
 ### B3. 高风险操作时设备上 Face ID / 生物识别不可用
 
@@ -163,7 +156,7 @@
 - **谁依赖**：C 线提醒展示；B 线排程。
 - **推荐**：暂不改 wire；客户端用 `deliver_after`（及可选 `context.metadata`）展示。若提醒必须区分「期望触发时刻」与「最早投递时刻」，再走网关 minor 给 `Card` 增加可选 `scheduled_at`。
 - **理由**：避免为尚未出现的 UI 需求改契约；D1.1 已预留这条 minor 路径。
-- **出处**：`notify/docs/data-model.md` §1.5 第 1 条；`contract.md` §4.8；`ReminderCard` description。
+- **出处**：`notify/docs/data-model.md` §1.5 第 1 条；`contract.md` §4.8；`notify/openapi/notify.v1.yaml` 中 `ReminderCard` 的 description（约第 168 行）。
 
 ### B10. `DeliveryRetryPolicy` 是否上 wire
 
@@ -173,13 +166,24 @@
 - **理由**：语义已在数据模型与示例中写清；上 wire 会变成新的兼容面。
 - **出处**：`notify/docs/data-model.md` §1.5 第 2 条、§3.2；`notify/openapi/notify.v1.yaml` `DeliveryRetryPolicy`。
 
-## 4. 本 PR 改动范围
+## 4. 本次文档改动范围
 
 | 文件 | 变更 |
 |---|---|
 | `notify/docs/contract-gaps.md` | 本清单（新增） |
-| `notify/docs/data-model.md` | 修正 §2.5 `interrupt`；§1.5 第 4 条改为 #74 已关闭；§2.6 补 `payload`/`result` 不透明约定；新增 §2.7 展示层默认映射 |
+| `notify/docs/data-model.md` | 修正 §2.5 `interrupt`；§1.5 第 4 条改为 #74 已关闭；§2.6 澄清 `payload` 禁令不自动扩到 `result`；新增 §2.7（仅未读与折叠） |
 | `notify/README.md`、`docs/README.md` | 增加清单与 `docs/openapi/` 索引 |
 | `docs/openapi/README.md` | 新增开放 API 总文档索引（D4.2 预留） |
 
 不改：任何实现代码、`gateway.v1.yaml` schema / 状态码、CI workflow、`docs/design/` 静态稿、中枢/个人通道文档的推进内容。
+
+A1–A5 已落笔；A6（断言编码）只在本清单写推荐。修正前的错误记载（`interrupt` 默认 `false`、#74 仍写未修）以修订后的 `data-model.md` 为准。
+
+## 5. 工程后续（非契约缺口，另开 PR）
+
+### E1. CI 为 notify/gateway 校验显式安装 PyYAML（#75）
+
+- **缺什么**：`notify/scripts/validate_examples.py` 与 `gateway/scripts/validate_openapi.py` 都依赖 PyYAML。lint job 里「Notify examples + gateway contract validation」一步直接调用二者，未先安装；同 job 的「Gateway unit tests」才 `pip install pyyaml`，且在校验步**之后**。当前能绿是因为 runner 镜像碰巧预装，与 #75 描述一致。
+- **谁依赖**：D1.1 契约校验、全部 PR 的 lint job。
+- **建议的默认方案**：在「Notify examples + gateway contract validation」步开头增加钉选安装（建议 `python3 -m pip install 'pyyaml>=6,<7'`，与现有 gateway 测试步的安装合并或前置）；保持实现代码不动。请另开小 PR 关 #75。本次文档改动不改 workflow。
+- **出处**：issue #75；`.github/workflows/ci.yml` 中上述两个 step；两份校验脚本的文件头说明。

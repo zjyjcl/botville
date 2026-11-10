@@ -48,7 +48,7 @@ F15（webhook 出口的开放接口语义）的**开源替代语义**；仅取�
 
 ### 1.5 与 B0.1 缺口清单（已知分歧与归属）
 
-通知域相对 B0.1 契约的已知缺口/分歧，评审对齐用：
+通知域相对 B0.1 契约的已知缺口/分歧（含已关闭记录），评审对齐用：
 
 | # | 项 | 现状与归属 |
 |---|---|---|
@@ -177,24 +177,25 @@ GET /audit/{audit_id} → AuditRecord（append-only 审计）
 `revision` 贯穿全程用于防 TOCTOU；`audit_id` 是通知模型引用审计记录的
 唯一入口；回执中的 `card` 反映拍板后的最新状态。
 
-`CardAction.payload`、`CardActionRequest.payload` 与回执/审计中的
-`result` 由来源模块定义，通知域 **不**规定全局业务 schema；已有禁令
-仍然适用（不得含密钥或个人敏感信息，命中则拒绝，contract §4.4 / §4.6
-规则 5）。断言的字节编码由 D2.1 定义，本模型只固定绑定字段。
+通知域 **不**规定全局业务 `payload` / `result` schema，二者结构都由发出该卡
+的模块定义。`payload` 与 `context.metadata` 适用既有禁令（不得含密钥或个人
+敏感信息，服务端扫描、命中拒绝，contract §4.4 / §4.6 规则 5）。回执/审计中的
+`result` 同样**建议**不要放密钥或个人敏感信息，但网关目前没有对应扫描规则，
+责任在来源模块与 D2.1，本文不把「命中则拒绝」扩到 `result`。断言的字节编码
+由 D2.1 定义，本模型只固定绑定字段。
 
 ### 2.7 列表展示的默认映射（不新增 API）
 
-通知列表与详情复用 `Card` 与 `GET /v1/cards`（含 `updated_since`），
-**不**另建通知对象或通知列表接口。以下为通知域的默认展示映射，
-供客户端使用既有字段；不新增 wire 字段。通知偏好界面是否单独做 API
-不在本节约定（见 [contract-gaps.md](contract-gaps.md) B2）。
+通知列表与详情复用 `Card` 与 `GET /cards`（基路径 `/v1`，含 `updated_since`），
+**不**另建通知对象或通知列表接口。下列两项可由既有 wire 语义直接推出，
+作为通知域的展示约定，不新增字段：
 
 | 展示问题 | 默认映射 |
 |---|---|
 | 未读 | `Card.status == active` 计为未读；`read` / `dismissed` / `expired` / `acted` 不计。未读与 `delivery[].state` 无关。 |
-| 分类 | 按 `type` 与 `source.capability_id` 分组；不另作分类枚举。 |
-| 排序 | 客户端默认按 `priority` 序（`urgent > high > normal > low`），同级按 `updated_at` 降序。服务端列表排序仍以网关契约为准（若未规定则由客户端排序）。 |
 | 折叠 | 同 `group_id` 收成一条摘要入口；同 `collapse_key` 的未读卡由新卡替换旧卡展示（见 §2.4）。折叠只影响展示，不改 `Card.status`。 |
+
+分类、排序与通知偏好界面仍为产品性选择，见 [contract-gaps.md](contract-gaps.md) B2，本文不写成定论。
 
 ## 3. 投递状态机
 
