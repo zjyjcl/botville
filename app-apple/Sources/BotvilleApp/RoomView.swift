@@ -13,7 +13,7 @@ struct RoomView: View {
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var scrollState = TimelineScrollState()
-    @State private var visibleMessageID: String?
+    @StateObject private var layoutVersion = TimelineLayoutVersion()
     @State private var timelineGeometry: TimelineGeometry?
     @State private var isDraggingTimeline = false
     @State private var draft = ""
@@ -27,7 +27,8 @@ struct RoomView: View {
     @State private var roomOpenGeneration = UUID()
     @State private var completedRoomOpenGeneration: UUID?
     @State private var roomTimelineLease: RoomTimelineLease?
-    @State private var isLoadingOlderMessages = false
+    @State private var olderMessagesOperation: UUID?
+    private var isLoadingOlderMessages: Bool { olderMessagesOperation != nil }
     @State private var errorMessage: String?
     @State private var isRefreshingSecurity = false
     @State private var isEnablingEncryption = false
@@ -124,6 +125,10 @@ struct RoomView: View {
             .padding()
         }
         .onChange(of: scrollInput, initial: true) { _, next in scrollState.update(next) }
+        .onChange(of: TimelineLayoutSnapshot(input: scrollInput,
+                     generation: scrollState.prependAnchor.layoutGeneration), initial: true) { _, snapshot in
+            layoutVersion.snapshot = snapshot
+        }
         .navigationTitle(room.name)
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
@@ -229,24 +234,25 @@ struct RoomView: View {
                             }, cancel: {
                                 Task { await actOnMessage(message.id, retry: false) }
                             })
+                            .overlay(alignment: .top) {
+                                // A zero-height target makes offset / viewportHeight
+                                // exact even for a partly visible, viewport-tall row.
+                                Color.clear.frame(height: 0)
+                                    .id(TimelinePrependPoint(messageID: message.id))
+                                    .allowsHitTesting(false)
+                            }
+                            .background(TimelineMessageMeasurement(input: input, messageID: message.id,
+                                                                   layoutVersion: layoutVersion))
                             .id(message.id)
                         }
                     }
-                    .scrollTargetLayout()
                     .padding()
-                    .background {
-                        GeometryReader { content in
-                            Color.clear.preference(key: TimelineGeometryKey.self, value: TimelineGeometry(
-                                input: input,
-                                distanceFromBottom: content.frame(in: .named("roomTimeline")).maxY - viewport.size.height,
-                                viewportHeight: viewport.size.height))
-                        }
-                    }
+                    .background(TimelineContentMeasurement(layoutVersion: layoutVersion,
+                                                           viewportHeight: viewport.size.height))
                 }
                 .coordinateSpace(name: "roomTimeline")
-                // No defaultScrollAnchor: its size-change behavior can pull history
-                // to the bottom. The top visible ID is maintained through prepend.
-                .scrollPosition(id: $visibleMessageID)
+                // Prepend is restored explicitly from measured row geometry. A
+                // scrollPosition binding would compete with the pixel correction.
                 .simultaneousGesture(DragGesture()
                     .onChanged { _ in
                         isDraggingTimeline = true
@@ -257,13 +263,42 @@ struct RoomView: View {
                         recordTimelineGeometry()
                     })
                 .onPreferenceChange(TimelineGeometryKey.self) { geometry in
+                    guard let geometry, geometry.input == scrollInput else { return }
                     timelineGeometry = geometry
+                }
+                .task(id: timelineGeometry) {
+                    // Act after the matched layout, outside preference reduction.
+                    // New data/appearance cancels this task and invalidates its sample.
+                    guard let geometry = timelineGeometry else { return }
+                    await Task.yield()
+                    guard !Task.isCancelled, geometry == timelineGeometry,
+                          geometry.input == scrollInput else { return }
+                    if !scrollState.hasInput(geometry.input) { scrollState.update(geometry.input) }
+                    if scrollState.prependAnchor.needsLayout,
+                       let height = geometry.viewportHeight, height.isFinite, height > 0,
+                       let action = scrollState.restorePrepend(for: geometry.input, generation: geometry.generation,
+                                                               frames: geometry.frames) {
+                        let generation = scrollState.prependAnchor.layoutGeneration
+                        var transaction = Transaction(animation: nil)
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) {
+                            switch action {
+                            case .locate(let id): proxy.scrollTo(id, anchor: .top)
+                            case .restore(let id, let offset):
+                                proxy.scrollTo(TimelinePrependPoint(messageID: id),
+                                               anchor: UnitPoint(x: 0.5, y: offset / height))
+                            }
+                        }
+                        scrollState.didExecutePrepend(generation: generation)
+                    }
+                    layoutVersion.snapshot = .init(input: scrollInput,
+                                                   generation: scrollState.prependAnchor.layoutGeneration)
                     recordTimelineGeometry()
                 }
-                .task(id: scrollState.pending) {
-                    guard let decision = scrollState.pending else { return }
+                .task(id: scrollState.followDecision) {
+                    guard let decision = scrollState.followDecision else { return }
                     await Task.yield()
-                    guard !Task.isCancelled, scrollState.pending == decision,
+                    guard !Task.isCancelled, scrollState.followDecision == decision,
                           latestScrollRequest == decision.request else { return }
                     withAnimation(decision.animated && !reduceMotion ? .easeOut(duration: 0.2) : nil) {
                         proxy.scrollTo(decision.request.latestMessageID, anchor: .bottom)
@@ -277,10 +312,12 @@ struct RoomView: View {
     }
 
     private func recordTimelineGeometry() {
-        guard !isDraggingTimeline, let geometry = timelineGeometry else { return }
+        guard !isDraggingTimeline, let geometry = timelineGeometry,
+              geometry.generation == scrollState.prependAnchor.layoutGeneration,
+              let distance = geometry.distanceFromBottom, let height = geometry.viewportHeight else { return }
         scrollState.recordGeometry(for: geometry.input,
-                                   distanceFromBottom: geometry.distanceFromBottom,
-                                   viewportHeight: geometry.viewportHeight)
+                                   distanceFromBottom: distance,
+                                   viewportHeight: height)
     }
 
     private func refreshSecurity() async {
@@ -341,13 +378,27 @@ struct RoomView: View {
 
     private func loadOlderMessages() async {
         guard !isLoadingOlderMessages else { return }
-        isLoadingOlderMessages = true
-        defer { isLoadingOlderMessages = false }
+        let operation = UUID()
+        let appearance = roomOpenGeneration
+        let input = scrollInput
+        let geometry = timelineGeometry.flatMap { $0.input == input ? $0 : nil }
+        scrollState.beginPrepend(operation: operation, input: input,
+                                 frames: geometry?.frames ?? [], viewportHeight: geometry?.viewportHeight ?? 0)
+        olderMessagesOperation = operation
+        defer {
+            if olderMessagesOperation == operation, roomOpenGeneration == appearance {
+                olderMessagesOperation = nil
+                scrollState.update(scrollInput)
+                scrollState.finishPrepend(operation: operation)
+            }
+        }
         errorMessage = nil
         do {
             try await service.loadOlderMessages()
         } catch {
-            errorMessage = error.localizedDescription
+            if olderMessagesOperation == operation, roomOpenGeneration == appearance {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -378,7 +429,7 @@ struct RoomView: View {
         let generation = UUID()
         roomOpenGeneration = generation
         scrollState = TimelineScrollState()
-        visibleMessageID = nil
+        olderMessagesOperation = nil
         timelineGeometry = nil
         isDraggingTimeline = false
         let lease = service.beginRoomOpen(room.id)
@@ -392,6 +443,9 @@ struct RoomView: View {
 
     private func releaseRoomForCurrentAppearance() {
         isInputActive = false
+        scrollState.cancelPrepend()
+        olderMessagesOperation = nil
+        timelineGeometry = nil
         roomOpenGeneration = UUID()
         roomOpenTask?.cancel()
         roomOpenTask = nil
@@ -418,17 +472,82 @@ struct RoomView: View {
 
 }
 
+@MainActor
+private final class TimelineLayoutVersion: ObservableObject {
+    @Published var snapshot: TimelineLayoutSnapshot?
+    var generation: UInt { snapshot?.generation ?? 0 }
+    var input: TimelineScrollInput? { snapshot?.input }
+}
+
+private struct TimelineLayoutSnapshot: Equatable {
+    let input: TimelineScrollInput
+    let generation: UInt
+}
+
+private struct TimelineContentMeasurement: View {
+    @ObservedObject var layoutVersion: TimelineLayoutVersion
+    let viewportHeight: Double
+
+    var body: some View {
+        GeometryReader { content in
+            if let input = layoutVersion.input {
+                Color.clear.preference(key: TimelineGeometryKey.self, value: TimelineGeometry(
+                    input: input, generation: layoutVersion.generation,
+                    distanceFromBottom: content.frame(in: .named("roomTimeline")).maxY - viewportHeight,
+                    viewportHeight: viewportHeight))
+            }
+        }
+        .id(layoutVersion.generation)
+    }
+}
+
+private struct TimelineMessageMeasurement: View {
+    let input: TimelineScrollInput
+    let messageID: String
+    // LazyVStack can materialize a cached row closure AFTER a scroll command.
+    // Observe a shared reference, not the cached closure's old value snapshot.
+    @ObservedObject var layoutVersion: TimelineLayoutVersion
+
+    var body: some View {
+        GeometryReader { row in
+            Color.clear.preference(key: TimelineGeometryKey.self, value: TimelineGeometry(
+                input: input, generation: layoutVersion.generation,
+                frames: [.init(id: messageID, minY: row.frame(in: .named("roomTimeline")).minY,
+                               height: row.size.height)]))
+        }
+    }
+}
+
 private struct TimelineGeometry: Equatable {
     let input: TimelineScrollInput
-    let distanceFromBottom: Double
-    let viewportHeight: Double
+    let generation: UInt
+    var distanceFromBottom: Double? = nil
+    var viewportHeight: Double? = nil
+    var frames: [TimelineMessageFrame] = []
 }
 
 private struct TimelineGeometryKey: PreferenceKey {
     static let defaultValue: TimelineGeometry? = nil
     static func reduce(value: inout TimelineGeometry?, nextValue: () -> TimelineGeometry?) {
-        value = nextValue() ?? value
+        guard let next = nextValue() else { return }
+        guard let previous = value else { value = next; return }
+        // Cached lazy rows may still carry an older input array even though
+        // their actual frame has just been measured. Only the content reader
+        // supplies the rendered data revision/viewport; rows cannot replace it.
+        if previous.generation != next.generation {
+            value = previous.generation > next.generation ? previous : next
+            return
+        }
+        var merged = next.viewportHeight != nil ? next : previous
+        merged.frames = previous.frames + next.frames
+        value = merged
     }
+}
+
+// Separate ID type avoids collisions with message IDs used for materialization
+// and bottom-follow. The marker is available after its lazy row is laid out.
+private struct TimelinePrependPoint: Hashable {
+    let messageID: String
 }
 
 @MainActor
