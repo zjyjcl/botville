@@ -54,6 +54,46 @@ final class TimelineLeaseOwnershipTests: XCTestCase {
         XCTAssertEqual(fixture.timeline.markReadCalls, 1)
         try await fixture.service.clearLocalSession()
     }
+
+    @MainActor
+    func testListenerRegistrationDoesNotPretendFirstSnapshotHasArrived() async throws {
+        let fixture = try await LeaseFixture.make()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        _ = try await fixture.service.openRoom(fixture.room.id())
+        XCTAssertFalse(fixture.service.hasReceivedTimelineSnapshot)
+        XCTAssertTrue(fixture.service.messages.isEmpty)
+        // A genuinely empty first snapshot ends the waiting state too.
+        fixture.timeline.listeners[0].onUpdate(diff: [.reset(values: [])])
+        for _ in 0..<100 where !fixture.service.hasReceivedTimelineSnapshot {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(fixture.service.hasReceivedTimelineSnapshot)
+        XCTAssertTrue(fixture.service.messages.isEmpty)
+        try await fixture.service.clearLocalSession()
+    }
+
+    @MainActor
+    func testOldListenerAndStaleCloseCannotChangeReopenedSnapshotReadiness() async throws {
+        let fixture = try await LeaseFixture.make()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let old = try await fixture.service.openRoom(fixture.room.id())
+        fixture.service.closeRoom(fixture.room.id(), lease: old)
+        let current = try await fixture.service.openRoom(fixture.room.id())
+        fixture.timeline.listeners[0].onUpdate(diff: [.reset(values: [])])
+        await Task.yield()
+        XCTAssertFalse(fixture.service.hasReceivedTimelineSnapshot)
+        fixture.timeline.listeners[1].onUpdate(diff: [.reset(values: [])])
+        for _ in 0..<100 where !fixture.service.hasReceivedTimelineSnapshot {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(fixture.service.hasReceivedTimelineSnapshot)
+        fixture.service.closeRoom(fixture.room.id(), lease: old)
+        XCTAssertTrue(fixture.service.hasReceivedTimelineSnapshot)
+        XCTAssertEqual(fixture.service.activeRoomID, fixture.room.id())
+        fixture.service.closeRoom(fixture.room.id(), lease: current)
+        XCTAssertFalse(fixture.service.hasReceivedTimelineSnapshot)
+        try await fixture.service.clearLocalSession()
+    }
 }
 
 private struct LeaseFixture {
@@ -133,10 +173,14 @@ private final class LeaseFakeRoom: Room, @unchecked Sendable {
 
 private final class LeaseFakeTimeline: Timeline, @unchecked Sendable {
     private(set) var markReadCalls = 0
+    private(set) var listeners: [TimelineListener] = []
     init() { super.init(noHandle: .init()) }
     required init(unsafeFromHandle handle: UInt64) { fatalError("test fake") }
     override func markAsRead(receiptType: ReceiptType) async throws { markReadCalls += 1 }
-    override func addListener(listener: TimelineListener) async -> TaskHandle { LeaseFakeTaskHandle() }
+    override func addListener(listener: TimelineListener) async -> TaskHandle {
+        listeners.append(listener)
+        return LeaseFakeTaskHandle()
+    }
 }
 
 private final class LeaseFakeTaskHandle: TaskHandle, @unchecked Sendable {
