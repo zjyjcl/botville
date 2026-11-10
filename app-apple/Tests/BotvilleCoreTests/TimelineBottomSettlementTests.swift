@@ -47,26 +47,66 @@ final class TimelineBottomSettlementTests: XCTestCase {
         }
     }
 
-    func testUnmaterializedLastRowGetsBoundedCorrections() throws {
+    func testMissingLastRowDoesNotExhaustRecoveryBeforeDeadline() throws {
         var state = try opened(input())
-        for index in 0..<TimelineBottomSettlement.maximumCorrections {
+        for index in 0..<20 {
             XCTAssertNotNil(correct(&state, input(), [], now: 10.11 + Double(index) * 0.15))
         }
-        XCTAssertNil(correct(&state, input(), [], now: 11.8))
+        XCTAssertNotNil(state.bottomSettlement.decision)
+        XCTAssertNil(correct(&state, input(), frame(500), now: 13.3))
+        XCTAssertNil(correct(&state, input(), frame(500), now: 13.7))
+        XCTAssertTrue(state.bottomSettlement.isConfirmed)
+        XCTAssertNil(correct(&state, input(), frame(2000), now: 14))
         XCTAssertNil(state.bottomSettlement.decision)
-        XCTAssertNil(correct(&state, input(), frame(2000), now: 11.9))
+    }
+
+    func testVisibleButChangingLongRowIsNotConfirmedAndLaterGrowthStillCorrects() throws {
+        var state = try opened(input())
+        XCTAssertNil(correct(&state, input(), frame(500), now: 10.2))
+        XCTAssertFalse(state.bottomSettlement.isConfirmed)
+        XCTAssertNil(correct(&state, input(), frame(400, 200), now: 10.5))
+        XCTAssertNil(correct(&state, input(), frame(300, 300), now: 10.8))
+        XCTAssertFalse(state.bottomSettlement.isConfirmed)
+        XCTAssertNil(correct(&state, input(), frame(300, 300), now: 11.2))
+        XCTAssertTrue(state.bottomSettlement.isConfirmed)
+        XCTAssertNotNil(correct(&state, input(), frame(300, 1200), now: 12.5))
+        XCTAssertFalse(state.bottomSettlement.isConfirmed)
+        XCTAssertNil(correct(&state, input(), frame(-600, 1200), now: 12.8))
+        XCTAssertNil(correct(&state, input(), frame(-600, 1200), now: 13.2))
+        XCTAssertTrue(state.bottomSettlement.isConfirmed)
+    }
+
+    func testLateCachedSnapshotReplacementRetargetsWithoutRenewingAppearanceDeadline() throws {
+        var state = try opened(input())
+        let replacement = input(["cache-a", "cache-b", "newest"])
+        state.update(replacement)
+        XCTAssertEqual(state.bottomSettlement.deadline, 14)
+        XCTAssertEqual(correct(&state, replacement, [], now: 12.5)?.request.latestMessageID, "newest")
+        XCTAssertEqual(state.bottomSettlement.decision?.reason, .appearance)
+        state.userBeganDragging()
+        state.update(input(["new-a", "new-b", "new-c", "later"]))
+        XCTAssertNil(state.bottomSettlement.decision)
+        XCTAssertNil(state.followDecision)
+    }
+
+    func testNewMessageAfterOldSnapshotLandingStillFollows() throws {
+        var state = try opened(input())
+        XCTAssertNil(correct(&state, input(), frame(500), now: 10.2))
+        state.update(input(["a", "last", "arrived-while-in-list"]))
+        XCTAssertEqual(state.followDecision?.request.latestMessageID, "arrived-while-in-list")
+        XCTAssertEqual(state.followDecision?.animationDuration(reduceMotion: false), 0.2)
     }
 
     func testTimeoutWithoutAnyGeometryAndLateFrameDoNotScroll() throws {
         var state = try opened(input())
-        state.expireScrollWork(now: 12)
-        XCTAssertNil(correct(&state, input(), frame(2000), now: 12.1))
+        state.expireScrollWork(now: 14)
+        XCTAssertNil(correct(&state, input(), frame(2000), now: 14.1))
         XCTAssertNil(state.bottomSettlement.decision)
     }
 
     func testDeadlineCheckedBeforeIssuingCorrection() throws {
         var state = try opened(input())
-        XCTAssertNil(correct(&state, input(), [], now: 12))
+        XCTAssertNil(correct(&state, input(), [], now: 14))
         XCTAssertNil(state.bottomSettlement.decision)
     }
 

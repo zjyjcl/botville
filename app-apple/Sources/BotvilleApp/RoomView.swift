@@ -70,8 +70,8 @@ struct RoomView: View {
     var body: some View {
         VStack(spacing: 0) {
             roomSecurityCard
-            if isOpening {
-                ProgressView("正在打开房间…")
+            if isOpening || (service.activeRoomID == room.id && !service.hasReceivedTimelineSnapshot) {
+                ProgressView(isOpening ? "正在打开房间…" : "正在同步消息…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if service.messages.isEmpty {
                 VStack(spacing: 12) {
@@ -230,8 +230,12 @@ struct RoomView: View {
                         if let olderMessagesLayoutError {
                             Text(olderMessagesLayoutError).font(.footnote).foregroundStyle(.secondary)
                         }
-                        if service.canLoadOlderMessages {
-                            olderMessagesButton
+                        // Keep the lazy stack's header identity when the final
+                        // page removes its button; only its measured height changes.
+                        VStack(spacing: 0) {
+                            if service.canLoadOlderMessages {
+                                olderMessagesButton
+                            }
                         }
                         ForEach(service.messages) { message in
                             MessageBubble(message: message, retry: {
@@ -278,7 +282,7 @@ struct RoomView: View {
                     let work = scrollWork
                     // One bounded driver per operation, not a task cancelled by
                     // every geometry frame. It also expires when no frames arrive.
-                    for _ in 0..<65 {
+                    for _ in 0..<160 {
                         guard !Task.isCancelled, work == scrollWork, !isDraggingTimeline, isVisible else { return }
                         let now = ProcessInfo.processInfo.systemUptime
                         scrollState.expireScrollWork(now: now)
@@ -346,7 +350,14 @@ struct RoomView: View {
     private func recordTimelineGeometry() {
         guard !isDraggingTimeline, scrollState.bottomSettlement.decision == nil, let geometry = timelineGeometry,
               geometry.generation == scrollState.prependAnchor.layoutGeneration,
-              let distance = geometry.distanceFromBottom, let height = geometry.viewportHeight else { return }
+              let height = geometry.viewportHeight else { return }
+        // LazyVStack's estimated content extent can say "not near bottom" even
+        // while the actual last row is visible. Preserve follow for late sync.
+        let last = geometry.frames.first {
+            $0.id == geometry.input.request?.latestMessageID && $0.minY.isFinite && $0.height.isFinite
+                && $0.height > 0 && $0.minY + $0.height > 0
+        }
+        let distance = last.map { $0.minY + $0.height - height } ?? .infinity
         scrollState.recordGeometry(for: geometry.input,
                                    distanceFromBottom: distance,
                                    viewportHeight: height)
@@ -418,7 +429,8 @@ struct RoomView: View {
                                                   viewportHeight: geometry?.viewportHeight ?? 0)
         // No valid capture has ever arrived: keep the page intact and allow retry
         // after layout, instead of performing an unanchored prepend.
-        guard input.request == nil || !capture.frames.isEmpty || scrollState.prependAnchor.blocksFollowing else {
+        guard input.messageIDs.isEmpty || (input.request != nil &&
+              (!capture.frames.isEmpty || scrollState.prependAnchor.blocksFollowing)) else {
             olderMessagesLayoutError = "消息布局尚未就绪，请重试加载更早的消息。"
             return
         }
@@ -454,8 +466,9 @@ struct RoomView: View {
         do {
             _ = try await service.openRoom(room.id, lease: lease)
             guard roomTimelineLease == lease, !Task.isCancelled else { return }
-            await loadOlderMessages()
-            guard roomTimelineLease == lease, !Task.isCancelled else { return }
+            // First presentation belongs to the live listener. An automatic
+            // backwards page delayed appearance and could mutate an unmeasured
+            // timeline before a scroll request even existed.
             completedRoomOpenGeneration = generation
         } catch is CancellationError {
             return
@@ -469,6 +482,8 @@ struct RoomView: View {
         roomOpenTask?.cancel()
         let generation = UUID()
         roomOpenGeneration = generation
+        completedRoomOpenGeneration = nil
+        isOpening = true
         scrollState = TimelineScrollState()
         olderMessagesOperation = nil
         olderMessagesLayoutError = nil

@@ -290,9 +290,9 @@ final class TimelinePrependAnchorTests: XCTestCase {
         state.update(input(next))
         XCTAssertNil(layout(&state, next, []))
         XCTAssertEqual(layout(&state, next, []), .locate("a"))
-        state.expire(now: 12.99)
+        state.expire(now: 14.99)
         XCTAssertTrue(state.blocksFollowing)
-        state.expire(now: 13)
+        state.expire(now: 15)
         XCTAssertFalse(state.blocksFollowing)
         state.finished(operation: operation)
         state.update(input(["late"] + next))
@@ -308,22 +308,53 @@ final class TimelinePrependAnchorTests: XCTestCase {
             XCTAssertNotNil(action)
             if execute { state.didExecute(generation: state.layoutGeneration) }
             XCTAssertNil(state.layout(input: input(ids), generation: state.layoutGeneration + 10, frames: [frame()]))
-            state.expire(now: 13)
+            state.expire(now: 15)
             XCTAssertFalse(state.blocksFollowing)
             XCTAssertNil(state.operation)
         }
     }
 
-    func testCompletionAndDataChangesDoNotRestartDeadline() {
+    func testCompletionNearDeadlineGetsOneBoundedRecoveryWindow() {
         var state = TimelinePrependAnchor()
         state.begin(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
-        state.finished(operation: operation)
-        _ = layout(&state, ids, [frame()])
-        state.update(input(["late"] + ids))
-        XCTAssertEqual(state.deadline, 13)
-        state.expire(now: 13)
+        state.finished(operation: operation, now: 14.9)
+        XCTAssertEqual(state.deadline, 16.9)
+        // Button disappeared without any new text rows. The target is seven
+        // screens away and is absent from the first post-completion packets.
+        XCTAssertNil(layout(&state, ids, []))
+        XCTAssertEqual(layout(&state, ids, []), .locate("a"))
+        state.expire(now: 15.1)
+        XCTAssertTrue(state.blocksFollowing)
+        XCTAssertEqual(layout(&state, ids, [frame("a", 0)]), .restore(id: "a", offset: 60))
+        XCTAssertNil(layout(&state, ids, [frame()]))
         XCTAssertFalse(state.blocksFollowing)
+        state.finished(operation: operation, now: 16)
+        state.update(input(["late"] + ids))
+        XCTAssertEqual(state.deadline, 16.9)
+        state.expire(now: 16.9)
         XCTAssertNil(layout(&state, ["late"] + ids, [frame("a", 900)]))
+    }
+
+    func testMissingTargetRetriesRegistrationButCannotRestoreAfterCompletionDeadline() {
+        var state = TimelinePrependAnchor()
+        state.begin(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
+        state.finished(operation: operation, now: 10.5)
+        var actions = 0
+        for _ in 0..<20 {
+            if layout(&state, ids, []) == .locate("a") { actions += 1 }
+        }
+        XCTAssertEqual(actions, 3)
+        state.expire(now: 12.5)
+        state.finished(operation: operation, now: 12.6)
+        XCTAssertNil(layout(&state, ids, [frame("a", 900)]))
+        XCTAssertNil(state.operation)
+    }
+
+    func testCompletionAfterLoadingDeadlineCannotReviveEvenWithoutDriverTick() {
+        var state = TimelinePrependAnchor()
+        state.begin(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
+        state.finished(operation: operation, now: 15.01)
+        XCTAssertNil(state.operation)
     }
 
     func testGestureThenLatePrependAndCompletionDoNotRestoreOrFollow() throws {

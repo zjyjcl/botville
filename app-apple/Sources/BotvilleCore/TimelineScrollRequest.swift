@@ -71,8 +71,9 @@ public struct TimelineScrollState: Sendable {
         prependAnchor.begin(operation: operation, input: input, frames: frames, viewportHeight: viewportHeight, now: now)
     }
 
-    public mutating func finishPrepend(operation: UUID) {
-        prependAnchor.finished(operation: operation)
+    public mutating func finishPrepend(operation: UUID,
+                                      now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        prependAnchor.finished(operation: operation, now: now)
     }
 
     public mutating func restorePrepend(for input: TimelineScrollInput, generation: UInt,
@@ -120,9 +121,19 @@ public struct TimelineScrollState: Sendable {
 
     public mutating func update(_ next: TimelineScrollInput) {
         let previous = input
-        if previous != next { bottomSettlement.cancel() }
+        let settlingAppearance = bottomSettlement.decision?.reason == .appearance
+            && bottomSettlement.decision?.request.appearanceID == next.request?.appearanceID
+        let change = Self.change(from: previous?.messageIDs ?? [], to: next.messageIDs)
         input = next
         prependAnchor.update(next)
+        if previous != next, settlingAppearance, let request = next.request,
+           change == .replacement, !next.latestMessageIsOwn,
+           next.messageIDs.count >= (previous?.messageIDs.count ?? 0),
+           !prependAnchor.blocksFollowing {
+            bottomSettlement.retarget(request)
+            return
+        }
+        if previous != next { bottomSettlement.cancel() }
         guard let request = next.request else {
             pending = nil
             return
@@ -131,7 +142,6 @@ public struct TimelineScrollState: Sendable {
             pending = .init(request: request, reason: .appearance)
             return
         }
-        let change = Self.change(from: previous?.messageIDs ?? [], to: next.messageIDs)
         guard change == .append else {
             // Keep an append follow deferred until active restoration completes.
             if change != .unchanged && !prependAnchor.blocksFollowing { pending = nil }

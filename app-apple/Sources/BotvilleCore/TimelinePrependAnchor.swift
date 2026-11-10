@@ -41,9 +41,12 @@ public struct TimelinePrependAnchor: Sendable {
         var phase: Phase = .layout
     }
 
-    public static let timeout: TimeInterval = 3
+    public static let timeout: TimeInterval = 5
+    public static let recoveryWindow: TimeInterval = 2
     public private(set) var deadline: TimeInterval?
+    private var hardDeadline: TimeInterval?
     private var missingFrameSamples = 0
+    private var locateAttempts = 0
     public private(set) var layoutGeneration: UInt = 0
     private var capture: Capture?
     private var input: TimelineScrollInput?
@@ -80,6 +83,7 @@ public struct TimelinePrependAnchor: Sendable {
             .filter { $0.intersects(viewportHeight: viewportHeight) }
         guard let target = chained?.target ?? visible.first else { return }
         deadline = now + Self.timeout
+        hardDeadline = now + Self.timeout + Self.recoveryWindow
         capture = Capture(operation: operation, appearance: appearance,
                           originalIDs: chained?.originalIDs ?? input.messageIDs,
                           visibleFrames: chained?.visibleFrames ?? visible, target: target)
@@ -88,7 +92,9 @@ public struct TimelinePrependAnchor: Sendable {
     public mutating func cancel() {
         capture = nil
         deadline = nil
+        hardDeadline = nil
         missingFrameSamples = 0
+        locateAttempts = 0
         awaitingExecution = false
         layoutGeneration &+= 1
     }
@@ -127,13 +133,20 @@ public struct TimelinePrependAnchor: Sendable {
         }
         capture = current
         missingFrameSamples = 0
+        locateAttempts = 0
         awaitingExecution = false
         layoutGeneration &+= 1
     }
 
-    public mutating func finished(operation: UUID) {
-        guard var current = capture, current.operation == operation else { return }
+    public mutating func finished(operation: UUID,
+                                 now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        expire(now: now)
+        guard var current = capture, current.operation == operation, current.loading else { return }
+        // One completion grace period, never renewed by geometry, data or a
+        // duplicate completion. A cancelled/expired capture cannot resurrect.
+        deadline = min(now + Self.recoveryWindow, hardDeadline ?? now)
         missingFrameSamples = 0
+        locateAttempts = 0
         current.loading = false
         current.phase = .layout // Includes spinner/button removal and empty pages.
         awaitingExecution = false
@@ -150,7 +163,7 @@ public struct TimelinePrependAnchor: Sendable {
     }
 
     /// Called only with geometry emitted by the current rendered message revision
-    /// and generation. At most one locate and two pixel corrections per revision.
+    /// and generation. Retry lazy registration at most three times per revision.
     public mutating func layout(input measuredInput: TimelineScrollInput, generation: UInt,
                                 frames: [TimelineMessageFrame]) -> Action? {
         guard measuredInput == input, generation == layoutGeneration,
@@ -169,18 +182,16 @@ public struct TimelinePrependAnchor: Sendable {
                 action = .restore(id: current.target.id, offset: current.target.minY)
                 current.phase = .corrected(corrections + 1)
             }
-        } else if case .layout = current.phase {
+        } else {
             // The first new-generation preference can contain only the content
             // reader. Give row preferences a turn before moving a visible row
             // to .top and back. The bounded driver retries even without events.
             missingFrameSamples += 1
-            guard missingFrameSamples >= 2 else { return nil }
+            guard missingFrameSamples >= (locateAttempts == 0 ? 2 : 4), locateAttempts < 3 else { return nil }
+            missingFrameSamples = 0
+            locateAttempts += 1
             action = .locate(current.target.id)
             current.phase = .located
-        } else {
-            // Lazy materialization may take more than one layout. Wait for the
-            // target's own frame; data removal is handled by update(_:).
-            return nil
         }
         capture = current
         awaitingExecution = action != nil

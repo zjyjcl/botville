@@ -137,6 +137,7 @@ public final class MatrixService: ObservableObject {
     private var timelineTask: Task<Void, Never>?
     private var timelineGeneration = UUID()
     private var timelineState = TimelineState()
+    @Published public private(set) var hasReceivedTimelineSnapshot = false
     private var timelineLeaseOwnership = TimelineLeaseOwnership()
     @Published public private(set) var isAuthenticating = false
     @Published public private(set) var authenticationStatus: String?
@@ -1099,6 +1100,7 @@ public final class MatrixService: ObservableObject {
                     guard !Task.isCancelled, let self, self.timelineGeneration == generation else { return }
                     self.timelineState.apply(updates)
                     self.messages = self.timelineState.messages
+                    self.hasReceivedTimelineSnapshot = true
                 }
             }
             let handle = await newTimeline.addListener(listener: listener)
@@ -1147,6 +1149,7 @@ public final class MatrixService: ObservableObject {
         timelineState = TimelineState()
         activeRoomID = nil
         messages = []
+        hasReceivedTimelineSnapshot = false
         canLoadOlderMessages = false
         paginationGeneration = nil
         sendingGeneration = nil
