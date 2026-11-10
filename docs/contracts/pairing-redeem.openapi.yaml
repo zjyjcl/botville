@@ -25,6 +25,9 @@ info:
       省略 `gw` 的配对是 **chat-only**（pairing-qr.md §5.1.1，Option A 定稿）：
       App 在该配对生命周期内不得为其启用网关功能；`gateway` 为 `null` 的响应
       **应省略** `features_url`（可选字段，App 忽略之）。
+    - 默认部署的网关基址为主域路径 `https://<domain>/_botville/gateway`（与 `hs`
+      同源，pairing-qr.md §11 B1）；App→网关鉴权方向为 Matrix OpenID token
+      （§11 B2，细节归网关契约 #124）。
     - `code`：32 字节随机数的 base64url 无填充（43 字符）；服务端只存 sha256；
       签发后 5 分钟过期、一次性、事务内原子核销。
     - 成功响应的 `homeserver` 是**签发时保存的 hs 原样返回**；App 必须与二维码中
@@ -244,7 +247,10 @@ components:
 
     PairingAuth:
       type: object
-      description: 一次性短时令牌。`type` 由签发时管理面决定，契约只传输。
+      description: |
+        一次性短时令牌。`type` 由签发时管理面决定，契约只传输。首版服务端只签发
+        `registration_token`（pairing-qr.md §11 B4，只支持 Synapse 部署，B3）；
+        `login_token` 保留在枚举中，客户端仍须能处理；管理面不得替他人签发。
       required: [type, token, expires_in_ms]
       properties:
         type:

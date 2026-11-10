@@ -117,7 +117,7 @@ fedgate 路由规则：
 - **反代与限速**：fedgate 转发 `/_matrix/pairing/*` 时剥掉客户端自带的 `X-Forwarded-For`/`X-Real-IP`/`Forwarded`，写入直连客户端 IP；pairing 仅当直连地址 ∈ `PAIRING_TRUSTED_PROXIES`（逗号分隔 CIDR，默认空=不信任）才采信 XFF 最后一个值，否则用直连 IP——伪造 XFF 无法稀释限速桶。
 - **闸门与 HS 解析一致性（B1）**：fedgate 遍历全部 Authorization 头，X-Matrix 头数量 ≠1 或任一参数名重复 → 403；参数切分/去引号/反斜杠转义与 Synapse v1.164.1 `_parse_auth_header` 一致；签名真伪由 HS 验签兜底。**HTTP 层**：Python 标准库与 Twisted 对折行（obs-fold）头的归一化不同（前者保留 `\r\n`+缩进，后者折成一个空格），任何跨解析器的归一化差异都是绕过面，所以闸门**不模拟**对方的归一化，而是在路由前拒绝任何折行头或含控制字符（HTAB 除外）的头名/头值（400），也顺带杜绝 CRLF 注入上游。**重复 Authorization**：在原始字节层面（不依赖 http.server/email 的合并结果）计数，`Authorization` 出现超过一次（不论是否 X-Matrix、不论大小写）、头名与冒号间有空白、或单个值内出现第二个凭证（第二个 `X-Matrix`/非法参数名）→ 400；转发时只转发那唯一一个已校验的值，绝不合并。不变量是「闸门解析的表示 == 转发给 HS 的表示」，任何偏离即绕过；「闸门放行的 origin == HS 认证的 origin」只在以上全部请求级检查成立时才成立（`parse_x_matrix_origin` 单独并不保证），由 raw socket 用例与差分单测（Twisted 折行语义 + 逐字照抄的 Synapse `_parse_auth_header` 参考实现，对照上游实际收到的头）守护。
 - **媒体访问的硬边界**：Synapse 对 `/_matrix/media/*`（联邦媒体下载）**不验联邦签名**，闸门也不验签（容器仅标准库，无 ed25519）；因此能伪造某 active 对端 origin 的请求方，只要知道 `media_id` 就能下载。**媒体访问的唯一保护是 media_id 的保密性**（Synapse media_id 约 24 位 62 进制，≈143 bit，不可猜）。A2.1 单配对部署下接受；**多配对或生产化前必须补令牌/签名（闸门验签）**。
-- **sink 的代价**：未配对 `/send` 回 `200 {"pdus":{}}` 并丢弃（读 body 上限 1 MiB，超限直接断开；日志按 origin 节流）。**切断期间的 EDU（to-device、E2EE 密钥包）永久丢失**（DAG 补不回、发送方收到 200 不再重试）；PDU 在重新配对后经 `get_missing_events`/`backfill` 补回——因此 sever 是"断流"而非"内容栅栏"，**重新配对后切断窗口内产生的事件会一并补回**；若需要"切断期内容永不再入"需后续做窗口栅栏。
+- **sink 的代价**：未配对 `/send` 回 `200 {"pdus":{}}` 并丢弃（读 body 上限 1 MiB，超限直接断开；日志按 origin 节流）。**切断期间的 EDU（to-device、E2EE 密钥包）永久丢失**（DAG 补不回、发送方收到 200 不再重试）；PDU 在重新配对后经 `get_missing_events`/`backfill` 补回——因此 sever 是"断流"而非"内容栅栏"，**重新配对后切断窗口内产生的事件会一并补回**；若需要"切断期内容永不再入"需后续做窗口栅栏。**产品决策（2026-11-10，B6，见 [pairing-qr.md §11](../contracts/pairing-qr.md)）**：首版**保留**这一行为——重新配对后补回切断期消息，App / 管理页在重新配对时须向用户说明「切断期间对方发出的消息会补回」；时间窗栅栏归 #118。
 - **管理面**：`Authorization: Bearer $PAIRING_ADMIN_TOKEN`，常量时间比对；token 缺失时服务**拒绝启动**；pairing 服务只应绑定内网/loopback（compose 只把 admin 端口映射到 `127.0.0.1`；fedgate 只转发 redeem/notify-severed，admin 端点不暴露公网口）。
 - **日志**：不打印 secret/token（qr_payload 只出现在请求体，永不落日志；shared_secret 同样只存 DB/响应体）。
 - **对端身份校验**（`PAIRING_VERIFY_PEER_KEY`，默认开）：redeem（invite 校验通过后）拉取对端 `/_matrix/key/v2/server` 并要求 server_name 一致，防止冒名配对；该校验比对的是对端声明字段，签名仍由联邦层验签保证。`PAIRING_PEER_KEY_URL_TEMPLATE`（默认 `https://{server_name}/_matrix/key/v2/server`）供测试/特殊拓扑改写；`PAIRING_INSECURE_TLS=true` 关闭证书校验，**仅限 CI/一次性测试栈**（自签证书场景）。
@@ -194,7 +194,7 @@ docker compose -p botville-fed -f server/compose/federation/docker-compose.feder
 
 ## 出站硬化（后续，不在本 PR）
 
-切断的**入站**验收语义（对方不能再向我方发消息、不能从我方拉取内容）已由双方入站闸门闭环；「我方 homeserver 主动出站仍会尝试」的硬化（配对变更时重渲染 HS 白名单并编排重启，Tuwunel/continuwuity 用 allowed/forbidden 列表；含对拒不配合对端的出站停推与切断窗口内容栅栏）列为后续任务。同样不在本 PR：App 侧扫码 UI（C2.2）、跨服 AI 关系（A2.3）、公网 TLS 证书的获取与续期流程、媒体端点的签名/令牌校验。
+切断的**入站**验收语义（对方不能再向我方发消息、不能从我方拉取内容）已由双方入站闸门闭环；「我方 homeserver 主动出站仍会尝试」的硬化（配对变更时重渲染 HS 白名单并编排重启，Tuwunel/continuwuity 用 allowed/forbidden 列表；含对拒不配合对端的出站停推与切断窗口内容栅栏，栅栏按 B6 决策归 #118）列为后续任务。同样不在本 PR：App 侧扫码 UI（C2.2）、跨服 AI 关系（A2.3）、公网 TLS 证书的获取与续期流程、媒体端点的签名/令牌校验。
 
 ## 实测要点（federation-e2e 调试结论）
 
