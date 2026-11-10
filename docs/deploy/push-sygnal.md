@@ -5,11 +5,10 @@
 > **验证状态与当前卡点**：homeserver → Sygnal → mock pushkin 链路的时延验收
 > （< 5s）已由 CI 的 `push-e2e (synapse)` / `push-e2e (tuwunel)` job 在每次提交时
 > 自动执行（`make push-e2e`，本地同样可跑）。**真实 APNs 送达尚未验证**：
-> 本项目当前没有 Apple 开发者账号，也没有 APNs 证书（.p8）。因此仓库内一切
-> APNs 相关配置均为占位符（`<key-id>` / `<team-id>` / `<bundle-id>`）或默认关闭
-> （`BOTVILLE_APNS_ENABLED=false`），不存在任何真实 Apple 值；Sygnal 侧 APNs
-> app 只有在放入真实 .p8 并填好真实值后才会被渲染。真实端到端（Sygnal →
-> APNs → 真机横幅）需要账号/证书/真机就绪后按 §7 手工验证并回填本页。
+> 已有 Apple 开发者账号与 APNs Auth Key（.p8），密钥只存放在部署侧、不进仓库
+> （仓库内 APNs 值仍一律占位，`BOTVILLE_APNS_ENABLED` 默认 false）。真实端到端
+> （Sygnal → APNs → 真机横幅）待 C 线真机 device token 后按 §7 手工验证并回填
+> 本页（issue #4）。
 
 本手册（及整条推送链路）只用 Matrix 标准接口（Client-Server `pushers/*` +
 Push Gateway `/_matrix/push/v1/notify`）；不引入任何私有 homeserver API。
@@ -24,7 +23,7 @@ Push Gateway `/_matrix/push/v1/notify`）；不引入任何私有 homeserver API
 4. [sandbox / production](#sandbox--production)
 5. [App 端需要的参数](#app-端需要的参数)
 6. [时延验收：mock 链路（已自动化）](#时延验收mock-链路已自动化)
-7. [时延验收：真实 APNs 端到端（手工，待账号）](#时延验收真实-apns-端到端手工待账号)
+7. [时延验收：真实 APNs 端到端（手工，待真机）](#时延验收真实-apns-端到端手工待真机)
 8. [隐私](#隐私)
 9. [运维与排障](#运维与排障)
 10. [内网推送放行](#内网推送放行botville_docker_subnet-与-botville_sygnal_ip)
@@ -124,8 +123,9 @@ apps:
 
 ## 启用真实 APNs（.p8 放置）
 
-前提：Apple Developer 账号下创建过 APNs Auth Key（.p8）。**当前项目没有账号，
-以下步骤属于「拿到账号后」的操作指引；在拿到之前不要把任何占位值改成看似真实的值。**
+前提：Apple Developer 账号下创建过 APNs Auth Key（.p8）。**账号与 .p8 已就绪
+（密钥只存放在部署侧、不进仓库）；以下步骤在部署机上操作，不要把任何真实值写进
+被跟踪的文件（仓库内 APNs 值一律占位）。**
 
 1. 把 .p8 文件放到 `server/compose/secrets/apns.p8`。目录由 `init.sh` 自动创建
    （`0700`，Linux 上首次 `up` 不会再让 Docker 建出更宽的 root 目录）：
@@ -275,7 +275,7 @@ make up HS=continuwuity PUSH=1 && make push-e2e
 注意：该验收覆盖 **homeserver → sygnal**（含 homeserver 内部 pusher 调度）；
 `sygnal → APNs → 真机` 不在内（mock pushkin 在 ③ 的位置截断）。
 
-## 时延验收：真实 APNs 端到端（手工，待账号）
+## 时延验收：真实 APNs 端到端（手工，待真机）
 
 前置：Apple 开发者账号、按 §3 放好 .p8 并启用、真机装了带推送 entitlement
 的 debug 构建、`APNS_PLATFORM` 与构建类型匹配。
