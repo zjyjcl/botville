@@ -245,6 +245,11 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `MAX_MESSAGE_CHARS` | `8000` | 单条正文上限（超限 → 400，不是 blocked） |
 | `PLATFORM_TOKEN_BUDGET` | `200000` | 平台层 token 预算（窗口同 `RATE_LIMIT_WINDOW_SECONDS`）；`0` = 平台不设该限额 |
 | `PLATFORM_PROACTIVE_PER_DAY` | `6` | 平台层主动发言/日上限；`0` = 平台不设该限额 |
+| `PLATFORM_MAX_CONSECUTIVE_AI_MESSAGES` | `0` | 平台层 `anti_spam.max_consecutive_ai_messages`（N7）；`0` = 平台不设该项，非 0 取 **1–50**，owner/peer 更宽松 → `422 limit.out_of_range` |
+| `PLATFORM_ANTI_SPAM_COOLDOWN_SECONDS` | `0` | 平台层 `anti_spam.cooldown_seconds`；`0` = 平台不设该项，非 0 取 **1–86400**（越大越严） |
+| `PLATFORM_MAX_AI_MESSAGES_PER_HOUR` | `0` | 平台层 `ai_loop.max_ai_messages_per_hour`；`0` = 平台不设该项（**不是** API 的「一条都不允许」），非 0 取 **1–1000** |
+| `PLATFORM_AI_LOOP_ON_BREAK` | `stop` | 平台层 `ai_loop.on_break`（`stop`/`notify`，大小写不敏感）；枚举**无**「不设」语义，默认 `stop` 即平台底线。`notify` 当前等价 `stop`，故平台 `stop` 时 owner/peer 写 `notify` 不报 422 |
+| `USAGE_RETENTION_SECONDS` | `2592000` | 用量事件保留期（秒，≥3600）。启动校验必须 **≥ `max(RATE_LIMIT_WINDOW_SECONDS, PLATFORM_ANTI_SPAM_COOLDOWN_SECONDS)`**（平台冷却 0 不参与），否则拒绝启动（N5：保留期短于窗口/冷却会静默 fail-open） |
 | `MAX_USAGE_EVENTS` | `10000` | 内存用量事件条数上限（超出按最旧优先淘汰，≥1） |
 | `MAX_IDEMPOTENCY_ENTRIES` | `2000` | 幂等缓存条目上限（LRU 淘汰，≥1） |
 | `IDEMPOTENCY_TTL_SECONDS` | `86400` | 幂等缓存保留时长（秒，`0` = 不过期） |

@@ -6,7 +6,8 @@
 - anti_spam：连续达 max → blocked(consecutive)；冷却期 blocked(cooldown) 且 may_clear_at 不变；
   冷却结束后计数清零可再发 max 条；blocked 事件不计入连续数。
 - ai_loop：两 AI 交替发言到 max_ai_messages_per_hour → blocked(tripped)；
-  on_break=notify 同样 blocked；may_clear_at = 最早事件 + 3600。
+  on_break=notify 同样 blocked；may_clear_at 取第 used−limit+1 早的计入项出窗时刻，
+  最终下界 max(计算值, ceil(now)+1s)（N8，契约 §6.3）。
 - record_human_message：重置 anti_spam / ai_loop 计数，提前解除冷却。
 - 三层取最严：owner/peer 更严生效；放宽超过平台 → 422；window_seconds 单写 → 422。
 - peer_id 422：非成员、等于自身、未注册带 peer_id、有 peer 规则时缺 peer_id；
