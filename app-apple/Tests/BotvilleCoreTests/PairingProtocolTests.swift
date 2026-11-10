@@ -158,7 +158,9 @@ final class PairingProtocolTests: XCTestCase {
     func testGatewayOnDifferentHostIsAcceptedInResponse() throws {
         let pairing = try PairingQRCode.parse("botville://pair?v=1&hs=https://hs.example.org&gw=https://gw.example.org&fp=sha256:\(String(repeating: "A", count: 43))&code=\(validCode)&exp=2000000000", now: future)
         let response = #"{"v":"1","homeserver":"https://hs.example.org","gateway":"https://gw.example.org","auth":{"type":"login_token","token":"test","expires_in_ms":1},"features_url":"https://gw.example.org/features"}"#.data(using: .utf8)!
-        XCTAssertNoThrow(try HTTPPairingService.decodeResponse(response, pairing: pairing, redeemHost: pairing.homeserver.host, receivedAt: future))
+        let decoded = try HTTPPairingService.decodeResponse(response, pairing: pairing, redeemHost: pairing.homeserver.host, receivedAt: future)
+        XCTAssertEqual(decoded.gateway?.absoluteString, "https://gw.example.org")
+        XCTAssertEqual(decoded.featuresURL?.absoluteString, "https://gw.example.org/features")
     }
 
     func testChatOnlyResponsesMayOmitFeatures() throws {
@@ -178,9 +180,38 @@ final class PairingProtocolTests: XCTestCase {
 
         let withGateway = try PairingQRCode.parse("botville://pair?v=1&hs=https://hs.example.org&gw=https://gw.example.org&code=\(validCode)&exp=2000000000", now: future)
         let responseGatewayNull = #"{"v":"1","homeserver":"https://hs.example.org","gateway":null,"auth":{"type":"login_token","token":"test","expires_in_ms":1}}"#.data(using: .utf8)!
-        XCTAssertNoThrow(try HTTPPairingService.decodeResponse(responseGatewayNull, pairing: withGateway, redeemHost: withGateway.homeserver.host, receivedAt: future))
+        var nullGatewayPayload = try XCTUnwrap(JSONSerialization.jsonObject(with: responseGatewayNull) as? [String: Any])
+        nullGatewayPayload["features_url"] = "https://gw.example.org/features"
+        for response in [responseGatewayNull, try JSONSerialization.data(withJSONObject: nullGatewayPayload)] {
+            let decoded = try HTTPPairingService.decodeResponse(response, pairing: withGateway, redeemHost: withGateway.homeserver.host, receivedAt: future)
+            XCTAssertNil(decoded.gateway)
+            XCTAssertNil(decoded.featuresURL)
+        }
+    }
+
+    func testGatewayResponsesMayOmitFeaturesOrProvideNull() throws {
+        let withGateway = try PairingQRCode.parse("botville://pair?v=1&hs=https://hs.example.org&gw=https://gw.example.org&code=\(validCode)&exp=2000000000", now: future)
         let missingFeaturesWithGateway = #"{"v":"1","homeserver":"https://hs.example.org","gateway":"https://gw.example.org","auth":{"type":"login_token","token":"test","expires_in_ms":1}}"#.data(using: .utf8)!
-        XCTAssertThrowsError(try HTTPPairingService.decodeResponse(missingFeaturesWithGateway, pairing: withGateway, redeemHost: withGateway.homeserver.host, receivedAt: future))
+        var nullFeaturesPayload = try XCTUnwrap(JSONSerialization.jsonObject(with: missingFeaturesWithGateway) as? [String: Any])
+        nullFeaturesPayload["features_url"] = NSNull()
+        for response in [missingFeaturesWithGateway, try JSONSerialization.data(withJSONObject: nullFeaturesPayload)] {
+            let decoded = try HTTPPairingService.decodeResponse(response, pairing: withGateway, redeemHost: withGateway.homeserver.host, receivedAt: future)
+            XCTAssertEqual(decoded.gateway?.absoluteString, "https://gw.example.org")
+            XCTAssertNil(decoded.featuresURL)
+        }
+    }
+
+    func testGatewayResponsesRejectInvalidFeaturesURL() throws {
+        let withGateway = try PairingQRCode.parse("botville://pair?v=1&hs=https://hs.example.org&gw=https://gw.example.org&code=\(validCode)&exp=2000000000", now: future)
+        let missingFeaturesWithGateway = #"{"v":"1","homeserver":"https://hs.example.org","gateway":"https://gw.example.org","auth":{"type":"login_token","token":"test","expires_in_ms":1}}"#.data(using: .utf8)!
+        var payload = try XCTUnwrap(JSONSerialization.jsonObject(with: missingFeaturesWithGateway) as? [String: Any])
+        for featuresURL in ["http://gw.example.org/features", "not-a-url", "https://gw.example.org/features?query=1"] {
+            payload["features_url"] = featuresURL
+            let response = try JSONSerialization.data(withJSONObject: payload)
+            XCTAssertThrowsError(try HTTPPairingService.decodeResponse(response, pairing: withGateway, redeemHost: withGateway.homeserver.host, receivedAt: future)) {
+                XCTAssertEqual($0 as? PairingError, .invalidResponse)
+            }
+        }
     }
 
     func testExpiresMustBePositiveAndDebugMockRedeemsParsedRawURI() async throws {

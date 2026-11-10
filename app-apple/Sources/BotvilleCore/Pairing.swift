@@ -206,15 +206,17 @@ public struct HTTPPairingService: PairingService {
         guard wire.v == "1", let homeserver = try? PairingURLPolicy.validatedHTTPS(wire.homeserver) else { throw PairingError.invalidResponse }
         guard wire.homeserver.utf8.elementsEqual(pairing.homeserverSource.utf8) else { throw PairingError.homeserverMismatch }
         guard let authType = PairingAuthType(rawValue: wire.auth.type), !wire.auth.token.isEmpty, wire.auth.expiresInMS >= 1 else { throw PairingError.invalidResponse }
-        // B3 divergence from the A-line contract: a QR without gw is chat-only.
-        // Do not let a response re-enable gateway features that QR omitted.
+        // Option A finalized (2026-11-06, #128/#132): a QR without gw is chat-only.
+        // Gateway features must stay disabled for this pairing's lifetime.
         let responseGateway = try wire.gateway.map(PairingURLPolicy.validatedHTTPS)
         let responseFeatures: URL?
-        if responseGateway == nil {
-            responseFeatures = nil
+        if responseGateway != nil, let featuresURL = wire.featuresURL {
+            guard let validatedFeatures = try? PairingURLPolicy.validatedHTTPS(featuresURL) else {
+                throw PairingError.invalidResponse
+            }
+            responseFeatures = validatedFeatures
         } else {
-            guard let featuresURL = wire.featuresURL else { throw PairingError.invalidResponse }
-            responseFeatures = try PairingURLPolicy.validatedHTTPS(featuresURL)
+            responseFeatures = nil
         }
         let gateway = pairing.gateway == nil ? nil : responseGateway
         let features = pairing.gateway == nil ? nil : responseFeatures

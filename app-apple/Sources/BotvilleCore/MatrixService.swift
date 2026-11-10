@@ -268,8 +268,8 @@ public final class MatrixService: ObservableObject {
             try Task.checkCancellation()
             try await retryRateLimits { try await newClient.restoreSession(session: session) }
             try Task.checkCancellation()
-            // Owner decision: a QR without gw is chat-only. This deliberately
-            // differs from A-line §3.1 (gw required), pending alignment.
+            // Option A finalized (2026-11-06, #128/#132): a QR without gw is chat-only.
+            // Gateway features must stay disabled for this pairing's lifetime.
             let gateway = qrCode.gateway == nil ? nil : response.gateway
             let gatewayPin = gateway.flatMap {
                 PairingURLSession.fingerprint(qrCode.fingerprint, homeserver: qrCode.homeserver, requestURL: $0)
