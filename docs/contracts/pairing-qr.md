@@ -401,7 +401,7 @@ matrix-rust-sdk（当前绑定如 `matrix-rust-components-swift` 26.x）的同�
 | `server/pairing_qr_contract.py` | 标准库参考实现：`parse_pair_uri` / `validate_redeem_response` / `validate_error` |
 | `server/tests/test_pairing_qr_contract.py` | 单测：示例分类、拒绝规则、hs 一致性、429 必带字段、OpenAPI 错误码覆盖、密钥扫描 |
 | `scripts/sync-pairing-qr-fixtures.sh` | 把示例目录同步为 App 测试 fixture（`--check` 供 CI 守卫，漂移即失败） |
-| `app-apple/Tests/BotvilleCoreTests/Fixtures/pairing-qr-contract/` | **生成副本，勿手改**：来源 `docs/contracts/examples/pairing-qr/`，文件集合与内容逐字节一致（CI 校验） |
+| `app-apple/Tests/BotvilleCoreTests/Fixtures/pairing-qr-contract/` | **生成副本，勿手改**：来源 `docs/contracts/examples/pairing-qr/`，除 README.md 外文件集合与内容逐字节一致（README 不同步，相对链接在 App 侧会失效；CI 校验） |
 
 ## 8. 不在本契约内（后续 PR）
 

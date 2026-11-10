@@ -4,10 +4,11 @@
 示例，同时是 App 测试 fixture 的**单一来源（single source of truth）**：
 
 - `app-apple/Tests/BotvilleCoreTests/Fixtures/pairing-qr-contract/` 是本目录的
-  **生成副本**（文件集合与内容逐字节一致），**勿手改**——漂移会被 CI 守卫拦下；
+  **生成副本**（除 README.md 外文件集合与内容逐字节一致——README 不同步，
+  本文件的相对链接在 App 侧会失效），**勿手改**——漂移会被 CI 守卫拦下；
 - 修改示例请直接改本目录，然后运行 `scripts/sync-pairing-qr-fixtures.sh`
-  （幂等；App 侧副本会被替换为与本目录一致，多余文件会被删除），两边的改动
-  一起提交；
+  （幂等；App 侧副本会被替换为与本目录一致，多余文件会被删除，README.md
+  不被同步），两边的改动一起提交；
 - CI（lint job）以 `scripts/sync-pairing-qr-fixtures.sh --check` 校验两目录
   无漂移，有差异即失败；
 - `server/tests/test_pairing_qr_contract.py` 按文件名分类校验本目录每个示例，
