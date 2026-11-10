@@ -12,6 +12,19 @@ final class PushNotificationContentTests: XCTestCase {
         super.tearDown()
     }
 
+    func testStubCancellationKeepsStartingRequestCallback() {
+        let stopped = expectation(description: "original request cancelled once")
+        URLProtocolStub.handler = { _, _ in }
+        URLProtocolStub.onStopLoading = { stopped.fulfill() }
+        let stub = URLProtocolStub(request: URLRequest(url: URL(string: "https://matrix.test/event")!),
+                                   cachedResponse: nil, client: nil)
+        stub.startLoading()
+        URLProtocolStub.onStopLoading = { XCTFail("late cancellation must not enter a later test's callback") }
+        stub.stopLoading()
+        stub.stopLoading()
+        wait(for: [stopped], timeout: 1)
+    }
+
     func testEventReferenceAcceptsSygnalTopLevelAndKnownWrappersWithoutMixing() {
         let expected = PushEventReference(roomID: "!room:example.test", eventID: "$event:example.test")
         for payload: [AnyHashable: Any] in [
@@ -359,15 +372,25 @@ final class PushNotificationContentTests: XCTestCase {
 }
 
 private final class URLProtocolStub: URLProtocol {
-    static var handler: ((URLRequest, URLProtocolStub) throws -> Void)?
-    static var onStopLoading: (() -> Void)?
+    @TestLocked static var handler: ((URLRequest, URLProtocolStub) throws -> Void)? = nil
+    @TestLocked static var onStopLoading: (() -> Void)? = nil
+    @TestLocked private var stopHandler: (() -> Void)? = nil
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
-        do { try Self.handler?(request, self) }
+        stopHandler = Self.onStopLoading
+        let handler = Self.handler
+        do { try handler?(request, self) }
         catch { client?.urlProtocol(self, didFailWithError: error) }
     }
-    override func stopLoading() { Self.onStopLoading?() }
+    override func stopLoading() {
+        let callback = $stopHandler.withValue { value in
+            let callback = value
+            value = nil
+            return callback
+        }
+        callback?()
+    }
 }
 
 private struct ThrowingCredentialsStore: SharedPushCredentialsStore {
