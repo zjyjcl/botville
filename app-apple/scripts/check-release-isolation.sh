@@ -68,6 +68,10 @@ for identifier, target in objects.items():
         if json_plutil(root / value).get('aps-environment') == 'development':
             raise SystemExit(f'{target.get("name")} Release entitlements must not use the development APNs environment')
     release_targets[identifier] = target
+# Compare configured teams without embedding or printing their values.
+teams = [settings.get('DEVELOPMENT_TEAM', '') for configs in (app, nse) for settings in configs.values()]
+if any(not isinstance(team, str) or not re.fullmatch(r'[A-Z0-9]{10}', team) for team in teams) or len(set(teams)) != 1:
+    raise SystemExit('App and extension require the same configured signing team')
 for target_name, configurations, bundle_id, entitlements, plists in (
     ('BotvilleApp-iOS', app, 'com.zjyjcl.botville',
      {'Debug': 'BotvilleApp/BotvilleApp.entitlements', 'Release': 'BotvilleApp/BotvilleApp-Release.entitlements'},
@@ -77,7 +81,7 @@ for target_name, configurations, bundle_id, entitlements, plists in (
      {'Debug': 'NotificationService/Info-Debug.plist', 'Release': 'NotificationService/Info.plist'}),
 ):
     for name, settings in configurations.items():
-        expected = {'CODE_SIGN_STYLE': 'Automatic', 'DEVELOPMENT_TEAM': '3Z8WP6U6F7',
+        expected = {'CODE_SIGN_STYLE': 'Automatic',
                     'CODE_SIGN_IDENTITY[sdk=iphonesimulator*]': '-',
                     'PRODUCT_BUNDLE_IDENTIFIER': bundle_id,
                     'CODE_SIGN_ENTITLEMENTS': entitlements[name],
