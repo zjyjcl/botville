@@ -189,6 +189,32 @@ App                          网关                        模块网页（WKWebV
   仍可代表任意 `sender_persona_id` 发言，per-caller token 也不额外做发送侧归属校验。
   per-caller 的发送隔离属后续版本，接入时不升主版本（仅扩展行为）。
 
+#### 1.2.3 终端用户身份（Matrix OpenID，已拍板）
+
+> 结论来自 2026-11-10 拍板（清单 B2 服务端线）。另见 [§8.4 B 线产品定论](#84-b-线产品定论2026-11-10-已拍板) B2 条。
+
+**身份层次**：本节定义**终端用户（Matrix 用户）**向网关证明身份的方式，与
+§1.2.2 的**站点/调用方级** `GATEWAY_CALLER_TOKENS` 层次不同、不互相替代；
+站点级 bearer（`GATEWAY_AUTH_TOKEN`）同样不变。
+
+**颁发**：App 经标准 Matrix C-S API
+`POST /_matrix/client/v3/user/{userId}/openid/request_token` 取得短时 OpenID token。
+
+**校验**：网关调用 homeserver 的 `GET /_matrix/federation/v1/openid/userinfo` 核验。
+该请求**不带 X-Matrix 签名**，经 fedgate 会被拒；因此网关须经 compose 内网直连本部署
+homeserver，**不经 fedgate、不走公网**。**OpenID token 不得写入日志。**
+
+**部署路径前缀**：网关须支持挂载在路径前缀 `/_botville/gateway` 之后——
+对外 URL 形如 `https://<domain>/_botville/gateway/v1/…`，edge 去前缀后反代；
+OpenAPI `servers` 的 `{host}` 可包含该前缀，网关自身**不得假设挂在根路径**
+（例如内部生成的绝对 URL 须考虑前缀）。
+
+**与现行鉴权的关系**：
+- §1.2.2 的 `GATEWAY_CALLER_TOKENS` 是**站点/调用方级**身份（服务实例之间），
+  本节 OpenID token 是**终端用户（Matrix 用户）**身份；两者层次不同，不互相替代。
+- 现行 `/moments*` 的 `matrixUserToken`（access token → whoami）在 #124 落地前仍有效；
+  迁移/并存方式与请求头格式由 #124 定，本节不改 `securitySchemes`。
+
 
 ### 1.3 错误模型（RFC 9457）
 
@@ -414,9 +440,11 @@ AI 运行时                        网关                        Matrix
   的关系快照：同一对人物在不同会话里可以有不同取值，读接口返回的是这个会话当时的结论。
 - **Persona 资源没有 `relation` 字段**，也不应被加上：`Persona` 描述的是角色本身
   （资料、状态、限额默认值），关系不是角色属性。
-- 跨会话如何汇总到「AI 资料」页（以及资料编辑权限、好友审批入口）仍未定，
-  待棉棉霸拍板（B2.8 / #24、清单 B6）。本条**只禁止发明 `Persona.relation`**，
-  不规定汇总规则。
+- 跨会话如何汇总到「AI 资料」页（以及资料编辑权限、好友审批入口）**已拍板（2026-11-10，清单 B6）**：
+  AI 资料页只使用**当前查看者与该 AI 的单聊** `Conversation.relation`；没有单聊则显示
+  `stranger`；**不做跨群汇总**。AI 好友角标只在 `kind=ai` 且该查看者视角下
+  `relation.state=friend` 时出现。关系编辑与审批走 B2.8（#24）将来新增的 `/relations/*`
+  （清单 B2），**不在 `PATCH /personas` 里改关系**。本条同时禁止发明 `Persona.relation`。
 
 ---
 
@@ -536,6 +564,19 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 - 已发布的能力 ID 不复用、不重命名；废弃走 [5.4](#54-弃用流程)。
 - `manifest_version` 用 semver：新增能力 = minor；修复元数据/文案 = patch；
   删除能力或改变既有能力语义 = major（在新契约版本里做）。
+
+**B 线保留 ID（2026-11-10 已拍板，清单 B9 / B10）**
+
+| 能力 ID | `module` | 用途 |
+|---|---|---|
+| `social.moments` | `social` | 朋友圈（动态）入口；同时是评论通知的 `source.capability_id`（`source.module=social`） |
+| `role.personas` | `role` | 「我的 AI」/ 角色 |
+| `bridge.manage` | `bridge` | 桥接管理 |
+
+- 三项**尚未正式发布**（发布前仍可修改；「发布后永不复用」只在正式发布后适用）。
+- **不**写进 [`examples/capability-manifest.json`](../openapi/examples/capability-manifest.json)
+  当作已发布 ID——该示例保持现有四项不变。
+- 小镇（town）入口继续用既有示例 ID `town.enter`；小镇启用后的路由仍待 M4（清单 B4）。
 
 ---
 
@@ -917,6 +958,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 | 版本 | 日期 | 变更 |
 |---|---|---|
 | 0.1.0 | 2026-11-10 | [#114 PR-C 实现] N7：`Config` 新增 4 个 `PLATFORM_*` 字段（`platform_max_consecutive_ai_messages` / `platform_anti_spam_cooldown_seconds` / `platform_max_ai_messages_per_hour` / `platform_ai_loop_on_break`），`limits._strictness_layers` 按 §6.3 写入平台层 `anti_spam` / `ai_loop`（数值项 0 省略键、`on_break` 始终写入），`_check_not_looser` 已覆盖数值底线校验，`on_break` 不进宽松校验（`notify` ≡ `stop`，不报 422）。N8：`policy._ai_loop_view` 改为事件与未超 TTL 在途预留放进同一排序（预留入窗时刻 = `at`），取第 `used − limit + 1` 早的出窗时刻；`limit=0` → `may_clear_at=null`；最终下界 `max(计算值, ceil(now)+1s)`，永不返回过去或当前时刻。#117 N5：`Config.__post_init__` 增加 `usage_retention_seconds >= max(rate_limit_window_seconds, platform_anti_spam_cooldown_seconds)` 硬校验（平台冷却 0 不参与）。 |
+| 0.1.0 | 2026-11-10 | [B 线 B1–B12 定论写入，**纯文档，不改字段、状态码与 schema**] 棉棉霸 2026-11-10 拍板结果落契约。**(1)** 新增 [§1.2.3 终端用户身份（Matrix OpenID）](#123-终端用户身份matrix-openid已拍板)：App 经 `POST /_matrix/client/v3/user/{userId}/openid/request_token` 取得短时 token，网关经 `GET /_matrix/federation/v1/openid/userinfo` 校验；该请求不带 X-Matrix 签名，须经 compose 内网直连本部署 homeserver，不经 fedgate/公网；OpenID token 不写日志；网关须支持挂在 `/_botville/gateway` 前缀之后。与 §1.2.2 调用方身份层次不同、不互相替代；现行 `/moments*` 的 `matrixUserToken` 在 #124 落地前仍有效，`securitySchemes` 不改。**(2)** §3.7 补 B9/B10 保留能力 ID：`social.moments` / `role.personas` / `bridge.manage`，发布前可改，**不**写入 `examples/capability-manifest.json`；评论通知 `source.capability_id` 用 `social.moments`。**(3)** 新增 [§8.4 B 线产品定论](#84-b-线产品定论2026-11-10-已拍板)集中表（B1–B12：定论 / 里程碑 / 契约影响，均为「无字段/状态码变化」）：B1 主动发言 `queued` 后复用 `Card type=notification` + D 线推送、同一 `Idempotency-Key` 重放同 `queue_id`；B2 审批走 B2.8 新增 `/relations/*`（动作接口细节未定义，本轮不写）；B3 v1 不加 `/conversations/{id}/turn`；B4 小镇维持不纳入、M4 再扩展；B5 签名继续用 `Persona.bio`；B6 资料页只用单聊关系快照、无单聊显示 `stranger`；B7 不加 `@ai_*` alias API；B8 发帖默认不自动评论、开启后计入 proactive 与 anti_spam/ai_loop；B11 `Conversation` 不加未读数/摘要/搜索；B12 四层记忆 API 等 B2.6。**(4)** §8.3 第 2–5 条「待棉棉霸拍板」改为「已拍板（2026-11-10，清单 Bn）」并补里程碑；第 2–5 条后一段「B5–B12 仍在拍板中」改为已拍板并指向 §8.4；第 1 条补指向 §1.2.3。**(5)** §2.3 末段改为引用 B6 定论。 |
 | 0.1.0 | 2026-11-10 | [B 线缺口 A1–A6，**纯文档对齐，不改字段与状态码**] 只同步已合入结论与仓库现状，不含产品或 schema 变更。**(1) A1 鉴权措辞同步 #125**：§0「不归本契约管」与 §1.2 去除「占位」说法，明确 `bearerAuth` 仍是站点级不透明 bearer（`GATEWAY_AUTH_TOKEN`）、调用方身份已在 §1.2.2 定义、面向终端用户的签发/轮换/OAuth 式 scope 管理仍不在 v1；§8.3.1 改为指向 §1.2.2 与 #124，删去「需在 B1.1 前后补」。**(2) A2 补动态总览**：§2 表补 `GET/POST /moments`、`GET/PATCH/DELETE /moments/{moment_id}`、评论与点赞路径（主要使用方 App / A2.2，指向 `moments.md`）；「附：文件清单」按仓库现状补 `docs/moments.md`、`context-assemble-*`、`moment*`/`comment-page`/`usage-event` 等示例与 `migrations/moments`、`coverage_check.py`。**(3) A3 里程碑笔误**：§6.1 `proactive.per_day` 的执行里程碑由 B2.2 更正为 B2.5（主动发言调度），并补「小镇预算执行留待 B4.2」。**(4) A4 会话登记口径**：新增 §2.2，写明网关只登记至少含一个 persona 的会话（与 `persona_ids` `minItems: 1` 一致），纯人类 Matrix 房间不走 `/v1/conversations`、由 App 直接对 Matrix 展示；`minItems` 不变。**(5) A5 关系快照**：新增 §2.3，写明 `Conversation.relation` 是该会话上的关系快照、Persona 资源没有也不应有 `relation` 字段，跨会话汇总仍待拍板（B2.8 / 清单 B6）。**(6) A6 内部评论边界**：新增 §2.0 交叉引用 `moments.md` §3——公开评论/点赞路径行为者恒为 human、不接受 `author_persona_id`，AI 评论/点赞只经 appservice 内部调用写入，不新造任何路径。**(7) B 类保持未决**：§8.3 第 2–5 条补「待棉棉霸拍板」与清单编号 B1–B4 及 issue #21 #24 #22，删除「待 M2 评估」等会被读成已定的表述；B5–B12 不写入契约正文。**(8)** OpenAPI 仅给 `CreateConversationRequest.persona_ids` 补一句 description 说明同一口径，未改 `minItems` 或任何约束。 |
 | 0.1.0 | 2026-11-05 | [#124 契约 r3] 修 r2 审查 B1 与 nit。**(1) B1**：删除 OpenAPI `POST /context/assemble` 的 path 级 `403`（描述「身份有效但无权限（如 persona 不属于调用方）」）——该接口只返回 `200` / `400` / `401` / `422`，persona 归属只体现为 persona 区为空，与 `http_server.py` 及 #123 信任隔离测试一致。**(2) 措辞收敛**：§1.2.2 与 OpenAPI bearerAuth 描述的「`/context/assemble` 一律 `200`」改为「persona 归属不改变状态码（`200`）」，并注明请求本身非法仍按 `400` / `401` / `422` 返回。**(3) nit**：§6.3 「事故排序」→「出窗排序」；预留离场路径由两条补为三条（提交 `sent` / TTL 回收 / 投递失败回滚 `_rollback` → `release`）；`notify` 段改写为「`notify` 目前等价 `stop`，故平台为 `stop` 时 owner / peer 设 `notify` 不报 `422`」；在 N8 处定义 `ceil_to_second` = 按整秒向上取整（非截断）；预留 TTL 出处改为「#114 PR-b（#126）实现、PR-C 消费」。 |
 | 0.1.0 | 2026-11-05 | [#124 契约 r2] §1.2.2 修 B1 矛盾：`/context/assemble` persona 归属不改变状态码（`200`），推不出 owner 或非 owner → persona 区为空（与 §7.2、#123 测试一致）；`403` 只用于 `/context/assemble` 以外的 persona 写操作，错误码统一为 `persona.not_owned`，删除 `auth.insufficient_scope`。补 nit5：多条用分号 `;` 或换行分隔（两种等价），`caller_id` / `token` / `owner_id` 不得含 `:` `;` 换行，缺/空字段拒绝启动，caller token 等于 legacy token 时拒绝启动，legacy 关闭且无 caller token 时所有请求 `401`（启动 WARNING）。补 nit6：v1 只约束 `/context/assemble` 的 persona 区，发送路径 `sender_persona_id` 所有权校验不在本期。`.env.example` 同步分隔符说明。OpenAPI bearerAuth 描述同步。 |
@@ -1525,21 +1567,56 @@ npx --yes @redocly/cli lint gateway/openapi/gateway.v1.yaml
 
 ### 8.3 已知未决事项（评审请关注）
 
-1. 面向终端用户的令牌签发/轮换与细粒度 scope 仍不在 v1；调用方身份契约见
-   [§1.2.2](#122-调用方身份124)，实现见 #124。
-2. 主动发言的调度与推送通道（`queued` 之后如何通知）未定，**待棉棉霸拍板**
-   （清单 B1；B2.5 / #21，与 D 线推送 #4 耦合）。本契约目前只约定回执里的
-   `outcome=queued` + `queue_id`，不约定「已到点 / 已投递」的通知方式。
-3. 关系策略（B2.8 / #24）的审批接口目前只在 `relation` 快照里体现；审批动作是否
-   新增 `/relations/*` **待棉棉霸拍板**（清单 B2）。无论是否新增，都按「只增不删」
-   的 minor 扩展走，不塞进 `PATCH /conversations`。
-4. 多 AI 群发言调度（B2.8 / #24）是否需要独立的 `/conversations/{id}/turn` 接口
-   **待棉棉霸拍板**（清单 B3）。在此之前调度只作为网关内部状态，不体现在 HTTP 契约里。
-5. 小镇接口（A4.1 / B4.2 / #28）未纳入本契约；是否在 v1 预留路径同样
-   **待棉棉霸拍板**（清单 B4）。`town.tokens_per_day` 已在限额模型内，不依赖预留路径。
+B 类清单的 12 项已于 **2026-11-10 由棉棉霸拍板**，逐项定论见 [§8.4](#84-b-线产品定论2026-11-10-已拍板)。
+本节保留原条目的上下文，改为「已拍板 + 待实现于哪个里程碑」。
 
-清单里其余 B 类项（B5–B12，含四层记忆开放 API 的 B2.6 / #22）仍在拍板中，
-本契约不为它们预写字段、路径或默认值。
+1. 面向终端用户的令牌签发/轮换与细粒度 scope 仍不在 v1；调用方身份契约见
+   [§1.2.2](#122-调用方身份124)，实现见 #124。**终端用户（Matrix 用户）身份**已定为
+   Matrix OpenID token，见 [§1.2.3](#123-终端用户身份matrix-openid已拍板)；站点级 bearer
+   与调用方身份不受影响。
+2. **已拍板（2026-11-10，清单 B1）**：主动发言 `queued` 之后**不新开专用通道、客户端不轮询
+   网关**；投递成功后复用 `Card type=notification` + D 线推送通知。客户端用**同一
+   `Idempotency-Key`** 重放可拿到同一 `queue_id`（与 §1.5 一致）。卡片文案与跳转归 D/C。
+   待实现于 B2.5（#21），推送依赖 D 线（#4）。
+3. **已拍板（2026-11-10，清单 B2）**：关系策略（B2.8 / #24）的审批以**独立的 minor 新增
+   `/relations/*`** 承载，**不塞进 `PATCH /conversations`**。**动作接口细节（具体路径、
+   请求/响应）仍未定义**，本轮不为它写任何动作接口；落地时按「只增不删」的 minor 扩展走。
+   身份验证方式见 [§1.2.3](#123-终端用户身份matrix-openid已拍板)。
+4. **已拍板（2026-11-10，清单 B3）**：多 AI 群发言调度（B2.8 / #24）**v1 不加**独立的
+   `/conversations/{id}/turn` 接口。调度作为网关内部状态，发言仍走
+   `POST /policy/evaluate` + `POST /messages`，受既有 `anti_spam` / `ai_loop`
+   （防刷屏、互聊熔断）与 `proactive` 预算约束。将来如需展示「轮到谁」，只增扩展。
+5. **已拍板（2026-11-10，清单 B4）**：小镇接口（A4.1 / B4.2 / #28）**维持不纳入 v1**，
+   不预留路径；到 M4 再按「只增不删」扩展。`town.tokens_per_day` 已在限额模型内，
+   不依赖预留路径。
+
+清单里其余 B 类项（B5–B12，含四层记忆开放 API 的 B2.6 / #22）也已于 2026-11-10 拍板，
+要点与该表的「落地里程碑」见 [§8.4](#84-b-线产品定论2026-11-10-已拍板)。本契约仍不为
+它们预写字段名、路径或默认值。
+
+### 8.4 B 线产品定论（2026-11-10 已拍板）
+
+> 本节只记录产品定论与里程碑归属，**不新增字段、状态码、enum 或 schema 约束**。
+> B2 的身份部分就近写在 [§1.2.3](#123-终端用户身份matrix-openid已拍板)，
+> B9 / B10 的保留能力 ID 就近写在 [§3.7](#37-命名约定)，下表给出汇总与索引。
+
+| 编号 | 定论 | 落地里程碑 / issue | 契约影响 |
+|---|---|---|---|
+| B1 | 主动发言 `queued` 之后复用 `Card type=notification` + D 线推送，不新开专用通道、客户端不轮询网关；同一 `Idempotency-Key` 重放拿到同一 `queue_id`。卡片文案/跳转归 D/C | B2.5（#21）；推送依赖 D 线（#4） | 无字段/状态码变化 |
+| B2 | 关系审批由 B2.8 以独立的 minor 新增 `/relations/*` 承载，不塞进 `PATCH /conversations`；动作接口细节未定义，本轮不写。终端用户身份定为 Matrix OpenID token（见 §1.2.3） | B2.8（#24）；身份实现见 #124 / PR-D | 无字段/状态码变化 |
+| B3 | v1 不加 `/conversations/{id}/turn`；多 AI 群调度作为网关内部状态，发言仍走 `POST /policy/evaluate` + `POST /messages`，受 `anti_spam` / `ai_loop` 与 proactive 预算约束 | B2.8（#24） | 无字段/状态码变化 |
+| B4 | 小镇接口维持不纳入 v1，M4 再按「只增不删」扩展；`town.tokens_per_day` 已在限额模型里 | M4 / B4.2（#28） | 无字段/状态码变化 |
+| B5 | AI 签名继续用 `Persona.bio` 作为签名展示，不新增 `signature` 字段 | B2.4 / C2.2（#35） | 无字段/状态码变化 |
+| B6 | AI 资料页只用当前查看者与该 AI 的**单聊** `Conversation.relation`；无单聊显示 `stranger`；不做跨群汇总。好友角标只在 `kind=ai` 且该视角 `relation.state=friend` 时出现。关系编辑/审批走 B2 的 `/relations/*`，不在 Persona PATCH 里改（见 §2.3） | C2.2（#35）、B2.8（#24） | 无字段/状态码变化 |
+| B7 | v1 不加 alias API；规范身份是 `persona_id` / Matrix user id，`@ai_*` 仅作 UI 展示，mention 仍提交规范 ID | B 线 persona 身份；C 线展示 | 无字段/状态码变化 |
+| B8 | 发帖默认**不**自动触发 AI 评论；所有者开启后才触发，且计入 `proactive.max_per_day` 与 `anti_spam` / `ai_loop`。订阅对象与回执形状未定，不写接口 | B2.5（#21）、A2.2 | 无字段/状态码变化 |
+| B9 | 保留能力 ID：`social.moments`（`module=social`）、`role.personas`（`module=role`）、`bridge.manage`（`module=bridge`）；正式发布前可改，不写进示例清单（见 §3.7） | C2.5（#38）、D2.3 | 无字段/状态码变化 |
+| B10 | 评论通知 `source.capability_id` 用 `social.moments`（`source.module=social`）；不发明新通知对象 | D1.1 / C 线通知列表 | 无字段/状态码变化 |
+| B11 | `Conversation` 不加未读数 / 最近消息摘要 / 搜索；这些走 Matrix；排序可用已有 `last_activity_at` | C 线会话列表（设计 01） | 无字段/状态码变化 |
+| B12 | 四层记忆开放 API 等 B2.6 再按「只增不删」新增；私聊记忆默认不在群上下文召回；v1 不预写字段名 | B2.6（#22） | 无字段/状态码变化 |
+
+共同约束：以上各项在落地前都**不**改变本契约的字段集合、状态码集合与 schema 约束；
+实现 PR 若需要新增字段或接口，按 [§5.3](#53-变更等级) 的「只增不删」走 minor。
 
 ---
 

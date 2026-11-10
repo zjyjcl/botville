@@ -12,6 +12,19 @@ final class PushNotificationContentTests: XCTestCase {
         super.tearDown()
     }
 
+    func testStubCancellationKeepsStartingRequestCallback() {
+        let stopped = expectation(description: "original request cancelled once")
+        URLProtocolStub.handler = { _, _ in }
+        URLProtocolStub.onStopLoading = { stopped.fulfill() }
+        let stub = URLProtocolStub(request: URLRequest(url: URL(string: "https://matrix.test/event")!),
+                                   cachedResponse: nil, client: nil)
+        stub.startLoading()
+        URLProtocolStub.onStopLoading = { XCTFail("late cancellation must not enter a later test's callback") }
+        stub.stopLoading()
+        stub.stopLoading()
+        wait(for: [stopped], timeout: 1)
+    }
+
     func testEventReferenceAcceptsSygnalTopLevelAndKnownWrappersWithoutMixing() {
         let expected = PushEventReference(roomID: "!room:example.test", eventID: "$event:example.test")
         for payload: [AnyHashable: Any] in [
@@ -337,10 +350,33 @@ final class PushNotificationContentTests: XCTestCase {
             XCTAssertEqual(try load(reference: standardReference, store: InMemorySharedPushCredentialsStore(credentials(homeserver: homeserver))), .unavailable)
         }
         URLProtocolStub.handler = { _, _ in }
-        let loader = PushNotificationLoader(credentialsStore: InMemorySharedPushCredentialsStore(credentials()), configuration: stubConfiguration, requestTimeout: 0.01, timeBudget: 0.01)
+        // Only the budget may expire within the one-second assertion window.
+        // Equal 10 ms request/budget timers race to return unavailable/placeholder.
+        let loader = PushNotificationLoader(credentialsStore: InMemorySharedPushCredentialsStore(credentials()), configuration: stubConfiguration, requestTimeout: 8, timeBudget: 0.01)
         let result = expectation(description: "budget")
         loader.load(userInfo: payload(for: standardReference)) { XCTAssertEqual($0, .placeholder); result.fulfill() }
         wait(for: [result], timeout: 1)
+    }
+
+    func testLoaderClampsRequestTimeoutAndMapsTimedOutToUnavailable() throws {
+        for (configured, expected) in [(0.0, 0.01), (60.0, 8.0)] {
+            let requestSeen = expectation(description: "request carries clamped timeout")
+            URLProtocolStub.handler = { request, protocolStub in
+                XCTAssertEqual(request.timeoutInterval, expected)
+                requestSeen.fulfill()
+                // Trigger the error path directly, without waiting for a real
+                // URLSession timeout to compete with the delivery deadline.
+                protocolStub.client?.urlProtocol(protocolStub, didFailWithError: URLError(.timedOut))
+            }
+            let loader = PushNotificationLoader(credentialsStore: InMemorySharedPushCredentialsStore(credentials()),
+                                                configuration: stubConfiguration, requestTimeout: configured, timeBudget: 10)
+            let result = expectation(description: "request timeout is unavailable")
+            loader.load(userInfo: payload(for: standardReference)) {
+                XCTAssertEqual($0, .unavailable)
+                result.fulfill()
+            }
+            wait(for: [requestSeen, result], timeout: 1)
+        }
     }
 
     private var standardReference: PushEventReference { PushEventReference(roomID: "!room:example.test", eventID: "$event:example.test") }
@@ -359,15 +395,25 @@ final class PushNotificationContentTests: XCTestCase {
 }
 
 private final class URLProtocolStub: URLProtocol {
-    static var handler: ((URLRequest, URLProtocolStub) throws -> Void)?
-    static var onStopLoading: (() -> Void)?
+    @TestLocked static var handler: ((URLRequest, URLProtocolStub) throws -> Void)? = nil
+    @TestLocked static var onStopLoading: (() -> Void)? = nil
+    @TestLocked private var stopHandler: (() -> Void)? = nil
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
-        do { try Self.handler?(request, self) }
+        stopHandler = Self.onStopLoading
+        let handler = Self.handler
+        do { try handler?(request, self) }
         catch { client?.urlProtocol(self, didFailWithError: error) }
     }
-    override func stopLoading() { Self.onStopLoading?() }
+    override func stopLoading() {
+        let callback = $stopHandler.withValue { value in
+            let callback = value
+            value = nil
+            return callback
+        }
+        callback?()
+    }
 }
 
 private struct ThrowingCredentialsStore: SharedPushCredentialsStore {
