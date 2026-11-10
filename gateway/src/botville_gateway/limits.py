@@ -401,6 +401,20 @@ def _strictness_layers(cfg: Config) -> LimitLayer:
         "end": cfg.silent_hours_end,
         "timezone": cfg.silent_hours_timezone,
     }
+    # N7（契约 §6.3）：三个数值项 0 = 「平台不设该项」→ 省略键（与 RATE_LIMIT_MESSAGES=0 一致）。
+    # 非 0 时写入平台层底线；on_break 始终写入（默认 stop，即平台底线）。
+    anti_spam: Dict[str, Any] = {}
+    if cfg.platform_max_consecutive_ai_messages != 0:
+        anti_spam["max_consecutive_ai_messages"] = cfg.platform_max_consecutive_ai_messages
+    if cfg.platform_anti_spam_cooldown_seconds != 0:
+        anti_spam["cooldown_seconds"] = cfg.platform_anti_spam_cooldown_seconds
+    if anti_spam:
+        rules["anti_spam"] = anti_spam
+
+    ai_loop: Dict[str, Any] = {"on_break": cfg.platform_ai_loop_on_break}
+    if cfg.platform_max_ai_messages_per_hour != 0:
+        ai_loop["max_ai_messages_per_hour"] = cfg.platform_max_ai_messages_per_hour
+    rules["ai_loop"] = ai_loop
     return LimitLayer(
         layer=LAYER_PLATFORM,
         scope=SCOPE_PEER,

@@ -1200,13 +1200,25 @@ class PolicyEngine:
         now: datetime,
         effective: Optional[EffectiveLimits],
     ) -> Optional[PolicyCheck]:
-        """互聊熔断：同会话任意 AI 在 1 小时滑动窗口内的消息数（B2.2 §6.3）。
+        """互聊熔断：同会话任意 AI 在 1 小时滑动窗口内的消息数（B2.2 §6.3, N8）。
 
-        count = 每小时滑动窗口内、最后一条人类消息之后的**任意 AI** sent 事件数
-        + 该会话在途预留。限额 = 被评估 persona 的生效 max_ai_messages_per_hour
-        （三层取最严）。超限 → blocked(ai_loop.tripped)；on_break=notify 按 stop 处理。
-        may_clear_at = 被计入 count 的最早一条事件出窗时刻（+3600s，向上取整到秒）；
-        若阻塞来自在途预留则给保守值（预留 at + 3600）。
+        计入 `count`（即 `used`）的项目 = 窗口内、最后一条人类消息之后的
+        `kind=sent` / `kind=deferred` 事件，**加上**未超 TTL 的在途预留
+        （`for_conversation` 已先回收过期条目；超 TTL 的不计入、不参与排序）。
+        `deferred` 已是事件，不是在途预留。限额 = 被评估 persona 的生效
+        max_ai_messages_per_hour（三层取最严）。超限 → blocked(ai_loop.tripped)；
+        on_break=notify 按 stop 处理。
+
+        `may_clear_at`（N8）：
+        - `limit = 0`（有效限额「一条都不允许」）→ **null**：永不因滑窗恢复，
+          不套出窗公式、不套下界。
+        - `limit > 0` 且 `used >= limit`：事件与在途预留放进**同一排序**
+          （事件的入窗时刻 = `recorded_at`，预留 = `at`；出窗 = `t + 3600`），
+          取第 `used − limit + 1` 早的计入项（`used == limit` 即第 1 早），
+          `may_clear_at = ceil_to_second(t + 3600)`。
+        - 取值下界：最终 `may_clear_at = max(计算值, ceil_to_second(now) + 1s)`，
+          永不返回过去或当前时刻（避免「到点重试仍被拦」的活锁）。
+        预留**不受**人类消息重置：过滤预留用窗口起点，而不是人类消息时刻。
         """
         if effective is None:
             return None
@@ -1235,20 +1247,31 @@ class PolicyEngine:
             ),
             key=lambda e: e.recorded_at,
         )
-        used = len(events)
-        # 在途预留：按会话过滤（任意 AI 的预留都计入同一会话的熔断计数）。
+        # 事件与未超 TTL 的在途预留放进同一排序（N8）：预留按 `at + 3600` 出窗，
+        # 窗口起点取 `at`；人类消息只重置事件计数，不回收预留，因此用
+        # `window_start` 而不是 `count_since` 过滤。
+        entry_times: List[datetime] = [e.recorded_at for e in events]
         if self._reservations is not None:
-            inflight_conv = self._reservations.for_conversation(conversation_id)
-            used += len(inflight_conv)
+            entry_times.extend(
+                r.at
+                for r in self._reservations.for_conversation(conversation_id)
+                if r.at > window_start
+            )
+        entry_times.sort()
+        used = len(entry_times)
 
         if used >= max_per_hour:
-            # may_clear_at = 被计入 count 的最早一条事件出窗时刻。
-            if events:
-                earliest = events[0].recorded_at
-                may_clear = earliest + timedelta(seconds=window_seconds)
+            if max_per_hour == 0:
+                # API 的 0 是有效限额「一条都不允许」：恢复只能靠调整限额，
+                # 没有任何「额度恢复时间」可报，故为 null。
+                reset_at: Optional[str] = None
             else:
-                # 阻塞来自在途预留：给保守值（now + 3600）。
-                may_clear = now + timedelta(seconds=window_seconds)
+                # 第 `used − limit + 1` 早的计入项出窗（0 基索引就是 used - limit）。
+                anchor = entry_times[used - max_per_hour]
+                computed = _ceil_to_second(anchor + timedelta(seconds=window_seconds))
+                # 下界：永不返回过去或当前时刻。
+                floor = _ceil_to_second(now) + timedelta(seconds=1)
+                reset_at = iso_utc(max(computed, floor))
             return PolicyCheck(
                 key="ai_loop.per_hour",
                 layer=layer,
@@ -1256,7 +1279,7 @@ class PolicyEngine:
                 limit=max_per_hour,
                 used=used,
                 remaining=0,
-                reset_at=iso_utc(_ceil_to_second(may_clear)),
+                reset_at=reset_at,
                 code=CODE_AI_LOOP_TRIPPED,
                 source_id=source_id,
             )

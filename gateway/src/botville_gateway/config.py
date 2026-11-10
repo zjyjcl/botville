@@ -88,6 +88,23 @@ DEFAULT_MAX_IDEMPOTENCY_ENTRIES = 2_000
 DEFAULT_IDEMPOTENCY_TTL = 86_400
 DEFAULT_MAX_QUEUE_ENTRIES = 1_000
 
+# N7（契约 §6.3）：平台层 anti_spam / ai_loop 的部署配置。
+# 三个数值项默认 0 = 「平台不设该项」（与 RATE_LIMIT_MESSAGES=0 同语义），
+# 非 0 时必须落在与 API 相同的取值范围内（上限见下）。**注意** env 的 0 与
+# API 的 0 含义不同：API 的 0 是有效限额「一条都不允许」。
+PLATFORM_MAX_CONSECUTIVE_AI_MESSAGES = 0
+PLATFORM_ANTI_SPAM_COOLDOWN_SECONDS = 0
+PLATFORM_MAX_AI_MESSAGES_PER_HOUR = 0
+DEFAULT_AI_LOOP_ON_BREAK = "stop"
+
+# 非 0 时的取值范围（与 limits._ANTI_SPAM_RANGES / _AI_LOOP_RANGES 一致；
+# 各自定义避免 config 反向依赖 limits）。
+PLATFORM_MAX_CONSECUTIVE_AI_MESSAGES_RANGE = (1, 50)
+PLATFORM_ANTI_SPAM_COOLDOWN_SECONDS_RANGE = (1, 86_400)
+PLATFORM_MAX_AI_MESSAGES_PER_HOUR_RANGE = (1, 1_000)
+# 枚举项没有「0 = 不设」语义；极限序 stop 严于 notify（见契约 §6.3）。
+AI_LOOP_ON_BREAK_VALUES = frozenset({"stop", "notify"})
+
 # 部署路径前缀（GATEWAY_HTTP_PATH_PREFIX）的禁用片段：这些要么改变路径语义
 # （`//`、`..`），要么在拼 URL / 反代重写时会被提前截断或解码（`?` `#` `%`），
 # 都会让「配置里的前缀」和「实际到达的路径」静默不一致。
@@ -300,6 +317,13 @@ class Config:
     platform_token_budget: int = DEFAULT_TOKEN_BUDGET
     # B2.1：平台层主动发言/日上限（0 = 不限）
     platform_proactive_per_day: int = DEFAULT_PROACTIVE_PER_DAY
+    # N7（契约 §6.3）：平台层 anti_spam / ai_loop。三个数值项 0 = 平台不设该项
+    # （平台层省略对应键），非 0 时即平台底线，owner/peer 更宽松会被 422 拒绝。
+    platform_max_consecutive_ai_messages: int = PLATFORM_MAX_CONSECUTIVE_AI_MESSAGES
+    platform_anti_spam_cooldown_seconds: int = PLATFORM_ANTI_SPAM_COOLDOWN_SECONDS
+    platform_max_ai_messages_per_hour: int = PLATFORM_MAX_AI_MESSAGES_PER_HOUR
+    # 枚举项：default stop 即平台底线，没有「不设」取值。
+    platform_ai_loop_on_break: str = DEFAULT_AI_LOOP_ON_BREAK
     # B2.1：内存容量上限（容量达到上限时按 LRU 淘汰）
     max_usage_events: int = DEFAULT_MAX_USAGE_EVENTS
     # B2.2：事件保留期（秒）；早于该时长的事件在 append 时优先淘汰。
@@ -337,6 +361,53 @@ class Config:
             raise ConfigError("max_usage_events must be >= 1")
         if self.usage_retention_seconds < 3600:
             raise ConfigError("usage_retention_seconds must be >= 3600")
+        # N7（契约 §6.3）：平台层 anti_spam / ai_loop 值校验（fail-closed）。
+        # 三个数值项：必须 >= 0；非 0 时必须落在与 API 相同的范围内。
+        # 0 表示「平台不设该项」，不能解释成 API 的「一条都不允许」。
+        def _check_platform_int(val: int, name: str, lo: int, hi: int) -> None:
+            if not isinstance(val, int) or isinstance(val, bool):
+                raise ConfigError(f"{name} must be an integer, got {val!r}")
+            if val < 0:
+                raise ConfigError(f"{name} must be >= 0, got {val}")
+            if val != 0 and not (lo <= val <= hi):
+                raise ConfigError(
+                    f"{name} must be 0 (platform floor not set) or {lo}..{hi}, got {val}"
+                )
+        _check_platform_int(
+            self.platform_max_consecutive_ai_messages,
+            "platform_max_consecutive_ai_messages",
+            *PLATFORM_MAX_CONSECUTIVE_AI_MESSAGES_RANGE,
+        )
+        _check_platform_int(
+            self.platform_anti_spam_cooldown_seconds,
+            "platform_anti_spam_cooldown_seconds",
+            *PLATFORM_ANTI_SPAM_COOLDOWN_SECONDS_RANGE,
+        )
+        _check_platform_int(
+            self.platform_max_ai_messages_per_hour,
+            "platform_max_ai_messages_per_hour",
+            *PLATFORM_MAX_AI_MESSAGES_PER_HOUR_RANGE,
+        )
+        if self.platform_ai_loop_on_break not in AI_LOOP_ON_BREAK_VALUES:
+            raise ConfigError(
+                f"platform_ai_loop_on_break must be one of "
+                f"{sorted(AI_LOOP_ON_BREAK_VALUES)}, got "
+                f"{self.platform_ai_loop_on_break!r}"
+            )
+        # #117 N5（契约 §6.3）：保留期必须 >= max(窗口, 平台冷却)。
+        # ai_loop 窗口固定 3600，而 usage_retention_seconds 最小值已是 3600，
+        # 无需单独检查。平台冷却 0 表示「不设」，不参与该比较。
+        min_retention = self.rate_limit_window_seconds
+        if self.platform_anti_spam_cooldown_seconds > 0:
+            min_retention = max(min_retention, self.platform_anti_spam_cooldown_seconds)
+        if self.usage_retention_seconds < min_retention:
+            raise ConfigError(
+                f"usage_retention_seconds ({self.usage_retention_seconds}) must be >= "
+                f"max(rate_limit_window_seconds={self.rate_limit_window_seconds}, "
+                f"platform_anti_spam_cooldown_seconds={self.platform_anti_spam_cooldown_seconds}) "
+                f"= {min_retention}; retention shorter than window/cooldown causes "
+                "silent fail-open (events evicted before they clear the window)"
+            )
         if self.max_idempotency_entries < 1:
             raise ConfigError("max_idempotency_entries must be >= 1")
         if self.idempotency_ttl_seconds < 0:
@@ -591,6 +662,27 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         platform_proactive_per_day=_env_int(
             source, "PLATFORM_PROACTIVE_PER_DAY", DEFAULT_PROACTIVE_PER_DAY
         ),
+        # N7：三个数值项 0 = 平台不设该项；非 0 的区间由 Config 校验（fail-closed）。
+        platform_max_consecutive_ai_messages=_env_int(
+            source,
+            "PLATFORM_MAX_CONSECUTIVE_AI_MESSAGES",
+            PLATFORM_MAX_CONSECUTIVE_AI_MESSAGES,
+        ),
+        platform_anti_spam_cooldown_seconds=_env_int(
+            source,
+            "PLATFORM_ANTI_SPAM_COOLDOWN_SECONDS",
+            PLATFORM_ANTI_SPAM_COOLDOWN_SECONDS,
+        ),
+        platform_max_ai_messages_per_hour=_env_int(
+            source,
+            "PLATFORM_MAX_AI_MESSAGES_PER_HOUR",
+            PLATFORM_MAX_AI_MESSAGES_PER_HOUR,
+        ),
+        # 枚举项按现有 env 惯例归一为小写；非法值由 Config 校验拒绝。
+        platform_ai_loop_on_break=_env_str(
+            source, "PLATFORM_AI_LOOP_ON_BREAK", DEFAULT_AI_LOOP_ON_BREAK
+        ).lower()
+        or DEFAULT_AI_LOOP_ON_BREAK,
         max_usage_events=_env_int(
             source, "MAX_USAGE_EVENTS", DEFAULT_MAX_USAGE_EVENTS, minimum=1
         ),
