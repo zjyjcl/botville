@@ -88,6 +88,11 @@ DEFAULT_MAX_IDEMPOTENCY_ENTRIES = 2_000
 DEFAULT_IDEMPOTENCY_TTL = 86_400
 DEFAULT_MAX_QUEUE_ENTRIES = 1_000
 
+# 部署路径前缀（GATEWAY_HTTP_PATH_PREFIX）的禁用片段：这些要么改变路径语义
+# （`//`、`..`），要么在拼 URL / 反代重写时会被提前截断或解码（`?` `#` `%`），
+# 都会让「配置里的前缀」和「实际到达的路径」静默不一致。
+_HTTP_PATH_PREFIX_FORBIDDEN = ("//", "..", "?", "#", "%")
+
 
 class ConfigError(ValueError):
     """配置值非法（启动时应直接失败，而不是带病运行）。"""
@@ -213,6 +218,36 @@ def _env_int_range(env: Mapping[str, str], name: str, default: int, *, minimum: 
     return value
 
 
+def normalize_http_path_prefix(prefix: str) -> str:
+    """归一化网关部署路径前缀（`GATEWAY_HTTP_PATH_PREFIX`）。
+
+    空串与 `/` 都表示「没有前缀」（不改变现有路由）；非空时去掉尾部 `/`，
+    并要求形如 `/a/b`：以 `/` 开头、不含 `//`、`..`、`?`、`#`、`%`、空白与
+    控制字符。形状非法抛 ConfigError（启动即失败，而不是让请求路径在运行
+    时静默错配）。
+    """
+    # 先归一（去尾部 `/`）再校验：`/a/` 与 `/a///` 都归一为 `/a`，`/` 归一为空。
+    prefix = prefix.rstrip("/")
+    if not prefix:
+        return ""
+    if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in prefix):
+        raise ConfigError(
+            f"GATEWAY_HTTP_PATH_PREFIX must not contain whitespace or control "
+            f"characters, got {prefix!r}"
+        )
+    if not prefix.startswith("/"):
+        raise ConfigError(
+            f"GATEWAY_HTTP_PATH_PREFIX must start with '/', got {prefix!r}"
+        )
+    for bad in _HTTP_PATH_PREFIX_FORBIDDEN:
+        if bad in prefix:
+            raise ConfigError(
+                f"GATEWAY_HTTP_PATH_PREFIX must not contain {bad!r}, got {prefix!r}"
+            )
+    # 去掉尾部 `/` 后纯斜杠即空：`/` 与 `/a/` 视为「空前缀」与「/a」。
+    return prefix.rstrip("/")
+
+
 def parse_hhmm(value: str) -> int:
     """把 `HH:MM` 解析为自午夜起的分钟数。格式非法时抛 ConfigError。"""
     parts = value.split(":")
@@ -272,6 +307,10 @@ class Config:
     max_idempotency_entries: int = DEFAULT_MAX_IDEMPOTENCY_ENTRIES
     idempotency_ttl_seconds: int = DEFAULT_IDEMPOTENCY_TTL
     max_queue_entries: int = DEFAULT_MAX_QUEUE_ENTRIES
+    # 部署路径前缀（GATEWAY_HTTP_PATH_PREFIX，默认空 = 不改变现有路由）。
+    # 空串表示「无前缀」；`/` 与尾部 `/` 由 normalize_http_path_prefix 归一为空。
+    # 非空时形如 `/a/b`：以 `/` 开头，不含 `//` `..` `?` `#` `%` 空白控制字符。
+    http_path_prefix: str = ""
 
     def __post_init__(self) -> None:
         # 构造时校验，避免明显错误的配置拖到第一次请求才炸。
@@ -304,6 +343,13 @@ class Config:
             raise ConfigError("idempotency_ttl_seconds must be >= 0")
         if self.max_queue_entries < 1:
             raise ConfigError("max_queue_entries must be >= 1")
+        # 路径前缀：直接构造 Config 时同样归一化 + 校验（fail closed）。
+        # frozen dataclass → object.__setattr__；归一是幂等的，重复构造安全。
+        object.__setattr__(
+            self,
+            "http_path_prefix",
+            normalize_http_path_prefix(self.http_path_prefix),
+        )
         try:
             ZoneInfo(self.silent_hours_timezone)
         except (ZoneInfoNotFoundError, ValueError) as exc:
@@ -560,4 +606,6 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         max_queue_entries=_env_int(
             source, "MAX_QUEUE_ENTRIES", DEFAULT_MAX_QUEUE_ENTRIES, minimum=1
         ),
+        # 默认空 = 现行行为完全不变；非法前缀在 Config 构造时抛 ConfigError。
+        http_path_prefix=_env_str(source, "GATEWAY_HTTP_PATH_PREFIX", ""),
     )

@@ -42,11 +42,17 @@ info:
 
 servers:
   - url: https://{host}/v1
-    description: 自部署网关（占位域名，部署时替换）。
+    description: 自部署网关（占位域名，部署时替换）。网关可部署在路径前缀之后，
+      此时 `host` 变量可包含该前缀（如 `example.invalid/_botville/gateway`），
+      请求路径即形如 `https://example.invalid/_botville/gateway/v1/limits`；
+      前缀由部署配置 `GATEWAY_HTTP_PATH_PREFIX` 指定，默认空 = 直接挂在域名根。
+      不带前缀的请求同样被接受（兼容已去前缀的反代）。
     variables:
       host:
         default: gateway.example.invalid
-        description: 网关对外域名。
+        description: 网关对外域名；部署在路径前缀之后时可写成 `域名/前缀`
+          （如 `example.invalid/_botville/gateway`），不要写 scheme 与结尾 `/`。
+          仅描述部署址，不改变任何路径模板。
 
 security:
   - bearerAuth: []

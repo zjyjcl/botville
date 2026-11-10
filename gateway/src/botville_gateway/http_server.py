@@ -63,6 +63,23 @@ _JSON_MEDIA_TYPE = "application/json"
 MAX_BODY_BYTES = 1_048_576  # 1 MiB
 
 
+def strip_path_prefix(path: str, prefix: str) -> str:
+    """剥掉部署路径前缀（`GATEWAY_HTTP_PATH_PREFIX`），只按完整路径段匹配。
+
+    - 空前缀 → 原样返回（默认配置下行为与以前完全一致）。
+    - `path == prefix` → `"/"`；`path` 以 `prefix + "/"` 开头 → 去掉该前缀段。
+    - 不带前缀的请求**原样返回**：edge / 入口反代可能已经去掉了前缀。
+    - 只认整段边界：`/_botville/gatewayX/health` 不匹配 `/_botville/gateway`。
+    """
+    if not prefix:
+        return path
+    if path == prefix:
+        return "/"
+    if path.startswith(prefix + "/"):
+        return path[len(prefix):]
+    return path
+
+
 def _problem(
     status: int,
     code: str,
@@ -106,6 +123,16 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             super().log_message(fmt, *args)
 
     # ------------------------------------------------------------- helpers
+    def _route_path(self) -> Tuple[str, str, str]:
+        """把一个请求解析成 (path, query, 剥掉部署前缀后的路由路径)。
+
+        查询串不参与前缀匹配；前缀只按整段边界剥离（`strip_path_prefix`），
+        不带前缀的请求也照常路由（兼容已去前缀的 edge / 入口反代）。
+        """
+        parsed = urlparse(self.path)
+        prefix = self.server.config.http_path_prefix  # type: ignore[attr-defined]
+        return parsed.path, parsed.query, strip_path_prefix(parsed.path, prefix)
+
     def _request_id(self) -> str:
         """每个请求只生成/校验一次；校验失败则换成服务端新 ID（不回显可疑值）。"""
         cached = getattr(self, "_rid", None)
@@ -297,19 +324,18 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         self._request_id()
         try:
-            parsed = urlparse(self.path)
-            path = parsed.path
+            _raw_path, query, path = self._route_path()
             if path in ("/health", "/v1/health"):
                 self._handle_health()
                 return
             if not self._auth_ok():
                 return
             if path == "/v1/limits":
-                self._handle_get_limits(parsed.query)
+                self._handle_get_limits(query)
             elif path == "/v1/usage":
-                self._handle_get_usage(parsed.query)
+                self._handle_get_usage(query)
             elif path == "/v1/usage/events":
-                self._handle_list_usage_events(parsed.query)
+                self._handle_list_usage_events(query)
             else:
                 self._send_problem(404, "not_found", "Not Found")
         except (BrokenPipeError, ConnectionResetError):
@@ -324,7 +350,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         self._request_id()
         try:
-            path = urlparse(self.path).path
+            _raw_path, _query, path = self._route_path()
             if not self._auth_ok():
                 return
             if path == "/v1/policy/evaluate":
@@ -354,7 +380,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         """只有 `PUT /v1/limits` 支持 PUT；其余路径 405。"""
         self._request_id()
         try:
-            path = urlparse(self.path).path
+            _raw_path, _query, path = self._route_path()
             if not self._auth_ok():
                 return
             if path != "/v1/limits":

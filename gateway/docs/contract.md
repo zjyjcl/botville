@@ -58,6 +58,12 @@ AI 发言（`POST /conversations/{id}/messages`）或预检（`POST /policy/eval
 ### 1.1 基本形态
 
 - 基础路径 `/v1`，资源名为复数，JSON 请求与响应（UTF-8）。
+- **部署路径前缀**（可选）：网关可以整体挂在某个路径前缀之后（如
+  `/_botville/gateway`），由部署配置 `GATEWAY_HTTP_PATH_PREFIX` 指定，**默认空 =
+  直接挂在域名根**。带前缀的请求（`/_botville/gateway/v1/limits`）与不带前缀的
+  请求（`/v1/limits`，兼容已去前缀的反代）都按同一套路由处理；前缀只按整段边界
+  匹配，且只影响请求路径、不影响查询串。它不改变本文的任何路径模板、字段、
+  状态码或错误码——契约里的路径始终写成 `/v1/...`，前缀只属于部署址。
 - 时间一律 **RFC 3339 / ISO 8601，UTC（`Z` 结尾）**（如 `2026-11-03T12:00:30Z`）。
   带偏移的写法（`+08:00`）一律不接受，示例与校验脚本都强制 `Z`，避免同一天在不同文件里
   出现 8 小时偏差。「面向人的日历边界」（如每日主动发言重置）额外带 `timezone` 字段，
@@ -916,6 +922,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.1.0 | 2026-11-10 | [网关路径前缀] 新增部署配置 `GATEWAY_HTTP_PATH_PREFIX`（默认空 = 现行行为完全不变）：网关整体挂在路径前缀之后（如 `/_botville/gateway`）时填写，请求可带前缀发出；未带前缀的请求仍被接受（兼容已去前缀的反代），前缀只按整段边界匹配。非法前缀（不以 `/` 开头、含 `//` `..` `?` `#` `%` 空白或控制字符）拒绝启动。属部署配置，**不改字段集合、状态码与错误码**，`/v1` 路径模板与路由语义均不变；契约侧仅同步 `servers` 的 `host` 变量描述（host 可含路径前缀）。 |
 | 0.1.0 | 2026-11-10 | [B 线缺口 A1–A6，**纯文档对齐，不改字段与状态码**] 只同步已合入结论与仓库现状，不含产品或 schema 变更。**(1) A1 鉴权措辞同步 #125**：§0「不归本契约管」与 §1.2 去除「占位」说法，明确 `bearerAuth` 仍是站点级不透明 bearer（`GATEWAY_AUTH_TOKEN`）、调用方身份已在 §1.2.2 定义、面向终端用户的签发/轮换/OAuth 式 scope 管理仍不在 v1；§8.3.1 改为指向 §1.2.2 与 #124，删去「需在 B1.1 前后补」。**(2) A2 补动态总览**：§2 表补 `GET/POST /moments`、`GET/PATCH/DELETE /moments/{moment_id}`、评论与点赞路径（主要使用方 App / A2.2，指向 `moments.md`）；「附：文件清单」按仓库现状补 `docs/moments.md`、`context-assemble-*`、`moment*`/`comment-page`/`usage-event` 等示例与 `migrations/moments`、`coverage_check.py`。**(3) A3 里程碑笔误**：§6.1 `proactive.per_day` 的执行里程碑由 B2.2 更正为 B2.5（主动发言调度），并补「小镇预算执行留待 B4.2」。**(4) A4 会话登记口径**：新增 §2.2，写明网关只登记至少含一个 persona 的会话（与 `persona_ids` `minItems: 1` 一致），纯人类 Matrix 房间不走 `/v1/conversations`、由 App 直接对 Matrix 展示；`minItems` 不变。**(5) A5 关系快照**：新增 §2.3，写明 `Conversation.relation` 是该会话上的关系快照、Persona 资源没有也不应有 `relation` 字段，跨会话汇总仍待拍板（B2.8 / 清单 B6）。**(6) A6 内部评论边界**：新增 §2.0 交叉引用 `moments.md` §3——公开评论/点赞路径行为者恒为 human、不接受 `author_persona_id`，AI 评论/点赞只经 appservice 内部调用写入，不新造任何路径。**(7) B 类保持未决**：§8.3 第 2–5 条补「待棉棉霸拍板」与清单编号 B1–B4 及 issue #21 #24 #22，删除「待 M2 评估」等会被读成已定的表述；B5–B12 不写入契约正文。**(8)** OpenAPI 仅给 `CreateConversationRequest.persona_ids` 补一句 description 说明同一口径，未改 `minItems` 或任何约束。 |
 | 0.1.0 | 2026-11-05 | [#124 契约 r3] 修 r2 审查 B1 与 nit。**(1) B1**：删除 OpenAPI `POST /context/assemble` 的 path 级 `403`（描述「身份有效但无权限（如 persona 不属于调用方）」）——该接口只返回 `200` / `400` / `401` / `422`，persona 归属只体现为 persona 区为空，与 `http_server.py` 及 #123 信任隔离测试一致。**(2) 措辞收敛**：§1.2.2 与 OpenAPI bearerAuth 描述的「`/context/assemble` 一律 `200`」改为「persona 归属不改变状态码（`200`）」，并注明请求本身非法仍按 `400` / `401` / `422` 返回。**(3) nit**：§6.3 「事故排序」→「出窗排序」；预留离场路径由两条补为三条（提交 `sent` / TTL 回收 / 投递失败回滚 `_rollback` → `release`）；`notify` 段改写为「`notify` 目前等价 `stop`，故平台为 `stop` 时 owner / peer 设 `notify` 不报 `422`」；在 N8 处定义 `ceil_to_second` = 按整秒向上取整（非截断）；预留 TTL 出处改为「#114 PR-b（#126）实现、PR-C 消费」。 |
 | 0.1.0 | 2026-11-05 | [#124 契约 r2] §1.2.2 修 B1 矛盾：`/context/assemble` persona 归属不改变状态码（`200`），推不出 owner 或非 owner → persona 区为空（与 §7.2、#123 测试一致）；`403` 只用于 `/context/assemble` 以外的 persona 写操作，错误码统一为 `persona.not_owned`，删除 `auth.insufficient_scope`。补 nit5：多条用分号 `;` 或换行分隔（两种等价），`caller_id` / `token` / `owner_id` 不得含 `:` `;` 换行，缺/空字段拒绝启动，caller token 等于 legacy token 时拒绝启动，legacy 关闭且无 caller token 时所有请求 `401`（启动 WARNING）。补 nit6：v1 只约束 `/context/assemble` 的 persona 区，发送路径 `sender_persona_id` 所有权校验不在本期。`.env.example` 同步分隔符说明。OpenAPI bearerAuth 描述同步。 |
