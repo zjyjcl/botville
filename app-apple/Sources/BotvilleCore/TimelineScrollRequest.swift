@@ -45,6 +45,9 @@ public struct TimelineScrollDecision: Equatable, Sendable {
     public let request: TimelineScrollRequest
     public let reason: Reason
     public var animated: Bool { reason != .appearance }
+    public func animationDuration(reduceMotion: Bool) -> Double? {
+        animated && !reduceMotion ? 0.2 : nil
+    }
 }
 
 /// Owns follow decisions and prepend restoration arbitration; the view only
@@ -54,15 +57,18 @@ public struct TimelineScrollState: Sendable {
 
     public private(set) var pending: TimelineScrollDecision?
     public private(set) var isNearBottom = false
+    public private(set) var bottomSettlement = TimelineBottomSettlement()
     public private(set) var prependAnchor = TimelinePrependAnchor()
     public var followDecision: TimelineScrollDecision? {
         prependAnchor.blocksFollowing ? nil : pending
     }
 
     public mutating func beginPrepend(operation: UUID, input: TimelineScrollInput,
-                                      frames: [TimelineMessageFrame], viewportHeight: Double) {
+                                      frames: [TimelineMessageFrame], viewportHeight: Double,
+                                      now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        bottomSettlement.cancel()
         update(input)
-        prependAnchor.begin(operation: operation, input: input, frames: frames, viewportHeight: viewportHeight)
+        prependAnchor.begin(operation: operation, input: input, frames: frames, viewportHeight: viewportHeight, now: now)
     }
 
     public mutating func finishPrepend(operation: UUID) {
@@ -79,6 +85,23 @@ public struct TimelineScrollState: Sendable {
     }
 
     public mutating func cancelPrepend() { prependAnchor.cancel() }
+
+    public mutating func expireScrollWork(now: TimeInterval) {
+        prependAnchor.expire(now: now)
+        bottomSettlement.expire(now: now)
+    }
+
+    public mutating func correctBottom(for input: TimelineScrollInput, frames: [TimelineMessageFrame],
+                                      viewportHeight: Double, now: TimeInterval) -> TimelineScrollDecision? {
+        guard hasInput(input), pending == nil, !prependAnchor.blocksFollowing else { return nil }
+        return bottomSettlement.correction(input: input, frames: frames, viewportHeight: viewportHeight, now: now)
+    }
+
+    public mutating func cancelScrollWork() {
+        prependAnchor.cancel()
+        bottomSettlement.cancel()
+        pending = nil
+    }
     private var input: TimelineScrollInput?
     private var scrolledAppearanceID: UUID?
 
@@ -97,6 +120,7 @@ public struct TimelineScrollState: Sendable {
 
     public mutating func update(_ next: TimelineScrollInput) {
         let previous = input
+        if previous != next { bottomSettlement.cancel() }
         input = next
         prependAnchor.update(next)
         guard let request = next.request else {
@@ -131,18 +155,23 @@ public struct TimelineScrollState: Sendable {
             distanceFromBottom: distanceFromBottom, viewportHeight: viewportHeight)
     }
 
-    public mutating func didScroll(_ decision: TimelineScrollDecision) {
+    public mutating func didScroll(_ decision: TimelineScrollDecision,
+                                   now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
         guard pending == decision, !prependAnchor.blocksFollowing else { return }
         prependAnchor.cancel()
         scrolledAppearanceID = decision.request.appearanceID
         isNearBottom = true
         pending = nil
+        bottomSettlement.begin(decision, now: now)
     }
 
     public mutating func userBeganDragging() {
         prependAnchor.cancel()
-        // A gesture wins over a queued animated follow. Opening still lands at latest.
-        if pending?.animated == true { pending = nil }
+        bottomSettlement.cancel()
+        // A gesture wins even during an appearance correction. Do not replay it
+        // on the next delivery-status update of the same message revision.
+        if let pending { scrolledAppearanceID = pending.request.appearanceID }
+        pending = nil
         isNearBottom = false
     }
 }

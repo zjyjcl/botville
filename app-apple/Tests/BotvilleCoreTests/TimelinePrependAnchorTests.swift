@@ -41,6 +41,7 @@ final class TimelinePrependAnchorTests: XCTestCase {
         let next = (0..<300).map { "old-\($0)" } + ids
         state.update(input(next))
         state.finished(operation: operation)
+        XCTAssertNil(layout(&state, next, [])) // Content-only first sample is not a locate.
         XCTAssertEqual(layout(&state, next, []), .locate("a"))
         XCTAssertTrue(state.blocksFollowing)
         // LazyVStack has not materialized the row yet: do not prematurely finish.
@@ -153,6 +154,7 @@ final class TimelinePrependAnchorTests: XCTestCase {
     func testQueuedActionRequiresExecutionBeforeAnotherLayoutCanCorrect() {
         var state = started()
         state.finished(operation: operation)
+        XCTAssertNil(state.layout(input: input(ids), generation: state.layoutGeneration, frames: []))
         let action = state.layout(input: input(ids), generation: state.layoutGeneration, frames: [])
         XCTAssertEqual(action, .locate("a"))
         let queuedGeneration = state.layoutGeneration
@@ -266,4 +268,84 @@ final class TimelinePrependAnchorTests: XCTestCase {
         XCTAssertNil(state.followDecision)
         XCTAssertFalse(state.isNearBottom)
     }
+
+    func testEmptyFirstGenerationSampleDoesNotLocateVisibleLongAnchor() {
+        var state = started(offset: -240, height: 900)
+        let next = ["older"] + ids
+        state.update(input(next))
+        state.finished(operation: operation)
+        let generation = state.layoutGeneration
+        XCTAssertNil(layout(&state, next, []))
+        XCTAssertEqual(state.layoutGeneration, generation)
+        XCTAssertEqual(layout(&state, next, [frame("a", -100, 900)]), .restore(id: "a", offset: -240))
+        XCTAssertEqual(layout(&state, next, [frame("a", -230, 900)]), .restore(id: "a", offset: -240))
+        XCTAssertNil(layout(&state, next, [frame("a", -240, 900)]))
+        XCTAssertFalse(state.blocksFollowing)
+    }
+
+    func testMissingMaterializedRowExpiresAndLatePrependCannotResurrectIt() {
+        var state = TimelinePrependAnchor()
+        state.begin(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
+        let next = ["older"] + ids
+        state.update(input(next))
+        XCTAssertNil(layout(&state, next, []))
+        XCTAssertEqual(layout(&state, next, []), .locate("a"))
+        state.expire(now: 12.99)
+        XCTAssertTrue(state.blocksFollowing)
+        state.expire(now: 13)
+        XCTAssertFalse(state.blocksFollowing)
+        state.finished(operation: operation)
+        state.update(input(["late"] + next))
+        XCTAssertNil(layout(&state, ["late"] + next, [frame("a", 0)]))
+        XCTAssertNil(state.targetID)
+    }
+
+    func testWrongGenerationAndAwaitingExecutionCannotExtendDeadline() {
+        for execute in [false, true] {
+            var state = TimelinePrependAnchor()
+            state.begin(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
+            let action = state.layout(input: input(ids), generation: state.layoutGeneration, frames: [frame("a", 900)])
+            XCTAssertNotNil(action)
+            if execute { state.didExecute(generation: state.layoutGeneration) }
+            XCTAssertNil(state.layout(input: input(ids), generation: state.layoutGeneration + 10, frames: [frame()]))
+            state.expire(now: 13)
+            XCTAssertFalse(state.blocksFollowing)
+            XCTAssertNil(state.operation)
+        }
+    }
+
+    func testCompletionAndDataChangesDoNotRestartDeadline() {
+        var state = TimelinePrependAnchor()
+        state.begin(operation: operation, input: input(ids), frames: [frame()], viewportHeight: 600, now: 10)
+        state.finished(operation: operation)
+        _ = layout(&state, ids, [frame()])
+        state.update(input(["late"] + ids))
+        XCTAssertEqual(state.deadline, 13)
+        state.expire(now: 13)
+        XCTAssertFalse(state.blocksFollowing)
+        XCTAssertNil(layout(&state, ["late"] + ids, [frame("a", 900)]))
+    }
+
+    func testGestureThenLatePrependAndCompletionDoNotRestoreOrFollow() throws {
+        var state = try opened(nearBottom: true)
+        state.update(input(ids + ["new"]))
+        state.userBeganDragging()
+        let late = input(["late"] + ids + ["new"])
+        state.update(late)
+        state.finishPrepend(operation: operation)
+        XCTAssertNil(state.restorePrepend(for: late, generation: state.prependAnchor.layoutGeneration,
+                                          frames: [frame("a", 900)]))
+        XCTAssertNil(state.followDecision)
+        XCTAssertFalse(state.prependAnchor.blocksFollowing)
+    }
+
+    func testTimeoutReleasesDeferredOwnFollowEvenIfSDKStillLoading() throws {
+        var state = try opened(nearBottom: false)
+        state.update(input(ids + ["mine"], own: true))
+        XCTAssertNil(state.followDecision)
+        state.expireScrollWork(now: .infinity)
+        XCTAssertEqual(state.followDecision?.reason, .ownMessage)
+        XCTAssertNil(state.prependAnchor.operation)
+    }
+
 }
