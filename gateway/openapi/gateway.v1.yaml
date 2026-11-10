@@ -1488,7 +1488,9 @@ paths:
           $ref: '#/components/responses/InternalError'
 
   # ----- 动态（A2.2 / issue #7）-----
-  # 身份：matrixUserToken（Matrix access token → HS whoami 换 user_id）。
+  # 身份：matrixOpenIdToken（Authorization: MatrixOpenID <token>，federation userinfo → sub）
+  #        或 matrixUserToken（Authorization: Bearer <Matrix access token>，CS whoami → user_id）
+  #        任一即可（并存阶段 1，#124）；两者语义相同，均为本服 Matrix user id。
   # 越权（can_view 为假）与不存在统一 404 moment.not_found，响应体逐字节相同。
   /moments:
     get:
@@ -1504,6 +1506,7 @@ paths:
         不会绕过可见性。`like_count` / `comment_count` / `liked_by_me` 都相对当前
         查看者计算：计数**只计查看者可见的条目**（可见性定义见评论、点赞路径）。
       security:
+        - matrixOpenIdToken: []
         - matrixUserToken: []
       parameters:
         - name: author
@@ -1559,6 +1562,7 @@ paths:
         `Idempotency-Key` 语义同全局约定：同 key 同请求体重放返回同一条动态（201），
         同 key 不同请求体返回 `409`。
       security:
+        - matrixOpenIdToken: []
         - matrixUserToken: []
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -1611,6 +1615,7 @@ paths:
         统一返回 `404` `moment.not_found`，响应体**逐字节相同**，不泄露存在性。
         `can_view` 的精确定义（含 `allow_list` 收窄）见 `gateway/docs/moments.md`。
       security:
+        - matrixOpenIdToken: []
         - matrixUserToken: []
       responses:
         '200':
@@ -1642,6 +1647,7 @@ paths:
         PATCH `allow_list`：**省略**=保持；`[]`=名单为空（仅作者/所有者可见）；
         `null`=清除收窄（回到仅按 `visibility`）。
       security:
+        - matrixOpenIdToken: []
         - matrixUserToken: []
       requestBody:
         required: true
@@ -1681,6 +1687,7 @@ paths:
         `404` `moment.not_found`，响应体逐字节相同，不泄露存在性；可见但无权删除的
         调用者同样收到该 404。删除后对外表现与不存在一致（读、列表、评论、点赞均 404）。
       security:
+        - matrixOpenIdToken: []
         - matrixUserToken: []
       responses:
         '204':
@@ -1721,6 +1728,7 @@ paths:
         互相看不到对方的评论（类朋友圈）；AI 评论按主人好友图判定。动态的
         `comment_count` 只计查看者可见的评论；已删除的评论不再返回。
       security:
+        - matrixOpenIdToken: []
         - matrixUserToken: []
       parameters:
         - $ref: '#/components/parameters/Cursor'
@@ -1767,6 +1775,7 @@ paths:
         （AI 行为者的好友判定绑到 `owner_id` / `friend_subject`，见 GET /
         `gateway/docs/moments.md` §4）。`Idempotency-Key` 语义同全局约定。
       security:
+        - matrixOpenIdToken: []
         - matrixUserToken: []
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -1826,6 +1835,7 @@ paths:
         `404` `moment.not_found`，响应体**逐字节相同**，不泄露存在性。
         删除后评论不再出现在列表与 `comment_count` 中。
       security:
+        - matrixOpenIdToken: []
         - matrixUserToken: []
       responses:
         '204':
@@ -1860,6 +1870,7 @@ paths:
         AI 点赞不走本公开路径，只经 appservice 内部调用写入（落库
         `actor_kind=ai` 与 `owner_id`，见 `gateway/docs/moments.md` §3）。
       security:
+        - matrixOpenIdToken: []
         - matrixUserToken: []
       responses:
         '200':
@@ -1886,6 +1897,7 @@ paths:
         以 `can_view(viewer, moment)` 为前提：为假（越权）与动态不存在统一返回
         `404` `moment.not_found`，响应体**逐字节相同**，不泄露存在性。
       security:
+        - matrixOpenIdToken: []
         - matrixUserToken: []
       responses:
         '200':
@@ -1925,6 +1937,7 @@ paths:
         定义与评论相同（含 AI 行为者绑到 `owner_id` 的好友判定，见
         `gateway/docs/moments.md` §4）。动态的 `like_count` 只计查看者可见的点赞。
       security:
+        - matrixOpenIdToken: []
         - matrixUserToken: []
       parameters:
         - $ref: '#/components/parameters/Cursor'
@@ -1975,6 +1988,35 @@ components:
         后建议关闭**；配置了 caller token 而旧 token 仍开启时启动打 WARNING。
         日志只记 `caller_id`，不记 token、token 哈希或 owner_id 明文。本节不新增请求字段，
         也不新增错误码（鉴权失败仍为 `401 auth.invalid_token`）。
+    matrixOpenIdToken:
+      type: http
+      scheme: MatrixOpenID
+      description: |
+        Matrix 终端用户身份（Matrix OpenID token，A2.2 动态模块，#124 契约加法）。
+        调用方在 `Authorization: MatrixOpenID <token>` 中携带 App 经标准 Matrix C-S API
+        `POST /_matrix/client/v3/user/{userId}/openid/request_token` 取得的**短时**
+        OpenID token（长期 access token 留在 App，不进入网关）。
+
+        网关用该 token 调本服 homeserver `GET /_matrix/federation/v1/openid/userinfo?
+        access_token=…`，以返回的 `sub` 作为本服 Matrix user id。该请求**不带 X-Matrix
+        签名**，必须经 compose **内网直连**本部署 homeserver（地址取自
+        `GATEWAY_HOMESERVER_FEDERATION_URL`，空则回落 `GATEWAY_HOMESERVER_URL`），
+        **不经 fedgate、不走公网**；只有这条 userinfo 直连，其他联邦流量仍走 fedgate。
+
+        - `sub` 的域必须等于本服 `GATEWAY_MATRIX_SERVER_NAME`，否则 `401`；不接受他服 OpenID。
+        - 缓存只按 **token 哈希**（不缓存明文、不写入日志），TTL ≤ 60s 且不超过剩余有效期
+          （`GATEWAY_OPENID_CACHE_TTL_SECONDS`，上限 60，默认 60）。
+        - 过期以 homeserver 返回的 `expires_in` 为准，网关不自行延长。
+        - **不另做网关侧 nonce 防重放**：OpenID token 是持有者令牌，过期前被盗即可重放，
+          属协议固有限制；缓解靠短时令牌、TLS、不落盘/不入日志、哈希缓存键。
+        - 无效 / 过期 / 域不匹配 → `401 auth.invalid_token`；缺头 → `401 auth.missing`。
+          不新增状态码或错误码。
+
+        **并存（阶段 1）**：本方案与 `matrixUserToken` 在全部 `/moments*` 操作上二者取一
+        （OpenAPI OR），语义同为「本服 Matrix user id」。禁止「先试 OpenID 再试 whoami」——
+        两者由请求头 scheme 显式区分。`matrixUserToken` 当前**未标 `deprecated`**，
+        仍完全有效；移除须另行公告并先报总管。共享 gateway token（`bearerAuth`）
+        **不得**用于以用户身份读写动态。完整规则见 `gateway/docs/contract.md` §1.2.3。
     matrixUserToken:
       type: http
       scheme: bearer
@@ -1984,6 +2026,12 @@ components:
         `Authorization: Bearer <Matrix access token>` 中携带 Matrix 客户端访问令牌，
         网关调用本服 homeserver `GET /_matrix/client/v3/account/whoami` 换出 `user_id`
         （按令牌哈希缓存，TTL ≤ 60 秒），不信任调用方自报的身份。
+
+        **并存（#124 阶段 1）**：`/moments*` 同时接受 `matrixOpenIdToken`
+        （`Authorization: MatrixOpenID <token>`；见上）与本方案，任一即可，语义同为
+        「本服 Matrix user id」。本方案**当前未标 `deprecated`**，仍完全有效；将来弃用与
+        移除须另行公告并先报总管。**禁止**在同一请求上「先试 OpenID 再试 whoami」：
+        凭据种类由请求头 scheme 区分。
 
         **共享 gateway token（`bearerAuth`）不得用于以用户身份读写动态**；它只保留给
         运维与内部服务。AI persona 代发动态经 appservice 的内部调用完成，不走本方案，

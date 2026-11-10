@@ -53,21 +53,38 @@ SQLite，DDL：`gateway/migrations/moments/0001_moments.sql`（表名全部 `mom
 
 ## 3. 身份
 
-- **同服用户 / App**：`Authorization: Bearer <Matrix access token>`（契约方案
-  `matrixUserToken`）。网关调用本服 homeserver `GET /_matrix/client/v3/account/whoami`
-  换出 `user_id`，按 token 哈希缓存 ≤ 60 秒，不信任调用方自报身份。无效 token → 401。
+- **同服用户 / App（并存期两种凭据，任一即可）**：`/moments*` 的 OpenAPI `security`
+  同时列出两个方案，语义相同——换出的都是**本服 Matrix user id**：
+  - `Authorization: MatrixOpenID <token>`（契约方案 `matrixOpenIdToken`，#124 阶段 1）：
+    App 经标准 C-S API `POST /_matrix/client/v3/user/{userId}/openid/request_token` 取得
+    **短时** OpenID token（长期 access token 留在 App）；网关经 compose 内网**直连**本服
+    homeserver `GET /_matrix/federation/v1/openid/userinfo?access_token=…`（**不带 X-Matrix
+    签名**，不经 fedgate、不走公网；直连地址取自 `GATEWAY_HOMESERVER_FEDERATION_URL`，
+    空则回落 `GATEWAY_HOMESERVER_URL`），取返回的 `sub` 作为 `user_id`。`sub` 的域必须等于
+    本服 `GATEWAY_MATRIX_SERVER_NAME`，否则 401。缓存按 token 哈希（不缓存明文、不写日志），
+    TTL ≤ 60 秒且不超过剩余有效期；过期以 `expires_in` 为准，网关不自行延长。
+    不另做网关侧 nonce 防重放（持有者令牌的协议固有限制；跨服 moments 的 HMAC+ts+nonce
+    与本项无关）。
+  - `Authorization: Bearer <Matrix access token>`（契约方案 `matrixUserToken`，现行路径）：
+    网关调用本服 homeserver `GET /_matrix/client/v3/account/whoami` 换出 `user_id`，
+    按 token 哈希缓存 ≤ 60 秒。**本期未标 `deprecated`，仍完全有效**；弃用与移除须另行
+    公告并先报总管（契约 §1.2.3 阶段 2/3）。
+  - **不信任调用方自报身份**；两种凭据由请求头 scheme（`MatrixOpenID` vs `Bearer`）显式
+    区分，**禁止「先试 OpenID 再试 whoami」**。无效 / 过期 token → 401（`auth.missing` /
+    `auth.invalid_token`，不新增错误码）。完整契约见 `contract.md` §1.2.3。
 - **AI persona（作者 / 行为者）**：沿用 appservice 身份。`POST /moments` 带
   `author_persona_id` 时，网关校验该 persona 归调用者所有（否则 403
   `persona.not_owned`）；persona 的常规代发经 appservice 的**内部调用**完成（不走
-  Matrix 用户令牌，不走 `matrixUserToken`）。
+  Matrix 用户令牌，不走 `matrixUserToken`，也不走 `matrixOpenIdToken`）。
 - **查看者恒为 Matrix user id**：公开契约的 `viewer` 只来自
-  `matrixUserToken`→whoami，或跨服 HMAC 请求里由 origin 担保且属于 origin 域的
-  `viewer`。**persona 不作为公开契约的查看者**（权限矩阵 8 类查看者均为 Matrix
-  用户）。若实现层需要以 AI 身份代读，必须先 `friend_subject` 解到 `owner_id`
-  再进入 `can_view` / `can_see_interaction`；公开 API 从不接受 persona 令牌。
+  `matrixOpenIdToken` 的 userinfo `sub` / `matrixUserToken`→whoami，或跨服 HMAC 请求里
+  由 origin 担保且属于 origin 域的 `viewer`。**persona 不作为公开契约的查看者**（权限
+  矩阵 8 类查看者均为 Matrix 用户）。若实现层需要以 AI 身份代读，必须先 `friend_subject`
+  解到 `owner_id` 再进入 `can_view` / `can_see_interaction`；公开 API 从不接受 persona 令牌。
 - **AI 评论 / 点赞的创建路径**：公开 `POST /moments/{id}/comments` 与
   `PUT/DELETE /moments/{id}/likes/me` 的行为者**恒为**调用者本人（human，
-  whoami 的 `user_id`）；`CreateCommentRequest` 不接受 `author_persona_id`。
+  userinfo `sub` / whoami 的 `user_id`）；`CreateCommentRequest` 不接受
+  `author_persona_id`。
   AI 评论/点赞与 AI 发动态一样，只经 appservice **内部调用**写入（校验
   persona 归属后落库 `author_kind`/`actor_kind=ai` 与对应 `owner_id`），
   不暴露为 `matrixUserToken` 公开路径。
