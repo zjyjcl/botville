@@ -343,15 +343,19 @@ jobs:
       - name: Pairing package unit tests (stdlib mock, no Docker)
         run: python3 -m unittest discover -s server/pairing/tests -v
 
+      # Issue #75: notify/gateway validators and gateway unit tests need
+      # PyYAML. Install it explicitly (pinned) instead of relying on the
+      # runner image; the next two steps share this install.
+      - name: Install PyYAML for contract validation
+        run: python3 -m pip install 'pyyaml>=6,<7'
+
       - name: Notify examples + gateway contract validation
         run: |
           python3 notify/scripts/validate_examples.py
           python3 gateway/scripts/validate_openapi.py
 
       - name: Gateway unit tests
-        run: |
-          pip install pyyaml
-          python3 -m unittest discover -s gateway/tests -v
+        run: python3 -m unittest discover -s gateway/tests -v
 
       - name: Compose config validates for every profile
         run: |
