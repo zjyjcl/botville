@@ -101,7 +101,8 @@ botville://pair?v=1&hs=<https-url>[&gw=<https-url>][&fp=<spki-hash>]&code=<b64ur
 OpenAPI `servers` 为 `https://{host}/v1`，`gateway/openapi/gateway.v1.yaml`）；
 客户端在去掉末尾 `/` 后拼 `/v1/…`；为兼容，已以 `/v1` 结尾的值客户端**不得**重复
 追加。签发端应写不带 `/v1` 的基址。`gw` 可以是独立子域，也可以是 hs 同源下的
-路径前缀（对外暴露方式未定，见 #128 后续），同源时按 §3.3.2 复用 pin。
+路径前缀；**本项目默认部署已定为主域路径** `https://<domain>/_botville/gateway`
+（§11 B1），与 `hs` 同源，因此按 §3.3.2 复用 pin。
 
 ### 3.3 fp（证书指纹）
 
@@ -241,6 +242,10 @@ matrix-rust-sdk（当前绑定如 `matrix-rust-components-swift` 26.x）的同�
 
 签发与作废只经管理面（不对外匿名开放）：
 
+> **首版范围（§11 B3/B4）**：只有 Synapse 部署提供签发；Tuwunel / continuwuity 部署的
+> 管理页与向导不提供 App 配对二维码，改为提示「请用密码登录」。管理面首版只签发
+> `registration_token`（新账号注册），**不得**替他人签发 `login_token`。
+
 - **管理员 Matrix 账号登录**管理页（Web）：输入/确认 `hs`、可选 `gw`（可选
   `fp`），服务端生成 `code` 并展示完整 URI / 二维码；
 - 或**本机 CLI**（如 `botville-pairing admin issue`）持**一次性管理 token** 操作：
@@ -370,9 +375,9 @@ matrix-rust-sdk（当前绑定如 `matrix-rust-components-swift` 26.x）的同�
 | `v` | `"1"` |
 | `homeserver` | **签发时保存的 hs 原样返回**（§5.2） |
 | `gateway` | 签发时保存的 gw 原样返回；签发时无 gw 则为 `null`（字段仍必现，见下） |
-| `auth.type` | `"registration_token"`（App 用 Matrix 注册流程换新账号）或 `"login_token"`（App 用 `m.login.token` 登录已有账号）；由签发时管理面决定，契约只传输 |
+| `auth.type` | `"registration_token"`（App 用 Matrix 注册流程换新账号）或 `"login_token"`（App 用 `m.login.token` 登录已有账号）；由签发时管理面决定，契约只传输。**首版服务端只签发 `registration_token`**（§11 B4）；`login_token` 仍保留在枚举中，App 仍须能处理（前向兼容） |
 | `auth.token` | 一次性短时令牌；建议 `expires_in_ms` ≤ 600000（10 分钟）；过期未用须重新配对 |
-| `features_url` | **可选**（总管拍板，不列入 OpenAPI `required`）：功能清单（capability manifest）拉取地址，`https://` URL，内容结构不在本契约（见网关契约）。`gateway` 为 null（签发无 gw，chat-only）的响应**应省略**本字段——即使出现，App 也须忽略、不得据此启用网关功能；`gateway` 非 null 时服务端**应**提供。**App 现状**：解析并保存 `features_url`（校验为 https），但**不请求该 URL**；功能清单直接请求 `{gateway}/v1/capabilities`（`GET /capabilities`，`gateway/openapi/gateway.v1.yaml`）。因此网关部署时服务端**应**让 `features_url` 等于 `{gateway}/v1/capabilities`，两者指向同一资源；示例 JSON 里的 `features.json` 仅是占位路径。拉取该接口的 App→网关鉴权方式尚未定（网关当前为 bearer 占位，见 `gateway/docs/contract.md` §1.2 与 issue #124），不在本契约 |
+| `features_url` | **可选**（总管拍板，不列入 OpenAPI `required`）：功能清单（capability manifest）拉取地址，`https://` URL，内容结构不在本契约（见网关契约）。`gateway` 为 null（签发无 gw，chat-only）的响应**应省略**本字段——即使出现，App 也须忽略、不得据此启用网关功能；`gateway` 非 null 时服务端**应**提供。**App 现状**：解析并保存 `features_url`（校验为 https），但**不请求该 URL**；功能清单直接请求 `{gateway}/v1/capabilities`（`GET /capabilities`，`gateway/openapi/gateway.v1.yaml`）。因此网关部署时服务端**应**让 `features_url` 等于 `{gateway}/v1/capabilities`，两者指向同一资源；示例 JSON 里的 `features.json` 仅是占位路径。App→网关鉴权**方向已定**：网关校验 Matrix OpenID token（§11 B2）；具体请求头、校验流程与缓存由网关契约定义（issue #124，B 线），落地前按现行网关契约（`gateway/docs/contract.md` §1.2 站点级 bearer、§1.2.2 调用方身份；`/moments*` 为 `matrixUserToken`），不在本契约 |
 
 `registration_token` 与 `login_token` 在 homeserver 侧的具体核销（注册流程 / 登录
 流程）由服务端实现负责，本契约只规定传输格式、短时性与一次性语义。
@@ -458,9 +463,10 @@ matrix-rust-sdk（当前绑定如 `matrix-rust-components-swift` 26.x）的同�
 - `features_url` 指向的功能清单内容结构（网关契约）；
 - 管理页对签发记录的列表/筛选/批量作废等运维功能细节；
 - 签发/作废管理 API（随 #128 PR-f 管理页定义）；
-- App→网关鉴权（#124，B 线）；
-- 一次性 `registration_token` / `login_token` 在 Tuwunel/continuwuity 上的签发
-  途径（兼容性待 spike）。
+- App→网关鉴权的具体协议（方向已定为 Matrix OpenID token，§11 B2；细节归网关契约，#124，B 线）；
+- Tuwunel/continuwuity 上的 App 扫码配对（首版不支持，§11 B3；以后如要支持，需先
+  spike 一次性注册令牌的签发途径）；
+- 「本人从已登录设备发起」签发 `login_token` 的流程（§11 B4，后续版本）。
 
 ## 9. C 线落地清单（chat-only 定稿 / features_url 可选）
 
@@ -484,5 +490,20 @@ Option A 定稿（2026-11-06，#128/#132）合入后，C 线（App）须确认�
 
 | 日期 | 变更 |
 |---|---|
+| 2026-11-10 | 写入 B1–B6 产品决策（§11）及正文对应说明（§3.2 gw 默认路径、§4.1 首版范围、§5.1 `auth.type`/`features_url`、§8）；仅说明文字，不改 errcode/状态码/required/enum/示例。 |
 | 2026-11-10 | #155 r1：兑换地址改为「去掉末尾一个 `/`」与 App 一致并禁止签发 `//` 结尾的 hs；5xx 重试改为建议（App 现状合规）；409 行理顺；`features_url` 按 App 现状描述（App 请求 `{gateway}/v1/capabilities`）；`Content-Type` 忽略参数。 |
 | 2026-11-10 | A 线契约缺口小修（仅澄清、向后兼容）：兑换地址拼接、gw 基址不含 /v1、exp 以服务端为准、限流默认值定稿、契约外响应处理、`device_display_name` 用途、`features_url` 建议指向 `/v1/capabilities`；不改 errcode/状态码/schema/示例。 |
+
+## 11. 产品决策记录（B1–B6，2026-11-10）
+
+棉棉霸 2026-11-10 拍板（经总管转达）。本节只记录结论与对本契约的影响；**均不改
+契约结构**（errcode、HTTP 状态码、required、enum、示例都不变）。
+
+| 编号 | 决策 | 对本契约的影响 | 依赖 |
+|---|---|---|---|
+| B1 | 网关对外暴露在**主域路径** `https://<domain>/_botville/gateway`（不另开 `gw.<domain>` 子域） | 签发端写 `gw=https://<domain>/_botville/gateway`（不带 `/v1`，§3.2）；与 `hs` 同源，有 `fp` 时网关请求复用 pin（§3.3.2） | B 线网关（路径前缀部署）、C 线客户端、#128 edge（Caddy 路由） |
+| B2 | App 向网关证明身份：**网关校验 Matrix OpenID token**（App 经标准 C-S `POST /_matrix/client/v3/user/{userId}/openid/request_token` 取得，网关经 `GET /_matrix/federation/v1/openid/userinfo` 向本部署 homeserver 校验——走 compose 内网直连 homeserver，不经 fedgate，见 [public-access.md](../deploy/public-access.md)） | 兑换响应**不**新增网关凭据；`features_url` / `/v1/capabilities` 的鉴权按网关契约；现行网关 `/moments*` 用 `matrixUserToken`（access token → whoami），迁移/并存由 B 线在 #124 定，**定之前现行契约有效**（见 [public-access.md §3](../deploy/public-access.md)） | B 线网关（#124）、C 线客户端 |
+| B3 | 首版扫码配对**只支持 Synapse**；Tuwunel / continuwuity 提示用密码登录 | 只有 Synapse 部署签发 App 配对二维码（§4.1）；URI 与兑换格式不变 | C 线（密码登录入口保留、提示文案）、服务端实现（签发/核销） |
+| B4 | 首版**只做新账号注册**（`registration_token`）；以后做「本人从已登录设备发起」；**不做**管理员代发 `login_token` | 服务端首版只签发 `registration_token`；`login_token` 留在枚举中（App 仍须能处理）；管理面不得替他人签发 | C 线、服务端实现 |
+| B5 | 有自有域名时先用 **Cloudflare Tunnel**，**裸域**当 `server_name`；国内不稳再补 frp | 典型二维码 `hs=https://<domain>`，不带 `fp`（§3.3.1 Cloudflare 行）；补 frp 时按 frp 行带 `fp` | #128（接入模块与向导），见 [public-access.md](../deploy/public-access.md) |
+| B6 | 首版**重新配对后补回切断期消息**，并在界面说明；时间窗栅栏放 #118 | 与本契约无关（属服务器间联邦），记录于 [paired-federation.md](../deploy/paired-federation.md) | 联邦（A2.1 后续）、#118、C 线/管理页（说明文案） |
