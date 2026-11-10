@@ -64,7 +64,7 @@ botville://pair?v=1&hs=<https>&gw=<https，可选>&fp=sha256:<base64url，可选
 
 确认页将摘要转换为每 4 个十六进制字符一组显示，并标明 SHA-256。`gw` 只在 `(scheme, host, port)` 与 `hs` 全部相同时复用 pin；不同 host、scheme 或 port 的网关一律使用系统 TLS；不同源的自签网关不受此 pin 支持，建议让 `gw` 与 `hs` 共用同源反代。网关 URL 和适用的指纹作为非秘密配置随 Matrix 会话保存在 Keychain，恢复及 soft logout 重新认证时保留；配对码和兑换所得临时 token 不保存。动态页启用已配对网关时复用固定传输，设置页不能将其静默改建为无指纹客户端。这里的网关固定范围为 `HTTPGatewayClient` 的 API 请求；WebKit 模块网页仍遵循现有网页 origin 与系统 TLS 策略。
 
-**Matrix Rust SDK 内部请求的 SPKI 固定仍待定，不受 `fp` SPKI pin 保护。** 当前精确固定依赖为 `matrix-rust-components-swift` **26.10.27**。其生成的 `Sources/MatrixRustSDK/matrix_sdk_ffi.swift` 中 `ClientBuilderProtocol`（约 4421–4634 行）暴露 `addRootCertificates`、`disableBuiltInRootCertificates`、`disableSslVerification` 等接口，但没有叶证书 SPKI pin 或自定义 TLS verifier / URLSession 注入接口。自定义根证书不等于叶证书 SPKI 固定，且绝不能用 `disableSslVerification` 关闭校验代替。SDK 的同步、消息及其内部请求继续使用 SDK 默认 TLS 信任策略；自签服务器可能通过配对 HTTP 请求却仍无法完成 SDK 登录或同步，本 PR 不宣称全链路已 pin。#132-PR2 将先验证是否能为单个 SDK Client 注入根证书，不能时改为引导安装信任描述文件，并向上游提出 per-client SPKI pin / custom verifier 需求。
+**Matrix Rust SDK 的同步、消息等内部请求无法做叶证书 SPKI pin，不受 `fp` 保护；这是已知限制。** 与[配对契约 §3.3.3](../../docs/contracts/pairing-qr.md#333-sdk-同步与-pin-边界已知限制)及[根 README 的已知边界](../../README.md)一致：作用域内 App 自管 HTTPS 有 `fp` 时以 SPKI pin 替代系统根信任，并校验叶证 SAN、有效期和 serverAuth EKU；无 `fp` 时仍走系统信任。配对 pin 不等于全链路 pin。 当前精确固定依赖为 `matrix-rust-components-swift` **26.10.27**。其生成的 `Sources/MatrixRustSDK/matrix_sdk_ffi.swift` 中 `ClientBuilderProtocol`（约 4421–4634 行）暴露 `addRootCertificates`、`disableBuiltInRootCertificates`、`disableSslVerification` 等接口，但没有叶证书 SPKI pin 或自定义 TLS verifier / URLSession 注入接口。自定义根证书不等于叶证书 SPKI 固定，且绝不能用 `disableSslVerification` 关闭校验代替。SDK 的同步、消息及其内部请求继续使用 SDK 默认 TLS 信任策略；自签服务器可能通过配对 HTTP 请求却仍无法完成 SDK 登录或同步，本 PR 不宣称全链路已 pin。契约所列 SDK 根证书注入评估、描述文件引导和上游接口需求属于后续缓解方向，不代表已实现或能为 SDK 流量提供 pin。
 
 ## Mock 与本地验证
 
@@ -94,7 +94,7 @@ xcodebuild -project Botville.xcodeproj -scheme BotvilleApp-iOS \
 - `swift test`：186 项，184 项通过，0 失败；**环境相关 skip**：本机 2 项 Synapse 集成测试未设置 E2E 环境变量，未计为配对联调通过。配对相关 33 项全部通过，覆盖全部 17 个契约 fixture；临时本地 TLS 服务也验证了公开 redeem 路径将证书拒绝报告为 `certificateMismatch`。
 - macOS Debug `swift build`：通过。iOS Simulator ad-hoc Debug：`BUILD SUCCEEDED`，arm64 + x86_64，`codesign` 确认 `Signature=adhoc`，bundle id 保持 `org.example.botville.c01`。
 - 本地验证日志位于 `app-apple/.build/pr130-verification/`，不纳入 Git。构建或单元测试成功不代表已验证真实摄像头、真实 A 线 redeem 服务、真实注册/登录联调或 macOS 14 真机兼容性。
-- SDK 内部 SPKI 固定仍为“待定”；此处所述 pin 仅覆盖本 App 的 URLSession 请求范围。
+- SDK 同步、消息等内部请求无法做 SPKI pin，仍走 SDK 默认 TLS 信任策略；此处所述 pin 仅覆盖作用域内本 App 自管的 URLSession 请求。
 
 配对相关文件（含既有 PR 实现，均在 `app-apple/`，不含忽略的构建产物）：
 

@@ -20,6 +20,7 @@ struct RoomView: View {
     // being recreated when the user returns to the chat tab.
     @State private var roomOpenTask: Task<Void, Never>?
     @State private var roomOpenGeneration = UUID()
+    @State private var completedRoomOpenGeneration: UUID?
     @State private var roomTimelineLease: RoomTimelineLease?
     @State private var isLoadingOlderMessages = false
     @State private var errorMessage: String?
@@ -41,6 +42,15 @@ struct RoomView: View {
         !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !isSending
             && service.activeRoomID == room.id
+    }
+
+    private var latestScrollRequest: TimelineScrollRequest? {
+        TimelineScrollRequest.make(
+            appearanceID: roomOpenGeneration, completedAppearanceID: completedRoomOpenGeneration,
+            isVisible: isVisible, isOpening: isOpening,
+            roomID: room.id, activeRoomID: service.activeRoomID,
+            latestMessageID: service.messages.last?.id
+        )
     }
 
     var body: some View {
@@ -80,11 +90,13 @@ struct RoomView: View {
                         }
                         .padding()
                     }
-                    .onAppear {
-                        scrollToLatest(using: proxy)
-                    }
-                    .onChange(of: service.messages.last?.id) { _, _ in
-                        scrollToLatest(using: proxy)
+                    .defaultScrollAnchor(.bottom)
+                    .task(id: latestScrollRequest) {
+                        guard let request = latestScrollRequest else { return }
+                        // Wait for the loaded LazyVStack to participate in layout.
+                        await Task.yield()
+                        guard !Task.isCancelled, latestScrollRequest == request else { return }
+                        proxy.scrollTo(request.latestMessageID, anchor: .bottom)
                     }
                 }
             }
@@ -295,6 +307,8 @@ struct RoomView: View {
             _ = try await service.openRoom(room.id, lease: lease)
             guard roomTimelineLease == lease, !Task.isCancelled else { return }
             await loadOlderMessages()
+            guard roomTimelineLease == lease, !Task.isCancelled else { return }
+            completedRoomOpenGeneration = roomOpenGeneration
         } catch is CancellationError {
             return
         } catch {
@@ -342,15 +356,6 @@ struct RoomView: View {
         .frame(maxWidth: .infinity)
     }
 
-    private func scrollToLatest(using proxy: ScrollViewProxy) {
-        guard let latestMessageID = service.messages.last?.id else { return }
-        Task { @MainActor in
-            await Task.yield()
-            withAnimation {
-                proxy.scrollTo(latestMessageID, anchor: .bottom)
-            }
-        }
-    }
 }
 
 @MainActor
