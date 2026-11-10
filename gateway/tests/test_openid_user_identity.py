@@ -16,6 +16,9 @@
   9. 路径前缀下仍工作；10. token 不泄露到日志；
  11. federation URL 空则回落 homeserver_url；显式时 userinfo 打该基址、whoami 仍打 CS；
  12. 配置 TTL 边界：0 合法，<0 / >60 / 非整数拒绝启动。
+ 13. 带端口的 server_name（如 `example.invalid:8448`）在 OpenID 与 Bearer
+     两条路径上都正确解析，不被误判 401 / 不进负缓存；非法 user_id 仍无效。
+ 14. 缓存条目数上限（插入时清过期项、超限淘汰最旧）与 inflight 异常路径必删。
 
 全部使用本地假 HTTPServer 与明显假 token，不含真实密钥。
 运行：PYTHONPATH=gateway/src python3 -m unittest gateway.tests.test_openid_user_identity -v
@@ -795,3 +798,235 @@ class TestMomentsHttpMethods(MomentsHttpTestBase):
             self.assertEqual(ok_status, 200)
             # 且全程没有触发 homeserver 用户校验。
             self.assertEqual(self.hs.requests, [])
+
+
+# ============================================================================
+# 4. B1：带端口的 server_name 解析（OpenID 与 Bearer 两条路径）
+# ============================================================================
+SERVER_NAME_WITH_PORT = "example.invalid:8448"
+USER_ID_WITH_PORT = "@alice:example.invalid:8448"
+USER_ID_WITH_PORT_UPPER = "@alice:EXAMPLE.INVALID:8448"
+USER_ID_WRONG_PORT = "@alice:example.invalid:9999"
+USER_ID_OTHER_HOST = "@alice:other.invalid:8448"
+
+
+class TestPortInServerName(VerifierTestBase):
+    """B1：GATEWAY_MATRIX_SERVER_NAME 带端口时 _check_domain 必须完整比较。"""
+
+    def make_port(self, **overrides) -> UserIdentityVerifier:
+        overrides.setdefault("homeserver_url", self.hs.base_url)
+        overrides.setdefault("matrix_server_name", SERVER_NAME_WITH_PORT)
+        return UserIdentityVerifier(_cfg(**overrides))
+
+    # -- 单元测试 _check_domain 直接 ----------------------------------------
+    def test_check_domain_with_port_ok(self):
+        v = self.make_port()
+        self.assertEqual(
+            v._check_domain(USER_ID_WITH_PORT),  # noqa: SLF001
+            (VERIFY_OK, USER_ID_WITH_PORT),
+        )
+
+    def test_check_domain_with_port_case_insensitive(self):
+        v = self.make_port()
+        code, _uid = v._check_domain(USER_ID_WITH_PORT_UPPER)  # noqa: SLF001
+        self.assertEqual(code, VERIFY_OK)
+
+    def test_check_domain_wrong_port_invalid(self):
+        v = self.make_port()
+        self.assertEqual(
+            v._check_domain(USER_ID_WRONG_PORT)[0], VERIFY_INVALID  # noqa: SLF001
+        )
+
+    def test_check_domain_no_port_when_config_has_port_invalid(self):
+        # 配置带 :8448，user_id 没端口 → 域不匹配
+        v = self.make_port()
+        self.assertEqual(
+            v._check_domain("@alice:example.invalid")[0],  # noqa: SLF001
+            VERIFY_INVALID,
+        )
+
+    def test_check_domain_other_host_invalid(self):
+        v = self.make_port()
+        self.assertEqual(
+            v._check_domain(USER_ID_OTHER_HOST)[0], VERIFY_INVALID  # noqa: SLF001
+        )
+
+    def test_check_domain_malformed_no_at(self):
+        v = self.make_port()
+        self.assertEqual(
+            v._check_domain("alice:example.invalid:8448")[0],  # noqa: SLF001
+            VERIFY_INVALID,
+        )
+
+    def test_check_domain_malformed_no_colon(self):
+        v = self.make_port()
+        self.assertEqual(
+            v._check_domain("@aliceexample.invalid")[0], VERIFY_INVALID  # noqa: SLF001
+        )
+
+    def test_check_domain_empty_localpart(self):
+        v = self.make_port()
+        self.assertEqual(
+            v._check_domain("@:example.invalid:8448")[0],  # noqa: SLF001
+            VERIFY_INVALID,
+        )
+
+    # -- OpenID 路径：fake HS 返回带端口的 sub ----------------------------------
+    def test_openid_with_port_server_name_ok(self):
+        self.hs.userinfo_body = {"sub": USER_ID_WITH_PORT}
+        v = self.make_port()
+        code, uid = v.verify("MatrixOpenID " + OPENID_TOKEN)
+        self.assertEqual(code, VERIFY_OK)
+        self.assertEqual(uid, USER_ID_WITH_PORT)
+
+    def test_openid_with_port_case_insensitive_domain(self):
+        self.hs.userinfo_body = {"sub": USER_ID_WITH_PORT_UPPER}
+        v = self.make_port(openid_cache_ttl_seconds=60)
+        code, _ = v.verify("MatrixOpenID " + OPENID_TOKEN)
+        self.assertEqual(code, VERIFY_OK)
+        # 再次请求走成功缓存，确认没有误入负缓存
+        code2, _ = v.verify("MatrixOpenID " + OPENID_TOKEN)
+        self.assertEqual(code2, VERIFY_OK)
+        self.assertEqual(
+            len(self.hs.matching(USERINFO_PATH)), 1,
+            "must hit the success cache, not the HS again",
+        )
+
+    def test_openid_with_port_domain_mismatch_invalid(self):
+        self.hs.userinfo_body = {"sub": USER_ID_OTHER_HOST}
+        v = self.make_port()
+        self.assertEqual(v.verify("MatrixOpenID " + OPENID_TOKEN)[0], VERIFY_INVALID)
+
+    # -- Bearer/whoami 路径：fake HS 返回带端口的 user_id ----------------------
+    def test_bearer_with_port_server_name_ok(self):
+        self.hs.whoami_tokens = {MATRIX_TOKEN: USER_ID_WITH_PORT}
+        v = self.make_port()
+        code, uid = v.verify("Bearer " + MATRIX_TOKEN)
+        self.assertEqual(code, VERIFY_OK)
+        self.assertEqual(uid, USER_ID_WITH_PORT)
+
+    def test_bearer_with_port_success_hits_cache_not_negative(self):
+        self.hs.whoami_tokens = {MATRIX_TOKEN: USER_ID_WITH_PORT}
+        v = self.make_port(openid_cache_ttl_seconds=60)
+        self.assertEqual(v.verify("Bearer " + MATRIX_TOKEN)[0], VERIFY_OK)
+        # 缓存命中，不再打 HS，且不是负缓存
+        self.assertEqual(v.verify("Bearer " + MATRIX_TOKEN)[0], VERIFY_OK)
+        self.assertEqual(
+            len(self.hs.matching(WHOAMI_PATH)), 1,
+            "second call must hit the success cache",
+        )
+
+    def test_bearer_with_port_domain_mismatch_invalid(self):
+        self.hs.whoami_tokens = {MATRIX_TOKEN: USER_ID_OTHER_HOST}
+        v = self.make_port()
+        self.assertEqual(v.verify("Bearer " + MATRIX_TOKEN)[0], VERIFY_INVALID)
+
+
+# ============================================================================
+# 5. N2：缓存上限与 inflight 异常路径
+# ============================================================================
+class TestCacheBound(VerifierTestBase):
+    """N2：_cache 条目数上限与过期清理。"""
+
+    @staticmethod
+    def _fill_expired(verifier: UserIdentityVerifier, n: int, now: float) -> None:
+        """直接写 n 条已过期缓存条目，不经过 HS（白盒）。"""
+        entry_cls = user_identity._CacheEntry  # noqa: SLF001
+        with verifier._lock:  # noqa: SLF001
+            for i in range(n):
+                # 过期时刻落在过去 → 下次插入时应被清掉
+                verifier._cache[i.to_bytes(32, "big")] = entry_cls(  # noqa: SLF001
+                    None, False, now - 1.0
+                )
+
+    def test_expired_entries_cleared_on_insert(self):
+        """插入新条目时，已过期的旧条目被顺带清理。"""
+        verifier = self.make(openid_cache_ttl_seconds=60)
+        self._fill_expired(verifier, 10, self.clock())
+        self.assertEqual(len(verifier._cache), 10)  # noqa: SLF001
+
+        verifier.verify("MatrixOpenID " + OPENID_TOKEN)  # 触发插入 → 清理
+
+        # 10 条过期项全部被清理，只剩这一条新的成功条目
+        self.assertEqual(len(verifier._cache), 1)  # noqa: SLF001
+        self.assertIn(
+            verifier._token_hash(OPENID_TOKEN), verifier._cache  # noqa: SLF001
+        )
+
+    def test_evict_oldest_when_at_capacity(self):
+        """达到 CACHE_MAX_ENTRIES 时淘汰最旧条目，新条目仍能进入。"""
+        entry_cls = user_identity._CacheEntry  # noqa: SLF001
+        verifier = self.make(openid_cache_ttl_seconds=60)
+
+        # 上限临时降到 3，避免测试真的填 4096 条
+        with mock.patch.object(user_identity, "CACHE_MAX_ENTRIES", 3):
+            now = self.clock()
+            with verifier._lock:  # noqa: SLF001
+                for i in range(3):
+                    # expires_at 递增，key0 最旧
+                    verifier._cache[i.to_bytes(32, "big")] = entry_cls(  # noqa: SLF001
+                        None, False, now + 10.0 + i
+                    )
+            self.assertEqual(len(verifier._cache), 3)  # noqa: SLF001
+
+            verifier.verify("MatrixOpenID " + OPENID_TOKEN)  # 插入第 4 条
+
+        self.assertEqual(len(verifier._cache), 3)  # noqa: SLF001
+        self.assertNotIn((0).to_bytes(32, "big"), verifier._cache)  # noqa: SLF001
+        self.assertIn(
+            verifier._token_hash(OPENID_TOKEN), verifier._cache  # noqa: SLF001
+        )
+
+
+class TestInflightCleanupOnError(VerifierTestBase):
+    """N2：leader 异常路径下 inflight 仍必须被清除并 set()。"""
+
+    def test_inflight_cleared_even_if_do_userinfo_raises(self):
+        """_do_userinfo 抛错 → inflight 被清、随后同 token 能重新成为 leader。"""
+        verifier = self.make(openid_cache_ttl_seconds=60)
+        call_count = [0]
+
+        def _flaky_userinfo(_token):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError("simulated internal error")
+            return (VERIFY_OK, USER_ID), None
+
+        with mock.patch.object(verifier, "_do_userinfo", side_effect=_flaky_userinfo):
+            # 第一次：leader 捕获为 server_error（不缓存），inflight 必须被删除
+            result1 = verifier.verify("MatrixOpenID " + OPENID_TOKEN)
+            self.assertEqual(result1[0], VERIFY_SERVER_ERROR)
+            self.assertNotIn(
+                verifier._token_hash(OPENID_TOKEN),  # noqa: SLF001
+                verifier._inflight,                   # noqa: SLF001
+                "inflight must be cleared after the leader raises",
+            )
+            # 第二次：同 token 能重新成为 leader，而不是永远等一个残留 flight
+            result2 = verifier.verify("MatrixOpenID " + OPENID_TOKEN)
+            self.assertEqual(result2, (VERIFY_OK, USER_ID))
+            self.assertEqual(
+                call_count[0], 2, "_do_userinfo must run again on retry"
+            )
+
+    def test_inflight_cleared_when_cache_write_raises(self):
+        """写缓存抛错 → finally 仍清 inflight，随后同 token 可重新校验。"""
+
+        def _bad_evict(_key, _entry):
+            raise RuntimeError("simulated cache write error")
+
+        verifier = self.make(openid_cache_ttl_seconds=60)
+        with mock.patch.object(
+            verifier, "_evict_and_insert", side_effect=_bad_evict
+        ):
+            with self.assertRaises(RuntimeError):
+                verifier.verify("MatrixOpenID " + OPENID_TOKEN)
+            self.assertNotIn(
+                verifier._token_hash(OPENID_TOKEN),  # noqa: SLF001
+                verifier._inflight,                   # noqa: SLF001
+                "inflight must be cleared even if the cache write raises",
+            )
+
+        # 不再 mock：同 token 重新校验能正常打 HS（inflight 未残留）
+        self.assertEqual(
+            verifier.verify("MatrixOpenID " + OPENID_TOKEN), (VERIFY_OK, USER_ID)
+        )

@@ -22,8 +22,8 @@ homeserver whoami 不认识它，会返回 401，网关转为 ``auth.invalid_tok
 - 成功 TTL = ``min(config_ttl, 60, expires_in_if_known)``。``expires_in`` 只在
   userinfo 响应带该字段时用来收紧；标准 userinfo 响应通常只有 ``sub``，未携带时
   不收紧，只受 config_ttl 与 60s 上限约束。whoami 没有该字段，同理。
-- 失败负缓存（**仅明确 4xx**）TTL = ``min(5, config_ttl)``；config_ttl=0 → 也不缓存。
-  5xx / 超时 / 连接失败**不缓存**，调用方可重试（返回 VERIFY_SERVER_ERROR）。
+- 失败负缓存（**仅对 401/403（及域不匹配）负缓存**）TTL = ``min(5, config_ttl)``；config_ttl=0 → 也不缓存。
+  其他 4xx / 5xx / 超时 / 连接失败**不缓存**，调用方可重试（返回 VERIFY_SERVER_ERROR）。
 
 **Single-flight**：同一 token（以哈希为键）的并发校验合并为一次 HS 请求，
 leader 完成后结果广播给所有等待者，防止缓存击穿打爆 homeserver
@@ -60,6 +60,13 @@ SUCCESS_CACHE_MAX_TTL = 60
 
 # userinfo / whoami 请求超时（秒）。
 HS_TIMEOUT = 5.0
+
+# 进程内缓存的条目数上限（成功与失败负缓存共用）。纯防御性：每台网关的
+# 活跃真人 token 远少于此，正常流量永远碰不到；它只防止 token 被持续轮换
+# 时字典无界增长。条目过期后只在同 key 下次插入时才被顺带清理，所以这里
+# 用模块级常量（不新增配置项），插入时先清过期项、仍超限则按 ``expires_at``
+# 最早优先淘汰。
+CACHE_MAX_ENTRIES = 4096
 
 # 缓存过期用单调时钟（不受系统时间回拨影响）；模块级绑定便于单测推进时间。
 _monotonic = __import__("time").monotonic
@@ -131,6 +138,22 @@ class UserIdentityVerifier:
         return VERIFY_MISSING, None
 
     # --------------------------------------------------------------- private
+    def _evict_and_insert(self, key: bytes, entry: _CacheEntry) -> None:
+        """过期清理 + 上限淘汰后插入缓存条目（**必须在 self._lock 下调用**）。
+
+        1. 顺带清理已过期项（lazy expiry，避免无限堆积）。
+        2. 清理后仍达 ``CACHE_MAX_ENTRIES``：按 ``expires_at`` 最早优先逐条淘汰，
+           直到有位置为止。正常流量下不会触发（活跃 token 远小于上限）。
+        """
+        now = _monotonic()
+        expired = [k for k, e in self._cache.items() if e.expires_at <= now]
+        for k in expired:
+            del self._cache[k]
+        while len(self._cache) >= CACHE_MAX_ENTRIES:
+            oldest = min(self._cache, key=lambda k: self._cache[k].expires_at)
+            del self._cache[oldest]
+        self._cache[key] = entry
+
     @staticmethod
     def _token_hash(token: str) -> bytes:
         """SHA-256(token UTF-8 bytes)：32 字节，不含明文。"""
@@ -173,29 +196,36 @@ class UserIdentityVerifier:
             logger.debug("user identity lookup raised unexpectedly")
             result, expires_in = (VERIFY_SERVER_ERROR, None), None
 
-        # ── 4. 写缓存：ok → 成功缓存；invalid → 负缓存；server_error → 不缓存 ──
+        # ── 4 & 5. 写缓存、清 inflight、通知 followers ───────────────────────
+        # inflight 必须在 finally 里清除并 set()，否则：
+        #   - 写缓存或其他路径抛异常 → inflight 残留 → follower 永远等到超时；
+        #   - 新的同 token 请求无法成为 leader，直到超时才降级 server_error。
         code, user_id = result
-        if self._ttl > 0:
-            now = _monotonic()
-            if code == VERIFY_OK and user_id is not None:
-                ttl = min(self._ttl, SUCCESS_CACHE_MAX_TTL)
-                if expires_in is not None and expires_in > 0:
-                    # 「若已知则剩余有效期」：只收紧，不延长。
-                    ttl = min(ttl, expires_in)
-                with self._lock:
-                    self._cache[key] = _CacheEntry(user_id, True, now + ttl)
-            elif code == VERIFY_INVALID:
-                fail_ttl = min(FAIL_CACHE_MAX_TTL, self._ttl)
-                if fail_ttl > 0:
+        try:
+            if self._ttl > 0:
+                now = _monotonic()
+                if code == VERIFY_OK and user_id is not None:
+                    ttl = min(self._ttl, SUCCESS_CACHE_MAX_TTL)
+                    if expires_in is not None and expires_in > 0:
+                        # 「若已知则剩余有效期」：只收紧，不延长。
+                        ttl = min(ttl, expires_in)
                     with self._lock:
-                        self._cache[key] = _CacheEntry(None, False, now + fail_ttl)
-
-        # ── 5. 通知 followers，清除 inflight 记录 ────────────────────────────
-        flight.result = result
-        with self._lock:
-            if self._inflight.get(key) is flight:
-                del self._inflight[key]
-        flight.event.set()
+                        self._evict_and_insert(
+                            key, _CacheEntry(user_id, True, now + ttl)
+                        )
+                elif code == VERIFY_INVALID:
+                    fail_ttl = min(FAIL_CACHE_MAX_TTL, self._ttl)
+                    if fail_ttl > 0:
+                        with self._lock:
+                            self._evict_and_insert(
+                                key, _CacheEntry(None, False, now + fail_ttl)
+                            )
+        finally:
+            flight.result = result
+            with self._lock:
+                if self._inflight.get(key) is flight:
+                    del self._inflight[key]
+            flight.event.set()
 
         return result
 
@@ -304,12 +334,18 @@ class UserIdentityVerifier:
             )
             return VERIFY_INVALID, None
 
-        # Matrix user_id 格式：@localpart:domain
-        if not matrix_id.startswith("@") or ":" not in matrix_id:
+        # Matrix user_id 格式：@localpart:server_name。server name **可带端口**
+        # （如 example.invalid:8448），因此必须在第一个 `:` 处切分（与
+        # matrix_appservice.py 的 ``user_id[1:].split(":", 1)`` 一致）：
+        # `rpartition(":")` 会把端口误当成域，合法用户被判 401 并进负缓存。
+        if not matrix_id.startswith("@"):
             return VERIFY_INVALID, None
 
-        _, _, domain = matrix_id.rpartition(":")
-        if domain.lower() != self._server_name.lower():
+        localpart, sep, server_name = matrix_id[1:].partition(":")
+        if not sep or not localpart or not server_name:
+            return VERIFY_INVALID, None
+
+        if server_name.lower() != self._server_name.lower():
             return VERIFY_INVALID, None
 
         return VERIFY_OK, matrix_id
