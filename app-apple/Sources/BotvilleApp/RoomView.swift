@@ -9,7 +9,6 @@ struct RoomView: View {
     @ObservedObject var service: MatrixService
     let room: MatrixRoom
     @Binding var isInputActive: Bool
-    @Binding var presentedRoomID: String?
 
     @State private var draft = ""
     @FocusState private var isInputFocused: Bool
@@ -147,11 +146,9 @@ struct RoomView: View {
         }
         .onDisappear {
             isInputActive = false
-            if presentedRoomID == room.id { presentedRoomID = nil }
             service.closeRoom(room.id)
         }
         .onAppear {
-            presentedRoomID = room.id
             updateInputActivity()
         }
         .onChange(of: isInputFocused) { _, _ in updateInputActivity() }

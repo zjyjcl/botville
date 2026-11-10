@@ -20,6 +20,7 @@ public final class MatrixService: ObservableObject {
     /// Ephemeral local-sync events, never populated from APNs/NSE payloads or logged.
     public let foregroundBannerCandidates = PassthroughSubject<ForegroundBannerCandidate, Never>()
     private var foregroundBannerDetector = ForegroundBannerDetector()
+    private var bannerResumeState = ForegroundBannerResumeState()
     @Published public private(set) var messages: [MatrixMessage] = []
     @Published public private(set) var activeRoomID: String?
     @Published public private(set) var userID: String?
@@ -581,11 +582,14 @@ public final class MatrixService: ObservableObject {
         enqueuePushRegistration()
     }
 
+    public func applicationDidEnterBackground() {
+        bannerResumeState.enteredBackground()
+    }
+
     public func applicationDidBecomeActive() async {
+        bannerResumeState.becameActive()
         updateApplicationBadge()
         if isLoggedIn {
-            // The next committed online snapshot absorbs background catch-up.
-            foregroundBannerDetector.beginCatchUp()
             try? await sync()
         }
         else if !requiresPasswordReauthentication { await restoreSession() }
@@ -612,6 +616,9 @@ public final class MatrixService: ObservableObject {
         previous?.cancel()
         await previous?.value
         guard session == sessionGeneration, generation == syncGeneration else { return }
+        // Only a real background edge rearms catch-up, after cancellation has
+        // drained and before the replacement sync can produce its first snapshot.
+        if bannerResumeState.syncWillStart() { foregroundBannerDetector.beginCatchUp() }
         syncTask = Task { [weak self] in
             var initial = true
             var backoff = ReconnectPolicy()
@@ -706,22 +713,24 @@ public final class MatrixService: ObservableObject {
         }
         guard session == sessionGeneration, refresh == roomRefreshGeneration, isLoggedIn, !isLoggingOut else { return }
         // A cancelled/replaced sync must not commit or arm the banner baseline.
-        if let onlineSyncGeneration {
-            guard !Task.isCancelled, onlineSyncGeneration == syncGeneration else { return }
+        let committed = RoomRefreshCommitGate.commit(onlineGeneration: onlineSyncGeneration,
+                                     currentGeneration: syncGeneration,
+                                     isCancelled: Task.isCancelled) {
+            rooms = MatrixRoom.sortedByActivity(Self.mergingSecurityUpdates(
+                refreshed: updated, current: rooms,
+                revisionsAtStart: securityRevisionsAtStart,
+                currentRevisions: roomSecurityRevisions,
+                observedEncryptedRooms: observedEncryptedRooms
+            ))
+            let snapshots = rooms.map { room in
+                ForegroundBannerSnapshot(room: room, candidate: Self.foregroundBannerCandidate(
+                    for: room, latest: latestEvents[room.id] ?? .none, currentUserID: userID))
+            }
+            for candidate in foregroundBannerDetector.candidates(in: snapshots, isOnlineSync: onlineSyncGeneration != nil) {
+                foregroundBannerCandidates.send(candidate)
+            }
         }
-        rooms = MatrixRoom.sortedByActivity(Self.mergingSecurityUpdates(
-            refreshed: updated, current: rooms,
-            revisionsAtStart: securityRevisionsAtStart,
-            currentRevisions: roomSecurityRevisions,
-            observedEncryptedRooms: observedEncryptedRooms
-        ))
-        let snapshots = rooms.map { room in
-            ForegroundBannerSnapshot(room: room, candidate: Self.foregroundBannerCandidate(
-                for: room, latest: latestEvents[room.id] ?? .none, currentUserID: userID))
-        }
-        for candidate in foregroundBannerDetector.candidates(in: snapshots, isOnlineSync: onlineSyncGeneration != nil) {
-            foregroundBannerCandidates.send(candidate)
-        }
+        guard committed else { return }
         updateApplicationBadge()
         if rooms.contains(where: { $0.encryption == .encrypted }) { refreshCryptoSafety(from: client) }
         if let activeRoomID, !rooms.contains(where: { $0.id == activeRoomID && $0.membership == .joined }) {
@@ -1313,6 +1322,7 @@ public final class MatrixService: ObservableObject {
         authTask = nil
         clearTimeline()
         foregroundBannerDetector.reset()
+        bannerResumeState = ForegroundBannerResumeState()
         rooms = []
         updateApplicationBadge()
         userID = nil
