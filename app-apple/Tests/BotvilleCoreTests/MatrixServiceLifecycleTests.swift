@@ -1065,24 +1065,51 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         let temporary = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: temporary) }
         let client = FakeClient(successfulSync: true)
+        client.suspendSyncUntilReleased = true
+        let initialSync = expectation(description: "initial sync started")
+        let recoveredSync = expectation(description: "network recovery sync started")
+        client.onSync = { [weak client] in
+            switch client?.syncCalls {
+            case 1: initialSync.fulfill()
+            case 2: recoveredSync.fulfill()
+            default: XCTFail("unexpected additional sync")
+            }
+        }
         let service = makeService(sessionStore: InMemorySessionStore(), directory: temporary, client: client)
         try await service.login(homeserver: "https://matrix.test", username: "foreground", password: "test-password")
-        try await Task.sleep(for: .milliseconds(15))
-        let beforeForeground = client.syncCalls
+        await fulfillment(of: [initialSync], timeout: 5)
+        XCTAssertEqual(client.syncCalls, 1)
+        XCTAssertEqual(client.cancelledSuspendedSyncCalls, 0)
         let initialEnableCount = client.queueEnableValues.filter { $0 }.count
+        XCTAssertEqual(initialEnableCount, 1)
 
+        // Keep the same request in flight: an immediately successful fake can
+        // legitimately start another loop iteration before a timed assertion.
         await service.applicationDidBecomeActive()
-        try await Task.sleep(for: .milliseconds(15))
-        XCTAssertEqual(client.syncCalls, beforeForeground)
+        XCTAssertEqual(client.syncCalls, 1)
+        XCTAssertEqual(client.cancelledSuspendedSyncCalls, 0, "foreground must preserve the in-flight sync")
         XCTAssertEqual(client.queueEnableValues.filter { $0 }.count, initialEnableCount)
 
-        let beforeNetwork = client.syncCalls
         await service.networkChanged(available: false)
+        XCTAssertEqual(client.syncCalls, 1)
+        XCTAssertEqual(client.cancelledSuspendedSyncCalls, 0)
         await service.networkChanged(available: true)
-        try await Task.sleep(for: .milliseconds(15))
-        XCTAssertGreaterThan(client.syncCalls, beforeNetwork)
+        await fulfillment(of: [recoveredSync], timeout: 5)
+        XCTAssertEqual(client.syncCalls, 2)
+        XCTAssertEqual(client.cancelledSuspendedSyncCalls, 1, "network recovery must drain the previous sync")
         XCTAssertEqual(client.queueEnableValues.filter { $0 }.count, initialEnableCount)
+        // Also exercise the successful-sync path: recovery must not enable a
+        // queue when its response is applied, not just when the request starts.
+        let connected = expectation(description: "recovery response applied")
+        let observation = service.$connectionStatus.filter { $0 == .connected }.prefix(1).sink { _ in connected.fulfill() }
+        client.onSync = nil
+        client.releaseSuspendedSync()
+        await fulfillment(of: [connected], timeout: 5)
+        withExtendedLifetime(observation) {
+            XCTAssertEqual(client.queueEnableValues.filter { $0 }.count, initialEnableCount)
+        }
         await service.logout()
+        XCTAssertFalse(client.isSyncSuspended, "logout must release any subsequent long poll")
     }
 
     func testSyncNotificationMappingPreservesPrivacyAndIdentity() throws {
@@ -1364,6 +1391,7 @@ private final class FakeClient: Client, @unchecked Sendable {
     private var delegate: ClientDelegate?
     private(set) var notificationListener: SyncNotificationListener?
     var onSync: (() -> Void)?
+    var suspendSyncUntilReleased = false
     var blockNextSync = false
     private var syncContinuation: CheckedContinuation<Void, Never>?
     var isSyncBlocked: Bool { syncContinuation != nil }
@@ -1431,7 +1459,25 @@ private final class FakeClient: Client, @unchecked Sendable {
     override func syncOnceV2(settings: SyncSettingsV2) async throws -> SyncResponseV2 {
         lifecycleEvents.append("sync")
         syncCalls += 1
-        onSync?()
+        if suspendSyncUntilReleased {
+            // Each request owns its stream; cancellation ends iteration even
+            // when it arrives before the iterator starts waiting.
+            let (pending, continuation) = AsyncStream<Void>.makeStream()
+            syncBlockLock.withLock { suspendedSyncContinuation = continuation }
+            defer {
+                continuation.finish()
+                syncBlockLock.withLock { suspendedSyncContinuation = nil }
+            }
+            onSync?()
+            await withTaskCancellationHandler {
+                for await _ in pending {}
+            } onCancel: {
+                self.syncBlockLock.withLock { self.suspendedSyncCancellationCount += 1 }
+            }
+            try Task.checkCancellation()
+        } else {
+            onSync?()
+        }
         if blockNextSync {
             blockNextSync = false
             await withTaskCancellationHandler {
@@ -1457,6 +1503,14 @@ private final class FakeClient: Client, @unchecked Sendable {
     func releaseBlockedSync() { let continuation = syncContinuation; syncContinuation = nil; continuation?.resume() }
     private let syncBlockLock = NSLock()
     private var blockedSyncCancelled = false
+    private var suspendedSyncCancellationCount = 0
+    private var suspendedSyncContinuation: AsyncStream<Void>.Continuation?
+    var isSyncSuspended: Bool { syncBlockLock.withLock { suspendedSyncContinuation != nil } }
+    func releaseSuspendedSync() {
+        let continuation = syncBlockLock.withLock { suspendedSyncContinuation }
+        continuation?.finish()
+    }
+    var cancelledSuspendedSyncCalls: Int { syncBlockLock.withLock { suspendedSyncCancellationCount } }
     var isBlockedSyncCancelled: Bool { syncBlockLock.withLock { blockedSyncCancelled } }
 }
 
