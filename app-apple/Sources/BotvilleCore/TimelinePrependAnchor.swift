@@ -55,6 +55,7 @@ public struct TimelinePrependAnchor: Sendable {
         // A post-pagination SDK snapshot is the fence, not the arrival of an
         // arbitrary status/append diff. nil means the page is not acknowledged.
         var expectedMessageIDs: [String]?
+        var revisionApplied = false
         var phase: Phase = .layout
     }
 
@@ -90,9 +91,7 @@ public struct TimelinePrependAnchor: Sendable {
     public var targetID: String? { capture?.target.id }
     public var targetOffset: Double? { capture?.target.minY }
     public var pageRevisionApplied: Bool {
-        guard let current = capture, !current.loading,
-              let expected = current.expectedMessageIDs, let input else { return false }
-        return Self.containsPageRevision(expected, in: input.messageIDs, replacing: current.pageStartIDs)
+        capture?.revisionApplied == true
     }
 
     /// Subsequent live appends may already be present when the page fence arrives.
@@ -182,6 +181,12 @@ public struct TimelinePrependAnchor: Sendable {
             cancel(); return
         }
         guard previous?.messageIDs != next.messageIDs else { return }
+        if !current.loading, let expected = current.expectedMessageIDs {
+            // Once observed, later live removals must not close the page fence
+            // again. Their geometry still gets its own generation below.
+            current.revisionApplied = current.revisionApplied
+                || Self.containsPageRevision(expected, in: next.messageIDs, replacing: current.pageStartIDs)
+        }
         let oldIDs = previous?.messageIDs ?? []
         // Also detects prepend+append and late SDK listener delivery after the
         // pagination await has completed. Keep a settled anchor until a gesture,
@@ -225,6 +230,9 @@ public struct TimelinePrependAnchor: Sendable {
         staleGeometrySamples = 0
         current.loading = false
         current.expectedMessageIDs = expectedMessageIDs
+        current.revisionApplied = expectedMessageIDs.map {
+            Self.containsPageRevision($0, in: input?.messageIDs ?? [], replacing: current.pageStartIDs)
+        } ?? false
         current.phase = .layout // Includes spinner/button removal and empty pages.
         awaitingExecution = false
         capture = current

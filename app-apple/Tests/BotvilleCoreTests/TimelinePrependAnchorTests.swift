@@ -561,4 +561,19 @@ final class TimelinePrependAnchorTests: XCTestCase {
         XCTAssertFalse(state.blocksFollowing) // correctionLimit, never success.
     }
 
+    func testAppliedPageFenceSurvivesLaterDeletionAndRestoresMeasuredSurvivor() {
+        var state = started()
+        let next = ["older"] + ids
+        state.finished(operation: operation, expectedMessageIDs: next)
+        state.update(input(next))
+        XCTAssertTrue(state.pageRevisionApplied)
+        let removed = ["older", "b", "c"]
+        state.update(input(removed))
+        XCTAssertTrue(state.pageRevisionApplied)
+        XCTAssertEqual(state.targetID, "b")
+        XCTAssertEqual(layout(&state, removed, [frame("b", 800)]), .restore(id: "b", offset: 172))
+        XCTAssertNil(layout(&state, removed, [frame("b", 172)]))
+        XCTAssertFalse(state.blocksFollowing)
+    }
+
 }
