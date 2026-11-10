@@ -16,7 +16,7 @@
 |---|---|---|---|---|---|---|
 | A0.1 | Synapse 与 Tuwunel/continuwuity 兼容性验证（分支现状需核实） | M0 | — | 标准接口清单与差异报告 | 1 | ZCode |
 | A0.2 | 仓库骨架、Compose profile、双服务器 CI | M0 | A0.1 | core profile 一键启动；CI 两服务器均绿；示例配置无真实值 | 1 | ZCode |
-| A1.1 | Synapse+Postgres 部署手册与备份（硬件待定） | M1 | A0.2 | Element 可注册私聊建群；备份可恢复 | 1 | ZCode |
+| A1.1 | Synapse+Postgres 部署手册与备份（参考宿主：8845 mini PC / Ubuntu Server 24.04，见 push-sygnal.md 对应节） | M1 | A0.2 | Element 可注册私聊建群；备份可恢复 | 1 | ZCode |
 | A1.2 | Sygnal 推送网关 + APNs | M1 | A1.1 | iOS 推送到达 <5s | 1 | ZCode |
 | A1.3 | appservice 注册 AI 账号命名空间 | M1 | A1.1 | 网关以 AI 身份代发 | 0.5 | ZCode |
 | A2.1 | 仅配对联邦与扫码配对后端，支持单方面切断 | M2 | A1.1 | 未配对服务器无法互通；任一方切断后对方不能再发消息、不能再拉取内容 | 2 | ZCode |
