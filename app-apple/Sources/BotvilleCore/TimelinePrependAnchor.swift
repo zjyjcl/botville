@@ -3,6 +3,19 @@
 
 import Foundation
 
+/// Keep the measured pagination header footprint after its button disappears.
+/// At content offset zero, removing it makes the former first-row offset
+/// unreachable by scrollTo (negative content offset is clamped). Keep the slot
+/// for this appearance, including after restoration expires or is cancelled.
+public struct TimelineHeaderFootprint: Sendable {
+    public private(set) var height: Double = 0
+    public init() {}
+    public mutating func record(height: Double, buttonVisible: Bool) {
+        guard buttonVisible, height.isFinite, height > 0 else { return }
+        self.height = height
+    }
+}
+
 /// A row's actual frame in the scroll viewport, including partially visible rows.
 public struct TimelineMessageFrame: Equatable, Sendable {
     public let id: String
@@ -30,14 +43,19 @@ public struct TimelinePrependAnchor: Sendable {
         case restore(id: String, offset: Double)
     }
 
-    private enum Phase: Sendable { case layout, located, corrected(Int), settled }
+    private enum Phase: Sendable { case layout, located, corrected, settled }
     private struct Capture: Sendable {
         let operation: UUID
         let appearance: UUID
         let originalIDs: [String]
+        let pageStartIDs: [String]
         let visibleFrames: [TimelineMessageFrame]
         var target: TimelineMessageFrame
         var loading = true
+        // A post-pagination SDK snapshot is the fence, not the arrival of an
+        // arbitrary status/append diff. nil means the page is not acknowledged.
+        var expectedMessageIDs: [String]?
+        var revisionApplied = false
         var phase: Phase = .layout
     }
 
@@ -48,6 +66,8 @@ public struct TimelinePrependAnchor: Sendable {
     private var hardDeadline: TimeInterval?
     private var missingFrameSamples = 0
     private var locateAttempts = 0
+    private var correctionAttempts = 0
+    private var staleGeometrySamples = 0
     public private(set) var layoutGeneration: UInt = 0
     private var capture: Capture?
     private var input: TimelineScrollInput?
@@ -70,6 +90,24 @@ public struct TimelinePrependAnchor: Sendable {
     public var operation: UUID? { capture?.operation }
     public var targetID: String? { capture?.target.id }
     public var targetOffset: Double? { capture?.target.minY }
+    public var pageRevisionApplied: Bool {
+        capture?.revisionApplied == true
+    }
+
+    /// Subsequent live appends may already be present when the page fence arrives.
+    /// Preserve ordering, rather than accepting an unrelated count/status change.
+    public static func containsPageRevision(_ expected: [String], in actual: [String],
+                                           replacing original: [String] = []) -> Bool {
+        // A snapshot can also remove a prior row. Seeing its surviving IDs is
+        // insufficient until that removal has reached the live input too.
+        let removed = Set(original).subtracting(expected)
+        guard removed.isDisjoint(with: actual) else { return false }
+        var index = expected.startIndex
+        for id in actual where index < expected.endIndex {
+            if id == expected[index] { index += 1 }
+        }
+        return index == expected.endIndex
+    }
 
     /// Beginning another page while correction is in flight chains the intended
     /// anchor, rather than capturing the transient top of the inserted batch.
@@ -92,6 +130,7 @@ public struct TimelinePrependAnchor: Sendable {
         hardDeadline = now + Self.timeout + Self.recoveryWindow
         capture = Capture(operation: operation, appearance: appearance,
                           originalIDs: chained?.originalIDs ?? input.messageIDs,
+                          pageStartIDs: input.messageIDs,
                           visibleFrames: chained?.visibleFrames ?? visible, target: target)
 #if DEBUG
         TimelineTrace.record(.anchorBegin, scope: operation, context: appearance, targetID: target.id,
@@ -105,6 +144,8 @@ public struct TimelinePrependAnchor: Sendable {
         hardDeadline = nil
         missingFrameSamples = 0
         locateAttempts = 0
+        correctionAttempts = 0
+        staleGeometrySamples = 0
         awaitingExecution = false
         layoutGeneration &+= 1
     }
@@ -140,6 +181,12 @@ public struct TimelinePrependAnchor: Sendable {
             cancel(); return
         }
         guard previous?.messageIDs != next.messageIDs else { return }
+        if !current.loading, let expected = current.expectedMessageIDs {
+            // Once observed, later live removals must not close the page fence
+            // again. Their geometry still gets its own generation below.
+            current.revisionApplied = current.revisionApplied
+                || Self.containsPageRevision(expected, in: next.messageIDs, replacing: current.pageStartIDs)
+        }
         let oldIDs = previous?.messageIDs ?? []
         // Also detects prepend+append and late SDK listener delivery after the
         // pagination await has completed. Keep a settled anchor until a gesture,
@@ -166,12 +213,13 @@ public struct TimelinePrependAnchor: Sendable {
         }
         capture = current
         missingFrameSamples = 0
-        locateAttempts = 0
+        staleGeometrySamples = 0
         awaitingExecution = false
         layoutGeneration &+= 1
     }
 
     public mutating func finished(operation: UUID,
+                                 expectedMessageIDs: [String]? = nil,
                                  now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
         expire(now: now)
         guard var current = capture, current.operation == operation, current.loading else { return }
@@ -179,16 +227,20 @@ public struct TimelinePrependAnchor: Sendable {
         // duplicate completion. A cancelled/expired capture cannot resurrect.
         deadline = min(now + Self.recoveryWindow, hardDeadline ?? now)
         missingFrameSamples = 0
-        locateAttempts = 0
-#if DEBUG
-        TimelineTrace.record(.anchorFinished, scope: operation, targetID: current.target.id,
-                             generation: layoutGeneration)
-#endif
+        staleGeometrySamples = 0
         current.loading = false
+        current.expectedMessageIDs = expectedMessageIDs
+        current.revisionApplied = expectedMessageIDs.map {
+            Self.containsPageRevision($0, in: input?.messageIDs ?? [], replacing: current.pageStartIDs)
+        } ?? false
         current.phase = .layout // Includes spinner/button removal and empty pages.
         awaitingExecution = false
         capture = current
         layoutGeneration &+= 1
+#if DEBUG
+        TimelineTrace.record(.anchorFinished, scope: operation, targetID: current.target.id,
+                             generation: layoutGeneration, pageApplied: pageRevisionApplied)
+#endif
     }
 
     /// The view executes outside the preference callback, after SwiftUI has
@@ -202,34 +254,57 @@ public struct TimelinePrependAnchor: Sendable {
         layoutGeneration &+= 1
     }
 
+    /// The driver calls this even when SwiftUI emits no matching preference.
+    /// Share the SAME three-locate budget with missing-row recovery, never reset
+    /// it on status/data updates. No stale frame is used for pixel correction.
+    public mutating func missingGeometry() -> Action? {
+        guard needsLayout, pageRevisionApplied, correctionAttempts < 2,
+              var current = capture else { return nil }
+        staleGeometrySamples += 1
+        guard staleGeometrySamples >= 3, locateAttempts < 3 else { return nil }
+        staleGeometrySamples = 0
+        locateAttempts += 1
+        current.phase = .located
+        capture = current
+        awaitingExecution = true
+#if DEBUG
+        TimelineTrace.record(.anchorLocate, reason: .staleGeometry, scope: current.operation,
+                             targetID: current.target.id, generation: layoutGeneration,
+                             attempt: locateAttempts, pageApplied: true)
+#endif
+        layoutGeneration &+= 1
+        return .locate(current.target.id)
+    }
+
     /// Called only with geometry emitted by the current rendered message revision
-    /// and generation. Retry lazy registration at most three times per revision.
+    /// and generation. Retry lazy registration at most three times per operation.
     public mutating func layout(input measuredInput: TimelineScrollInput, generation: UInt,
                                 frames: [TimelineMessageFrame]) -> Action? {
         guard measuredInput == input, generation == layoutGeneration,
-              !awaitingExecution, var current = capture else { return nil }
+              !awaitingExecution, pageRevisionApplied, var current = capture else { return nil }
+        staleGeometrySamples = 0
         if case .settled = current.phase { return nil }
         let frame = frames.first { $0.id == current.target.id && $0.minY.isFinite }
         var action: Action?
         if let frame {
             missingFrameSamples = 0
             let delta = frame.minY - current.target.minY
-            let corrections: Int
-            if case .corrected(let count) = current.phase { corrections = count } else { corrections = 0 }
+            let corrections = correctionAttempts
             if abs(delta) <= 0.5 || corrections >= 2 {
 #if DEBUG
                 TimelineTrace.record(.anchorResult, reason: abs(delta) <= 0.5 ? .success : .correctionLimit,
                                      scope: current.operation, targetID: current.target.id,
-                                     generation: layoutGeneration, attempt: corrections, offset: delta)
+                                     generation: layoutGeneration, attempt: corrections, offset: delta, pageApplied: true)
 #endif
                 current.phase = .settled
             } else {
 #if DEBUG
                 TimelineTrace.record(.anchorRestore, scope: current.operation, targetID: current.target.id,
-                                     generation: layoutGeneration, attempt: corrections + 1, offset: delta)
+                                     generation: layoutGeneration, attempt: corrections + 1, offset: delta, pageApplied: true)
 #endif
                 action = .restore(id: current.target.id, offset: current.target.minY)
-                current.phase = .corrected(corrections + 1)
+                correctionAttempts += 1
+                current.phase = .corrected
             }
         } else {
             // The first new-generation preference can contain only the content
@@ -243,7 +318,8 @@ public struct TimelinePrependAnchor: Sendable {
                                      generation: layoutGeneration, attempt: locateAttempts)
             }
 #endif
-            guard missingFrameSamples >= (locateAttempts == 0 ? 2 : 4), locateAttempts < 3 else { return nil }
+            guard missingFrameSamples >= (locateAttempts == 0 ? 2 : 4), locateAttempts < 3,
+                  correctionAttempts < 2 else { return nil }
             missingFrameSamples = 0
             locateAttempts += 1
 #if DEBUG

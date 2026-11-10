@@ -19,6 +19,7 @@ struct RoomView: View {
     @StateObject private var layoutVersion = TimelineLayoutVersion()
     @State private var timelineGeometry: TimelineGeometry?
     @State private var anchorGeometryCache = TimelineAnchorGeometryCache()
+    @State private var headerFootprint = TimelineHeaderFootprint()
     @State private var isDraggingTimeline = false
     @State private var draft = ""
     @FocusState private var isInputFocused: Bool
@@ -233,13 +234,18 @@ struct RoomView: View {
                         if let olderMessagesLayoutError {
                             Text(olderMessagesLayoutError).font(.footnote).foregroundStyle(.secondary)
                         }
-                        // Keep the lazy stack's header identity when the final
-                        // page removes its button; only its measured height changes.
+                        // Keep both identity AND measured footprint. At the top,
+                        // removing this height would require an unreachable
+                        // negative content offset to retain the first row.
                         VStack(spacing: 0) {
                             if service.canLoadOlderMessages {
                                 olderMessagesButton
                             }
                         }
+                        .frame(minHeight: service.canLoadOlderMessages ? 0 : headerFootprint.height)
+                        .background(GeometryReader { header in
+                            Color.clear.preference(key: TimelineHeaderHeightKey.self, value: header.size.height)
+                        })
                         ForEach(service.messages) { message in
                             MessageBubble(message: message, retry: {
                                 Task { await actOnMessage(message.id, retry: true) }
@@ -279,6 +285,19 @@ struct RoomView: View {
                         isDraggingTimeline = false
                         recordTimelineGeometry()
                     })
+#if DEBUG
+                .onChange(of: service.canLoadOlderMessages) { _, visible in
+                    TimelineTrace.record(.headerLayout, scope: roomOpenGeneration,
+                                         visible: visible, offset: headerFootprint.height)
+                }
+#endif
+                .onPreferenceChange(TimelineHeaderHeightKey.self) { height in
+                    headerFootprint.record(height: height, buttonVisible: service.canLoadOlderMessages)
+#if DEBUG
+                    TimelineTrace.record(.headerLayout, scope: roomOpenGeneration,
+                                         visible: service.canLoadOlderMessages, offset: height)
+#endif
+                }
                 .onPreferenceChange(TimelineGeometryKey.self) { geometry in
                     guard let geometry, geometry.input == scrollInput else { return }
                     timelineGeometry = geometry
@@ -318,7 +337,9 @@ struct RoomView: View {
 #if DEBUG
                         if let operation = scrollState.prependAnchor.operation {
                             let gate: TimelineTrace.Reason
-                            if let geometry = timelineGeometry {
+                            if !scrollState.prependAnchor.pageRevisionApplied {
+                                gate = .awaitingPage
+                            } else if let geometry = timelineGeometry {
                                 if geometry.input != scrollInput || geometry.generation != scrollState.prependAnchor.layoutGeneration {
                                     gate = .staleGeometry
                                 } else if let height = geometry.viewportHeight, height.isFinite, height > 0 {
@@ -329,34 +350,43 @@ struct RoomView: View {
                                 lastTraceGate = gate
                                 TimelineTrace.record(.anchorWaiting, reason: gate, scope: operation,
                                                      count: timelineGeometry?.frames.count,
-                                                     generation: scrollState.prependAnchor.layoutGeneration)
+                                                     generation: scrollState.prependAnchor.layoutGeneration,
+                                                     pageApplied: scrollState.prependAnchor.pageRevisionApplied)
                             }
                         }
 #endif
-                        if let geometry = timelineGeometry, geometry.input == scrollInput,
-                           geometry.generation == scrollState.prependAnchor.layoutGeneration,
-                           let height = geometry.viewportHeight, height.isFinite, height > 0 {
-                            if scrollState.prependAnchor.needsLayout,
-                               let action = scrollState.restorePrepend(for: geometry.input,
-                                   generation: geometry.generation, frames: geometry.frames) {
-                                let generation = scrollState.prependAnchor.layoutGeneration
-                                var transaction = Transaction(animation: nil)
-                                transaction.disablesAnimations = true
-                                withTransaction(transaction) {
-                                    switch action {
-                                    case .locate(let id): proxy.scrollTo(id, anchor: .top)
-                                    case .restore(let id, let offset):
+                        let geometry = timelineGeometry.flatMap {
+                            $0.input == scrollInput && $0.generation == scrollState.prependAnchor.layoutGeneration
+                                && ($0.viewportHeight ?? 0).isFinite && ($0.viewportHeight ?? 0) > 0 ? $0 : nil
+                        }
+                        let action: TimelinePrependAnchor.Action?
+                        if let geometry {
+                            action = scrollState.restorePrepend(for: geometry.input,
+                                generation: geometry.generation, frames: geometry.frames)
+                        } else {
+                            action = scrollState.recoverMissingPrependGeometry()
+                        }
+                        if let action {
+                            let generation = scrollState.prependAnchor.layoutGeneration
+                            var transaction = Transaction(animation: nil)
+                            transaction.disablesAnimations = true
+                            withTransaction(transaction) {
+                                switch action {
+                                case .locate(let id): proxy.scrollTo(id, anchor: .top)
+                                case .restore(let id, let offset):
+                                    if let height = geometry?.viewportHeight {
                                         proxy.scrollTo(TimelinePrependPoint(messageID: id),
                                                        anchor: UnitPoint(x: 0.5, y: offset / height))
                                     }
                                 }
-                                scrollState.didExecutePrepend(generation: generation)
-                            } else if let decision = scrollState.correctBottom(for: geometry.input,
-                                frames: geometry.frames, viewportHeight: height, now: now) {
-                                let duration = decision.animationDuration(reduceMotion: reduceMotion)
-                                withAnimation(duration.map { .easeOut(duration: $0) }) {
-                                    proxy.scrollTo(decision.request.latestMessageID, anchor: .bottom)
-                                }
+                            }
+                            scrollState.didExecutePrepend(generation: generation)
+                        } else if let geometry, let height = geometry.viewportHeight,
+                                  let decision = scrollState.correctBottom(for: geometry.input,
+                                    frames: geometry.frames, viewportHeight: height, now: now) {
+                            let duration = decision.animationDuration(reduceMotion: reduceMotion)
+                            withAnimation(duration.map { .easeOut(duration: $0) }) {
+                                proxy.scrollTo(decision.request.latestMessageID, anchor: .bottom)
                             }
                         }
                         layoutVersion.update(.init(input: scrollInput,
@@ -465,6 +495,7 @@ struct RoomView: View {
         guard !isLoadingOlderMessages else { return }
         let operation = UUID()
         let appearance = roomOpenGeneration
+        var expectedMessageIDs: [String]?
         let input = scrollInput
         let geometry = timelineGeometry.flatMap { $0.input == input ? $0 : nil }
         let capture = anchorGeometryCache.capture(input: input, frames: geometry?.frames ?? [],
@@ -487,12 +518,12 @@ struct RoomView: View {
             if olderMessagesOperation == operation, roomOpenGeneration == appearance {
                 olderMessagesOperation = nil
                 scrollState.update(scrollInput)
-                scrollState.finishPrepend(operation: operation)
+                scrollState.finishPrepend(operation: operation, expectedMessageIDs: expectedMessageIDs)
             }
         }
         errorMessage = nil
         do {
-            try await service.loadOlderMessages(operation: operation)
+            expectedMessageIDs = try await service.loadOlderMessages(operation: operation)
         } catch {
             if olderMessagesOperation == operation, roomOpenGeneration == appearance {
                 errorMessage = error.localizedDescription
@@ -540,6 +571,7 @@ struct RoomView: View {
         olderMessagesLayoutError = nil
         timelineGeometry = nil
         anchorGeometryCache = TimelineAnchorGeometryCache()
+        headerFootprint = TimelineHeaderFootprint()
         isDraggingTimeline = false
         let lease = service.beginRoomOpen(room.id)
         roomTimelineLease = lease
@@ -649,6 +681,11 @@ private struct TimelineGeometry: Equatable {
     var distanceFromBottom: Double? = nil
     var viewportHeight: Double? = nil
     var frames: [TimelineMessageFrame] = []
+}
+
+private struct TimelineHeaderHeightKey: PreferenceKey {
+    static let defaultValue: Double = 0
+    static func reduce(value: inout Double, nextValue: () -> Double) { value = max(value, nextValue()) }
 }
 
 private struct TimelineGeometryKey: PreferenceKey {

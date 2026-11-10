@@ -88,6 +88,50 @@ final class TimelineLeaseOwnershipTests: XCTestCase {
         XCTAssertTrue(state.hasReceivedSnapshot)
     }
 
+    func testPageSnapshotRequiresInitialResetAndNeverUsesLaterIncrementalDiffs() {
+        let snapshot = TimelinePageSnapshot()
+        snapshot.onUpdate(diff: [])
+        snapshot.onUpdate(diff: [.pushBack(value: LeaseNonTextItem())])
+        XCTAssertNil(snapshot.messageIDs())
+        snapshot.onUpdate(diff: [.reset(values: [LeaseNonTextItem()])])
+        XCTAssertEqual(snapshot.messageIDs(), [])
+        snapshot.onUpdate(diff: [.clear, .reset(values: [])])
+        XCTAssertEqual(snapshot.messageIDs(), [])
+    }
+
+    @MainActor
+    func testPaginationUsesIndependentSnapshotFenceAndCancelsOnlyItsHandle() async throws {
+        let fixture = try await LeaseFixture.make()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        _ = try await fixture.service.openRoom(fixture.room.id())
+        fixture.timeline.pageSnapshot = []
+        let expected = try await fixture.service.loadOlderMessages()
+        XCTAssertEqual(expected, []) // Explicitly acknowledged no text, no inc diff.
+        XCTAssertEqual(fixture.timeline.paginationCalls, 1)
+        XCTAssertEqual(fixture.timeline.listeners.count, 2)
+        XCTAssertFalse(fixture.timeline.handles[0].cancelled)
+        XCTAssertTrue(fixture.timeline.handles[1].cancelled)
+        // A fence must not overwrite or reset the primary stream's state.
+        XCTAssertFalse(fixture.service.hasReceivedTimelineSnapshot)
+        fixture.timeline.listeners[0].onUpdate(diff: [.reset(values: [LeaseNonTextItem()])])
+        for _ in 0..<100 where !fixture.service.hasReceivedTimelineSnapshot {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(fixture.service.hasReceivedTimelineSnapshot)
+        try await fixture.service.clearLocalSession()
+    }
+
+    @MainActor
+    func testMissingSDKSnapshotDoesNotInventAnEmptyPageAcknowledgement() async throws {
+        let fixture = try await LeaseFixture.make()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        _ = try await fixture.service.openRoom(fixture.room.id())
+        let expected = try await fixture.service.loadOlderMessages()
+        XCTAssertNil(expected)
+        XCTAssertTrue(fixture.timeline.handles[1].cancelled)
+        try await fixture.service.clearLocalSession()
+    }
+
     @MainActor
     func testSynchronousLookupErrorAlsoClearsCurrentLease() async throws {
         let fixture = try await LeaseFixture.make()
@@ -276,19 +320,30 @@ private final class LeaseFakeRoom: Room, @unchecked Sendable {
 private final class LeaseFakeTimeline: Timeline, @unchecked Sendable {
     private(set) var markReadCalls = 0
     private(set) var listeners: [TimelineListener] = []
+    private(set) var handles: [LeaseFakeTaskHandle] = []
+    private(set) var paginationCalls = 0
+    var pageSnapshot: [TimelineItem]?
     init() { super.init(noHandle: .init()) }
     required init(unsafeFromHandle handle: UInt64) { fatalError("test fake") }
     override func markAsRead(receiptType: ReceiptType) async throws { markReadCalls += 1 }
+    override func paginateBackwards(numEvents: UInt16) async throws -> Bool {
+        paginationCalls += 1
+        return true
+    }
     override func addListener(listener: TimelineListener) async -> TaskHandle {
         listeners.append(listener)
-        return LeaseFakeTaskHandle()
+        if listeners.count > 1, let pageSnapshot { listener.onUpdate(diff: [.reset(values: pageSnapshot)]) }
+        let handle = LeaseFakeTaskHandle()
+        handles.append(handle)
+        return handle
     }
 }
 
 private final class LeaseFakeTaskHandle: TaskHandle, @unchecked Sendable {
+    private(set) var cancelled = false
     init() { super.init(noHandle: .init()) }
     required init(unsafeFromHandle handle: UInt64) { fatalError("test fake") }
-    override func cancel() {}
+    override func cancel() { cancelled = true }
 }
 
 private final class LeaseNonTextItem: TimelineItem, @unchecked Sendable {

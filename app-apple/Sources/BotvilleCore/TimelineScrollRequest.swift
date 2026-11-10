@@ -72,8 +72,9 @@ public struct TimelineScrollState: Sendable {
     }
 
     public mutating func finishPrepend(operation: UUID,
+                                      expectedMessageIDs: [String]? = nil,
                                       now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
-        prependAnchor.finished(operation: operation, now: now)
+        prependAnchor.finished(operation: operation, expectedMessageIDs: expectedMessageIDs, now: now)
     }
 
     public mutating func restorePrepend(for input: TimelineScrollInput, generation: UInt,
@@ -83,6 +84,10 @@ public struct TimelineScrollState: Sendable {
 
     public mutating func didExecutePrepend(generation: UInt) {
         prependAnchor.didExecute(generation: generation)
+    }
+
+    public mutating func recoverMissingPrependGeometry() -> TimelinePrependAnchor.Action? {
+        prependAnchor.missingGeometry()
     }
 
     public mutating func cancelPrepend() { prependAnchor.cancel() }
