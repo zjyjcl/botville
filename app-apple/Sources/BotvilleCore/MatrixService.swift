@@ -583,7 +583,11 @@ public final class MatrixService: ObservableObject {
 
     public func applicationDidBecomeActive() async {
         updateApplicationBadge()
-        if isLoggedIn { try? await sync() }
+        if isLoggedIn {
+            // The next committed online snapshot absorbs background catch-up.
+            foregroundBannerDetector.beginCatchUp()
+            try? await sync()
+        }
         else if !requiresPasswordReauthentication { await restoreSession() }
     }
 
@@ -615,7 +619,7 @@ public final class MatrixService: ObservableObject {
                 do {
                     _ = try await client.syncOnceV2(settings: SyncSettingsV2(timeoutMs: initial ? 0 : 30_000))
                     guard !Task.isCancelled, let self, self.syncGeneration == generation else { return }
-                    await self.refreshRooms(from: client, session: session, resolveUnknownEncryption: true)
+                    await self.refreshRooms(from: client, session: session, resolveUnknownEncryption: true, onlineSyncGeneration: generation)
                     guard !Task.isCancelled, self.syncGeneration == generation else { return }
                     self.isSyncing = false
                     self.syncError = nil
@@ -650,7 +654,8 @@ public final class MatrixService: ObservableObject {
         }
     }
 
-    private func refreshRooms(from client: Client, session: UUID, resolveUnknownEncryption: Bool = false) async {
+    private func refreshRooms(from client: Client, session: UUID, resolveUnknownEncryption: Bool = false,
+                              onlineSyncGeneration: UUID? = nil) async {
         let refresh = UUID()
         roomRefreshGeneration = refresh
         let securityRevisionsAtStart = roomSecurityRevisions
@@ -700,6 +705,10 @@ public final class MatrixService: ObservableObject {
                                       participants: participants))
         }
         guard session == sessionGeneration, refresh == roomRefreshGeneration, isLoggedIn, !isLoggingOut else { return }
+        // A cancelled/replaced sync must not commit or arm the banner baseline.
+        if let onlineSyncGeneration {
+            guard !Task.isCancelled, onlineSyncGeneration == syncGeneration else { return }
+        }
         rooms = MatrixRoom.sortedByActivity(Self.mergingSecurityUpdates(
             refreshed: updated, current: rooms,
             revisionsAtStart: securityRevisionsAtStart,
@@ -710,7 +719,7 @@ public final class MatrixService: ObservableObject {
             ForegroundBannerSnapshot(room: room, candidate: Self.foregroundBannerCandidate(
                 for: room, latest: latestEvents[room.id] ?? .none, currentUserID: userID))
         }
-        for candidate in foregroundBannerDetector.candidates(in: snapshots) {
+        for candidate in foregroundBannerDetector.candidates(in: snapshots, isOnlineSync: onlineSyncGeneration != nil) {
             foregroundBannerCandidates.send(candidate)
         }
         updateApplicationBadge()
