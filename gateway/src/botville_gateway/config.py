@@ -89,6 +89,11 @@ DEFAULT_MAX_IDEMPOTENCY_ENTRIES = 2_000
 DEFAULT_IDEMPOTENCY_TTL = 86_400
 DEFAULT_MAX_QUEUE_ENTRIES = 1_000
 
+# 终端用户身份（#124 §1.2.3）：OpenID userinfo 结果缓存 TTL。
+# 默认 60 秒；0 = 不缓存；负数或 > 60 拒绝启动（契约写死上限 60）。
+DEFAULT_OPENID_CACHE_TTL_SECONDS = 60
+OPENID_CACHE_TTL_MAX_SECONDS = 60
+
 # N7（契约 §6.3）：平台层 anti_spam / ai_loop 的部署配置。
 # 三个数值项默认 0 = 「平台不设该项」（与 RATE_LIMIT_MESSAGES=0 同语义），
 # 非 0 时必须落在与 API 相同的取值范围内（上限见下）。**注意** env 的 0 与
@@ -405,6 +410,12 @@ class Config:
     caller_tokens: Tuple[CallerToken, ...] = field(default=(), repr=False)
     # 是否仍接受站点级 GATEWAY_AUTH_TOKEN；关闭后只有 caller token 可用。
     legacy_token_enabled: bool = True
+    # #124 §1.2.3：终端用户身份 OpenID。
+    # federation userinfo 专用基址（空则回落 homeserver_url）；
+    # 只有这一条 userinfo 走直连，不影响其他联邦流量。
+    homeserver_federation_url: Optional[str] = None
+    # OpenID userinfo 结果缓存 TTL（秒）；0 = 不缓存；>60 拒绝启动。
+    openid_cache_ttl_seconds: int = DEFAULT_OPENID_CACHE_TTL_SECONDS
     # 部署路径前缀（GATEWAY_HTTP_PATH_PREFIX，默认空 = 不改变现有路由）。
     # 空串表示「无前缀」；`/` 与尾部 `/` 由 normalize_http_path_prefix 归一为空。
     # 非空时形如 `/a/b`：以 `/` 开头，不含 `//` `..` `?` `#` `%` 空白控制字符。
@@ -488,6 +499,26 @@ class Config:
             raise ConfigError("idempotency_ttl_seconds must be >= 0")
         if self.max_queue_entries < 1:
             raise ConfigError("max_queue_entries must be >= 1")
+        # #124 §1.2.3：OpenID 缓存 TTL。0 = 不缓存；负数或 >60 拒绝启动
+        # （契约写死上限 60；<0 无语义）。直接构造 Config 也走同一套校验。
+        if not isinstance(self.openid_cache_ttl_seconds, int) or isinstance(
+            self.openid_cache_ttl_seconds, bool
+        ):
+            raise ConfigError(
+                "openid_cache_ttl_seconds must be an integer, got "
+                f"{self.openid_cache_ttl_seconds!r}"
+            )
+        if self.openid_cache_ttl_seconds < 0:
+            raise ConfigError(
+                "openid_cache_ttl_seconds must be >= 0 (0 disables the cache), got "
+                f"{self.openid_cache_ttl_seconds}"
+            )
+        if self.openid_cache_ttl_seconds > OPENID_CACHE_TTL_MAX_SECONDS:
+            raise ConfigError(
+                "openid_cache_ttl_seconds must be <= "
+                f"{OPENID_CACHE_TTL_MAX_SECONDS} (contract §1.2.3 hard cap), got "
+                f"{self.openid_cache_ttl_seconds}"
+            )
         # #124 调用方身份（契约 §1.2.2）。校验放在这里（而非只在 load_config），
         # 保证直接构造 Config 的调用方（测试/嵌入）也走同一套规则。
         self._validate_caller_tokens()
@@ -648,6 +679,30 @@ class Config:
                 "(0 disables the alias->room cache), got "
                 f"{self.room_alias_cache_ttl_seconds}"
             )
+        # #124 §1.2.3：federation userinfo 直连基址（可选）。配置了就复用
+        # 与 GATEWAY_HOMESERVER_URL 完全相同的明文 http 规则：transport 带的是
+        # 短时 OpenID token（query），同样不能在跨主机明文上传输。
+        fed = self.homeserver_federation_url
+        if fed is not None:
+            if not fed.startswith(("http://", "https://")):
+                raise ConfigError(
+                    "GATEWAY_HOMESERVER_FEDERATION_URL must be an http:// or "
+                    f"https:// URL, got {fed!r}"
+                )
+            if not self.allow_insecure_homeserver and not fed.startswith("https://"):
+                host = _plaintext_homeserver_host(fed)
+                if host is None or (
+                    host not in _LOCAL_HOMESERVER_HOSTS
+                    and not _PLAINTEXT_HS_SINGLE_LABEL_RE.fullmatch(host)
+                ):
+                    raise ConfigError(
+                        f"GATEWAY_HOMESERVER_FEDERATION_URL {fed!r} would send the "
+                        "OpenID token over plaintext http:// to a host outside the "
+                        "allowlist (loopback localhost/127.0.0.1/::1 or a dotless "
+                        "single-label compose service name); use https://, point at a "
+                        "loopback or compose-internal host, or set "
+                        "GATEWAY_ALLOW_INSECURE_HS=true to accept the risk"
+                    )
 
     def _validate_caller_tokens(self) -> None:
         """#124 / 契约 §1.2.2：caller token 表的结构与强度校验。
@@ -874,6 +929,16 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         # dev 也拒绝；强度（短/重复）由 Config.__post_init__ 决定 dev 警告。
         caller_tokens=parse_caller_tokens(_env_str(source, "GATEWAY_CALLER_TOKENS", "")),
         legacy_token_enabled=_env_bool(source, "GATEWAY_LEGACY_TOKEN_ENABLED", True),
+        # #124 §1.2.3：federation userinfo 直连基址（空则回落 homeserver_url）。
+        homeserver_federation_url=(
+            _env_str(source, "GATEWAY_HOMESERVER_FEDERATION_URL", "") or None
+        ),
+        # OpenID 缓存 TTL：0 = 不缓存；<0 / >60 由 Config 校验拒绝启动。
+        openid_cache_ttl_seconds=_env_int(
+            source,
+            "GATEWAY_OPENID_CACHE_TTL_SECONDS",
+            DEFAULT_OPENID_CACHE_TTL_SECONDS,
+        ),
         # 默认空 = 现行行为完全不变；非法前缀在 Config 构造时抛 ConfigError。
         http_path_prefix=_env_str(source, "GATEWAY_HTTP_PATH_PREFIX", ""),
     )

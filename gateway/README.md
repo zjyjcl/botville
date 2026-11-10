@@ -262,8 +262,8 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_MATRIX_TRANSPORT` | `memory` | `memory`=内存假后端（B1.1 现状）；`appservice`=真实 homeserver 代发（A1.3，见 [docs/deploy/appservice.md](../docs/deploy/appservice.md)） |
 | `GATEWAY_HOMESERVER_URL` | *(空)* | appservice 模式必填：homeserver 的 CS API 地址（`http(s)://…`）；明文 `http://` 只允许 loopback / 无点单标签容器名，跨主机要 `https://`（`GATEWAY_ALLOW_INSECURE_HS=true` 可显式放开） |
 | `GATEWAY_MATRIX_SERVER_NAME` | *(空)* | appservice 模式必填：homeserver 的 `server_name`（主机名或 IP，可带 `:端口`；统一小写）。**OpenID userinfo 校验时**，`sub` 的域须等于该值，否则 401 |
-| `GATEWAY_OPENID_CACHE_TTL_SECONDS` | `60` | 契约 §1.2.3（#124 OpenID）：OpenID userinfo 结果缓存 TTL（秒），**上限 60**，且不超过 token 剩余有效期。缓存键只用 token 哈希（不缓存明文、不入日志）。值为 0 表示不缓存；>60 拒绝启动。实现见下一 PR |
-| `GATEWAY_HOMESERVER_FEDERATION_URL` | *(空)* | 契约 §1.2.3：**仅**用于 `GET /_matrix/federation/v1/openid/userinfo` 的**内网直连** homeserver 基址（如 compose 内网 `http://synapse:8008`）。留空则回落 `GATEWAY_HOMESERVER_URL`。不得经 fedgate / 公网；只有这条 userinfo 走直连，其他联邦流量仍走 fedgate，且**不得把该端点暴露到公网入口** |
+| `GATEWAY_OPENID_CACHE_TTL_SECONDS` | `60` | 契约 §1.2.3（#124 OpenID）：OpenID userinfo 结果缓存 TTL（秒），**上限 60**，且不超过 token 剩余有效期（响应未带 `expires_in` 时不收紧，只受该上限与配置约束）。缓存键只用 token 哈希（不缓存明文、不入日志）。值为 0 表示不缓存；`<0` 或 `>60` 拒绝启动。**自本 PR 起生效** |
+| `GATEWAY_HOMESERVER_FEDERATION_URL` | *(空)* | 契约 §1.2.3：**仅**用于 `GET /_matrix/federation/v1/openid/userinfo` 的**内网直连** homeserver 基址（如 compose 内网 `http://synapse:8008`）。留空则回落 `GATEWAY_HOMESERVER_URL`。不得经 fedgate / 公网；只有这条 userinfo 走直连，其他联邦流量仍走 fedgate，且**不得把该端点暴露到公网入口**。**自本 PR 起生效** |
 | `GATEWAY_AS_TOKEN` | *(空)* | appservice 模式必填：与部署层注册文件的 `APPSERVICE_AS_TOKEN` 一致；留空/`<change-me>`/短于 32 字符/含空白都拒绝启动，不进 repr/日志 |
 | `GATEWAY_ROOM_ALIAS_PREFIX` | `botville_conv_` | conversation → 房间别名 localpart 前缀（`^[a-z0-9._=-]{1,64}$`）；改前缀须同步改部署模板的 exclusive aliases 正则（`server/compose/appservice/botville-gateway.yaml.tmpl`） |
 | `GATEWAY_ROOM_ALIAS_CACHE_TTL` | `60` | 别名 → room_id 进程内缓存 TTL（秒），过期重新 directory lookup；`0` = 不缓存，负数拒绝启动 |
