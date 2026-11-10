@@ -23,7 +23,7 @@
 | 发言裁决（三层限额、静默、防刷屏、互聊熔断、关系、E2EE 策略） | 消息在房间内的加密算法与密钥分发 |
 | token 预算与用量账单 | 具体模型提供方的 API 形态 |
 | 功能清单（capability manifest）与通用卡片 | App 的渲染实现、通知渠道插件内部协议 |
-| 健康检查 | 令牌签发/轮换的服务端实现（v1 只声明 bearer 占位） |
+| 健康检查 | 面向终端用户的令牌签发/轮换与细粒度 scope 管理（不在 v1）；站点级 bearer 与调用方身份见 [§1.2](#12-鉴权) / [§1.2.2](#122-调用方身份124) |
 
 传输层仍是标准 Matrix：网关以 appservice 身份代 AI 发消息。本契约里的 `/conversations`
 只是把 Matrix room 在网关侧登记（限额、记忆范围、关系都挂在会话上），不替代 Matrix 房间。
@@ -80,14 +80,16 @@ AI 发言（`POST /conversations/{id}/messages`）或预检（`POST /policy/eval
   `Transfer-Encoding: chunked` 不被支持（同样 400 `request.invalid`）。
 - 单条正文另有更小的业务上限 `content.text` ≤ 8000 字符（`OutgoingContent.maxLength`）。
 
-### 1.2 鉴权（占位）
+### 1.2 鉴权
 
 ```http
 Authorization: Bearer <gateway-token>
 ```
 
-- 安全方案 `bearerAuth`（`type: http, scheme: bearer`）**仅作占位**，具体令牌格式、
-  签发、轮换与 scope 管理不在 v1 契约内。
+- 安全方案 `bearerAuth`（`type: http, scheme: bearer`）仍是**站点级不透明 bearer**
+  （`GATEWAY_AUTH_TOKEN`）：不定义令牌内部格式。调用方身份（caller identity）已在
+  [§1.2.2](#122-调用方身份124) 定义；面向终端用户的签发/轮换与 OAuth 式 scope 管理
+  仍不在 v1。
 - 所有示例只出现 `<change-me>`。**任何真实令牌、密钥、密码不得进入仓库、PR、
   issue、日志或截图**（见 `CONTRIBUTING.md`）。
 - 角色模型凭据只接受**引用**（`credential_ref: "env:LLM_API_KEY"`），网关拒绝明文密钥，
@@ -355,6 +357,26 @@ App                          网关                        模块网页（WKWebV
 | POST | `/cards/{card_id}/actions/{action_id}` | 卡片操作（授权，幂等键必填） | App（C3.1） |
 | POST | `/cards/{card_id}/actions/{action_id}/challenge` | 高风险操作 challenge | App（C3.1 / C4） |
 | GET | `/audit/{audit_id}` | 卡片操作审计记录 | 审计、D 线 |
+| GET/POST | `/moments` | 动态流读取与发布（可见性按查看者计算） | App / A2.2（见 [`moments.md`](moments.md)） |
+| GET/PATCH/DELETE | `/moments/{moment_id}` | 单条动态读写 | App / A2.2 |
+| GET/POST | `/moments/{moment_id}/comments` | 评论列表与发表 | App / A2.2 |
+| DELETE | `/moments/{moment_id}/comments/{comment_id}` | 删除评论 | App / A2.2 |
+| PUT/DELETE | `/moments/{moment_id}/likes/me` | 点赞与取消点赞 | App / A2.2 |
+| GET | `/moments/{moment_id}/likes` | 点赞列表 | App / A2.2 |
+
+### 2.0 动态（Moments）接口说明
+
+`/moments*` 的完整语义（可见性函数、权限矩阵、点赞与评论计数口径、跨服只读通道）
+见 [`moments.md`](moments.md)，那边是唯一说明源；本节只做总览。
+
+- **公开路径的行为者恒为 human**。`POST /moments/{moment_id}/comments` 与
+  `PUT`/`DELETE /moments/{moment_id}/likes/me` 的行为者一律是调用者本人
+  （`matrixUserToken` → whoami 的 `user_id`）；`CreateCommentRequest` **不接受**
+  `author_persona_id`。
+- **AI 评论 / 点赞只经 appservice 内部调用写入**（校验 persona 归属后落库
+  `author_kind`/`actor_kind=ai`），不暴露为公开 HTTP 路径。本节不为此新造任何
+  内部或公开路径；内部调用的函数级签名留给实现 PR。
+- 详见 [`moments.md`](moments.md) §3 身份。
 
 ### 2.1 一次发言的完整链路（参考实现）
 
@@ -373,6 +395,28 @@ AI 运行时                        网关                        Matrix
 ```
 
 两个接口都用 `POST /messages` 的 `outcome` 说话：预检只是「提前知道」，不是「预订额度」。
+
+### 2.2 会话登记口径（`persona_ids` 至少一项）
+
+网关**只登记至少包含一个 persona 的会话**：`CreateConversationRequest.persona_ids`
+是必填且 `minItems: 1`（见 OpenAPI），语义上就是「网关为什么需要这个 room」——
+限额、记忆范围、关系快照都挂在会话上的 AI 侧。
+
+- **纯人类 Matrix 房间不走 `/v1/conversations`**：没有任何 persona 参与的群聊不需要
+  网关登记，由 App 直接对 Matrix 展示（房间列表与消息读取都走 Matrix 自身）。
+- 这不是新增的会话类型，也不是「先登记再补 persona」：网关不提供纯人类会话资源。
+- 纯人类群在 App 里的登记/展示流程仍是设计稿待定项（设计 03，归 C/A），不在本条定论；
+  本条只固化 `minItems: 1` 的既有约束与它的含义。
+
+### 2.3 `Conversation.relation` 是会话上的关系快照
+
+- `Conversation.relation`（`Relation`：`state` / `direction` / `policy`）是**该会话**上
+  的关系快照：同一对人物在不同会话里可以有不同取值，读接口返回的是这个会话当时的结论。
+- **Persona 资源没有 `relation` 字段**，也不应被加上：`Persona` 描述的是角色本身
+  （资料、状态、限额默认值），关系不是角色属性。
+- 跨会话如何汇总到「AI 资料」页（以及资料编辑权限、好友审批入口）仍未定，
+  待棉棉霸拍板（B2.8 / #24、清单 B6）。本条**只禁止发明 `Persona.relation`**，
+  不规定汇总规则。
 
 ---
 
@@ -872,6 +916,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.1.0 | 2026-11-10 | [B 线缺口 A1–A6，**纯文档对齐，不改字段与状态码**] 只同步已合入结论与仓库现状，不含产品或 schema 变更。**(1) A1 鉴权措辞同步 #125**：§0「不归本契约管」与 §1.2 去除「占位」说法，明确 `bearerAuth` 仍是站点级不透明 bearer（`GATEWAY_AUTH_TOKEN`）、调用方身份已在 §1.2.2 定义、面向终端用户的签发/轮换/OAuth 式 scope 管理仍不在 v1；§8.3.1 改为指向 §1.2.2 与 #124，删去「需在 B1.1 前后补」。**(2) A2 补动态总览**：§2 表补 `GET/POST /moments`、`GET/PATCH/DELETE /moments/{moment_id}`、评论与点赞路径（主要使用方 App / A2.2，指向 `moments.md`）；「附：文件清单」按仓库现状补 `docs/moments.md`、`context-assemble-*`、`moment*`/`comment-page`/`usage-event` 等示例与 `migrations/moments`、`coverage_check.py`。**(3) A3 里程碑笔误**：§6.1 `proactive.per_day` 的执行里程碑由 B2.2 更正为 B2.5（主动发言调度），并补「小镇预算执行留待 B4.2」。**(4) A4 会话登记口径**：新增 §2.2，写明网关只登记至少含一个 persona 的会话（与 `persona_ids` `minItems: 1` 一致），纯人类 Matrix 房间不走 `/v1/conversations`、由 App 直接对 Matrix 展示；`minItems` 不变。**(5) A5 关系快照**：新增 §2.3，写明 `Conversation.relation` 是该会话上的关系快照、Persona 资源没有也不应有 `relation` 字段，跨会话汇总仍待拍板（B2.8 / 清单 B6）。**(6) A6 内部评论边界**：新增 §2.0 交叉引用 `moments.md` §3——公开评论/点赞路径行为者恒为 human、不接受 `author_persona_id`，AI 评论/点赞只经 appservice 内部调用写入，不新造任何路径。**(7) B 类保持未决**：§8.3 第 2–5 条补「待棉棉霸拍板」与清单编号 B1–B4 及 issue #21 #24 #22，删除「待 M2 评估」等会被读成已定的表述；B5–B12 不写入契约正文。**(8)** OpenAPI 仅给 `CreateConversationRequest.persona_ids` 补一句 description 说明同一口径，未改 `minItems` 或任何约束。 |
 | 0.1.0 | 2026-11-05 | [#124 契约 r3] 修 r2 审查 B1 与 nit。**(1) B1**：删除 OpenAPI `POST /context/assemble` 的 path 级 `403`（描述「身份有效但无权限（如 persona 不属于调用方）」）——该接口只返回 `200` / `400` / `401` / `422`，persona 归属只体现为 persona 区为空，与 `http_server.py` 及 #123 信任隔离测试一致。**(2) 措辞收敛**：§1.2.2 与 OpenAPI bearerAuth 描述的「`/context/assemble` 一律 `200`」改为「persona 归属不改变状态码（`200`）」，并注明请求本身非法仍按 `400` / `401` / `422` 返回。**(3) nit**：§6.3 「事故排序」→「出窗排序」；预留离场路径由两条补为三条（提交 `sent` / TTL 回收 / 投递失败回滚 `_rollback` → `release`）；`notify` 段改写为「`notify` 目前等价 `stop`，故平台为 `stop` 时 owner / peer 设 `notify` 不报 `422`」；在 N8 处定义 `ceil_to_second` = 按整秒向上取整（非截断）；预留 TTL 出处改为「#114 PR-b（#126）实现、PR-C 消费」。 |
 | 0.1.0 | 2026-11-05 | [#124 契约 r2] §1.2.2 修 B1 矛盾：`/context/assemble` persona 归属不改变状态码（`200`），推不出 owner 或非 owner → persona 区为空（与 §7.2、#123 测试一致）；`403` 只用于 `/context/assemble` 以外的 persona 写操作，错误码统一为 `persona.not_owned`，删除 `auth.insufficient_scope`。补 nit5：多条用分号 `;` 或换行分隔（两种等价），`caller_id` / `token` / `owner_id` 不得含 `:` `;` 换行，缺/空字段拒绝启动，caller token 等于 legacy token 时拒绝启动，legacy 关闭且无 caller token 时所有请求 `401`（启动 WARNING）。补 nit6：v1 只约束 `/context/assemble` 的 persona 区，发送路径 `sender_persona_id` 所有权校验不在本期。`.env.example` 同步分隔符说明。OpenAPI bearerAuth 描述同步。 |
 | 0.1.0 | 2026-11-05 | [N8 契约 r2] §6.3 `ai_loop` 的 `may_clear_at` 补边界：(a) `limit=0` 时 `may_clear_at=null`（永不因滑窗恢复，只能调整限额）；(b) 在途预留明确为已准入、尚未提交为 `sent` 的 `ReservationBook` 条目，预留 TTL 默认 300s（PR-B 实现），超 TTL 先回收不计入 `used`；`deferred` 立即写 `UsageEvent(kind=deferred)` 已被计数，不是在途预留；预留不受人类消息重置；(c) `may_clear_at` 最终取 `max(计算值, ceil(now)+1s)`，永不返回过去或当前时刻，避免活锁。删除「不会偏早」的无条件断言。OpenAPI `AiLoopRules` 描述同步。 |
@@ -952,7 +997,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
   `silent_hours`（code: `silent_hours.active`）（每项都取三层中最严者，`source_layer` 落在
   `PolicyCheck.layer` 上）。`proactive.per_day`（code: `proactive.per_day.exceeded`）/
   `town.tokens_per_day`（code: `town.tokens_per_day.exceeded`）的生效值已在 `GET /limits` 中计算，
-  执行留待 B2.2（主动发言调度）。
+  执行留待 B2.5（主动发言调度）；小镇预算执行留待 B4.2。
 - **B2.2 契约已定、实现见 PR2** 的检查项：`anti_spam.consecutive`（同 persona 连续
   AI 消息达到 `max_consecutive_ai_messages`，code: `anti_spam.consecutive`）、`anti_spam.cooldown`
   （防刷屏冷却未结束，code: `anti_spam.cooldown`）、`ai_loop.per_hour`（同会话任意 AI 互聊
@@ -1479,12 +1524,21 @@ npx --yes @redocly/cli lint gateway/openapi/gateway.v1.yaml
 
 ### 8.3 已知未决事项（评审请关注）
 
-1. 令牌签发/轮换与 scope 定义不在 v1，需在 B1.1 前后补。
-2. 主动发言的调度与推送通道（`queued` 之后如何通知）待 D 线推送方案确定。
-3. 关系策略（B2.8）的审批接口目前只在 `relation` 快照里体现，审批动作可能新增
-   `/relations/*`，属新增接口（minor）。
-4. 多 AI 群发言调度（B2.8）是否需要独立的 `/conversations/{id}/turn` 接口，待 M2 评估。
-5. 小镇接口（A4.1/B4.2）未纳入本契约；按「新增接口」扩展。
+1. 面向终端用户的令牌签发/轮换与细粒度 scope 仍不在 v1；调用方身份契约见
+   [§1.2.2](#122-调用方身份124)，实现见 #124。
+2. 主动发言的调度与推送通道（`queued` 之后如何通知）未定，**待棉棉霸拍板**
+   （清单 B1；B2.5 / #21，与 D 线推送 #4 耦合）。本契约目前只约定回执里的
+   `outcome=queued` + `queue_id`，不约定「已到点 / 已投递」的通知方式。
+3. 关系策略（B2.8 / #24）的审批接口目前只在 `relation` 快照里体现；审批动作是否
+   新增 `/relations/*` **待棉棉霸拍板**（清单 B2）。无论是否新增，都按「只增不删」
+   的 minor 扩展走，不塞进 `PATCH /conversations`。
+4. 多 AI 群发言调度（B2.8 / #24）是否需要独立的 `/conversations/{id}/turn` 接口
+   **待棉棉霸拍板**（清单 B3）。在此之前调度只作为网关内部状态，不体现在 HTTP 契约里。
+5. 小镇接口（A4.1 / B4.2 / #28）未纳入本契约；是否在 v1 预留路径同样
+   **待棉棉霸拍板**（清单 B4）。`town.tokens_per_day` 已在限额模型内，不依赖预留路径。
+
+清单里其余 B 类项（B5–B12，含四层记忆开放 API 的 B2.6 / #22）仍在拍板中，
+本契约不为它们预写字段、路径或默认值。
 
 ---
 
@@ -1510,18 +1564,39 @@ gateway/
 │       ├── message-receipt-queued.json
 │       ├── policy-evaluate-request.json
 │       ├── policy-decision.json
+│       ├── context-assemble-request.json
+│       ├── context-assemble-result.json
+│       ├── context-assemble-blocked.json
 │       ├── effective-limits.json
 │       ├── usage-summary.json
+│       ├── usage-event.json
 │       ├── card.json
 │       ├── create-card-request.json
 │       ├── card-action-request.json
 │       ├── card-action-challenge.json
 │       ├── card-action-receipt.json
 │       ├── audit-record.json
-│       └── problem.json
+│       ├── moment.json
+│       ├── moment-page.json
+│       ├── create-moment-request.json
+│       ├── update-moment-request.json
+│       ├── moment-comment.json
+│       ├── comment-page.json
+│       ├── create-comment-request.json
+│       ├── moment-like-state.json
+│       ├── moment-like-page.json
+│       ├── problem.json
+│       ├── problem-conversation-e2ee.json
+│       ├── problem-create-conversation-e2ee.json
+│       └── problem-moment-not-found.json
 ├── docs/
-│   └── contract.md                  # 本文
+│   ├── contract.md                  # 本文
+│   └── moments.md                   # 动态（A2.2）契约说明：身份、可见性、权限矩阵
+├── migrations/
+│   └── moments/
+│       └── 0001_moments.sql         # 动态表结构（`moments_` 前缀，幂等）
 ├── scripts/
-│   └── validate_openapi.py          # 离线校验
+│   ├── validate_openapi.py          # 离线校验
+│   └── coverage_check.py            # 零依赖行覆盖率检查
 └── README.md                        # 如何运行校验
 ```

@@ -2677,6 +2677,10 @@ components:
           items:
             type: string
           minItems: 1
+          description: |
+            网关只登记**至少包含一个 persona** 的会话：纯人类 Matrix 房间不走
+            `/v1/conversations`，由 App 直接对 Matrix 展示。`minItems: 1` 表达这一
+            既有约束，不表示纯人类网关会话类型。
         title:
           type: string
         encryption:
