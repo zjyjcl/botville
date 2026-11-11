@@ -1287,6 +1287,82 @@ class TestMalformedInputs(unittest.TestCase):
                     self.assertNotEqual(status, 500)
                     self.assertEqual(status, expected)
 
+    def test_request_target_forms_never_500(self):
+        """RFC 9112 §3.2 各种请求目标形式（#184 r3）：绝不 500。
+
+        absolute-form 合法时按 path 照常路由；括号未闭合的 IPv6 字面量、
+        asterisk-form（非 OPTIONS）、authority-form、相对路径、其他 scheme、
+        空 authority 一律 400 request.invalid。
+        """
+        import socket
+        with MomentsServer() as fx:
+            _s, m = _create(fx, ALICE, {"body": "m", "visibility": "server"})
+            mid = m["id"].encode("ascii")
+            host, port = fx.server.server_address[:2]
+            token = USER_TOKEN[ALICE].encode("ascii")
+
+            def send(method: bytes, target: bytes, body: bytes = b""):
+                request = (
+                    method + b" " + target + b" HTTP/1.1\r\n"
+                    + b"Host: 127.0.0.1\r\n"
+                    + b"Authorization: Bearer " + token + b"\r\n"
+                    + b"Content-Type: application/json\r\n"
+                    + b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                    + b"Connection: close\r\n\r\n" + body
+                )
+                with socket.create_connection((host, port), timeout=10) as sock:
+                    sock.sendall(request)
+                    chunks = []
+                    while True:
+                        data = sock.recv(65536)
+                        if not data:
+                            break
+                        chunks.append(data)
+                raw = b"".join(chunks)
+                head, _sep, payload = raw.partition(b"\r\n\r\n")
+                status = int(head.split(b" ", 2)[1])
+                parsed = json.loads(payload) if payload.strip() else None
+                return status, parsed
+
+            cases = [
+                # 括号未闭合（审查原例）与同类：400。
+                (b"GET", b"http://[::1", 400),
+                (b"GET", b"http://[/v1/moments", 400),
+                (b"GET", b"https://[::1/v1/moments/" + mid, 400),
+                (b"PATCH", b"http://[::1/v1/moments/" + mid, 400),
+                (b"DELETE", b"http://[x", 400),
+                # 以 // 开头：较新的 stdlib 会先折叠成单个 /（→ 路由 404），
+                # 否则由我们的校验拒为 400；两者都不得 500。
+                (b"GET", b"//[::1/v1/moments", (400, 404)),
+                # 合法 absolute-form：取 path 照常路由。
+                (b"GET", b"http://127.0.0.1/v1/moments", 200),
+                (b"GET", b"HTTP://example.invalid:8080/v1/moments?limit=1", 200),
+                (b"GET", b"http://[::1]:8080/v1/moments/" + mid, 200),
+                (b"GET", b"https://example.invalid/health", 200),
+                (b"GET", b"http://example.invalid/v1/moments/" + b"0" * 26, 404),
+                # asterisk-form：只有 OPTIONS 放行（随后照旧 405）。
+                (b"GET", b"*", 400),
+                (b"OPTIONS", b"*", 405),
+                # authority-form / 相对 / 其他 scheme / 空 authority：400。
+                (b"GET", b"example.invalid:443", 400),
+                (b"CONNECT", b"example.invalid:443", 400),
+                (b"GET", b"v1/moments", 400),
+                (b"GET", b"ftp://example.invalid/v1/moments", 400),
+                (b"GET", b"http:///v1/moments", 400),
+            ]
+            for method, target, expected in cases:
+                with self.subTest(method=method, target=target):
+                    status, body = send(method, target)
+                    self.assertNotEqual(status, 500, body)
+                    allowed = expected if isinstance(expected, tuple) else (expected,)
+                    self.assertIn(status, allowed, body)
+                    if status == 400:
+                        self.assertEqual(body["code"], "request.invalid")
+            # absolute-form 的写操作同样路由到 moments。
+            status, body = send(b"POST", b"http://127.0.0.1/v1/moments", b'{"body": "abs"}')
+            self.assertEqual(status, 201, body)
+            self.assertEqual(body["body"], "abs")
+
     def test_lone_surrogate_in_body_is_400(self):
         surrogate = "\ud800"
         with MomentsServer() as fx:

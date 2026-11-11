@@ -145,11 +145,42 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             super().log_message(fmt, *args)
 
     # ------------------------------------------------------------- helpers
+    def parse_request(self) -> bool:  # type: ignore[override]
+        """在任何 do_* 之前统一校验 / 规范化请求目标（RFC 9112 §3.2）。
+
+        stdlib 只拆请求行；目标交给 `_route_path` 的 urlparse 时，括号未闭合的
+        IPv6 字面量（`http://[::1`、`//[x`）会抛 ValueError，被 do_* 兜底成 500。
+        这里一次性处理，所有方法（含 HEAD / OPTIONS / TRACE 与 moments 二次取路径）
+        都受益：
+
+        - origin-form（以 `/` 开头）：原样保留，只校验可解析；
+        - absolute-form（`http://` / `https://` + 非空 authority）：按 RFC 9112
+          取其 path（空则 `/`）+ query 改写成 origin-form 后照常路由；
+        - asterisk-form `*`：只允许 OPTIONS（随后照旧 405）；
+        - 其余（authority-form、相对路径、其他 scheme、解析异常）→
+          400 `request.invalid`。
+        """
+        if not super().parse_request():
+            return False
+        normalized = _normalize_request_target(self.command, self.path)
+        if normalized is None:
+            self.close_connection = True
+            self._send_problem(
+                400,
+                "request.invalid",
+                "Bad Request",
+                detail="invalid request target",
+            )
+            return False
+        self.path = normalized
+        return True
+
     def _route_path(self) -> Tuple[str, str, str]:
         """把一个请求解析成 (path, query, 剥掉部署前缀后的路由路径)。
 
         查询串不参与前缀匹配；前缀只按整段边界剥离（`strip_path_prefix`），
         不带前缀的请求也照常路由（兼容已去前缀的 edge / 入口反代）。
+        请求目标已在 `parse_request` 校验 / 规范化，这里不会再遇到无法解析的目标。
         """
         parsed = urlparse(self.path)
         prefix = self.server.config.http_path_prefix  # type: ignore[attr-defined]
@@ -776,6 +807,35 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             status, exc.code, title,
             detail=exc.detail, errors=errors,
         )
+
+
+def _normalize_request_target(method: str, target: str) -> Optional[str]:
+    """请求目标 → 可安全交给 `_route_path` 的 origin-form；非法返回 None（→ 400）。"""
+    if target == "*":
+        # asterisk-form 只用于服务器级 OPTIONS（RFC 9112 §3.2.4）。
+        return target if method == "OPTIONS" else None
+    if target.startswith("/"):
+        candidate = target
+    else:
+        try:
+            parsed = urlparse(target)
+        except ValueError:
+            return None
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+            return None  # authority-form / 相对路径 / 其他 scheme
+        candidate = parsed.path or "/"
+        if not candidate.startswith("/"):
+            return None
+        if parsed.params:
+            candidate += ";" + parsed.params
+        if parsed.query:
+            candidate += "?" + parsed.query
+    try:
+        # 与 `_route_path` 同一解析器再走一遍：`//[x` 这类 origin-form 也会抛。
+        urlparse(candidate)
+    except ValueError:
+        return None
+    return candidate
 
 
 def _is_moments_path(path: str) -> bool:
