@@ -1,0 +1,8 @@
+{
+  "type": "urn:botville:error:internal.error",
+  "title": "Homeserver unavailable",
+  "status": 500,
+  "detail": "user identity could not be verified; retry later",
+  "code": "internal.error",
+  "request_id": "req_demo_hs_unavailable"
+}
