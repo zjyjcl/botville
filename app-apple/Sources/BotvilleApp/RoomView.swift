@@ -865,10 +865,10 @@ private struct RoomNotificationSettingsSheet: View {
                 if let error = state.errorMessage {
                     Section {
                         Text(error).font(.footnote).foregroundStyle(.red)
-                        Button("重新读取") { Task { await controller.refresh(room) } }
-                            .disabled(state.isUpdating)
+                        Button("重试") { Task { await controller.refresh(room) } }
+                            .disabled(state.isUpdating || state.readStatus == .loading)
                     }
-                } else if !state.isLoaded {
+                } else if state.readStatus == .loading {
                     ProgressView("正在读取设置…")
                 }
             }

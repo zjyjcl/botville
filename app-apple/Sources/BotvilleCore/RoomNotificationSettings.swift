@@ -98,11 +98,16 @@ final class RoomNotificationSettingsBridge: NotificationSettingsDelegate, Sendab
     func settingsDidChange() { continuation.yield(()) }
 }
 
+public enum RoomMuteReadStatus: Equatable, Sendable {
+    case notLoaded, loading, loaded, failed
+}
+
 public struct RoomMuteState: Equatable, Sendable {
     public var isMuted = false
     public var isLoaded = false
     public var isUpdating = false
     public var errorMessage: String?
+    public var readStatus: RoomMuteReadStatus = .notLoaded
 }
 
 public struct RoomMuteListPresentation: Equatable, Sendable {
@@ -152,24 +157,48 @@ public final class RoomMuteController: ObservableObject {
         guard !rooms.isEmpty else { return }
         let generation = session
         var reads: [String: UUID] = [:]
+        var previousStates: [String: RoomMuteState] = [:]
         for room in rooms {
             let revision = UUID()
             reads[room.id] = revision
             revisions[room.id] = revision
+            var state = state(for: room.id)
+            previousStates[room.id] = state
+            state.readStatus = .loading
+            state.errorMessage = nil
+            states[room.id] = state
+        }
+        // Cancellation must not strand this room in the loading state. A newer
+        // read, toggle or session owns its own state and must not be touched.
+        defer {
+            if generation == session {
+                for room in rooms where revisions[room.id] == reads[room.id] {
+                    if states[room.id]?.readStatus == .loading {
+                        if previousStates[room.id]?.readStatus == .loading {
+                            markReadFailed(room.id)
+                        } else {
+                            states[room.id] = previousStates[room.id]
+                        }
+                    }
+                }
+            }
         }
         do {
             let values = try await provider.mutedStates(for: rooms)
             guard generation == session, !Task.isCancelled else { return }
+            var confirmed: [String: RoomMuteState] = [:]
             for room in rooms where revisions[room.id] == reads[room.id] {
-                guard let muted = values[room.id] else { continue }
-                publish(RoomMuteState(isMuted: muted, isLoaded: true), roomID: room.id)
+                if let muted = values[room.id] {
+                    confirmed[room.id] = RoomMuteState(isMuted: muted, isLoaded: true, readStatus: .loaded)
+                } else {
+                    markReadFailed(room.id)
+                }
             }
+            publish(confirmed)
         } catch {
             guard generation == session, !Task.isCancelled else { return }
             for room in rooms where revisions[room.id] == reads[room.id] {
-                var state = state(for: room.id)
-                state.errorMessage = "无法读取消息免打扰设置，请检查网络后重试。"
-                states[room.id] = state
+                markReadFailed(room.id)
             }
             didChange?()
         }
@@ -180,17 +209,20 @@ public final class RoomMuteController: ObservableObject {
         guard let provider, previous.isLoaded, !previous.isUpdating, previous.isMuted != muted else { return }
         let revision = UUID(), generation = session
         revisions[room.id] = revision
-        publish(RoomMuteState(isMuted: muted, isLoaded: true, isUpdating: true), roomID: room.id)
+        publish(RoomMuteState(isMuted: muted, isLoaded: true, isUpdating: true, readStatus: .loaded), roomID: room.id)
         do {
             try await provider.setMuted(muted, room: room)
             let confirmed = try await provider.isMuted(room)
             guard generation == session, revisions[room.id] == revision else { return }
-            var state = RoomMuteState(isMuted: confirmed, isLoaded: true)
+            var state = RoomMuteState(isMuted: confirmed, isLoaded: true, readStatus: .loaded)
             if confirmed != muted { state.errorMessage = "服务器尚未确认此设置，请稍后重试。" }
             publish(state, roomID: room.id)
         } catch {
             guard generation == session, revisions[room.id] == revision else { return }
             var restored = previous
+            // The toggle superseded any pending read; its loading state no
+            // longer has an owner once that older completion is fenced out.
+            if restored.readStatus == .loading { restored.readStatus = .loaded }
             if error is RoomNotificationSettingsError {
                 restored.errorMessage = "暂时无法确认房间加密状态，已恢复原设置。请稍后重试。"
             } else {
@@ -217,18 +249,41 @@ public final class RoomMuteController: ObservableObject {
         }
     }
 
+    private func markReadFailed(_ roomID: String) {
+        var state = state(for: roomID)
+        state.readStatus = .failed
+        state.errorMessage = "无法读取消息免打扰设置，请检查网络后重试。"
+        states[roomID] = state
+    }
+
     private func publish(_ value: RoomMuteState, roomID: String) {
-        var state = value
-        let hash = SharedRoomMuteStore.hash(roomID)
-        if state.isMuted { hashes.insert(hash) } else { hashes.remove(hash) }
+        publish([roomID: value])
+    }
+
+    /// Publish one consistent digest snapshot per batch. The store keeps its
+    /// sorted JSON and atomic replacement contract shared with the NSE.
+    private func publish(_ values: [String: RoomMuteState]) {
+        guard !values.isEmpty else { didChange?(); return }
+        var values = values
+        for (roomID, state) in values {
+            let hash = SharedRoomMuteStore.hash(roomID)
+            if state.isMuted { hashes.insert(hash) } else { hashes.remove(hash) }
+        }
         do { try sharedStore.save(hashes) }
         catch SharedRoomMuteStoreError.containerUnavailable {
 #if DEBUG
             Logger(subsystem: "com.zjyjcl.botville", category: "RoomMute").debug("Shared mute container unavailable.")
 #endif
         }
-        catch { state.errorMessage = state.errorMessage ?? "设置已读回，但本机通知防御缓存未能保存；请重新打开 App 重试。" }
-        states[roomID] = state
+        catch {
+            for (roomID, value) in values {
+                var state = value
+                state.errorMessage = state.errorMessage
+                    ?? "设置已读回，但本机通知防御缓存未能保存；请重新打开 App 重试。"
+                values[roomID] = state
+            }
+        }
+        states.merge(values) { _, new in new }
         didChange?()
     }
 }

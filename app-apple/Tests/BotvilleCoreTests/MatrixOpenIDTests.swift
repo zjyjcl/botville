@@ -291,7 +291,7 @@ final class MatrixOpenIDTests: XCTestCase {
     }
 
     func testServerErrorsRetryOnlyGETOrIdempotencyKeyWithExactBackoff() async throws {
-        for (method, key, retries) in [("GET", nil, 3), ("POST", "placeholder-intent", 3),
+        for (method, key, retries) in [("GET", nil, 3), ("get", nil, 3), ("gEt", nil, 3), ("POST", "placeholder-intent", 3),
                                        ("POST", nil, 0), ("PATCH", nil, 0), ("DELETE", nil, 0), ("HEAD", nil, 0), ("POST", " ", 0)] {
             let waits = OpenIDWaits()
             let source = OpenIDSource()
@@ -309,10 +309,66 @@ final class MatrixOpenIDTests: XCTestCase {
             XCTAssertEqual(recorder.requests.count, retries + 1)
             XCTAssertEqual(delays, retries == 3 ? [1, 2, 4] : [])
             for request in recorder.requests {
-                XCTAssertEqual(request.httpMethod, method)
+                XCTAssertEqual(request.httpMethod?.lowercased(), method.lowercased())
                 XCTAssertEqual(request.httpBody, body)
                 XCTAssertEqual(request.value(forHTTPHeaderField: "Idempotency-Key"), key)
                 XCTAssertTrue(request.value(forHTTPHeaderField: "Authorization") == "MatrixOpenID synthetic-openid-1")
+            }
+        }
+    }
+
+    func testGatewayProblemExamplesDriveStatusCodeAndRetryBranches() async throws {
+        struct Problem: Decodable { let status: Int; let code: String }
+        for (name, status, code, requests, issues) in [
+            ("problem-auth-missing", 401, "auth.missing", 1, 1),
+            ("problem-auth-invalid-token", 401, "auth.invalid_token", 2, 2),
+            ("problem-homeserver-unavailable", 500, "internal.error", 4, 1)
+        ] {
+            let data = try OpenIDFixtures.data(name)
+            let problem = try JSONDecoder().decode(Problem.self, from: data)
+            XCTAssertEqual(problem.status, status)
+            XCTAssertEqual(problem.code, code)
+            let source = OpenIDSource()
+            let (client, recorder) = try transport(MatrixOpenIDTokenProvider { try await source.issue() })
+            recorder.statuses = Array(repeating: problem.status, count: requests)
+            recorder.bodies = Array(repeating: data, count: requests)
+            do { _ = try await client.momentsRequest(); XCTFail("Expected contract problem") }
+            catch {
+                let actual = try XCTUnwrap(error as? GatewayClientError)
+                if code == "auth.invalid_token" {
+                    XCTAssertEqual(actual, .serverAuthMisconfigured)
+                    XCTAssertEqual(actual.httpStatus, problem.status)
+                    XCTAssertEqual(actual.problemCode, problem.code)
+                } else {
+                    XCTAssertEqual(actual, .problem(status: problem.status, code: problem.code))
+                    XCTAssertEqual(actual.httpStatus, problem.status)
+                    XCTAssertEqual(actual.problemCode, problem.code)
+                }
+            }
+            XCTAssertEqual(recorder.requests.count, requests)
+            let count = await source.count
+            XCTAssertEqual(count, issues)
+        }
+    }
+
+    func testNonMomentsInternalErrorNeverRetriesEvenWithIdempotencyKey() async throws {
+        for path in [["capabilities"], ["cards"], ["cards", "id", "actions", "open"],
+                     ["capabilities", "id", "session-tokens"], ["context", "assemble"], ["momentsx"]] {
+            for method in ["GET", "get", "POST"] {
+                let waits = OpenIDWaits()
+                let (client, recorder) = try transport(sleep: { await waits.record($0) })
+                recorder.statuses = [500, 200]
+                recorder.bodies = [try OpenIDFixtures.data("problem-homeserver-unavailable")]
+                do {
+                    _ = try await client.responseData(for: client.request(path, method: method,
+                        idempotencyKey: "placeholder-intent"))
+                    XCTFail("Expected original server problem")
+                } catch {
+                    XCTAssertEqual(error as? GatewayClientError, .problem(status: 500, code: "internal.error"))
+                }
+                XCTAssertEqual(recorder.requests.count, 1)
+                let delays = await waits.values
+                XCTAssertTrue(delays.isEmpty)
             }
         }
     }
@@ -428,6 +484,115 @@ final class MatrixOpenIDTests: XCTestCase {
         XCTAssertEqual(count, 2)
     }
 
+    func testSingleCallerCancellationReturnsBeforeSourceCompletes() async throws {
+        let gate = OpenIDGate()
+        let source = OpenIDSource()
+        let provider = MatrixOpenIDTokenProvider {
+            _ = try await source.issue()
+            return await gate.issue()
+        }
+        let returned = expectation(description: "Cancelled caller returned without SDK completion")
+        let pending = Task {
+            defer { returned.fulfill() }
+            return try await provider.token()
+        }
+        await gate.waitUntilStarted()
+        pending.cancel()
+        await fulfillment(of: [returned], timeout: 2)
+        await gate.release()
+        do { _ = try await pending.value; XCTFail("Expected caller cancellation") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        // With all callers cancelled, the bounded flight remains available to
+        // subsequent callers and may warm the cache; it is never restarted here.
+        _ = try await provider.token()
+        let count = await source.count
+        XCTAssertEqual(count, 1)
+        await provider.shutdown()
+    }
+
+    func testOneCancelledCallerDoesNotCancelOtherWaiters() async throws {
+        let gate = OpenIDGate()
+        let source = OpenIDSource()
+        let provider = MatrixOpenIDTokenProvider {
+            _ = try await source.issue()
+            return await gate.issue()
+        }
+        let returned = expectation(description: "Only cancelled caller returned")
+        let cancelled = Task {
+            defer { returned.fulfill() }
+            return try await provider.token()
+        }
+        await gate.waitUntilStarted()
+        let survivor = Task { try await provider.token() }
+        cancelled.cancel()
+        await fulfillment(of: [returned], timeout: 2)
+        await gate.release()
+        do { _ = try await cancelled.value; XCTFail("Expected caller cancellation") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        let token = try await survivor.value
+        XCTAssertTrue(token.isValid)
+        let count = await source.count
+        XCTAssertEqual(count, 1)
+        await provider.shutdown()
+    }
+
+    func testInjectedTimeoutReleasesCallerAndNextFlightCanSucceed() async throws {
+        let gate = OpenIDGate() // Deliberately ignores SDK Task cancellation.
+        let deadline = OpenIDGate()
+        let source = OpenIDSource()
+        let sleeps = OpenIDSource()
+        let observedTimeouts = OpenIDWaits()
+        let provider = MatrixOpenIDTokenProvider(requestTimeout: 7, timeoutSleep: { duration in
+            await observedTimeouts.record(duration)
+            _ = try await sleeps.issue()
+            if await sleeps.count == 1 { _ = await deadline.issue() }
+            else { try await Task.sleep(for: .seconds(3600)) }
+        }) {
+            let value = try await source.issue()
+            if await source.count == 1 { return await gate.issue() }
+            return value
+        }
+        let returned = expectation(description: "Deadline returned before uncooperative SDK")
+        let pending = Task {
+            defer { returned.fulfill() }
+            return try await provider.token()
+        }
+        await gate.waitUntilStarted()
+        await deadline.waitUntilStarted()
+        await deadline.release()
+        await fulfillment(of: [returned], timeout: 2)
+        do { _ = try await pending.value; XCTFail("Expected timeout") }
+        catch { XCTAssertTrue(error as? MatrixOpenIDError == .requestTimedOut) }
+        let recovered = try await provider.token()
+        XCTAssertTrue(recovered.isValid)
+        await gate.release() // Late completion must not replace the new cache.
+        let cached = try await provider.token()
+        XCTAssertTrue(cached.identity == recovered.identity)
+        let count = await source.count
+        XCTAssertEqual(count, 2)
+        let timeouts = await observedTimeouts.values
+        XCTAssertFalse(timeouts.isEmpty)
+        XCTAssertTrue(timeouts.allSatisfy { $0 == 7 })
+        await provider.shutdown()
+    }
+
+    func testAlreadyCancelledCallerDoesNotStartRefresh() async throws {
+        let gate = OpenIDGate()
+        let source = OpenIDSource()
+        let provider = MatrixOpenIDTokenProvider { try await source.issue() }
+        let pending = Task {
+            _ = await gate.issue()
+            return try await provider.token()
+        }
+        await gate.waitUntilStarted()
+        pending.cancel()
+        await gate.release()
+        do { _ = try await pending.value; XCTFail("Expected caller cancellation") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        let count = await source.count
+        XCTAssertEqual(count, 0)
+    }
+
     func testShutdownClearsCacheAndDisablesRetainedGatewayClient() async throws {
         let source = OpenIDSource()
         let provider = MatrixOpenIDTokenProvider { try await source.issue() }
@@ -444,9 +609,14 @@ final class MatrixOpenIDTests: XCTestCase {
     func testShutdownDuringRefreshCannotRepopulateCache() async throws {
         let gate = OpenIDGate()
         let provider = MatrixOpenIDTokenProvider { await gate.issue() }
-        let pending = Task { try await provider.token() }
+        let returned = expectation(description: "Shutdown releases pending callers")
+        let pending = Task {
+            defer { returned.fulfill() }
+            return try await provider.token()
+        }
         await gate.waitUntilStarted()
         await provider.shutdown()
+        await fulfillment(of: [returned], timeout: 2)
         await gate.release()
         do { _ = try await pending.value; XCTFail("Expected ended session") }
         catch { XCTAssertTrue(error as? MatrixOpenIDError == .sessionEnded) }

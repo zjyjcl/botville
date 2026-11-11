@@ -83,6 +83,7 @@ public enum PushBadge {
 }
 
 
+#if DEBUG
 /// DEBUG foreground willPresent evidence. Writes only event names and option
 /// raw bits into the App Group cache — never tokens, Authorization, or bodies.
 public enum PushForegroundProbeLog {
@@ -147,3 +148,4 @@ public enum PushForegroundProbeLog {
         return formatter
     }()
 }
+#endif

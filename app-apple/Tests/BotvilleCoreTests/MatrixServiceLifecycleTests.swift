@@ -1449,7 +1449,8 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         try await service.login(homeserver: "https://matrix.test", username: "test", password: "test-password")
         try await waitUntil { client.notificationSettings.isRawReadBlocked && service.connectionStatus == .connected }
         XCTAssertEqual(service.rooms.count, 1)
-        XCTAssertTrue(service.roomNotifications.states.isEmpty)
+        XCTAssertFalse(service.roomNotifications.state(for: "!first:test").isLoaded)
+        XCTAssertEqual(service.roomNotifications.state(for: "!first:test").readStatus, .loading)
         client.notificationSettings.suspendRawRead = false
         client.notificationSettings.releaseRawRead()
         try await waitUntil { service.roomNotifications.state(for: "!first:test").isLoaded }

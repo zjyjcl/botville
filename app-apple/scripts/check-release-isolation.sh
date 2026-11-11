@@ -222,6 +222,12 @@ for directory in (sources, root / 'NotificationService'):
             if token in text: guarded(source, token)
 core = root / 'Sources/BotvilleCore'
 guarded(core / 'PushRegistrar.swift', 'static let isDebugBuild = true')
+# Keep the probe implementation and every reference out of shipping builds.
+for relative in ('Sources/BotvilleCore/PushNotificationUX.swift',
+                 'Sources/BotvilleApp/BotvilleApp.swift',
+                 'Sources/BotvilleApp/PushDiagnosticsView.swift',
+                 'Tests/BotvilleCoreTests/PushNotificationUXTests.swift'):
+    guarded(root / relative, 'PushForegroundProbeLog')
 if 'PushHTTPPolicy.permitsHTTP(allowHTTP)' not in (core / 'MatrixService.swift').read_text():
     raise SystemExit('MatrixService must delegate push HTTP policy to PushHTTPPolicy')
 
