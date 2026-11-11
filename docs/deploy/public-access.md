@@ -18,7 +18,7 @@
 | 总管 2026-11-05 | `push.<domain>` 默认不对公网开放（`BOTVILLE_PUSH_PUBLIC=false`），留开关 | push-sygnal.md |
 | 总管 2026-11-05 | 保留局域网选项，标注「仅测试，外网无法连接」 | #128 向导 |
 | 棉棉霸 2026-11-10（B1） | 网关对外暴露在**主域路径** `https://<domain>/_botville/gateway`，不另开 `gw.<domain>` | B 线网关、C 线客户端、#128 edge |
-| 棉棉霸 2026-11-10（B2） | App→网关鉴权：网关校验 Matrix OpenID token（与现行 `matrixUserToken` 的对齐见 §3） | B 线网关（#124）、C 线客户端 |
+| 棉棉霸 2026-11-10（B2） | App→网关鉴权：网关校验 Matrix OpenID token（#124 已落地；App 只发 `MatrixOpenID`，网关为其他调用方保留 `matrixUserToken`，见 §3） | B 线网关（#124）、C 线客户端 |
 | 棉棉霸 2026-11-10（B5） | 有自有域名时先上 **Cloudflare Tunnel**，**裸域**当 `server_name`；国内不稳再补 frp | #128 PR-c / PR-d |
 
 ## 2. B1：网关路径
@@ -42,12 +42,13 @@
   **不经** fedgate（fedgate 对 `/_matrix/federation/*` 要求 X-Matrix 签名，会拒绝此
   请求），也不走公网。homeserver 须在内网监听上提供 openid 资源。
 - 目标：网关只拿短时 OpenID token，不拿用户的 access token；OpenID token 不得写入日志。
-- **与现行网关契约的差异（待对齐）**：现行 `gateway/openapi/gateway.v1.yaml` 的
-  `/moments*`（A2.2）用 `matrixUserToken`——App 带 Matrix access token，网关调
-  `GET /_matrix/client/v3/account/whoami` 换 `user_id`（`gateway/docs/moments.md` §3）。
-  B2 落地意味着该方案要迁移到 OpenID token，或明确两者并存的范围。迁移方式由 B 线在
-  #124 中给出并另行审查；**在那之前现行 `matrixUserToken` 契约继续有效**，本文不改
-  网关契约。
+- **与网关契约的关系（已对齐）**：OpenID 校验已在 #124 落地，契约见
+  `gateway/docs/contract.md` §1.2.3。**App 只发 `Authorization: MatrixOpenID <token>`**，
+  无 feature flag、无回退，**不得**拿用户的 Matrix access token 当 `Bearer` 兜底。网关在
+  `/moments*` 上继续接受 `Authorization: Bearer <Matrix access token>`
+  （`matrixUserToken`→whoami），那是留给 **App 以外其他调用方**的阶段 1 共存路径，未标
+  `deprecated`、仍有效。退场节奏（T1 观察 → T2 清点 → T3 进阶段 2 标 `deprecated` →
+  T4 进阶段 3 移除）见契约 §1.2.3，均须先公告、先报总管。
 - 依赖：B 线网关契约与实现（#124）、C 线客户端、A 线 compose（内网可达与 listener
   配置，实现时验证）。
 
