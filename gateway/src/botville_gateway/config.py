@@ -94,6 +94,13 @@ DEFAULT_MAX_QUEUE_ENTRIES = 1_000
 DEFAULT_OPENID_CACHE_TTL_SECONDS = 60
 OPENID_CACHE_TTL_MAX_SECONDS = 60
 
+# A2.2（issue #7）动态模块保留天数（moments.md §7）：软删行硬删 / 审计清理。
+DEFAULT_MOMENTS_SOFT_DELETE_RETENTION_DAYS = 30
+DEFAULT_MOMENTS_AUDIT_RETENTION_DAYS = 90
+# 清理任务间隔（秒）：0 = 关闭；非 0 时至少 60 秒。
+DEFAULT_MOMENTS_PURGE_INTERVAL_SECONDS = 86_400
+MOMENTS_PURGE_INTERVAL_MIN_SECONDS = 60
+
 # N7（契约 §6.3）：平台层 anti_spam / ai_loop 的部署配置。
 # 三个数值项默认 0 = 「平台不设该项」（与 RATE_LIMIT_MESSAGES=0 同语义），
 # 非 0 时必须落在与 API 相同的取值范围内（上限见下）。**注意** env 的 0 与
@@ -420,6 +427,17 @@ class Config:
     # 空串表示「无前缀」；`/` 与尾部 `/` 由 normalize_http_path_prefix 归一为空。
     # 非空时形如 `/a/b`：以 `/` 开头，不含 `//` `..` `?` `#` `%` 空白控制字符。
     http_path_prefix: str = ""
+    # A2.2（issue #7）动态模块：SQLite 库路径。空/None = 模块关闭
+    # （/moments* 鉴权后仍 404/405，与合入前一致）。
+    moments_db_path: Optional[str] = None
+    # 临时好友图文件（A2.3 前的可测试实现，JSON {"friends": [[a, b], ...]}）；
+    # 空 = 空图（fail-closed：friends 档下除作者/所有者无人可见）。
+    moments_friends_file: Optional[str] = None
+    # 软删行动硬删保留天数（purge；默认 30）/ moments_events 审计保留天数（默认 90）。
+    moments_soft_delete_retention_days: int = DEFAULT_MOMENTS_SOFT_DELETE_RETENTION_DAYS
+    moments_audit_retention_days: int = DEFAULT_MOMENTS_AUDIT_RETENTION_DAYS
+    # purge 定时间隔（秒）：0 = 关闭；启用时启动跑一次、之后按间隔后台跑。
+    moments_purge_interval_seconds: int = DEFAULT_MOMENTS_PURGE_INTERVAL_SECONDS
 
     def __post_init__(self) -> None:
         # 构造时校验，避免明显错误的配置拖到第一次请求才炸。
@@ -518,6 +536,30 @@ class Config:
                 "openid_cache_ttl_seconds must be <= "
                 f"{OPENID_CACHE_TTL_MAX_SECONDS} (contract §1.2.3 hard cap), got "
                 f"{self.openid_cache_ttl_seconds}"
+            )
+        # A2.2：动态保留天数（软删 / 审计）。直接构造 Config 也走同一校验。
+        def _check_retention_days(val: int, name: str) -> None:
+            if not isinstance(val, int) or isinstance(val, bool):
+                raise ConfigError(f"{name} must be an integer, got {val!r}")
+            if val < 1:
+                raise ConfigError(f"{name} must be >= 1 day, got {val}")
+        _check_retention_days(
+            self.moments_soft_delete_retention_days,
+            "moments_soft_delete_retention_days",
+        )
+        _check_retention_days(
+            self.moments_audit_retention_days,
+            "moments_audit_retention_days",
+        )
+        purge_interval = self.moments_purge_interval_seconds
+        if not isinstance(purge_interval, int) or isinstance(purge_interval, bool):
+            raise ConfigError(
+                f"moments_purge_interval_seconds must be an integer, got {purge_interval!r}"
+            )
+        if purge_interval != 0 and purge_interval < MOMENTS_PURGE_INTERVAL_MIN_SECONDS:
+            raise ConfigError(
+                "moments_purge_interval_seconds must be 0 (disabled) or >= "
+                f"{MOMENTS_PURGE_INTERVAL_MIN_SECONDS}, got {purge_interval}"
             )
         # #124 调用方身份（契约 §1.2.2）。校验放在这里（而非只在 load_config），
         # 保证直接构造 Config 的调用方（测试/嵌入）也走同一套规则。
@@ -941,4 +983,30 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         ),
         # 默认空 = 现行行为完全不变；非法前缀在 Config 构造时抛 ConfigError。
         http_path_prefix=_env_str(source, "GATEWAY_HTTP_PATH_PREFIX", ""),
+        # A2.2（issue #7）：动态模块开关（库路径空 = 关闭）与保留天数；
+        # 好友图文件缺失/非法由 StaticRelationProvider.from_file 拒绝（fail-closed）。
+        moments_db_path=(
+            _env_str(source, "GATEWAY_MOMENTS_DB_PATH", "") or None
+        ),
+        moments_friends_file=(
+            _env_str(source, "GATEWAY_MOMENTS_FRIENDS_FILE", "") or None
+        ),
+        moments_soft_delete_retention_days=_env_int(
+            source,
+            "GATEWAY_MOMENTS_SOFT_DELETE_RETENTION_DAYS",
+            DEFAULT_MOMENTS_SOFT_DELETE_RETENTION_DAYS,
+            minimum=1,
+        ),
+        moments_audit_retention_days=_env_int(
+            source,
+            "GATEWAY_MOMENTS_AUDIT_RETENTION_DAYS",
+            DEFAULT_MOMENTS_AUDIT_RETENTION_DAYS,
+            minimum=1,
+        ),
+        moments_purge_interval_seconds=_env_int(
+            source,
+            "GATEWAY_MOMENTS_PURGE_INTERVAL_SECONDS",
+            DEFAULT_MOMENTS_PURGE_INTERVAL_SECONDS,
+            minimum=0,
+        ),
     )

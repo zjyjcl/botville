@@ -58,6 +58,8 @@ from .errors import (
 )
 from .limits import LimitStore
 from .matrix import InMemoryMatrixTransport, MatrixTransport
+from .moments.http_api import handle as _handle_moments_dispatch
+from .moments.service import build_moments_service
 from .service import GatewayService
 from .store import UsageStore
 from .timeutil import iso_utc
@@ -143,11 +145,42 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             super().log_message(fmt, *args)
 
     # ------------------------------------------------------------- helpers
+    def parse_request(self) -> bool:  # type: ignore[override]
+        """在任何 do_* 之前统一校验 / 规范化请求目标（RFC 9112 §3.2）。
+
+        stdlib 只拆请求行；目标交给 `_route_path` 的 urlparse 时，括号未闭合的
+        IPv6 字面量（`http://[::1`、`//[x`）会抛 ValueError，被 do_* 兜底成 500。
+        这里一次性处理，所有方法（含 HEAD / OPTIONS / TRACE 与 moments 二次取路径）
+        都受益：
+
+        - origin-form（以 `/` 开头）：原样保留，只校验可解析；
+        - absolute-form（`http://` / `https://` + 非空 authority）：按 RFC 9112
+          取其 path（空则 `/`）+ query 改写成 origin-form 后照常路由；
+        - asterisk-form `*`：只允许 OPTIONS（随后照旧 405）；
+        - 其余（authority-form、相对路径、其他 scheme、解析异常）→
+          400 `request.invalid`。
+        """
+        if not super().parse_request():
+            return False
+        normalized = _normalize_request_target(self.command, self.path)
+        if normalized is None:
+            self.close_connection = True
+            self._send_problem(
+                400,
+                "request.invalid",
+                "Bad Request",
+                detail="invalid request target",
+            )
+            return False
+        self.path = normalized
+        return True
+
     def _route_path(self) -> Tuple[str, str, str]:
         """把一个请求解析成 (path, query, 剥掉部署前缀后的路由路径)。
 
         查询串不参与前缀匹配；前缀只按整段边界剥离（`strip_path_prefix`），
         不带前缀的请求也照常路由（兼容已去前缀的 edge / 入口反代）。
+        请求目标已在 `parse_request` 校验 / 规范化，这里不会再遇到无法解析的目标。
         """
         parsed = urlparse(self.path)
         prefix = self.server.config.http_path_prefix  # type: ignore[attr-defined]
@@ -393,13 +426,16 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     def _handle_moments(self) -> None:
         """`/moments*` 的请求入口（#124）。
 
-        本 PR 只做**用户身份校验**：校验通过后动态资源尚未实现，按 404 返回
-        （契约路径均已声明，但 CRUD 留待后续 PR）。这样测试可以覆盖「成功通过
-        鉴权」与「鉴权失败的 401」两条路径，而不必实现完整 CRUD。
+        先做**用户身份校验**（401 先于业务）；通过后：moments 已启用则交给
+        新模块分发（A2.2 PR2），未配置 `GATEWAY_MOMENTS_DB_PATH` 时保持
+        原占位行为（404）。
         """
         if not self._auth_user_ok():
             return
-        self._send_problem(404, "not_found", "Not Found")
+        if self.server.moments_service is None:
+            self._send_problem(404, "not_found", "Not Found")
+            return
+        _handle_moments_dispatch(self)
 
     # ---------------------------------------------------------------- GET
     def do_GET(self) -> None:
@@ -488,20 +524,27 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             self._internal_error(exc)
 
     def _moments_method_not_allowed(self) -> None:
-        """PATCH / DELETE 在 `/moments*` 上：先鉴权再 405（本 PR 未实现 CRUD）。"""
+        """PATCH / DELETE 在 `/moments*` 上：先鉴权，再按 moments 开关分发。
+
+        moments 已启用 → 交新模块（PATCH/DELETE 是合法操作）；未启用 →
+        保持原占位 405。
+        """
         self._request_id()
         try:
-            _raw_path, _query, path = self._route_path()
+            _raw, _query, path = self._route_path()
             if _is_moments_path(path):
                 # 先校验用户身份；鉴权失败已在 _auth_user_ok 里发响应。
                 if not self._auth_user_ok():
                     return
-                self._send_problem(
-                    405,
-                    "request.invalid",
-                    "Method Not Allowed",
-                    detail=f"{self.command} is not yet supported on {path}",
-                )
+                if self.server.moments_service is None:
+                    self._send_problem(
+                        405,
+                        "request.invalid",
+                        "Method Not Allowed",
+                        detail=f"{self.command} is not yet supported on {path}",
+                    )
+                    return
+                _handle_moments_dispatch(self)
                 return
             self._method_not_allowed()
         except (BrokenPipeError, ConnectionResetError):
@@ -766,6 +809,35 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         )
 
 
+def _normalize_request_target(method: str, target: str) -> Optional[str]:
+    """请求目标 → 可安全交给 `_route_path` 的 origin-form；非法返回 None（→ 400）。"""
+    if target == "*":
+        # asterisk-form 只用于服务器级 OPTIONS（RFC 9112 §3.2.4）。
+        return target if method == "OPTIONS" else None
+    if target.startswith("/"):
+        candidate = target
+    else:
+        try:
+            parsed = urlparse(target)
+        except ValueError:
+            return None
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+            return None  # authority-form / 相对路径 / 其他 scheme
+        candidate = parsed.path or "/"
+        if not candidate.startswith("/"):
+            return None
+        if parsed.params:
+            candidate += ";" + parsed.params
+        if parsed.query:
+            candidate += "?" + parsed.query
+    try:
+        # 与 `_route_path` 同一解析器再走一遍：`//[x` 这类 origin-form 也会抛。
+        urlparse(candidate)
+    except ValueError:
+        return None
+    return candidate
+
+
 def _is_moments_path(path: str) -> bool:
     """`/moments*` 路径族（部署前缀已剥离）：等于前缀或以 `前缀 + "/"` 开头。
 
@@ -823,8 +895,18 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         # #124 §1.2.3：`/moments*` 的终端用户身份校验（MatrixOpenID / Matrix Bearer）。
         # 与上面的 caller/legacy authenticator 并存但互不替代：`/moments*` 只走这里。
         self.user_verifier = UserIdentityVerifier(config)
+        # A2.2（issue #7）动态服务：未配置 GATEWAY_MOMENTS_DB_PATH → None
+        # （模块关闭，`/moments*` 鉴权后行为与合入前一致）。
+        self.moments_service = build_moments_service(config)
         log_startup_warnings(config)
         super().__init__((config.host, config.port), GatewayHandler)
+
+    def server_close(self) -> None:
+        """关闭监听前先停 moments 清理线程（未启用时为 no-op）。"""
+        moments = getattr(self, "moments_service", None)
+        if moments is not None:
+            moments.stop_purge_scheduler()
+        super().server_close()
 
 
 def build_transport(config: Config) -> MatrixTransport:
