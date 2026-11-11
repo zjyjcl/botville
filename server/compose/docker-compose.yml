@@ -262,8 +262,8 @@ services:
     # CI). No image: line on purpose -- compose names the local build
     # <project>-gateway, and nothing is pulled for it.
     #
-    # Homeserver wiring (still no HS->AS transactions: the registration url
-    # stays null, see server/compose/appservice/botville-gateway.yaml.tmpl):
+    # Homeserver wiring (send via the Client-Server API, and -- #192 -- receive
+    # HS->AS transactions at the root path /_matrix/app/v1/*):
     #   - Transport is selected per HS profile by `make up`, which exports
     #     GATEWAY_MATRIX_TRANSPORT (appservice for synapse and tuwunel, which
     #     load the registration file; memory for continuwuity, which has no
@@ -278,14 +278,28 @@ services:
     #   - GATEWAY_HOMESERVER_FEDERATION_URL is empty: OpenID userinfo falls
     #     back to GATEWAY_HOMESERVER_URL (in-stack, not fedgate or the public
     #     federation address).
-    #   - GATEWAY_AS_TOKEN is the existing APPSERVICE_AS_TOKEN (same value,
-    #     two names); hs_token is not passed to the gateway.
+    #   - GATEWAY_AS_TOKEN is the existing APPSERVICE_AS_TOKEN and
+    #     GATEWAY_HS_TOKEN the existing APPSERVICE_HS_TOKEN (same values, two
+    #     names each; never a second copy). init.sh generates both as distinct
+    #     64-hex values; the gateway refuses to start if they are equal, short,
+    #     a placeholder or contain whitespace.
+    #   - The registration url is http://gateway:8080 (no path prefix) only for
+    #     `make up GATEWAY=1` on synapse/tuwunel, null otherwise (init.sh
+    #     renders it; `make up` restarts the HS when it changes). Received
+    #     transactions are stored in GATEWAY_AS_TXN_DB_PATH on the
+    #     gateway-data volume (backed up with it).
+    #   - Compose fallbacks (only when the variable is unset, e.g. `compose
+    #     config` before init or a plain `docker compose up` outside make):
+    #     transport memory, HS synapse, server name localhost, tokens empty
+    #     (an empty GATEWAY_HS_TOKEN means AS callbacks answer 403).
     #   - In appservice mode the process whoami's the HS at startup and exits
     #     if that fails; restart: unless-stopped retries, and depends_on
     #     waits for the active HS (synapse: healthy; tuwunel/continuwuity:
     #     started -- those images have no healthcheck). required: false so a
     #     dependency whose profile is off is ignored.
-    #   - Do not run two gateway replicas that would receive transactions.
+    #   - Exactly one gateway: it is a single process (SQLite stores with
+    #     in-process locks). Never `--scale gateway=2` or run a second copy
+    #     against the same volume or the same registration.
     #   - Plain http is allowed only for loopback or a single-label service
     #     name; http://synapse:8008 / http://tuwunel:8008 qualify.
     # Changing BOTVILLE_SERVER_NAME must stay in sync with the registration
@@ -311,6 +325,10 @@ services:
       GATEWAY_HOMESERVER_FEDERATION_URL: ""
       GATEWAY_MATRIX_SERVER_NAME: ${BOTVILLE_SERVER_NAME:-localhost}
       GATEWAY_AS_TOKEN: ${APPSERVICE_AS_TOKEN:-}
+      GATEWAY_HS_TOKEN: ${APPSERVICE_HS_TOKEN:-}
+      # Raw HS->AS transactions (idempotent by txnId), top level of the
+      # gateway-data volume like moments.db, so backups checkpoint it.
+      GATEWAY_AS_TXN_DB_PATH: /var/lib/botville-gateway/as_transactions.db
       # Moments SQLite on the gateway-data volume; migrations ship in the
       # image (/app/gateway/migrations/moments) and run at startup.
       GATEWAY_MOMENTS_DB_PATH: /var/lib/botville-gateway/moments.db

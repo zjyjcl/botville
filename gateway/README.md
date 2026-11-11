@@ -82,7 +82,7 @@ curl -s -X POST localhost:8080/v1/conversations/conv_demo/messages \
 部署栈里用 `make up GATEWAY=1` 起（compose `gateway` profile，宿主端口只绑
 `127.0.0.1:${BOTVILLE_GATEWAY_PORT:-8020}`，数据在卷 `gateway-data`）。
 synapse / tuwunel 用 `appservice` 传输（`GATEWAY_HOMESERVER_URL=http://<服务名>:8008`，
-`GATEWAY_AS_TOKEN` 即 `APPSERVICE_AS_TOKEN`，注册 `url` 仍为 `null`）；
+`GATEWAY_AS_TOKEN` / `GATEWAY_HS_TOKEN` 即 `APPSERVICE_AS_TOKEN` / `APPSERVICE_HS_TOKEN`，注册 `url` 为 `http://gateway:8080`，事务库 `as_transactions.db` 在 `gateway-data` 卷；只跑一个网关）；
 continuwuity 仍用 `memory`（尚无文件注册）。运维注意见
 [docs/deploy/appservice.md](../docs/deploy/appservice.md) 与
 [docs/deploy/z423-synapse.md](../docs/deploy/z423-synapse.md)；卷与备份见
@@ -285,7 +285,7 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_MOMENTS_SOFT_DELETE_RETENTION_DAYS` | `30` | 软删动态/评论硬删前的保留天数（由定时清理执行） |
 | `GATEWAY_MOMENTS_AUDIT_RETENTION_DAYS` | `90` | `moments_events` 审计默认保留 90 天（由定时清理执行） |
 | `GATEWAY_MOMENTS_PURGE_INTERVAL_SECONDS` | `86400` | 定时清理间隔（秒）：启动先跑一次，之后后台按间隔跑，失败只记日志。`0` = 关闭（两个保留天数不生效）；非 0 时 **≥60**，否则拒绝启动 |
-| `GATEWAY_HS_TOKEN` | *(空)* | Matrix AS 回调（B 线 as-transactions）的共享密钥：必须与注册文件里的 `hs_token`（= `server/compose/.env` 的 `APPSERVICE_HS_TOKEN`）同值。只从 `Authorization: Bearer` 请求头校验（不认 `?access_token=`），恒定时间比较，不入日志。**留空 = 网关照常启动但 `/_matrix/app/v1/transactions/*` 与 `/ping` 一律 403 `M_FORBIDDEN`**（当前 compose 尚未注入）。设置后要求非占位符、**≥32 字符**、无空白，且**不能等于 `GATEWAY_AS_TOKEN`**，否则拒绝启动。见 [docs/contract.md](docs/contract.md) §1.7 |
+| `GATEWAY_HS_TOKEN` | *(空)* | Matrix AS 回调（B 线 as-transactions）的共享密钥：必须与注册文件里的 `hs_token`（= `server/compose/.env` 的 `APPSERVICE_HS_TOKEN`）同值。只从 `Authorization: Bearer` 请求头校验（不认 `?access_token=`），恒定时间比较，不入日志。**留空 = 网关照常启动但 `/_matrix/app/v1/transactions/*` 与 `/ping` 一律 403 `M_FORBIDDEN`**（compose 从 `APPSERVICE_HS_TOKEN` 注入）。设置后要求非占位符、**≥32 字符**、无空白，且**不能等于 `GATEWAY_AS_TOKEN`**，否则拒绝启动。见 [docs/contract.md](docs/contract.md) §1.7 |
 | `GATEWAY_AS_TXN_DB_PATH` | *(空)* | AS 事务 SQLite 路径（WAL + `synchronous=FULL`，返回 200 前提交）。**留空 = 关闭接收**（transactions 返回 `500 M_UNKNOWN`，HS 重试），与 `GATEWAY_MOMENTS_DB_PATH` 的「空 = 关闭」约定一致。compose 接线时由 A 线显式设为 `/var/lib/botville-gateway/as_transactions.db`（与 `moments.db` 共用 `gateway-data` 卷）。见 [docs/contract.md](docs/contract.md) §1.7 |
 | `GATEWAY_AS_MAX_BODY_BYTES` | `16777216` | AS 回调请求体上限（字节，**16 MiB**；正整数，最大 256 MiB）。与 `/v1` 的 1 MiB 上限**相互独立**；超限 → `413 M_TOO_LARGE` |
 

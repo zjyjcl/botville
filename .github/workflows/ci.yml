@@ -7,17 +7,22 @@
 # backup-restore (A1.1, synapse only): init -> open registration -> up
 #         with GATEWAY=1 (synapse + gateway profiles, appservice transport) ->
 #         e2e seed -> marker in gateway-data via the running gateway ->
-#         gateway-hs-smoke (startup whoami + OpenID userinfo) -> backup
-#         (must contain gateway-data.tar.gz) -> down -v (wipe) -> up
-#         (fresh stack) -> restore -> e2e verify + gateway-data marker/
-#         migrations/health + gateway-hs-smoke again.
+#         gateway-hs-smoke (startup whoami + OpenID userinfo + AS
+#         transactions: HS->gateway ping, pushed room message stored in
+#         as_transactions.db, gateway restart + txnId replay stored once) ->
+#         backup (gateway-data.tar.gz must hold as_transactions.db) -> down -v
+#         (wipe) -> up (fresh stack) -> restore -> e2e verify + gateway-data
+#         marker/migrations/stored AS transactions/health + smoke again.
 # gateway-compose (A2.2, tuwunel + continuwuity): gateway image builds and
 #         ships the moments migrations (non-root), `config --volumes` lists
 #         gateway-data, up with GATEWAY=1 -> /health + migrations applied ->
-#         tuwunel: appservice + gateway-hs-smoke; continuwuity: memory
-#         transport (no file-based appservice) -> make backup-gateway ->
+#         tuwunel: appservice, registration url http://gateway:8080 +
+#         gateway-hs-smoke (incl. AS transactions); continuwuity: memory
+#         transport and registration url null (no file-based appservice) ->
+#         make backup-gateway ->
 #         down -v (wipe) -> up -> make restore-gateway -> marker + /health
-#         verify (tuwunel also re-runs gateway-hs-smoke).
+#         verify (tuwunel also re-runs gateway-hs-smoke --skip-as-txn: the wiped
+#         HS restarts its txnIds, which would collide with the restored db).
 # gateway-data deletion, as these jobs do it (and the docs say): the volume
 #         is deleted by `docker compose ... --profile gateway down -v`, i.e.
 #         only while the gateway service (which mounts it) is in the active
@@ -161,7 +166,11 @@ jobs:
           echo "PROJECT=${project:-botville}" >> "$GITHUB_ENV"
 
       - name: Start stack (synapse + gateway profile)
-        run: make up HS=synapse GATEWAY=1
+        run: |
+          set -euo pipefail
+          make up HS=synapse GATEWAY=1
+          # GATEWAY=1 on synapse: the HS pushes AS transactions to the gateway.
+          grep -qx 'url: http://gateway:8080' server/compose/generated/appservice/botville-gateway.yaml
 
       - name: Seed e2e data (alice/bob/carol, DM, group)
         run: make e2e E2E_PHASE=seed
@@ -189,6 +198,8 @@ jobs:
           test -f "${backup_dir}/gateway-data.tar.gz"
           grep -q 'gateway-data.tar.gz' "${backup_dir}/manifest.txt"
           tar -tzf "${backup_dir}/gateway-data.tar.gz" | grep -qx './ci-seed.txt'
+          # AS transactions (#192) live on the same volume, top level.
+          tar -tzf "${backup_dir}/gateway-data.tar.gz" | grep -qx './as_transactions.db'
           echo "RESTORE_DIR=${backup_dir}" >> "$GITHUB_ENV"
 
       - name: Wipe volumes (simulated disaster)
@@ -221,8 +232,9 @@ jobs:
       - name: Verify gateway-data survived (gateway healthy on it)
         run: |
           set -euo pipefail
-          ${STACK} exec -T gateway grep -qx botville-gateway-data-seed /var/lib/botville-gateway/ci-seed.txt
-          ${STACK} exec -T gateway python -c "import sqlite3; c = sqlite3.connect('/var/lib/botville-gateway/moments.db'); assert c.execute('select count(*) from moments_schema_migrations').fetchone()[0] >= 1"
+          # Wait for /health first: after the restore the gateway may still be
+          # restarting (startup whoami against the restored synapse), and
+          # `exec` into a restarting container fails.
           port="$(sed -n 's/^BOTVILLE_GATEWAY_PORT=//p' server/compose/.env | tail -n 1)"
           for _ in $(seq 1 60); do
             curl -fsS "http://127.0.0.1:${port:-8020}/health" && break
@@ -230,6 +242,10 @@ jobs:
           done
           curl -fsS "http://127.0.0.1:${port:-8020}/health" >/dev/null \
             || { echo "::error::gateway /health not OK after restore"; exit 1; }
+          ${STACK} exec -T gateway grep -qx botville-gateway-data-seed /var/lib/botville-gateway/ci-seed.txt
+          ${STACK} exec -T gateway python -c "import sqlite3; c = sqlite3.connect('/var/lib/botville-gateway/moments.db'); assert c.execute('select count(*) from moments_schema_migrations').fetchone()[0] >= 1"
+          # The transaction stored by the pre-backup smoke survived the restore.
+          ${STACK} exec -T gateway python -c "import sqlite3; c = sqlite3.connect('/var/lib/botville-gateway/as_transactions.db'); assert c.execute('select count(*) from as_transactions').fetchone()[0] >= 1"
 
       - name: Gateway homeserver smoke after restore (whoami + OpenID userinfo)
         run: make gateway-hs-smoke
@@ -320,10 +336,17 @@ jobs:
           # (it contains tokens).
           transport="$(${STACK} exec -T gateway printenv GATEWAY_MATRIX_TRANSPORT)"
           echo "GATEWAY_MATRIX_TRANSPORT=${transport}"
+          # grep -x on the url line only (the file also carries the tokens;
+          # -q prints nothing).
+          reg=server/compose/generated/appservice/botville-gateway.yaml
           if [ "${{ matrix.homeserver }}" = continuwuity ]; then
             test "${transport}" = memory
+            grep -qx 'url: null' "${reg}"
+            echo "registration url: null"
           else
             test "${transport}" = appservice
+            grep -qx 'url: http://gateway:8080' "${reg}"
+            echo "registration url: http://gateway:8080"
             make gateway-hs-smoke
           fi
 
@@ -335,6 +358,8 @@ jobs:
           test -f "${backup_dir}/gateway-data.tar.gz"
           grep -q 'gateway-data.tar.gz' "${backup_dir}/manifest.txt"
           tar -tzf "${backup_dir}/gateway-data.tar.gz" | grep -qx './ci-seed.txt'
+          # The gateway opens as_transactions.db at startup on every profile.
+          tar -tzf "${backup_dir}/gateway-data.tar.gz" | grep -qx './as_transactions.db'
           test ! -e "${backup_dir}/env"
           echo "RESTORE_DIR=${backup_dir}" >> "$GITHUB_ENV"
 
@@ -369,7 +394,12 @@ jobs:
           curl -fsS "http://127.0.0.1:${GATEWAY_PORT}/health" >/dev/null \
             || { echo "::error::gateway /health not OK after restore"; exit 1; }
           if [ "${{ matrix.homeserver }}" != continuwuity ]; then
-            make gateway-hs-smoke
+            ${STACK} exec -T gateway python -c "import sqlite3; c = sqlite3.connect('/var/lib/botville-gateway/as_transactions.db'); assert c.execute('select count(*) from as_transactions').fetchone()[0] >= 1"
+            # The homeserver was wiped (down -v) but gateway-data restored, so the
+            # fresh HS restarts its txnIds and would collide with the restored
+            # ones (stored once by design). AS transactions were already
+            # covered before the backup; here check whoami + OpenID only.
+            make gateway-hs-smoke GATEWAY_HS_SMOKE_ARGS=--skip-as-txn
           fi
 
       - name: Dump logs
