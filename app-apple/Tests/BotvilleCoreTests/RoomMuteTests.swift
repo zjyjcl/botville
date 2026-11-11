@@ -17,11 +17,17 @@ final class TestNotificationSettings: NotificationSettings, @unchecked Sendable 
     override func setDelegate(delegate: NotificationSettingsDelegate?) { lock.withLock { self.delegate = delegate } }
     private var rawReads = 0
     private var roomReads: [String] = []
+    private var failedRooms = Set<String>()
+    private var readEncryption: [Bool] = []
+    private var unmuteEncryption: [Bool] = []
     private var rawReadContinuation: CheckedContinuation<String?, Error>?
     var suspendRawRead = false
     var missingRules = false
     var rawReadCount: Int { lock.withLock { rawReads } }
     var roomReadIDs: [String] { lock.withLock { roomReads } }
+    var roomReadEncryption: [Bool] { lock.withLock { readEncryption } }
+    var unmuteEncryptionArguments: [Bool] { lock.withLock { unmuteEncryption } }
+    func failReads(for rooms: Set<String>) { lock.withLock { failedRooms = rooms } }
     var isRawReadBlocked: Bool { lock.withLock { rawReadContinuation != nil } }
     func releaseRawRead() {
         let pending = lock.withLock { let value = rawReadContinuation; rawReadContinuation = nil; return value }
@@ -37,7 +43,12 @@ final class TestNotificationSettings: NotificationSettings, @unchecked Sendable 
         return missingRules ? nil : "{}"
     }
     override func getRoomNotificationSettings(roomId: String, isEncrypted: Bool, isOneToOne: Bool) async throws -> RoomNotificationSettings {
-        lock.withLock { roomReads.append(roomId); return RoomNotificationSettings(mode: muted.contains(roomId) ? .mute : .allMessages, isDefault: false) }
+        try lock.withLock {
+            roomReads.append(roomId)
+            readEncryption.append(isEncrypted)
+            if failedRooms.contains(roomId) { throw MatrixServiceError.operationFailed }
+            return RoomNotificationSettings(mode: muted.contains(roomId) ? .mute : .allMessages, isDefault: false)
+        }
     }
     override func setRoomNotificationMode(roomId: String, mode: RoomNotificationMode) async throws {
         let callback = lock.withLock {
@@ -47,6 +58,7 @@ final class TestNotificationSettings: NotificationSettings, @unchecked Sendable 
         callback?.settingsDidChange()
     }
     override func unmuteRoom(roomId: String, isEncrypted: Bool, isOneToOne: Bool) async throws {
+        lock.withLock { unmuteEncryption.append(isEncrypted) }
         try await setRoomNotificationMode(roomId: roomId, mode: .allMessages)
     }
 }
@@ -100,7 +112,7 @@ private final class FakeRoomNotificationProvider: RoomNotificationSettingsProvid
 
 @MainActor
 final class RoomMuteTests: XCTestCase {
-    private let room = MatrixRoom(id: "!mute:test", name: "Test", unreadCount: 7)
+    private let room = MatrixRoom(id: "!mute:test", name: "Test", unreadCount: 7, encryption: .unencrypted)
 
     private func fixture() -> (RoomMuteController, FakeRoomNotificationProvider, MemoryRoomMuteStore) {
         let store = MemoryRoomMuteStore(), provider = FakeRoomNotificationProvider()
@@ -187,7 +199,7 @@ final class RoomMuteTests: XCTestCase {
         provider.failRead = true
         await controller.refresh(room)
         XCTAssertTrue(controller.isMuted(room.id))
-        XCTAssertNotNil(controller.state(for: room.id).errorMessage)
+        XCTAssertNil(controller.state(for: room.id).errorMessage)
         XCTAssertFalse(try store.load().isEmpty)
     }
 
@@ -295,7 +307,7 @@ final class RoomMuteTests: XCTestCase {
     func testSDKBatchChecksRawRulesOnceAndReadsEveryRoomFromServer() async throws {
         let settings = TestNotificationSettings()
         try await settings.setRoomNotificationMode(roomId: room.id, mode: .mute)
-        let other = MatrixRoom(id: "!other:test", name: "Other")
+        let other = MatrixRoom(id: "!other:test", name: "Other", encryption: .unencrypted)
         let values = try await SDKRoomNotificationSettings(settings).mutedStates(for: [room, other])
         XCTAssertEqual(settings.rawReadCount, 1)
         XCTAssertEqual(settings.roomReadIDs, [room.id, other.id])
@@ -312,6 +324,122 @@ final class RoomMuteTests: XCTestCase {
         XCTAssertTrue(settings.roomReadIDs.isEmpty)
         XCTAssertFalse(controller.state(for: room.id).isLoaded)
         XCTAssertNotNil(controller.state(for: room.id).errorMessage)
+    }
+
+    func testSDKBatchMiddleFailurePreservesOnlyThatRoomAndRetries() async throws {
+        let settings = TestNotificationSettings(), store = MemoryRoomMuteStore()
+        let controller = RoomMuteController(sharedStore: store)
+        controller.configure(provider: SDKRoomNotificationSettings(settings))
+        let middle = MatrixRoom(id: "!middle:test", name: "Middle", encryption: .encrypted)
+        let last = MatrixRoom(id: "!last:test", name: "Last", encryption: .unencrypted)
+        let rooms = [room, middle, last]
+        try await settings.setRoomNotificationMode(roomId: middle.id, mode: .mute)
+        await controller.refresh(rooms)
+        let previous = controller.state(for: middle.id)
+        settings.failReads(for: [middle.id])
+        try await settings.setRoomNotificationMode(roomId: middle.id, mode: .allMessages)
+        for room in [room, last] { try await settings.setRoomNotificationMode(roomId: room.id, mode: .mute) }
+        await controller.refresh(rooms)
+        XCTAssertEqual(settings.rawReadCount, 2)
+        XCTAssertEqual(Array(settings.roomReadIDs.suffix(3)), rooms.map(\.id))
+        XCTAssertTrue(controller.isMuted(room.id))
+        XCTAssertTrue(controller.isMuted(last.id))
+        XCTAssertEqual(controller.state(for: middle.id), previous)
+        XCTAssertNil(controller.state(for: middle.id).errorMessage)
+        XCTAssertEqual(try store.load(), Set(rooms.map { SharedRoomMuteStore.hash($0.id) }))
+        settings.failReads(for: [])
+        await controller.refresh(rooms)
+        XCTAssertEqual(settings.rawReadCount, 3)
+        XCTAssertFalse(controller.isMuted(middle.id))
+        XCTAssertTrue(controller.state(for: middle.id).isLoaded)
+    }
+
+    func testRawFailurePreservesLoadedBatchAndDoesNotReadRooms() async throws {
+        let settings = TestNotificationSettings()
+        let controller = RoomMuteController(sharedStore: MemoryRoomMuteStore())
+        controller.configure(provider: SDKRoomNotificationSettings(settings))
+        try await settings.setRoomNotificationMode(roomId: room.id, mode: .mute)
+        await controller.refresh([room])
+        settings.missingRules = true
+        await controller.refresh([room])
+        XCTAssertEqual(settings.rawReadCount, 2)
+        XCTAssertEqual(settings.roomReadIDs, [room.id])
+        XCTAssertTrue(controller.isMuted(room.id))
+        XCTAssertTrue(controller.state(for: room.id).isLoaded)
+    }
+
+    func testUnknownEncryptionRejectsUnmuteAndRestoresUIWithoutSDKWrite() async throws {
+        let settings = TestNotificationSettings(), store = MemoryRoomMuteStore()
+        let controller = RoomMuteController(sharedStore: store)
+        controller.configure(provider: SDKRoomNotificationSettings(settings))
+        try await settings.setRoomNotificationMode(roomId: room.id, mode: .mute)
+        await controller.refresh(room)
+        let unknown = room.withSecurity(encryption: .unknown, participants: .unknown)
+        await controller.setMuted(false, room: unknown)
+        XCTAssertTrue(settings.unmuteEncryptionArguments.isEmpty)
+        XCTAssertTrue(controller.isMuted(room.id))
+        XCTAssertFalse(controller.state(for: room.id).isUpdating)
+        XCTAssertTrue(controller.state(for: room.id).errorMessage?.contains("无法确认房间加密状态") == true)
+        XCTAssertEqual(try store.load(), [SharedRoomMuteStore.hash(room.id)])
+    }
+
+    func testUnknownEncryptionReadKeepsOldOrUnloadedStateWithoutSDKModeRead() async throws {
+        let settings = TestNotificationSettings()
+        let controller = RoomMuteController(sharedStore: MemoryRoomMuteStore())
+        controller.configure(provider: SDKRoomNotificationSettings(settings))
+        try await settings.setRoomNotificationMode(roomId: room.id, mode: .mute)
+        await controller.refresh(room)
+        let previous = controller.state(for: room.id)
+        await controller.refresh([room.withSecurity(encryption: .unknown, participants: .unknown),
+                                  MatrixRoom(id: "!unknown:test", name: "Unknown")])
+        XCTAssertEqual(controller.state(for: room.id), previous)
+        XCTAssertFalse(controller.state(for: "!unknown:test").isLoaded)
+        XCTAssertEqual(settings.roomReadIDs, [room.id])
+        do {
+            _ = try await SDKRoomNotificationSettings(settings).isMuted(MatrixRoom(id: "!unknown:test", name: "Unknown"))
+            XCTFail("A single unknown read must throw, never return false")
+        } catch { XCTAssertTrue(error is RoomNotificationSettingsError) }
+    }
+
+    func testResolvedEncryptionIsPassedToUnmuteAndReadback() async throws {
+        for encryption in [RoomEncryptionState.encrypted, .unencrypted] {
+            let settings = TestNotificationSettings()
+            var resolutions = 0
+            let provider = SDKRoomNotificationSettings(settings) { _ in
+                resolutions += 1
+                return encryption
+            }
+            let unknown = room.withSecurity(encryption: .unknown, participants: .unknown)
+            try await provider.setMuted(false, room: unknown)
+            let muted = try await provider.isMuted(unknown)
+            XCTAssertFalse(muted)
+            XCTAssertEqual(resolutions, 2)
+            XCTAssertEqual(settings.unmuteEncryptionArguments, [encryption == .encrypted])
+            XCTAssertEqual(settings.roomReadEncryption, [encryption == .encrypted])
+        }
+    }
+
+    func testEncryptionResolutionFailureDoesNotCallUnmuteOrModeRead() async {
+        let settings = TestNotificationSettings()
+        let provider = SDKRoomNotificationSettings(settings) { _ in throw MatrixServiceError.operationFailed }
+        let unknown = room.withSecurity(encryption: .unknown, participants: .unknown)
+        do {
+            try await provider.setMuted(false, room: unknown)
+            XCTFail("Resolution failure must reject unmute")
+        } catch { XCTAssertTrue(error is RoomNotificationSettingsError) }
+        let values = try? await provider.mutedStates(for: [unknown, room])
+        XCTAssertEqual(values, [room.id: false])
+        XCTAssertTrue(settings.unmuteEncryptionArguments.isEmpty)
+        XCTAssertEqual(settings.roomReadIDs, [room.id])
+    }
+
+    func testSDKSingleReadFailureThrowsInsteadOfConfirmingUnmuted() async {
+        let settings = TestNotificationSettings()
+        settings.failReads(for: [room.id])
+        do {
+            _ = try await SDKRoomNotificationSettings(settings).isMuted(room)
+            XCTFail("Failed post-write readback must throw")
+        } catch { XCTAssertEqual(settings.roomReadIDs, [room.id]) }
     }
 
     func testOldBatchCannotPopulateNewSession() async {

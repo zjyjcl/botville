@@ -273,8 +273,42 @@ final class ReleaseIsolationTests: XCTestCase {
         }
         XCTAssertTrue(stack.isEmpty); XCTAssertTrue(found, "\(needle) missing from \(url)")
     }
+    private func unsafeNotificationLogs(in text: String, source: String) throws -> Int {
+        let allowed: [String: [String]] = [
+            "SharedPushCredentials.swift": [
+                #".debug("Shared push credentials present: \(present, privacy: .public)")"#,
+                #".warning("Shared push credentials unavailable")"#
+            ],
+            "SharedRoomMute.swift": [#".debug("room_mute_nse degraded scope=\(scope, privacy: .public)")"#]
+        ]
+        let regex = try NSRegularExpression(pattern: #"\.\s*(trace|debug|info|notice|warning|error|fault|critical|log)\s*\("#)
+        let ns = text as NSString
+        return regex.matches(in: text, range: NSRange(location: 0, length: ns.length)).filter { match in
+            let call = "." + ns.substring(with: match.range(at: 1)) + "(" + ns.substring(from: NSMaxRange(match.range))
+            return !(allowed[source] ?? []).contains { call.hasPrefix($0) }
+        }.count
+    }
+
+    func testNSELogScannerCatchesLeadingDotMultilineAndAdditionalArguments() throws {
+        for level in ["trace", "debug", "info", "notice", "warning", "error", "fault", "critical", "log"] {
+            XCTAssertEqual(try unsafeNotificationLogs(in: "Logger()\n    .\n \(level) (\"unsafe\")", source: "SharedRoomMute.swift"), 1)
+        }
+        let safe = #".debug("room_mute_nse degraded scope=\(scope, privacy: .public)")"#
+        XCTAssertEqual(try unsafeNotificationLogs(in: "Logger()\n    " + safe, source: "SharedRoomMute.swift"), 0)
+        XCTAssertEqual(try unsafeNotificationLogs(in: safe, source: "NotificationService.swift"), 1)
+        XCTAssertEqual(try unsafeNotificationLogs(in: safe.replacingOccurrences(of: "scope,", with: "roomID,"), source: "SharedRoomMute.swift"), 1)
+        XCTAssertEqual(try unsafeNotificationLogs(in: #"logger.debug("Shared push credentials present: \(present, privacy: .public)")"#,
+                                                  source: "SharedPushCredentials.swift"), 0)
+        XCTAssertEqual(try unsafeNotificationLogs(in: #"logger.warning("Shared push credentials unavailable")"#,
+                                                  source: "SharedPushCredentials.swift"), 0)
+        XCTAssertEqual(try unsafeNotificationLogs(in: #"logger.warning("Shared push credentials unavailable", extra)"#,
+                                                  source: "SharedPushCredentials.swift"), 1)
+        XCTAssertEqual(try unsafeNotificationLogs(in: "let level = config.log\nlet other = config.logger()", source: "SharedRoomMute.swift"), 0)
+    }
+
     private func assertNotificationServiceBoundary(_ objects: [String: Any]) throws {
         let sources = try notificationServiceSources(objects)
+        XCTAssertEqual(sources.count, 4, "NSE must contain exactly four source entries, without duplicates")
         XCTAssertEqual(Set(sources.map(\.lastPathComponent)), ["NotificationService.swift", "SharedPushCredentials.swift", "PushNotificationContent.swift", "SharedRoomMute.swift"])
         for source in sources {
             let text = try String(contentsOf: source, encoding: .utf8)
@@ -285,21 +319,25 @@ final class ReleaseIsolationTests: XCTestCase {
                 XCTAssertFalse(text.contains("URLRequest"), "Only PushNotificationContent may use URLRequest in NSE")
             }
             XCTAssertNil(text.range(of: #"\b(?:print|debugPrint|dump|NSLog|os_log)\s*\("#, options: .regularExpression), "NSE must use only its safe Logger diagnostics")
-            for line in text.split(separator: "\n") where line.range(of: #"\b\w+\.(?:trace|debug|info|notice|warning|error|fault|critical|log)\s*\("#, options: .regularExpression) != nil {
-                let lower = line.lowercased()
-                XCTAssertFalse(lower.contains("token"), "NSE logs must not expose tokens")
-                XCTAssertTrue([
-                    "logger.debug(\"Shared push credentials present: \\(present, privacy: .public)\")",
-                    "logger.warning(\"Shared push credentials unavailable\")"
-                ].contains(String(line).trimmingCharacters(in: .whitespaces)), "NSE only permits its two safe diagnostic logs")
-            }
+            XCTAssertEqual(try unsafeNotificationLogs(in: text, source: source.lastPathComponent), 0,
+                           "NSE only permits reviewed diagnostic calls, including multiline calls")
             // The sole file-backed NSE data is a validated array of SHA-256 room
             // digests. Credential sources retain the stricter no-file-I/O gate.
             if source.lastPathComponent == "SharedRoomMute.swift" {
                 try guarded("room_mute_nse", at: source)
                 XCTAssertTrue(text.contains("import CryptoKit"))
                 XCTAssertFalse(text.contains("SharedPushCredentials"))
-                XCTAssertFalse(text.contains("accessToken"))
+                for required in ["room-mute-sha256.json", "SHA256.hash", "validHash", "BotvilleAppGroupIdentifier"] {
+                    XCTAssertTrue(text.contains(required), "NSE digest cache requires \(required)")
+                }
+                for forbidden in ["Keychain", "SecItem", "accessToken", "Authorization", "UserDefaults", "FileHandle"] {
+                    XCTAssertFalse(text.contains(forbidden), "NSE digest cache forbids \(forbidden)")
+                }
+                XCTAssertEqual(text.components(separatedBy: "write(to:").count - 1, 1)
+                XCTAssertEqual(text.components(separatedBy: "Data(contentsOf:").count - 1, 1)
+                XCTAssertNil(text.range(of: #""group\.[A-Za-z0-9]"#, options: .regularExpression))
+                XCTAssertTrue(text.contains(#"let scope = String(SharedRoomMuteStore.hash(roomID(in: content.userInfo) ?? "").prefix(8))"#),
+                              "The diagnostic scope must remain an eight-character SHA-256 prefix")
                 continue
             }
             for forbidden in ["UserDefaults", "FileHandle", "write(to:", "Data(contentsOf:"] {
@@ -334,7 +372,9 @@ final class ReleaseIsolationTests: XCTestCase {
         for phase in phases.compactMap({ objects[$0] as? [String: Any] }) where phase["isa"] as? String == "PBXFrameworksBuildPhase" {
             XCTAssertTrue((phase["files"] as? [String] ?? []).isEmpty, "NSE must not link frameworks")
         }
-        let sourcePhase = try XCTUnwrap(phases.compactMap { objects[$0] as? [String: Any] }.first { $0["isa"] as? String == "PBXSourcesBuildPhase" })
+        let sourcePhases = phases.compactMap { objects[$0] as? [String: Any] }.filter { $0["isa"] as? String == "PBXSourcesBuildPhase" }
+        XCTAssertEqual(sourcePhases.count, 1)
+        let sourcePhase = try XCTUnwrap(sourcePhases.first)
         return try XCTUnwrap(sourcePhase["files"] as? [String]).map { identifier in
             let buildFile = try XCTUnwrap(objects[identifier] as? [String: Any])
             let fileRef = try XCTUnwrap(buildFile["fileRef"] as? String)

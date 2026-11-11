@@ -654,7 +654,21 @@ public final class MatrixService: ObservableObject {
         let settings = await client.getNotificationSettings()
         guard generation == sessionGeneration else { throw CancellationError() }
         notificationSettings = settings
-        roomNotifications.configure(provider: SDKRoomNotificationSettings(settings))
+        roomNotifications.configure(provider: SDKRoomNotificationSettings(settings) { [weak self] snapshot in
+            guard let self, generation == self.sessionGeneration, self.isLoggedIn, !self.isLoggingOut else {
+                throw CancellationError()
+            }
+            if self.observedEncryptedRooms.contains(snapshot.id) { return .encrypted }
+            guard let room = try client.getRoom(roomId: snapshot.id), room.membership() == .joined else {
+                throw RoomNotificationSettingsError.encryptionUnknown
+            }
+            let encryption = SDKEncryptionState.map(try await room.latestEncryptionState())
+            guard generation == self.sessionGeneration, self.isLoggedIn, !self.isLoggingOut else {
+                throw CancellationError()
+            }
+            if encryption == .encrypted { self.observedEncryptedRooms.insert(snapshot.id) }
+            return encryption
+        })
         let (changes, changesContinuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
         let settingsBridge = RoomNotificationSettingsBridge(changesContinuation)
         notificationSettingsBridge = settingsBridge

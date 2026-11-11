@@ -1335,6 +1335,48 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         withExtendedLifetime(observation) {}
     }
 
+    func testNotificationUnmuteResolvesUnknownEncryptionThroughSDKRoom() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let room = FakeRoom(id: "!encryption:test", name: "Encryption")
+        let client = FakeClient(successfulSync: true, rooms: [room])
+        try await client.notificationSettings.setRoomNotificationMode(roomId: room.id(), mode: .mute)
+        let service = makeService(sessionStore: InMemorySessionStore(), directory: temporary, client: client)
+        try await service.login(homeserver: "https://matrix.test", username: "test", password: "test-password")
+        try await waitUntil { service.roomNotifications.state(for: room.id()).isLoaded && service.connectionStatus == .connected }
+        let unknown = MatrixRoom(id: room.id(), name: "Encryption")
+        room.encryption = .unknown
+        await service.roomNotifications.setMuted(false, room: unknown)
+        XCTAssertTrue(client.notificationSettings.unmuteEncryptionArguments.isEmpty)
+        XCTAssertTrue(service.roomNotifications.isMuted(room.id()))
+        XCTAssertTrue(service.roomNotifications.state(for: room.id()).errorMessage?.contains("加密状态") == true)
+        room.encryption = .encrypted
+        await service.roomNotifications.setMuted(false, room: unknown)
+        XCTAssertEqual(client.notificationSettings.unmuteEncryptionArguments, [true])
+        XCTAssertEqual(client.notificationSettings.roomReadEncryption.last, true)
+        XCTAssertFalse(service.roomNotifications.isMuted(room.id()))
+        await service.logout()
+    }
+
+    func testLogoutDuringNotificationEncryptionResolutionPreventsSDKUnmute() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let room = FakeRoom(id: "!blocked-encryption:test", name: "Encryption")
+        let client = FakeClient(successfulSync: true, rooms: [room])
+        try await client.notificationSettings.setRoomNotificationMode(roomId: room.id(), mode: .mute)
+        let service = makeService(sessionStore: InMemorySessionStore(), directory: temporary, client: client)
+        try await service.login(homeserver: "https://matrix.test", username: "test", password: "test-password")
+        try await waitUntil { service.roomNotifications.state(for: room.id()).isLoaded && service.connectionStatus == .connected }
+        room.suspendEncryptionRead = true
+        let operation = Task { await service.roomNotifications.setMuted(false, room: MatrixRoom(id: room.id(), name: "Encryption")) }
+        try await waitUntil { room.isEncryptionReadBlocked }
+        await service.logout()
+        room.releaseEncryptionRead()
+        await operation.value
+        XCTAssertTrue(client.notificationSettings.unmuteEncryptionArguments.isEmpty)
+        XCTAssertTrue(service.roomNotifications.states.isEmpty)
+    }
+
     func testFailingMuteStoreDoesNotBlockLogoutLoginOrRestore() async throws {
         let temporary = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: temporary) }
@@ -1577,6 +1619,7 @@ private final class BlockingPusherTransport: MatrixPusherTransport, @unchecked S
 private final class FakeClient: Client, @unchecked Sendable {
     let notificationSettings = TestNotificationSettings()
     override func getNotificationSettings() async -> NotificationSettings { notificationSettings }
+    override func getRoom(roomId: String) throws -> Room? { configuredRooms.first { $0.id() == roomId } }
     private let configuredLogoutError: Error?
     private let configuredRestoreError: Error?
     @TestLocked var syncError: Error? = nil
@@ -1766,7 +1809,27 @@ private final class FakeRoom: Room, @unchecked Sendable {
     override func roomInfo() async throws -> RoomInfo { throw ClientError.Generic(msg: "unused", details: nil) }
     override func latestEvent() async -> LatestEventValue { latest }
     override func isDirect() async -> Bool { false }
-    override func latestEncryptionState() async throws -> EncryptionState { .unknown }
+    @TestLocked var encryption: EncryptionState = .notEncrypted
+    @TestLocked var suspendEncryptionRead = false
+    private let encryptionReadLock = NSLock()
+    private var encryptionReadContinuation: CheckedContinuation<EncryptionState, Never>?
+    var isEncryptionReadBlocked: Bool { encryptionReadLock.withLock { encryptionReadContinuation != nil } }
+    func releaseEncryptionRead() {
+        let pending = encryptionReadLock.withLock {
+            let value = encryptionReadContinuation
+            encryptionReadContinuation = nil
+            return value
+        }
+        pending?.resume(returning: encryption)
+    }
+    override func latestEncryptionState() async throws -> EncryptionState {
+        if suspendEncryptionRead {
+            return await withCheckedContinuation { continuation in
+                encryptionReadLock.withLock { encryptionReadContinuation = continuation }
+            }
+        }
+        return encryption
+    }
 }
 
 private final class FakeTimelineEvent: TimelineEvent, @unchecked Sendable {

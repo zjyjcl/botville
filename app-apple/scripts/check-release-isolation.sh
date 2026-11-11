@@ -239,8 +239,11 @@ for phase_id in nse_target['buildPhases']:
     phase = objects[phase_id]
     if phase.get('isa') == 'PBXFrameworksBuildPhase' and phase.get('files', []):
         raise SystemExit('NSE must not link frameworks')
-nse_sources_phase = next(objects[phase_id] for phase_id in nse_target['buildPhases']
-                         if objects[phase_id].get('isa') == 'PBXSourcesBuildPhase')
+nse_sources_phases = [objects[phase_id] for phase_id in nse_target['buildPhases']
+                      if objects[phase_id].get('isa') == 'PBXSourcesBuildPhase']
+if len(nse_sources_phases) != 1:
+    raise SystemExit('NSE must have exactly one Sources phase')
+nse_sources_phase = nse_sources_phases[0]
 nse_source_paths = []
 for build_file_id in nse_sources_phase['files']:
     file_ref_id = objects[build_file_id].get('fileRef')
@@ -259,20 +262,29 @@ for build_file_id in nse_sources_phase['files']:
                                             for group in objects.values() if group.get('isa') == 'PBXGroup'):
         raise SystemExit('NSE group-relative source must be in NotificationService group')
     nse_source_paths.append(source_paths[path, source_tree])
-if {path.name for path in nse_source_paths} != {'NotificationService.swift', 'SharedPushCredentials.swift', 'PushNotificationContent.swift', 'SharedRoomMute.swift'}:
+if len(nse_source_paths) != 4 or {path.name for path in nse_source_paths} != {'NotificationService.swift', 'SharedPushCredentials.swift', 'PushNotificationContent.swift', 'SharedRoomMute.swift'}:
     raise SystemExit('NSE source set must be exactly NotificationService, SharedPushCredentials, PushNotificationContent, and SharedRoomMute')
 for source in nse_source_paths:
     source_text = source.read_text()
     if re.search(r'\b(?:print|debugPrint|dump|NSLog|os_log)\s*\(', source_text):
         raise SystemExit(f'NSE must use only its safe Logger diagnostics: {source}')
-    for number, line in enumerate(source_text.splitlines(), 1):
-        if re.search(r'\b\w+\.(?:trace|debug|info|notice|warning|error|fault|critical|log)\s*\(', line):
-            safe_logs = {
-                'logger.debug("Shared push credentials present: \\(present, privacy: .public)")',
-                'logger.warning("Shared push credentials unavailable")',
-            }
-            if line.strip() not in safe_logs or 'token' in line.lower():
-                raise SystemExit(f'NSE has an unsafe log statement: {source}:{number}')
+    # Scan the entire source, including chained/leading-dot Logger calls.
+    # Bare properties such as `.log` and methods such as `.logger()` do not
+    # match. Any new same-named non-logging call needs an explicit review.
+    safe_logs = {
+        'SharedPushCredentials.swift': (
+            '.debug("Shared push credentials present: \\(present, privacy: .public)")',
+            '.warning("Shared push credentials unavailable")',
+        ),
+        'SharedRoomMute.swift': (
+            '.debug("room_mute_nse degraded scope=\\(scope, privacy: .public)")',
+        ),
+    }
+    for match in re.finditer(r'\.\s*(trace|debug|info|notice|warning|error|fault|critical|log)\s*\(', source_text):
+        call = '.' + match[1] + '(' + source_text[match.end():]
+        if not any(call.startswith(allowed) for allowed in safe_logs.get(source.name, ())):
+            number = source_text.count('\n', 0, match.start()) + 1
+            raise SystemExit(f'NSE has an unsafe log statement: {source}:{number}')
     # SharedRoomMute (#179) is the one NSE file allowed to read/write a file: the
     # App Group cache of full SHA-256 room digests. It must hold no credentials,
     # stay validated as 64-char lowercase hex, and make no network requests.
@@ -288,6 +300,8 @@ for source in nse_source_paths:
             raise SystemExit('NSE room-mute cache may contain only its single digest read and write')
         if re.search(r'"group\.[A-Za-z0-9]', source_text):
             raise SystemExit('NSE room-mute cache must read the App Group from Info.plist, not hard-code it')
+        if 'let scope = String(SharedRoomMuteStore.hash(roomID(in: content.userInfo) ?? "").prefix(8))' not in source_text:
+            raise SystemExit('NSE room-mute log scope must remain an eight-character SHA-256 prefix')
     for forbidden_storage in ('UserDefaults', 'FileHandle', 'write(to:', 'Data(contentsOf:'):
         if forbidden_storage in source_text and not room_mute_cache:
             raise SystemExit(f'NSE must not use plaintext credential storage ({forbidden_storage}): {source}')

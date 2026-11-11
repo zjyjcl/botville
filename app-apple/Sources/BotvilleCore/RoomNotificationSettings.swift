@@ -18,7 +18,12 @@ public protocol RoomNotificationSettingsProviding {
 public extension RoomNotificationSettingsProviding {
     func mutedStates(for rooms: [MatrixRoom]) async throws -> [String: Bool] {
         var result: [String: Bool] = [:]
-        for room in rooms { result[room.id] = try await isMuted(room) }
+        for room in rooms {
+            try Task.checkCancellation()
+            do { result[room.id] = try await isMuted(room) }
+            catch is CancellationError { throw CancellationError() }
+            catch { continue } // A missing value preserves this room's old state.
+        }
         return result
     }
 }
@@ -26,10 +31,18 @@ public extension RoomNotificationSettingsProviding {
 @MainActor
 final class SDKRoomNotificationSettings: RoomNotificationSettingsProviding {
     let settings: NotificationSettings
-    init(_ settings: NotificationSettings) { self.settings = settings }
+    private let resolveEncryption: (MatrixRoom) async throws -> RoomEncryptionState
+
+    init(_ settings: NotificationSettings,
+         resolveEncryption: @escaping (MatrixRoom) async throws -> RoomEncryptionState = { _ in .unknown }) {
+        self.settings = settings
+        self.resolveEncryption = resolveEncryption
+    }
 
     func isMuted(_ room: MatrixRoom) async throws -> Bool {
-        try await mutedStates(for: [room])[room.id] == true
+        // A failed single read must throw, especially after an optimistic write.
+        guard try await settings.getRawPushRules() != nil else { throw MatrixServiceError.operationFailed }
+        return try await readMuted(room)
     }
 
     func mutedStates(for rooms: [MatrixRoom]) async throws -> [String: Bool] {
@@ -40,8 +53,9 @@ final class SDKRoomNotificationSettings: RoomNotificationSettingsProviding {
         var result: [String: Bool] = [:]
         for room in rooms {
             try Task.checkCancellation()
-            result[room.id] = try await settings.getRoomNotificationSettings(roomId: room.id,
-                isEncrypted: room.encryption == .encrypted, isOneToOne: room.isDirect).mode == .mute
+            do { result[room.id] = try await readMuted(room) }
+            catch is CancellationError { throw CancellationError() }
+            catch { continue } // Retry on the next delegate/page/notification refresh.
         }
         return result
     }
@@ -49,11 +63,34 @@ final class SDKRoomNotificationSettings: RoomNotificationSettingsProviding {
     func setMuted(_ muted: Bool, room: MatrixRoom) async throws {
         if muted { try await settings.setRoomNotificationMode(roomId: room.id, mode: .mute) }
         else {
+            let encrypted = try await isEncrypted(room)
+            try Task.checkCancellation()
             try await settings.unmuteRoom(roomId: room.id,
-                isEncrypted: room.encryption == .encrypted, isOneToOne: room.isDirect)
+                isEncrypted: encrypted, isOneToOne: room.isDirect)
+        }
+    }
+
+    private func readMuted(_ room: MatrixRoom) async throws -> Bool {
+        let encrypted = try await isEncrypted(room)
+        try Task.checkCancellation()
+        return try await settings.getRoomNotificationSettings(roomId: room.id,
+            isEncrypted: encrypted, isOneToOne: room.isDirect).mode == .mute
+    }
+
+    private func isEncrypted(_ room: MatrixRoom) async throws -> Bool {
+        let encryption: RoomEncryptionState
+        do { encryption = room.encryption == .unknown ? try await resolveEncryption(room) : room.encryption }
+        catch is CancellationError { throw CancellationError() }
+        catch { throw RoomNotificationSettingsError.encryptionUnknown }
+        switch encryption {
+        case .encrypted: return true
+        case .unencrypted: return false
+        case .unknown: throw RoomNotificationSettingsError.encryptionUnknown
         }
     }
 }
+
+enum RoomNotificationSettingsError: Error { case encryptionUnknown }
 
 final class RoomNotificationSettingsBridge: NotificationSettingsDelegate, Sendable {
     let continuation: AsyncStream<Void>.Continuation
@@ -154,7 +191,11 @@ public final class RoomMuteController: ObservableObject {
         } catch {
             guard generation == session, revisions[room.id] == revision else { return }
             var restored = previous
-            restored.errorMessage = "消息免打扰修改失败，已恢复原设置。请检查网络后重试。"
+            if error is RoomNotificationSettingsError {
+                restored.errorMessage = "暂时无法确认房间加密状态，已恢复原设置。请稍后重试。"
+            } else {
+                restored.errorMessage = "消息免打扰修改失败，已恢复原设置。请检查网络后重试。"
+            }
             publish(restored, roomID: room.id)
         }
     }
