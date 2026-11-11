@@ -266,15 +266,16 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
 - 匿名或 Matrix token 无效：401（`auth.invalid_token`）；传输层限速 429。
 - `reply_to_comment_id`：目标评论不存在、已软删、或不在同一动态、或对当前查看者不可见（`can_view ∧ can_see_interaction` 为假）时，**统一**返回 `422` `request.invalid`（`errors[].field = reply_to_comment_id`），不区分原因，避免靠 404/422 差异探评论 ULID。
   **格式不像 ULID 的字符串**同样按「目标不存在」返回 422（类型对、值找不到属语义错误）；
-  只有**类型错误**（数字、对象、数组、空串）返回 `400` `request.invalid`。
+  只有**类型错误**（数字、布尔、对象、数组、空串）返回 `400` `request.invalid`。
+  显式 `null` 视同省略（顶层评论，`201`）；OpenAPI 请求 schema 仍声明为 `string`，
+  客户端应省略该字段而不是发 `null`。
 - **幂等作用域与重放**（实现口径，登记于 `contract.md` §1.5「动态端点」）：缓存键为
   `(操作, 调用者, 目标资源, key)`，评论的目标资源是 `moment_id`；persona 归属与目标动态
   可见性**先于**幂等缓存判定。因此动态被删除、或与作者解除好友后，用原
   `Idempotency-Key` 重放评论返回 `404` `moment.not_found`（不是原回执）；persona 归属
   被收回后重放 `POST /moments` 返回 `403` `persona.not_owned`。
-- 幂等缓存为进程内存，TTL 沿用 `IDEMPOTENCY_TTL_SECONDS`（默认 86400）。**已知差异**：
-  全局约定 `IDEMPOTENCY_TTL_SECONDS=0` 表示「不过期」，而动态端点当前实现把 `0` 当作
-  立即过期（等于不缓存，同 key 重放会再写一次）。默认值不受影响；修正留给后续代码 PR。
+- 幂等缓存为进程内存，TTL 沿用 `IDEMPOTENCY_TTL_SECONDS`（默认 86400），与全局约定一致：
+  `0` = 不过期（只受 `MAX_IDEMPOTENCY_ENTRIES` 容量淘汰约束）；网关重启后清空。
 - 非法请求目标（authority-form、其他 scheme、IPv6 括号未闭合、`*` 搭配非 `OPTIONS`）
   在路由前即返回 `400` `request.invalid`，对所有端点生效，见 `contract.md` §1.1。
 - 结构/类型错误（未知字段、类型不符、非法 JSON、含孤立代理项的 JSON 字符串、畸形
@@ -317,7 +318,10 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
   {"friends": [["@alice:example.invalid", "@bob:example.invalid"]]}
   ```
 
-  - 每项是两个**非空** Matrix user id 组成的数组，表示一条**无向**好友边（写一次即双向）；
+  - 每项是两个**非空**字符串组成的数组，表示一条**无向**好友边（写一次即双向）；
+  - **不校验 user id 格式**：只要求非空字符串，不检查 `@localpart:server` 形态、大小写或
+    所属服务器，按字符串原样精确比较。写错（如漏 `@`、大小写不一致）不会报错，只是该边
+    永远匹配不上，等同没写；
   - 两端都是 Matrix user（AI persona 没有独立好友图，AI 按其 `owner_id` 判定）；
   - 文件只在**启动时读取一次**，改了要重启网关才生效；
   - 文件不存在、不是合法 JSON、缺 `friends` 数组或条目畸形 → **拒绝启动**（不会静默
@@ -336,9 +340,10 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
 部署目标为 8845 小主机（Ubuntu Server 24.04，**尚未装好**）。本 PR 与后续 PR 的交付
 边界：只改仓库内容，**不连接、不部署任何机器**，不写任何真实密钥。
 
-- compose 为网关新增持久化卷 `gateway-data`（挂载 `GATEWAY_MOMENTS_DB_PATH` 所在目录，
-  SQLite + WAL，随容器重启保留）。
-- 备份/恢复：计划把网关 DB 纳入既有 `backup-synapse.sh` / `restore-synapse.sh`
+- **未做（计划）**：compose 为网关新增持久化卷 `gateway-data`（挂载
+  `GATEWAY_MOMENTS_DB_PATH` 所在目录，SQLite + WAL，随容器重启保留）。当前 compose
+  尚无该卷，与 §10「未做」一致；在它落地前若在容器内开启动态模块，数据随容器删除而丢失。
+- 备份/恢复（**未做**）：计划把网关 DB 纳入既有 `backup-synapse.sh` / `restore-synapse.sh`
   （冻结 WAL 后整库拷贝），部署手册按 A1.1 流程在 8845 上执行时补「网关数据」一节。
 - 跨服入口只经 fedgate 暴露 `/_matrix/botville/*`；网关 HTTP 端口只在 compose 内网或
   `127.0.0.1` 监听。

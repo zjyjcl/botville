@@ -22,6 +22,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import threading
 import time as _time
 from dataclasses import dataclass
@@ -226,7 +227,7 @@ def _validate_visibility(value: Any) -> str:
 class _IdemEntry:
     fingerprint: str
     response: Dict[str, Any]
-    expires_at: float  # monotonic 时间戳
+    expires_at: float  # monotonic 时间戳；TTL=0（不过期）时为 math.inf
 
 
 class MomentsService:
@@ -431,7 +432,12 @@ class MomentsService:
             self._idem[cache_key] = _IdemEntry(
                 fingerprint=fingerprint,
                 response=response,
-                expires_at=self._monotonic() + self._idem_ttl,
+                # 与全局约定一致（README / service.py `_idempotency_get`）：
+                # IDEMPOTENCY_TTL_SECONDS=0 = 不过期，只受容量淘汰约束。
+                expires_at=(
+                    self._monotonic() + self._idem_ttl
+                    if self._idem_ttl > 0 else math.inf
+                ),
             )
 
     # ------------------------------------------------------------ 读
