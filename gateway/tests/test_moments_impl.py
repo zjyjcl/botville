@@ -811,7 +811,6 @@ class TestServiceComments(ServiceTestBase):
             new_ulid(),                       # 不存在
             by_bob["id"],                     # 已软删
             other_comment["id"],              # 不同动态
-            12345,                            # 非字符串
         ]
         for target in cases:
             with self.subTest(target=target):
@@ -822,6 +821,16 @@ class TestServiceComments(ServiceTestBase):
                     )
                 self.assertEqual(ctx.exception.field, "reply_to_comment_id")
                 self.assertEqual(ctx.exception.http_status, 422)
+        # 结构类型错（非字符串 / 空串）→ 400（契约 §1.3），不属于 §6 的四类语义 422。
+        for bad in (12345, {"x": 1}, ["a"], ""):
+            with self.subTest(type_error=bad):
+                with self.assertRaises(ValidationError) as ctx:
+                    self.service.create_comment(
+                        "@carol:localhost", moment["id"],
+                        {"body": "r", "reply_to_comment_id": bad},
+                    )
+                self.assertNotIsInstance(ctx.exception, UnprocessableError)
+                self.assertEqual(ctx.exception.http_status, 400)
         # 不可见评论（CAROL 看不到 BOB 的评论）→ 422。
         hidden = self.service.create_comment(BOB, moment["id"], {"body": "h"})
         with self.assertRaises(UnprocessableError):

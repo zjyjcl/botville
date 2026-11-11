@@ -709,7 +709,6 @@ class TestReplyToInvalid(unittest.TestCase):
                 "other-moment": other_comment["id"],
                 "invisible": bob_visible["id"],  # CAROL 与 BOB 非共同好友
                 "non-ulid": "zzz-not-ulid",
-                "non-string": 12345,
             }
             for name, target in cases.items():
                 with self.subTest(case=name):
@@ -721,6 +720,15 @@ class TestReplyToInvalid(unittest.TestCase):
                     self.assertEqual(body["code"], "request.invalid")
                     self.assertEqual(body["errors"][0]["field"],
                                      "reply_to_comment_id")
+            # 结构类型错 → 400 request.invalid（不是 422）。
+            for name, target in {"int": 12345, "object": {"a": 1}, "empty": ""}.items():
+                with self.subTest(type_error=name):
+                    status, body, _ = fixture.request(
+                        "POST", f"/v1/moments/{mid}/comments", CAROL,
+                        body={"body": "r", "reply_to_comment_id": target},
+                    )
+                    self.assertEqual(status, 400, body)
+                    self.assertEqual(body["code"], "request.invalid")
             # 合法回复目标（自己的评论 / 可见评论）→ 201。
             status, body, _ = fixture.request(
                 "POST", f"/v1/moments/{mid}/comments", CAROL,
@@ -1003,6 +1011,257 @@ class TestDisabledAndAuth(unittest.TestCase):
                 "GET", existing, ALICE, scheme="MatrixOpenID"
             )
             self.assertEqual(status, 200)
+
+
+# ============================================================================
+# #184 审查 B1：幂等作用域必须含目标资源，且可见性先于幂等缓存
+# ============================================================================
+def _not_found(testcase, status, body):
+    testcase.assertEqual(status, 404, body)
+    testcase.assertEqual(body["code"], "moment.not_found")
+
+
+class TestIdempotencyTargetScope(unittest.TestCase):
+    KEY = "idem-key-b1-0001"
+
+    def _key(self, key=None):
+        return {"Idempotency-Key": key or self.KEY}
+
+    def test_comment_same_key_other_visible_moment_is_independent(self):
+        with MomentsServer() as fx:
+            _s, a = _create(fx, ALICE, {"body": "A", "visibility": "server"})
+            _s, b = _create(fx, ALICE, {"body": "B", "visibility": "server"})
+            st, c1, _ = fx.request(
+                "POST", f"/v1/moments/{a['id']}/comments", STRANGER,
+                body={"body": "same"}, headers=self._key(),
+            )
+            self.assertEqual(st, 201, c1)
+            st, c2, _ = fx.request(
+                "POST", f"/v1/moments/{b['id']}/comments", STRANGER,
+                body={"body": "same"}, headers=self._key(),
+            )
+            # 换目标：不得重放 A 的回执，必须真的在 B 上创建。
+            self.assertEqual(st, 201, c2)
+            self.assertEqual(c2["moment_id"], b["id"])
+            self.assertNotEqual(c2["id"], c1["id"])
+            _s, page, _ = fx.request("GET", f"/v1/moments/{b['id']}/comments", ALICE)
+            self.assertEqual([c["id"] for c in page["items"]], [c2["id"]])
+            # 原目标重放仍是同一回执。
+            st, again, _ = fx.request(
+                "POST", f"/v1/moments/{a['id']}/comments", STRANGER,
+                body={"body": "same"}, headers=self._key(),
+            )
+            self.assertEqual(st, 201)
+            self.assertEqual(again["id"], c1["id"])
+            # 同目标同 key 不同请求体 → 409 idempotency.conflict（契约 §1.5）。
+            st, body, _ = fx.request(
+                "POST", f"/v1/moments/{a['id']}/comments", STRANGER,
+                body={"body": "different"}, headers=self._key(),
+            )
+            self.assertEqual(st, 409, body)
+            self.assertEqual(body["code"], "idempotency.conflict")
+
+    def test_comment_key_on_unreachable_targets_is_404(self):
+        with MomentsServer() as fx:
+            _s, a = _create(fx, ALICE, {"body": "A", "visibility": "server"})
+            _s, gone = _create(fx, ALICE, {"body": "D", "visibility": "server"})
+            _s, hidden = _create(fx, ALICE, {"body": "H", "visibility": "self"})
+            st, _c, _ = fx.request(
+                "POST", f"/v1/moments/{a['id']}/comments", STRANGER,
+                body={"body": "same"}, headers=self._key(),
+            )
+            self.assertEqual(st, 201)
+            fx.request("DELETE", f"/v1/moments/{gone['id']}", ALICE)
+            for name, mid in (
+                ("nonexistent", new_ulid()),
+                ("deleted", gone["id"]),
+                ("invisible", hidden["id"]),
+                ("non-ulid", "not-a-ulid"),
+            ):
+                with self.subTest(target=name):
+                    st, body, _ = fx.request(
+                        "POST", f"/v1/moments/{mid}/comments", STRANGER,
+                        body={"body": "same"}, headers=self._key(),
+                    )
+                    _not_found(self, st, body)
+            # 不可见目标上没有被写入任何评论。
+            _s, page, _ = fx.request(
+                "GET", f"/v1/moments/{hidden['id']}/comments", ALICE
+            )
+            self.assertEqual(page["items"], [])
+
+    def test_comment_replay_after_delete_or_unfriend_is_404(self):
+        with MomentsServer(pairs=[[ALICE, FRIEND]]) as fx:
+            _s, a = _create(fx, ALICE, {"body": "A", "visibility": "server"})
+            _s, f = _create(fx, ALICE, {"body": "F", "visibility": "friends"})
+            for mid in (a["id"], f["id"]):
+                st, _c, _ = fx.request(
+                    "POST", f"/v1/moments/{mid}/comments", FRIEND,
+                    body={"body": "x"}, headers=self._key(),
+                )
+                self.assertEqual(st, 201)
+            fx.request("DELETE", f"/v1/moments/{a['id']}", ALICE)
+            fx.service.relations.replace([])  # 删好友
+            for mid in (a["id"], f["id"]):
+                with self.subTest(moment=mid):
+                    st, body, _ = fx.request(
+                        "POST", f"/v1/moments/{mid}/comments", FRIEND,
+                        body={"body": "x"}, headers=self._key(),
+                    )
+                    _not_found(self, st, body)
+
+    def test_moment_replay_after_persona_revoked_is_403(self):
+        personas = {PERSONA: (OWNER, "大肥鱼", "friends")}
+        with MomentsServer(personas=personas) as fx:
+            payload = {"body": "ai", "author_persona_id": PERSONA}
+            st, m, _ = fx.request(
+                "POST", "/v1/moments", OWNER, body=payload, headers=self._key(),
+            )
+            self.assertEqual(st, 201, m)
+            fx.service.persona_dir = StaticPersonaDirectory({})
+            st, body, _ = fx.request(
+                "POST", "/v1/moments", OWNER, body=payload, headers=self._key(),
+            )
+            self.assertEqual(st, 403, body)
+            self.assertEqual(body["code"], "persona.not_owned")
+
+    def test_moment_and_comment_scopes_do_not_collide(self):
+        with MomentsServer() as fx:
+            st, m, _ = fx.request(
+                "POST", "/v1/moments", ALICE,
+                body={"body": "m", "visibility": "server"}, headers=self._key(),
+            )
+            self.assertEqual(st, 201)
+            st, c, _ = fx.request(
+                "POST", f"/v1/moments/{m['id']}/comments", ALICE,
+                body={"body": "m"}, headers=self._key(),
+            )
+            self.assertEqual(st, 201, c)
+            self.assertEqual(c["moment_id"], m["id"])
+
+    def test_uncached_writes_with_key_follow_404_and_target(self):
+        """点赞 / PATCH / DELETE / 删评论不做幂等缓存：带 key 也按目标独立处理。"""
+        with MomentsServer() as fx:
+            _s, a = _create(fx, ALICE, {"body": "A", "visibility": "server"})
+            _s, b = _create(fx, ALICE, {"body": "B", "visibility": "server"})
+            _s, gone = _create(fx, ALICE, {"body": "D", "visibility": "server"})
+            _s, hidden = _create(fx, ALICE, {"body": "H", "visibility": "self"})
+            _s, ca, _ = fx.request(
+                "POST", f"/v1/moments/{a['id']}/comments", ALICE, body={"body": "c"}
+            )
+            fx.request("DELETE", f"/v1/moments/{gone['id']}", ALICE)
+            # 同 key 点赞两条不同动态：两条都被点赞。
+            for mid in (a["id"], b["id"]):
+                st, state, _ = fx.request(
+                    "PUT", f"/v1/moments/{mid}/likes/me", STRANGER,
+                    headers=self._key(),
+                )
+                self.assertEqual(st, 200)
+                self.assertEqual(state, {"moment_id": mid, "liked": True})
+            _s, view_b, _ = fx.request("GET", f"/v1/moments/{b['id']}", STRANGER)
+            self.assertTrue(view_b["liked_by_me"])
+            self.assertEqual(view_b["like_count"], 1)
+            for name, mid in (
+                ("nonexistent", new_ulid()),
+                ("deleted", gone["id"]),
+                ("invisible", hidden["id"]),
+            ):
+                for method, path, body in (
+                    ("PUT", f"/v1/moments/{mid}/likes/me", None),
+                    ("DELETE", f"/v1/moments/{mid}/likes/me", None),
+                    ("PATCH", f"/v1/moments/{mid}", {"revision": 1}),
+                    ("DELETE", f"/v1/moments/{mid}", None),
+                    ("DELETE", f"/v1/moments/{mid}/comments/{ca['id']}", None),
+                ):
+                    with self.subTest(target=name, op=method + " " + path):
+                        st, resp, _ = fx.request(
+                            method, path, STRANGER, body=body, headers=self._key(),
+                        )
+                        _not_found(self, st, resp)
+
+
+# ============================================================================
+# #184 审查 M1：外部输入解析不得 500
+# ============================================================================
+def _b64_cursor(payload) -> str:
+    import base64
+    raw = json.dumps(payload).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+class TestMalformedInputs(unittest.TestCase):
+    def test_well_formed_but_invalid_cursor_is_400(self):
+        with MomentsServer() as fx:
+            _s, m = _create(fx, ALICE, {"body": "m", "visibility": "server"})
+            _create(fx, ALICE, {"body": "n", "visibility": "server"})
+            mid = m["id"]
+            for user in (ALICE, STRANGER):
+                fx.request("POST", f"/v1/moments/{mid}/comments", user, body={"body": "c"})
+                fx.request("PUT", f"/v1/moments/{mid}/likes/me", user)
+            cases = {
+                "/v1/moments": [
+                    {"k": "m"}, {"k": "m", "c": "x"}, {"k": "m", "i": "x"},
+                    {"k": "m", "c": 1, "i": "x"}, {"k": "m", "c": "x", "i": 2},
+                    {"k": "m", "c": [], "i": {}}, {"k": "m", "c": "", "i": "x"},
+                    {"k": "m", "c": "x" * 600, "i": "x"}, {"k": "c", "c": "x", "i": "y"},
+                    [], "str", 1, None,
+                ],
+                f"/v1/moments/{mid}/comments": [
+                    {"k": "c"}, {"k": "c", "c": 1, "i": "x"}, {"k": "c", "c": "x", "i": None},
+                    {"k": "m", "c": "x", "i": "y"},
+                ],
+                f"/v1/moments/{mid}/likes": [
+                    {"k": "l"}, {"k": "l", "c": 1, "a": "x"}, {"k": "l", "c": "x", "i": "y"},
+                    {"k": "l", "c": "x", "a": ["y"]},
+                ],
+            }
+            for path, cursors in cases.items():
+                for cursor in cursors:
+                    for limit in ("1", "20"):
+                        with self.subTest(path=path, cursor=cursor, limit=limit):
+                            st, body, _ = fx.request(
+                                "GET",
+                                f"{path}?limit={limit}&cursor={_b64_cursor(cursor)}",
+                                ALICE,
+                            )
+                            self.assertEqual(st, 400, body)
+                            self.assertEqual(body["code"], "request.invalid")
+
+    def test_lone_surrogate_in_body_is_400(self):
+        surrogate = "\ud800"
+        with MomentsServer() as fx:
+            _s, m = _create(fx, ALICE, {"body": "m", "visibility": "server"})
+            mid = m["id"]
+            cases = [
+                ("POST", "/v1/moments", {"body": surrogate}),
+                ("POST", "/v1/moments", {"body": "ok", "media": [
+                    {"mxc_uri": "mxc://h/" + surrogate, "mimetype": "image/png"}]}),
+                ("POST", "/v1/moments", {"body": "ok", "media": [
+                    {"mxc_uri": "mxc://h/a", "mimetype": surrogate}]}),
+                ("POST", "/v1/moments", {"body": "ok", "allow_list": [surrogate]}),
+                ("POST", "/v1/moments", {surrogate: "x"}),
+                ("POST", f"/v1/moments/{mid}/comments", {"body": surrogate}),
+                ("POST", f"/v1/moments/{mid}/comments", {surrogate: 1}),
+                ("PATCH", f"/v1/moments/{mid}", {"revision": 1, "allow_list": [surrogate]}),
+                ("PATCH", f"/v1/moments/{mid}", {surrogate: 1}),
+            ]
+            for method, path, body in cases:
+                with self.subTest(method=method, path=path, body=repr(body)):
+                    st, resp, _ = fx.request(method, path, ALICE, body=body)
+                    self.assertEqual(st, 400, resp)
+                    self.assertEqual(resp["code"], "request.invalid")
+
+    def test_204_has_no_content_length(self):
+        with MomentsServer() as fx:
+            _s, m = _create(fx, ALICE, {"body": "m"})
+            req = urllib.request.Request(
+                fx.base + f"/v1/moments/{m['id']}", method="DELETE",
+            )
+            req.add_header("Authorization", "Bearer " + USER_TOKEN[ALICE])
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                self.assertEqual(resp.status, 204)
+                self.assertIsNone(resp.headers.get("Content-Length"))
+                self.assertEqual(resp.read(), b"")
 
 
 if __name__ == "__main__":

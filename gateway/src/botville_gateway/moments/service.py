@@ -74,6 +74,12 @@ def encode_cursor(payload: Dict[str, Any]) -> str:
     return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
 
 
+# 各列表游标的必需字段：m=动态（created_at, id），c=评论（created_at, id），
+# l=点赞（created_at, actor_id）。字段值必须是非空字符串。
+_CURSOR_FIELDS = {"m": ("c", "i"), "c": ("c", "i"), "l": ("c", "a")}
+_CURSOR_FIELD_MAX = 512
+
+
 def decode_cursor(cursor: str, kind: str) -> Dict[str, Any]:
     """不透明游标解析；非法（非 base64 / 非 JSON / kind 不符 / 缺字段）→
     400 request.invalid（契约：cursor 不透明，非法值是请求错误）。"""
@@ -84,6 +90,12 @@ def decode_cursor(cursor: str, kind: str) -> Dict[str, Any]:
         raise ValidationError("request.invalid", "invalid cursor") from exc
     if not isinstance(payload, dict) or payload.get("k") != kind:
         raise ValidationError("request.invalid", "invalid cursor")
+    # 合法 base64 + JSON 但缺字段 / 类型不对，同样是请求错误（400），
+    # 不能在后续 params["c"] 取值或元组比较时抛 KeyError / TypeError → 500。
+    for field in _CURSOR_FIELDS[kind]:
+        value = payload.get(field)
+        if not isinstance(value, str) or not value or len(value) > _CURSOR_FIELD_MAX:
+            raise ValidationError("request.invalid", "invalid cursor")
     return payload
 
 
@@ -355,9 +367,16 @@ class MomentsService:
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     def _idem_get(
-        self, scope: str, viewer: str, key: str, fingerprint: str
+        self, scope: str, viewer: str, target: Optional[str], key: str,
+        fingerprint: str,
     ) -> Optional[Dict[str, Any]]:
-        cache_key = (scope, viewer, key)
+        """幂等缓存查找。作用域 = (scope, viewer, 目标资源, key)：
+
+        与 #114 消息账本 `(conversation_id, sender, txnId)` 同一思路，同一 key
+        用在**另一个**目标资源上是另一次请求，不会命中前一个目标的回执。
+        调用方必须**先**完成鉴权 / 可见性判定再查缓存，保证重放也遵守 404 规则。
+        """
+        cache_key = (scope, viewer, target, key)
         with self._idem_lock:
             self._idem_evict_locked()
             entry = self._idem.get(cache_key)
@@ -380,10 +399,10 @@ class MomentsService:
             self._idem.pop(next(iter(self._idem)))
 
     def _idem_put(
-        self, scope: str, viewer: str, key: str,
+        self, scope: str, viewer: str, target: Optional[str], key: str,
         fingerprint: str, response: Dict[str, Any],
     ) -> None:
-        cache_key = (scope, viewer, key)
+        cache_key = (scope, viewer, target, key)
         with self._idem_lock:
             self._idem_evict_locked()
             self._idem[cache_key] = _IdemEntry(
@@ -549,9 +568,16 @@ class MomentsService:
         idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """POST /v1/moments。作者为调用者本人或其名下 AI persona。"""
+        # 授权先于幂等缓存：persona 归属被收回后，同 key 重放也必须 403，
+        # 不能拿旧回执绕过（与评论「先可见性再查缓存」同一原则）。
+        early_persona = payload.get("author_persona_id")
+        if isinstance(early_persona, str) and early_persona:
+            self._resolve_persona_author(viewer, early_persona)
         if idempotency_key is not None:
-            fingerprint = self._fingerprint(payload)
-            cached = self._idem_get("moment", viewer, idempotency_key, fingerprint)
+            fingerprint = self._fingerprint({"scope": "moment", "body": payload})
+            cached = self._idem_get(
+                "moment", viewer, None, idempotency_key, fingerprint
+            )
             if cached is not None:
                 return cached
         _reject_unknown(
@@ -605,7 +631,7 @@ class MomentsService:
         response = self._moment_response(moment, viewer)
         if idempotency_key is not None:
             self._idem_put(
-                "moment", viewer, idempotency_key, fingerprint, response
+                "moment", viewer, None, idempotency_key, fingerprint, response
             )
         return response
 
@@ -688,7 +714,8 @@ class MomentsService:
         moment = self._load_visible_moment(viewer, moment_id)
         self._require_owned_by(viewer, moment)
         self.store.soft_delete_post(moment.id, iso_utc(self._now()))
-        self._audit(moment.author_id, "delete", moment.id)
+        # 审计记实际操作者（owner 删 AI 动态时是 owner，不是 persona）。
+        self._audit(viewer, "delete", moment.id)
 
     # ------------------------------------------------------------ 评论
     def create_comment(
@@ -698,10 +725,20 @@ class MomentsService:
         payload: Dict[str, Any],
         idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """POST /v1/moments/{id}/comments：行为者恒为 viewer（human）。"""
+        """POST /v1/moments/{id}/comments：行为者恒为 viewer（human）。
+
+        顺序（#184 审查 B1）：先 `_load_visible_moment`（不存在 / 软删 / 不可见
+        → 404，含幂等重放），再按 (viewer, moment_id, key) 查幂等缓存；
+        moment_id 同时进缓存键与指纹，换目标动态不会重放前一条的 201。
+        """
+        moment = self._load_visible_moment(viewer, moment_id)
         if idempotency_key is not None:
-            fingerprint = self._fingerprint(payload)
-            cached = self._idem_get("comment", viewer, idempotency_key, fingerprint)
+            fingerprint = self._fingerprint(
+                {"scope": "comment", "moment_id": moment.id, "body": payload}
+            )
+            cached = self._idem_get(
+                "comment", viewer, moment.id, idempotency_key, fingerprint
+            )
             if cached is not None:
                 return cached
         # 公开路径不接受 author_persona_id（契约 additionalProperties:false）。
@@ -713,7 +750,6 @@ class MomentsService:
                 "request.invalid",
                 f"'body' must be at most {MAX_COMMENT_CHARS} characters", "body",
             )
-        moment = self._load_visible_moment(viewer, moment_id)
         reply_to = self._validate_reply_target(viewer, moment, payload)
         comment = self.store.insert_comment(
             id=self._ulid(),
@@ -729,7 +765,8 @@ class MomentsService:
         response = self._comment_response(comment)
         if idempotency_key is not None:
             self._idem_put(
-                "comment", viewer, idempotency_key, fingerprint, response
+                "comment", viewer, moment.id, idempotency_key, fingerprint,
+                response,
             )
         return response
 
@@ -748,9 +785,12 @@ class MomentsService:
         elif value is None:
             reply_to = None
         else:
-            raise UnprocessableError(
+            # 结构类型错（数字 / 对象 / 空串等）按契约 §1.3 是 400；moments.md §6
+            # 的统一 422 只覆盖「不存在 / 已软删 / 不同动态 / 不可见」四类语义非法。
+            raise ValidationError(
+                "request.invalid",
                 "'reply_to_comment_id' must be a ULID string",
-                field="reply_to_comment_id",
+                "reply_to_comment_id",
             )
         if reply_to is None:
             return None

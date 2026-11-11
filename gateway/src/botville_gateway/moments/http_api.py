@@ -54,8 +54,8 @@ def moment_not_found_problem(
 
 def _send_no_content(handler) -> None:
     """204 响应（无响应体）；头部语义与 handler._send_json 保持一致。"""
+    # RFC 9110 §8.6：204 不得带 Content-Length。
     handler.send_response(204)
-    handler.send_header("Content-Length", "0")
     handler.send_header("X-Request-Id", handler._request_id())
     handler.send_header("Cache-Control", "no-store")
     handler.end_headers()
@@ -234,12 +234,38 @@ def _route(
     handler._send_problem(404, "not_found", "Not Found")
 
 
+def _has_lone_surrogate(value: Any) -> bool:
+    """JSON 允许 `\\ud800` 这类孤立代理项转义，解析后是无法 UTF-8 编码的 str。
+
+    这种值写 SQLite / 回显时会抛 UnicodeEncodeError（→ 500），因此在入口统一
+    拒绝为 400（键和值都查，递归）。
+    """
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            return True
+        return False
+    if isinstance(value, dict):
+        return any(
+            _has_lone_surrogate(k) or _has_lone_surrogate(v)
+            for k, v in value.items()
+        )
+    if isinstance(value, list):
+        return any(_has_lone_surrogate(v) for v in value)
+    return False
+
+
 def _read_body(handler) -> Optional[Dict[str, Any]]:
     """读请求体；已发送 400 problem 时返回 None（调用方直接 return）。"""
     body, problem = handler._read_json()
     if problem is not None:
         handler._send_json(400, problem, problem=True)
         return None
+    if _has_lone_surrogate(body):
+        raise ValidationError(
+            "request.invalid", "request body contains invalid Unicode (lone surrogate)"
+        )
     return body
 
 
