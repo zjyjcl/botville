@@ -270,8 +270,10 @@ class BootstrapScriptTest(unittest.TestCase):
             reset_confirm="yes",
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("docker volume rm botville_continuwuity-data", proc.stdout)
+        self.assertIn("--profile continuwuity --profile gateway down -v", proc.stdout)
+        self.assertIn("docker volume rm -f <project>_gateway-data", proc.stdout)
         self.assertIn("never runs them", proc.stdout)
+        self.assertNotIn("docker volume rm botville_continuwuity-data", proc.stdout)
 
     def test_no_log_token_config_token_valid_means_bootstrapped(self):
         proc, hs = self.bootstrap("user_exists", QUIET_LOGS)

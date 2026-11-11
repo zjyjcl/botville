@@ -127,7 +127,9 @@ vi server/compose/.env
 ```bash
 make up          # = init.sh + docker compose --profile synapse up -d
 make ps          # 查看容器状态，等 postgres/synapse 都变 healthy
-make logs        # 跟踪日志（Ctrl-C 退出）
+                 # （始终带 push/gateway profile，与 make down 一样；不必再加
+                 # PUSH=1 / GATEWAY=1 才能看到已启动的服务）
+make logs        # 跟踪日志（Ctrl-C 退出；同样始终带这两个 profile）
 ```
 
 首次启动会拉取镜像并：postgres 建库（UTF-8、C locale）→ Synapse 自动建表、

@@ -80,12 +80,9 @@ COMPOSE="${COMPOSE_OVERRIDE:-$(default_compose)}"
 env_file="server/compose/.env"
 generated_config="server/compose/generated/synapse/homeserver.yaml"
 
-# Checksum line from manifest.txt for the given artifact name, if present.
-expected_sha() {
-    [[ -f "${backup_dir}/manifest.txt" ]] || return 1
-    sed -n "s/^\([0-9a-f]\{64\}\)  [0-9][0-9]*  $1\$/\1/p" "${backup_dir}/manifest.txt" | head -n 1
-}
-
+# Checksums come from lib.sh's manifest_sha (same helper as
+# verify_gateway_data_artifact). Missing manifest or missing entry yields
+# an empty string — the loop below treats those two cases differently.
 wait_for_health() {
     python3 - "$1" <<'PY'
 import sys
@@ -205,7 +202,7 @@ fi
 # swapped artifact goes unnoticed. Only a backup without any manifest falls
 # back to skipping verification (warned about above).
 for f in synapse-db.dump synapse-data.tar.gz homeserver.yaml env; do
-    expected="$(expected_sha "${f}")" || expected=""
+    expected="$(manifest_sha "${backup_dir}" "${f}")"
     if [[ -f "${backup_dir}/manifest.txt" && -z "${expected}" ]]; then
         echo "restore-synapse.sh: manifest.txt has no sha256 entry for ${f}" >&2
         exit 1

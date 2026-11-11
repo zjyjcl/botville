@@ -383,5 +383,43 @@ class EnvValueFromLastWinsTest(unittest.TestCase):
             self.assertEqual(proc.stdout.strip(), "second\n8018")
 
 
+
+class ManifestShaHelperTest(unittest.TestCase):
+    """restore-synapse.sh reuses lib.sh's manifest_sha; the helper itself
+    returns an empty string when the manifest or the entry is missing
+    (the restore loop already covers the end-to-end checksum cases)."""
+
+    def test_restore_synapse_reuses_lib_manifest_sha(self):
+        text = RESTORE.read_text(encoding="utf-8")
+        self.assertNotIn("expected_sha", text)
+        self.assertIn('manifest_sha "${backup_dir}"', text)
+        self.assertIn("manifest_sha()", (LIB.read_text(encoding="utf-8")))
+
+    def _manifest_sha(self, backup, name):
+        script = (
+            "set -euo pipefail; source {lib}; manifest_sha {backup} {name}"
+        ).format(lib=repr(str(LIB)), backup=repr(str(backup)), name=repr(name))
+        proc = subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True, timeout=10
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.strip()
+
+    def test_manifest_sha_empty_without_manifest_or_entry(self):
+        tmp = Path(tempfile.mkdtemp(prefix="botville-manifest-sha-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        self.assertEqual(self._manifest_sha(tmp, "env"), "")
+        (tmp / "manifest.txt").write_text(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            "  1  env\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self._manifest_sha(tmp, "homeserver.yaml"), "")
+        self.assertEqual(
+            self._manifest_sha(tmp, "env"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

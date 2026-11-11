@@ -55,11 +55,13 @@ ifeq ($(strip $(PORT)),)
 PORT := 8008
 endif
 
-# Optional push gateway (A1.2): PUSH=1 (also true/yes) on up/logs/ps adds
-# --profile push (sygnal; stacks onto any HS profile). `down` always carries
-# --profile push so a PUSH=1 stack tears down fully (sygnal and the compose
-# network would otherwise linger; idempotent when push was never started —
-# PUSH=0 does not opt out of `down`). Loopback port mirrors
+# Optional push gateway (A1.2): PUSH=1 (also true/yes) on `up` adds
+# --profile push (sygnal; stacks onto any HS profile). `down`, `ps` and
+# `logs` always carry --profile push (and --profile gateway, below) so a
+# PUSH=1 / GATEWAY=1 stack is fully visible and tears down fully without
+# repeating the flag; idempotent when that profile was never started —
+# PUSH=0 / GATEWAY=0 does not hide a running service from ps/logs or opt
+# out of `down`. Loopback port mirrors
 # BOTVILLE_PUSH_PORT; homeservers reach sygnal in-network at sygnal:5000.
 # `up` with PUSH=1 additionally force-recreates ONLY the sygnal container
 # after `up -d` (PR #127 B1): the APNs-related .env keys are consumed by
@@ -74,12 +76,13 @@ ifeq ($(strip $(PUSH_PORT)),)
 PUSH_PORT := 8019
 endif
 
-# Optional botville gateway (A2.2 / #7): GATEWAY=1 (also true/yes) on
-# up/logs/ps adds --profile gateway (built from gateway/Dockerfile; stacks
-# onto any HS profile, mounts the gateway-data volume). `up` with GATEWAY=1
-# first runs `compose build gateway` so the local image tracks the checkout
-# (cached layers make it cheap when nothing changed). Like push, `down` always
-# carries --profile gateway so a GATEWAY=1 stack tears down fully; `down`
+# Optional botville gateway (A2.2 / #7): GATEWAY=1 (also true/yes) on `up`
+# adds --profile gateway (built from gateway/Dockerfile; stacks onto any HS
+# profile, mounts the gateway-data volume). `up` with GATEWAY=1 first runs
+# `compose build gateway` so the local image tracks the checkout (cached
+# layers make it cheap when nothing changed). `down`, `ps` and `logs` always
+# carry --profile gateway (same as push, above) so a GATEWAY=1 stack is
+# fully visible and tears down fully without repeating the flag; `down`
 # never passes -v, so no volume (gateway-data included) is deleted by it.
 GATEWAY ?=
 GATEWAY_PROFILE := $(if $(filter 1 true yes,$(GATEWAY)),--profile gateway,)
@@ -123,10 +126,10 @@ down:
 	$(COMPOSE) --profile $(HS) --profile push --profile gateway down --remove-orphans
 
 logs:
-	$(COMPOSE) --profile $(HS) $(PUSH_PROFILE) $(GATEWAY_PROFILE) logs -f --tail=200
+	$(COMPOSE) --profile $(HS) --profile push --profile gateway logs -f --tail=200
 
 ps:
-	$(COMPOSE) --profile $(HS) $(PUSH_PROFILE) $(GATEWAY_PROFILE) ps
+	$(COMPOSE) --profile $(HS) --profile push --profile gateway ps
 
 smoke: init
 	python3 server/tests/smoke.py \

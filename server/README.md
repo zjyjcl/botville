@@ -28,8 +28,9 @@ make push-e2e        # 推送验收：HS→sygnal 时延 <5s（mock pushkin，�
 make appservice-e2e  # 验收：网关以 @ai_* 身份代发（A1.3；synapse/tuwunel）
 make federation-e2e  # 配对联邦验收（A2.1；独立 botville-fed 项目，双 Synapse + fedgate）
 make federation-down # 只销毁 botville-fed 项目（down -v）
-make logs            # 跟踪日志
-make ps              # 容器状态
+make logs            # 跟踪日志（与 make down 一样始终带 push/gateway profile，
+                     # 不必再加 PUSH=1 / GATEWAY=1 才能看到已启动的服务）
+make ps              # 容器状态（同上）
 make down            # 停止（不传 -v，不删任何卷）。清卷：docker compose ... --profile <hs> --profile gateway down -v
                      # （带 gateway profile 才删 gateway-data）；单删：docker volume rm -f <项目名>_gateway-data
 ```
@@ -83,8 +84,12 @@ continuwuity 默认关闭上游 announcements 检查（避免 SIGTERM 卡到 SIG
   `BOTVILLE_BOOTSTRAP_TIMEOUT`（等待客户端 API 就绪的秒数，默认 180）、
   `COMPOSE`（docker compose 命令前缀）。密码与令牌经环境变量传给 python，不进 argv、不回显。
 - 重置（仅手动，⚠️ 不可恢复：会删除该实例全部账号与消息；生产/NAS 上执行前务必先备份并二次确认，勿在已有数据的部署上执行）：bootstrap 脚本不会删除或重置任何数据。确需丢弃 continuwuity 全部数据
-  从零开始时，手动执行：
-  `docker compose -f server/compose/docker-compose.yml --env-file server/compose/.env --profile continuwuity down && docker volume rm botville_continuwuity-data && make up HS=continuwuity`。
+  从零开始时，手动执行（`make down` 不传 `-v`，不会删任何卷）：
+  `docker compose -f server/compose/docker-compose.yml --env-file server/compose/.env --profile continuwuity --profile gateway down -v && make up HS=continuwuity`。
+  有网关服务挂载时，带 `--profile gateway` 的 `down -v` 会连 `gateway-data` 一起删；
+  未启用网关或需单独删除时用 `docker volume rm -f <项目名>_gateway-data`
+  （项目名取 `.env` 的 `COMPOSE_PROJECT_NAME`，默认 `botville`）。要用网关再加
+  `make up HS=continuwuity GATEWAY=1`。
   带 `BOTVILLE_BOOTSTRAP_RESET_CONFIRM=yes` 运行 bootstrap 脚本可以让它打印这组命令
   （同样只打印、绝不自动执行）。
 - 环境变量读取：`init.sh`、bootstrap 脚本与 Makefile 直接读 `server/compose/.env`，

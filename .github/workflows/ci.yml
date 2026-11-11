@@ -322,6 +322,11 @@ jobs:
             echo "::error::down -v left ${GATEWAY_VOLUME} behind"
             exit 1
           fi
+          leftover="$(docker volume ls -q --filter "label=com.docker.compose.project=${PROJECT}")"
+          if [ -n "${leftover}" ]; then
+            echo "::error::down -v left volumes behind: ${leftover}"
+            exit 1
+          fi
 
       - name: Restart empty stack, restore gateway-data
         run: |
