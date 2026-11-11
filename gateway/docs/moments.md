@@ -267,8 +267,8 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
 - `reply_to_comment_id`：目标评论不存在、已软删、或不在同一动态、或对当前查看者不可见（`can_view ∧ can_see_interaction` 为假）时，**统一**返回 `422` `request.invalid`（`errors[].field = reply_to_comment_id`），不区分原因，避免靠 404/422 差异探评论 ULID。
   **格式不像 ULID 的字符串**同样按「目标不存在」返回 422（类型对、值找不到属语义错误）；
   只有**类型错误**（数字、布尔、对象、数组、空串）返回 `400` `request.invalid`。
-  显式 `null` 视同省略（顶层评论，`201`）；OpenAPI 请求 schema 仍声明为 `string`，
-  客户端应省略该字段而不是发 `null`。
+  显式 `null` 视同省略（顶层评论，`201`）。OpenAPI 请求 schema 为 `string | null`
+  （`type: [string, 'null']`），与实现一致；建议客户端省略该字段而不是发 `null`。
 - **幂等作用域与重放**（实现口径，登记于 `contract.md` §1.5「动态端点」）：缓存键为
   `(操作, 调用者, 目标资源, key)`，评论的目标资源是 `moment_id`；persona 归属与目标动态
   可见性**先于**幂等缓存判定。因此动态被删除、或与作者解除好友后，用原
