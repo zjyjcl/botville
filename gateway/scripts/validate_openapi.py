@@ -84,6 +84,10 @@ EXAMPLE_TARGETS = {
     "audit-record.json": "#/paths/~1audit~1{audit_id}/get/responses/200/content/application~1json/schema",
     "session-token.json": "#/paths/~1capabilities~1{capability_id}~1session-tokens/post/responses/201/content/application~1json/schema",
     "problem.json": "#/components/responses/Forbidden/content/application~1problem+json/schema",
+    # #124 OpenID App 接入：/moments* 终端用户身份校验的实际输出
+    "problem-auth-missing.json": "#/components/responses/Unauthorized/content/application~1problem+json/schema",
+    "problem-auth-invalid-token.json": "#/components/responses/Unauthorized/content/application~1problem+json/schema",
+    "problem-homeserver-unavailable.json": "#/components/responses/InternalError/content/application~1problem+json/schema",
     "problem-conversation-e2ee.json": "#/paths/~1conversations~1{conversation_id}~1messages/post/responses/403/content/application~1problem+json/schema",
     "problem-create-conversation-e2ee.json": "#/paths/~1conversations/post/responses/422/content/application~1problem+json/schema",
     # A2.2 moments (issue #7)

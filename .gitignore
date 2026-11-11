@@ -25,6 +25,7 @@ __pycache__/
 *.pyc
 .venv/
 # Apple
+/app-apple/Config/Local.xcconfig
 DerivedData/
 *.xcuserstate
 xcuserdata/
