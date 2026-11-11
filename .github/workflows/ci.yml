@@ -5,15 +5,19 @@
 #         All three profiles are required-green; images are pinned
 #         (tag@sha256 digest), so failures are real failures.
 # backup-restore (A1.1, synapse only): init -> open registration -> up
-#         with GATEWAY=1 (synapse + gateway profiles) -> e2e seed -> marker
-#         in gateway-data via the running gateway -> backup (must contain
-#         gateway-data.tar.gz) -> down -v (wipe) -> up (fresh stack) ->
-#         restore -> e2e verify + gateway-data marker/migrations/health.
+#         with GATEWAY=1 (synapse + gateway profiles, appservice transport) ->
+#         e2e seed -> marker in gateway-data via the running gateway ->
+#         gateway-hs-smoke (startup whoami + OpenID userinfo) -> backup
+#         (must contain gateway-data.tar.gz) -> down -v (wipe) -> up
+#         (fresh stack) -> restore -> e2e verify + gateway-data marker/
+#         migrations/health + gateway-hs-smoke again.
 # gateway-compose (A2.2, tuwunel + continuwuity): gateway image builds and
 #         ships the moments migrations (non-root), `config --volumes` lists
 #         gateway-data, up with GATEWAY=1 -> /health + migrations applied ->
-#         make backup-gateway -> down -v (wipe) -> up -> make restore-gateway
-#         -> marker + /health verify.
+#         tuwunel: appservice + gateway-hs-smoke; continuwuity: memory
+#         transport (no file-based appservice) -> make backup-gateway ->
+#         down -v (wipe) -> up -> make restore-gateway -> marker + /health
+#         verify (tuwunel also re-runs gateway-hs-smoke).
 # gateway-data deletion, as these jobs do it (and the docs say): the volume
 #         is deleted by `docker compose ... --profile gateway down -v`, i.e.
 #         only while the gateway service (which mounts it) is in the active
@@ -51,8 +55,8 @@
 #         Certs/configs/tokens are generated at run time (gitignored).
 # lint:   compose config for all three profiles (each also with push and
 #         with gateway; + the federation stack),
-#         shellcheck, python syntax, stdlib unit tests for the bootstrap/
-#         init scripts and the pairing package (no Docker),
+#         shellcheck, python syntax, server/ and pairing package tests
+#         (stdlib mocks; compose probes use Docker when available),
 #         notify/gateway contract validation, a guard that the App pairing-qr
 #         fixtures stay a byte-identical copy of
 #         docs/contracts/examples/pairing-qr (#128/#132), a guard that
@@ -171,6 +175,9 @@ jobs:
           ${STACK} exec -T gateway sh -c 'printf "botville-gateway-data-seed\n" > /var/lib/botville-gateway/ci-seed.txt'
           docker volume inspect "${GATEWAY_VOLUME}" >/dev/null
 
+      - name: Gateway homeserver smoke (whoami + OpenID userinfo)
+        run: make gateway-hs-smoke
+
       - name: Backup
         run: |
           set -euo pipefail
@@ -217,12 +224,15 @@ jobs:
           ${STACK} exec -T gateway grep -qx botville-gateway-data-seed /var/lib/botville-gateway/ci-seed.txt
           ${STACK} exec -T gateway python -c "import sqlite3; c = sqlite3.connect('/var/lib/botville-gateway/moments.db'); assert c.execute('select count(*) from moments_schema_migrations').fetchone()[0] >= 1"
           port="$(sed -n 's/^BOTVILLE_GATEWAY_PORT=//p' server/compose/.env | tail -n 1)"
-          for _ in $(seq 1 30); do
-            curl -fsS "http://127.0.0.1:${port:-8020}/health" && exit 0
+          for _ in $(seq 1 60); do
+            curl -fsS "http://127.0.0.1:${port:-8020}/health" && break
             sleep 2
           done
-          echo "::error::gateway /health not OK after restore"
-          exit 1
+          curl -fsS "http://127.0.0.1:${port:-8020}/health" >/dev/null \
+            || { echo "::error::gateway /health not OK after restore"; exit 1; }
+
+      - name: Gateway homeserver smoke after restore (whoami + OpenID userinfo)
+        run: make gateway-hs-smoke
 
       - name: Dump logs
         if: failure()
@@ -295,13 +305,27 @@ jobs:
         run: |
           set -euo pipefail
           ok=0
-          for _ in $(seq 1 30); do
+          for _ in $(seq 1 60); do
             if curl -fsS "http://127.0.0.1:${GATEWAY_PORT}/health"; then ok=1; break; fi
             sleep 2
           done
           [ "${ok}" = 1 ] || { echo "::error::gateway /health not OK"; exit 1; }
           ${STACK} exec -T gateway python -c "import sqlite3; c = sqlite3.connect('/var/lib/botville-gateway/moments.db'); assert c.execute('select count(*) from moments_schema_migrations').fetchone()[0] >= 1"
           ${STACK} exec -T gateway sh -c 'printf "botville-gateway-data-seed\n" > /var/lib/botville-gateway/ci-seed.txt'
+
+      - name: Gateway transport and homeserver smoke
+        run: |
+          set -euo pipefail
+          # printenv of this one key only — never dump the whole environment
+          # (it contains tokens).
+          transport="$(${STACK} exec -T gateway printenv GATEWAY_MATRIX_TRANSPORT)"
+          echo "GATEWAY_MATRIX_TRANSPORT=${transport}"
+          if [ "${{ matrix.homeserver }}" = continuwuity ]; then
+            test "${transport}" = memory
+          else
+            test "${transport}" = appservice
+            make gateway-hs-smoke
+          fi
 
       - name: Backup gateway-data (make backup-gateway)
         run: |
@@ -338,12 +362,15 @@ jobs:
         run: |
           set -euo pipefail
           ${STACK} exec -T gateway grep -qx botville-gateway-data-seed /var/lib/botville-gateway/ci-seed.txt
-          for _ in $(seq 1 30); do
-            curl -fsS "http://127.0.0.1:${GATEWAY_PORT}/health" && exit 0
+          for _ in $(seq 1 60); do
+            curl -fsS "http://127.0.0.1:${GATEWAY_PORT}/health" && break
             sleep 2
           done
-          echo "::error::gateway /health not OK after restore"
-          exit 1
+          curl -fsS "http://127.0.0.1:${GATEWAY_PORT}/health" >/dev/null \
+            || { echo "::error::gateway /health not OK after restore"; exit 1; }
+          if [ "${{ matrix.homeserver }}" != continuwuity ]; then
+            make gateway-hs-smoke
+          fi
 
       - name: Dump logs
         if: failure()
@@ -527,7 +554,7 @@ jobs:
             server/pairing/__init__.py server/pairing/store.py server/pairing/service.py \
             server/pairing/fedgate.py server/pairing/validate.py
 
-      - name: Bootstrap/init script unit tests (stdlib mock, no Docker)
+      - name: Server tests (stdlib mock; compose probes use Docker when available)
         run: python3 -m unittest discover -s server/tests -p "test_*.py" -v
 
       # Issue #4: no APNs keys (.p8) or PEM private-key headers may ever be
@@ -556,14 +583,18 @@ jobs:
         run: |
           bash server/scripts/init.sh
           for hs in synapse tuwunel continuwuity; do
+            if [ "${hs}" = continuwuity ]; then transport=memory; else transport=appservice; fi
             echo "== docker compose config --profile ${hs}"
-            docker compose -f server/compose/docker-compose.yml \
+            BOTVILLE_HOMESERVER="${hs}" GATEWAY_MATRIX_TRANSPORT="${transport}" \
+              docker compose -f server/compose/docker-compose.yml \
               --env-file server/compose/.env --profile "${hs}" config --quiet
             echo "== docker compose config --profile ${hs} --profile push (A1.2)"
-            docker compose -f server/compose/docker-compose.yml \
+            BOTVILLE_HOMESERVER="${hs}" GATEWAY_MATRIX_TRANSPORT="${transport}" \
+              docker compose -f server/compose/docker-compose.yml \
               --env-file server/compose/.env --profile "${hs}" --profile push config --quiet
             echo "== docker compose config --profile ${hs} --profile gateway (A2.2)"
-            docker compose -f server/compose/docker-compose.yml \
+            BOTVILLE_HOMESERVER="${hs}" GATEWAY_MATRIX_TRANSPORT="${transport}" \
+              docker compose -f server/compose/docker-compose.yml \
               --env-file server/compose/.env --profile "${hs}" --profile gateway config --quiet
           done
           echo "== docker compose config (federation, A2.1)"

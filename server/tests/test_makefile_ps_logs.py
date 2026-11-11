@@ -63,6 +63,17 @@ class MakefilePsLogsProfilesTest(unittest.TestCase):
         self.assertIn("$(PUSH_PROFILE)", recipe)
         self.assertIn("$(GATEWAY_PROFILE)", recipe)
 
+    def test_up_exports_homeserver_url_and_transport(self):
+        """`make up HS=...` must export BOTVILLE_HOMESERVER and
+        GATEWAY_MATRIX_TRANSPORT so compose interpolation matches the
+        profile actually started."""
+        recipe = "\n".join(target_recipe("up"))
+        self.assertIn("$(GATEWAY_HS_ENV)", recipe)
+        makefile = MAKEFILE.read_text(encoding="utf-8")
+        self.assertIn("GATEWAY_HS_ENV := BOTVILLE_HOMESERVER=$(HS) GATEWAY_MATRIX_TRANSPORT=$(GATEWAY_TRANSPORT)", makefile)
+        self.assertIn("GATEWAY_TRANSPORT := memory", makefile)
+        self.assertIn("GATEWAY_TRANSPORT := appservice", makefile)
+
 
 if __name__ == "__main__":
     unittest.main()

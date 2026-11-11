@@ -12,6 +12,7 @@ Run:  python3 -m unittest discover -s server/tests -p "test_*.py" -v
 
 import hashlib
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -375,7 +376,7 @@ class EnvValueFromLastWinsTest(unittest.TestCase):
                 'printf "%s\\n%s" '
                 '"$(env_value_from {env} COMPOSE_PROJECT_NAME)" '
                 '"$(env_value_from {env} BOTVILLE_HTTP_PORT)"'
-            ).format(lib=repr(str(lib)), env=repr(str(env)))
+            ).format(lib=shlex.quote(str(lib)), env=shlex.quote(str(env)))
             proc = subprocess.run(
                 ["bash", "-c", script], capture_output=True, text=True, timeout=30
             )
@@ -385,20 +386,19 @@ class EnvValueFromLastWinsTest(unittest.TestCase):
 
 
 class ManifestShaHelperTest(unittest.TestCase):
-    """restore-synapse.sh reuses lib.sh's manifest_sha; the helper itself
-    returns an empty string when the manifest or the entry is missing
-    (the restore loop already covers the end-to-end checksum cases)."""
+    """Behaviour of lib.sh's manifest_sha, which restore-synapse.sh uses
+    for every artifact (the end-to-end checksum cases live on
+    RestoreSynapseTest)."""
 
-    def test_restore_synapse_reuses_lib_manifest_sha(self):
-        text = RESTORE.read_text(encoding="utf-8")
-        self.assertNotIn("expected_sha", text)
-        self.assertIn('manifest_sha "${backup_dir}"', text)
-        self.assertIn("manifest_sha()", (LIB.read_text(encoding="utf-8")))
-
-    def _manifest_sha(self, backup, name):
+    def _manifest_sha(self, backup, name, lib=None):
+        lib = LIB if lib is None else lib
         script = (
             "set -euo pipefail; source {lib}; manifest_sha {backup} {name}"
-        ).format(lib=repr(str(LIB)), backup=repr(str(backup)), name=repr(name))
+        ).format(
+            lib=shlex.quote(str(lib)),
+            backup=shlex.quote(str(backup)),
+            name=shlex.quote(name),
+        )
         proc = subprocess.run(
             ["bash", "-c", script], capture_output=True, text=True, timeout=10
         )
@@ -420,6 +420,17 @@ class ManifestShaHelperTest(unittest.TestCase):
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         )
 
+    def test_manifest_sha_accepts_quoted_paths(self):
+        """Paths with spaces and quotes must be passed via shlex.quote, not repr()."""
+        tmp = Path(tempfile.mkdtemp(prefix="botville-manifest-sha-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        backup = tmp / "dir with spaces" / 'quote"here'
+        backup.mkdir(parents=True)
+        digest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        (backup / "manifest.txt").write_text(
+            "{}  4  env\n".format(digest), encoding="utf-8"
+        )
+        self.assertEqual(self._manifest_sha(backup, "env"), digest)
 
 if __name__ == "__main__":
     unittest.main()

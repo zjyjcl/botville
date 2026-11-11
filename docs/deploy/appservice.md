@@ -128,10 +128,25 @@ sender → **400 `request.invalid`**；房间别名不存在 → **404
   渲染进注册文件曾被证实会让 Synapse 接受**无鉴权**的 `@ai_*` 注册，因此
   三层都不放行。init.sh 全程 `umask 077` 并无条件 `chmod 600` `.env` 与渲染
   产物。
-- `url: null` 是有意为之：M1 网关不接收 HS 推送的事务，null 让 HS 无处可推、
-  也不会重试。A2 网关开始接收事务时改为 `http://gateway:<port>`。compose 的
-  可选 `gateway` profile（A2.2，`make up GATEWAY=1`）已有网关容器（容器端口
-  8080），但目前用内存传输、不接收事务，注册文件仍保持 `url: null`。
+- `url: null` 是有意为之：网关目前不接收 HS 推送的事务，null 让 HS 无处可推、
+  也不会重试。接收事务（改注册 `url`、处理 ping / hs_token）是后续 B 线的工作，
+  **本部署不要把 `url` 改成 `http://gateway:8080`**。
+- compose 的可选 `gateway` profile（`make up GATEWAY=1`）已经把网关接到
+  homeserver 的 Client-Server API 上（只代发、不收事务）：
+  - synapse / tuwunel：`GATEWAY_MATRIX_TRANSPORT=appservice`，
+    `GATEWAY_HOMESERVER_URL=http://${BOTVILLE_HOMESERVER}:8008`（服务名，不要写
+    `127.0.0.1`），`GATEWAY_MATRIX_SERVER_NAME=${BOTVILLE_SERVER_NAME}`，
+    `GATEWAY_AS_TOKEN=${APPSERVICE_AS_TOKEN}`（同一份 as_token，不另造），
+    `GATEWAY_HOMESERVER_FEDERATION_URL` 留空（OpenID userinfo 走内网直连）。
+    `hs_token` 不进网关。
+  - continuwuity：仍用 `memory`。它还没有文件方式的 appservice 注册，切到
+    appservice 后启动 whoami 会失败、容器会反复退出。
+  - 运维注意：appservice 模式下网关启动会 whoami，失败即退出（`restart:
+    unless-stopped`，并对当前 HS `depends_on`）；改 `BOTVILLE_SERVER_NAME` 时
+    注册正则和 `GATEWAY_MATRIX_SERVER_NAME` 要同步改；轮换 `APPSERVICE_AS_TOKEN`
+    时 HS 与网关必须同时切换；不要跑两个会接收事务的网关副本；明文 `http://`
+    只允许 loopback 或单标签服务名。
+  - 验收：`make gateway-hs-smoke`（whoami + OpenID userinfo；不打印 token）。
 
 ## 注册方式差异
 
@@ -160,7 +175,8 @@ Tuwunel 的 `appservice_dir`（`[global]` 配置项，容器环境变量
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `GATEWAY_MATRIX_TRANSPORT` | `memory` | `memory`=内存假后端（B1.1 现状）；`appservice`=真实代发 |
-| `GATEWAY_HOMESERVER_URL` | — | homeserver 的 Client-Server API 地址（如 `http://127.0.0.1:8008`）；明文 `http://` 只允许 loopback（`localhost`/`127.0.0.1`/`::1`）与无点单标签容器名（如 `synapse`/`tuwunel`），其余（含任意非 `::1` 的 IPv6、空 host）拒绝；跨主机必须 `https://` |
+| `GATEWAY_HOMESERVER_URL` | — | homeserver 的 Client-Server API 地址。compose 里是 `http://${BOTVILLE_HOMESERVER}:8008`（容器内服务名；不要写 `127.0.0.1`）。明文 `http://` 只允许 loopback（`localhost`/`127.0.0.1`/`::1`）与无点单标签容器名（如 `synapse`/`tuwunel`），其余（含任意非 `::1` 的 IPv6、空 host）拒绝；跨主机必须 `https://` |
+| `GATEWAY_HOMESERVER_FEDERATION_URL` | *(空)* | OpenID userinfo 专用基址；**留空则回落到 `GATEWAY_HOMESERVER_URL`**。compose 里刻意留空，走内网直连，不要指向 fedgate 或公网 |
 | `GATEWAY_MATRIX_SERVER_NAME` | — | homeserver 的 `server_name`（主机名或 IP，可带 `:端口`；统一小写），用于命名空间校验 |
 | `GATEWAY_AS_TOKEN` | — | 与 `server/compose/.env` 的 `APPSERVICE_AS_TOKEN` 一致；非空、≥32 字符、不含空白，否则拒绝启动 |
 | `GATEWAY_HMAC_SECRET` | — | **必填**（#114 PR-a / N10）：**只接受十六进制**，至少 **64 个 hex 字符**（= 32 字节），拒绝全零；用于 txnId 与 `text_sha256` 的 HMAC。留空、为 `<change-me>` 或非 hex 时网关拒绝启动（fail-closed）。生成：`python3 -c 'import secrets;print(secrets.token_hex(32))'` |

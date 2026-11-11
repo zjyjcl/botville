@@ -80,8 +80,14 @@ curl -s -X POST localhost:8080/v1/conversations/conv_demo/messages \
 容器方式（A2.2 / #7）：`gateway/Dockerfile` 基于固定 digest 的 `python:3.12-slim`（自带
 时区库），按仓库布局放入 `src/` 与 `migrations/`，非 root（uid 10001）运行，不含密钥。
 部署栈里用 `make up GATEWAY=1` 起（compose `gateway` profile，宿主端口只绑
-`127.0.0.1:${BOTVILLE_GATEWAY_PORT:-8020}`，数据在卷 `gateway-data`），见
-[docs/moments.md](docs/moments.md) §8 与 `docs/deploy/z423-synapse.md`。
+`127.0.0.1:${BOTVILLE_GATEWAY_PORT:-8020}`，数据在卷 `gateway-data`）。
+synapse / tuwunel 用 `appservice` 传输（`GATEWAY_HOMESERVER_URL=http://<服务名>:8008`，
+`GATEWAY_AS_TOKEN` 即 `APPSERVICE_AS_TOKEN`，注册 `url` 仍为 `null`）；
+continuwuity 仍用 `memory`（尚无文件注册）。运维注意见
+[docs/deploy/appservice.md](../docs/deploy/appservice.md) 与
+[docs/deploy/z423-synapse.md](../docs/deploy/z423-synapse.md)；卷与备份见
+[docs/moments.md](docs/moments.md) §8。`make gateway-hs-smoke` 可对真实 HS
+做 whoami + OpenID userinfo 冒烟（不打印 token）。
 
 ### HTTP 端点（子集）
 

@@ -309,17 +309,40 @@ curl -s http://127.0.0.1:8020/health   # 端口 = .env 的 BOTVILLE_GATEWAY_PORT
 镜像由 `gateway/Dockerfile` 在本机构建（固定 digest 的 `python:3.12-slim` + 网关源码 +
 `gateway/migrations/moments/`，以非 root 的 uid 10001 运行，不含任何密钥）；
 `GATEWAY_AUTH_TOKEN` / `GATEWAY_HMAC_SECRET` 由 init.sh 生成到 `.env` 的
-`BOTVILLE_GATEWAY_AUTH_TOKEN` / `BOTVILLE_GATEWAY_HMAC_SECRET`。compose 里的网关目前用
-内存 Matrix 传输（不连 homeserver；appservice 接线见 [appservice.md](appservice.md)）。
+`BOTVILLE_GATEWAY_AUTH_TOKEN` / `BOTVILLE_GATEWAY_HMAC_SECRET`。
+
+`make up GATEWAY=1` 会按 homeserver profile 给网关接线（详见 [appservice.md](appservice.md)）：
+
+- **synapse / tuwunel**：`GATEWAY_MATRIX_TRANSPORT=appservice`，
+  `GATEWAY_HOMESERVER_URL=http://<服务名>:8008`（`BOTVILLE_HOMESERVER` 就是 compose
+  服务名，容器里不要写 `127.0.0.1`），`GATEWAY_MATRIX_SERVER_NAME=${BOTVILLE_SERVER_NAME}`，
+  `GATEWAY_AS_TOKEN` 注入现有的 `APPSERVICE_AS_TOKEN`（同一份值，不另造一份），
+  `GATEWAY_HOMESERVER_FEDERATION_URL` 留空（OpenID userinfo 回落到上面的内网地址，
+  不走 fedgate 或公网）。注册文件的 `url` 仍是 `null`（不接收 HS→AS 事务）。
+- **continuwuity**：仍用 `memory` 传输。它还没有文件方式的 appservice 注册，切到
+  appservice 后网关启动 whoami 会失败并反复退出。
+- 切到 appservice 后，网关启动会请求 HS 的 whoami，失败就退出；compose 里
+  `restart: unless-stopped`，并对当前 HS 设了 `depends_on`（synapse 等 healthy，
+  tuwunel 等 started——后者镜像没有 healthcheck）。HS 未就绪时会自动重启几次。
+- 改 `BOTVILLE_SERVER_NAME` 时，注册正则（init.sh 渲染）和
+  `GATEWAY_MATRIX_SERVER_NAME` 要一起改，并重启 homeserver 与网关。
+- 轮换 `APPSERVICE_AS_TOKEN` 时必须让 HS（重新渲染注册文件并重启）和网关
+  （同一变量注入为 `GATEWAY_AS_TOKEN`）同时切换。
+- 不要跑两个会接收事务的网关副本。
+- 明文 `http://` 时，网关只允许 loopback 或单标签服务名（`http://synapse:8008` /
+  `http://tuwunel:8008` 可以；不要开 `GATEWAY_ALLOW_INSECURE_HS`）。
+
+本地或 CI 冒烟：`make gateway-hs-smoke`（`/health` 的 matrix 检查 = 启动 whoami；
+再用 OpenID token 打 `GET /v1/moments` 校验内网 userinfo）。脚本不会打印任何 token。
 
 网关挂载 compose 卷 `gateway-data`（实际名 `<项目名>_gateway-data`）到
 `/var/lib/botville-gateway`，`GATEWAY_MOMENTS_DB_PATH=/var/lib/botville-gateway/moments.db`，
 启动时自动执行镜像内的 moments 迁移。删除语义：
 
 - `make down` **不传** `-v`，不删除任何卷（包括 `gateway-data`）。
-- `docker compose ... --profile gateway down -v`（带上 gateway profile，此时有服务挂载
-  该卷）会连同其他卷一起删掉 `gateway-data`。**不带** `--profile gateway` 时 compose
-  不认为该卷在用，`down -v` 删不掉它，`docker compose config --volumes` 也不列它。
+- `docker compose ... --profile gateway down -v`（只要带上 gateway profile，与网关
+  容器是否正在运行无关）会连同其他卷一起删掉 `gateway-data`。**不带** `--profile gateway`
+  时 compose 不认为该卷在用，`down -v` 删不掉它，`docker compose config --volumes` 也不列它。
 - 任何时候都可以单独删除：
 
 ```bash
@@ -411,7 +434,7 @@ drop/recreate 数据库（UTF8、C locale）→ `pg_restore` → 恢复数据卷
 make e2e E2E_PHASE=seed                  # ① 造数据：三用户、私聊、群、消息
 make backup                             # ② 备份（记下输出的目录）
 make down                               # ③ 停栈（make down 不删卷）
-# 带上 --profile gateway：gateway-data 有服务挂载，down -v 会一起删掉
+# 带上 --profile gateway：down -v 就会删掉 gateway-data（与容器是否在跑无关）
 docker compose -f server/compose/docker-compose.yml \
   --env-file server/compose/.env --profile synapse --profile gateway down -v --remove-orphans
 # 没带 --profile gateway 时它不会被删，需要：docker volume rm -f <项目名>_gateway-data

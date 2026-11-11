@@ -256,12 +256,42 @@ services:
     # Botville gateway (A2.2 / #7), optional `gateway` profile -- stacks onto
     # any homeserver profile like `push`: `make up GATEWAY=1` /
     # `make up HS=tuwunel GATEWAY=1`. Not part of the default `make up`
-    # (see docs/deploy/z423-synapse.md "网关服务"): it needs its own secrets
-    # and its homeserver wiring (appservice transport) is still open.
+    # (see docs/deploy/z423-synapse.md "网关服务").
     # Built locally from gateway/Dockerfile (stdlib-only Python on the pinned
     # python:3.12-slim base; the FROM line is pinned by digest and checked in
     # CI). No image: line on purpose -- compose names the local build
     # <project>-gateway, and nothing is pulled for it.
+    #
+    # Homeserver wiring (still no HS->AS transactions: the registration url
+    # stays null, see server/compose/appservice/botville-gateway.yaml.tmpl):
+    #   - Transport is selected per HS profile by `make up`, which exports
+    #     GATEWAY_MATRIX_TRANSPORT (appservice for synapse and tuwunel, which
+    #     load the registration file; memory for continuwuity, which has no
+    #     file-based registration -- appservice would crash-loop on whoami).
+    #     Default below is memory so `compose config` and a bare
+    #     `--profile gateway` stay safe.
+    #   - GATEWAY_HOMESERVER_URL uses the compose *service name*
+    #     (BOTVILLE_HOMESERVER: synapse / tuwunel / continuwuity) on container
+    #     port 8008, never 127.0.0.1 (that would be this container). `make up
+    #     HS=...` exports BOTVILLE_HOMESERVER so a one-off HS= override is not
+    #     stuck on a stale .env value.
+    #   - GATEWAY_HOMESERVER_FEDERATION_URL is empty: OpenID userinfo falls
+    #     back to GATEWAY_HOMESERVER_URL (in-stack, not fedgate or the public
+    #     federation address).
+    #   - GATEWAY_AS_TOKEN is the existing APPSERVICE_AS_TOKEN (same value,
+    #     two names); hs_token is not passed to the gateway.
+    #   - In appservice mode the process whoami's the HS at startup and exits
+    #     if that fails; restart: unless-stopped retries, and depends_on
+    #     waits for the active HS (synapse: healthy; tuwunel/continuwuity:
+    #     started -- those images have no healthcheck). required: false so a
+    #     dependency whose profile is off is ignored.
+    #   - Do not run two gateway replicas that would receive transactions.
+    #   - Plain http is allowed only for loopback or a single-label service
+    #     name; http://synapse:8008 / http://tuwunel:8008 qualify.
+    # Changing BOTVILLE_SERVER_NAME must stay in sync with the registration
+    # regex (init.sh) and GATEWAY_MATRIX_SERVER_NAME (below). Rotating
+    # APPSERVICE_AS_TOKEN requires re-rendering the registration and
+    # recreating both the HS and the gateway so they switch together.
     build:
       context: ../../gateway
       dockerfile: Dockerfile
@@ -276,9 +306,11 @@ services:
       # :- empty defaults only keep `compose config` working before init.
       GATEWAY_AUTH_TOKEN: ${BOTVILLE_GATEWAY_AUTH_TOKEN:-}
       GATEWAY_HMAC_SECRET: ${BOTVILLE_GATEWAY_HMAC_SECRET:-}
-      # In-memory Matrix transport: the compose gateway does not talk to the
-      # homeserver yet (appservice wiring = later PR, docs/deploy/appservice.md).
-      GATEWAY_MATRIX_TRANSPORT: memory
+      GATEWAY_MATRIX_TRANSPORT: ${GATEWAY_MATRIX_TRANSPORT:-memory}
+      GATEWAY_HOMESERVER_URL: http://${BOTVILLE_HOMESERVER:-synapse}:8008
+      GATEWAY_HOMESERVER_FEDERATION_URL: ""
+      GATEWAY_MATRIX_SERVER_NAME: ${BOTVILLE_SERVER_NAME:-localhost}
+      GATEWAY_AS_TOKEN: ${APPSERVICE_AS_TOKEN:-}
       # Moments SQLite on the gateway-data volume; migrations ship in the
       # image (/app/gateway/migrations/moments) and run at startup.
       GATEWAY_MOMENTS_DB_PATH: /var/lib/botville-gateway/moments.db
@@ -286,12 +318,22 @@ services:
       - "127.0.0.1:${BOTVILLE_GATEWAY_PORT:-8020}:8080"
     volumes:
       - gateway-data:/var/lib/botville-gateway
+    depends_on:
+      synapse:
+        condition: service_healthy
+        required: false
+      tuwunel:
+        condition: service_started
+        required: false
+      continuwuity:
+        condition: service_started
+        required: false
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5)"]
       interval: 10s
       timeout: 5s
       retries: 12
-      start_period: 10s
+      start_period: 20s
     restart: unless-stopped
 
 networks:
@@ -317,9 +359,9 @@ volumes:
   # /var/lib/botville-gateway/moments.db；卷名 <项目名>_gateway-data。
   # 删除语义：
   #   - `make down` 不传 -v，不删任何卷（包括本卷）。
-  #   - 带上 `--profile gateway` 的 `docker compose ... down -v` 会删本卷
-  #     （有服务挂载它）；没启用 gateway profile 时 compose 不认为本卷在用，
-  #     down -v 不删它，`compose config --volumes` 也不列它。
+  #   - 带上 `--profile gateway` 的 `docker compose ... down -v` 就会删本卷
+  #     （与网关容器是否正在运行无关）；没启用 gateway profile 时 compose
+  #     不认为本卷在用，down -v 不删它，`compose config --volumes` 也不列它。
   #   - 单独删除（任何时候都可用）：docker volume rm -f <项目名>_gateway-data
   # 备份：backup-synapse.sh（synapse）或 backup-gateway-data.sh（任一
   # profile，make backup-gateway）；卷不存在时跳过。
