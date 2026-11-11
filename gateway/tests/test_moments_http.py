@@ -1206,14 +1206,21 @@ class TestMalformedInputs(unittest.TestCase):
                     {"k": "m", "c": [], "i": {}}, {"k": "m", "c": "", "i": "x"},
                     {"k": "m", "c": "x" * 600, "i": "x"}, {"k": "c", "c": "x", "i": "y"},
                     [], "str", 1, None,
+                    # 孤立代理项（JSON \\ud800 转义）：不得在绑定 SQLite 参数时 500。
+                    {"k": "m", "c": "\ud800", "i": "x"},
+                    {"k": "m", "c": "2026-11-11T00:00:00Z", "i": "\udfff"},
                 ],
                 f"/v1/moments/{mid}/comments": [
                     {"k": "c"}, {"k": "c", "c": 1, "i": "x"}, {"k": "c", "c": "x", "i": None},
                     {"k": "m", "c": "x", "i": "y"},
+                    {"k": "c", "c": "\ud800", "i": "x"},
+                    {"k": "c", "c": "x", "i": "\udfff"},
                 ],
                 f"/v1/moments/{mid}/likes": [
                     {"k": "l"}, {"k": "l", "c": 1, "a": "x"}, {"k": "l", "c": "x", "i": "y"},
                     {"k": "l", "c": "x", "a": ["y"]},
+                    {"k": "l", "c": "\ud800", "a": "x"},
+                    {"k": "l", "c": "x", "a": "\udfff"},
                 ],
             }
             for path, cursors in cases.items():
@@ -1227,6 +1234,58 @@ class TestMalformedInputs(unittest.TestCase):
                             )
                             self.assertEqual(st, 400, body)
                             self.assertEqual(body["code"], "request.invalid")
+
+    def test_raw_query_path_and_header_bytes_never_500(self):
+        """query / 路径 / 头里的非法 UTF-8（含 UTF-8 编码的代理项 ED A0 80）。
+
+        请求行里的原始非 ASCII 字节由 http.server 直接 400；百分号编码的
+        ED A0 80 经 parse_qs（errors=replace）变成 U+FFFD，路径不做百分号解码
+        （非 ULID → 404）；头按 latin-1 解码。所以只可能是 4xx / 2xx，绝不 500。
+        """
+        import socket
+        with MomentsServer() as fx:
+            _s, m = _create(fx, ALICE, {"body": "m", "visibility": "server"})
+            mid = m["id"].encode("ascii")
+            host, port = fx.server.server_address[:2]
+            token = USER_TOKEN[ALICE].encode("ascii")
+            surrogate_pct = b"%ED%A0%80"
+            surrogate_raw = b"\xed\xa0\x80"
+            cases = [
+                (b"GET", b"/v1/moments?author=" + surrogate_pct, b"", 200),
+                (b"GET", b"/v1/moments?author=" + surrogate_raw, b"", 400),  # 请求行非 ASCII：stdlib 400
+                (b"GET", b"/v1/moments?cursor=" + surrogate_pct, b"", 400),
+                (b"GET", b"/v1/moments?limit=" + surrogate_pct, b"", 400),
+                (b"GET", b"/v1/moments/" + mid + b"/comments?cursor=" + surrogate_raw, b"", 400),
+                (b"GET", b"/v1/moments/" + mid + b"/likes?cursor=" + surrogate_pct, b"", 400),
+                (b"GET", b"/v1/moments/" + surrogate_pct, b"", 404),
+                (b"GET", b"/v1/moments/" + surrogate_raw, b"", 400),
+                (b"DELETE", b"/v1/moments/" + mid + b"/comments/" + surrogate_pct, b"", 404),
+                (b"PUT", b"/v1/moments/" + surrogate_raw + b"/likes/me", b"", 400),
+                (b"POST", b"/v1/moments", b"Idempotency-Key: abcdefgh" + surrogate_raw + b"\r\n", 201),
+            ]
+            for method, target, extra_headers, expected in cases:
+                with self.subTest(method=method, target=target):
+                    body = b'{"body": "x"}' if method == b"POST" else b""
+                    request = (
+                        method + b" " + target + b" HTTP/1.1\r\n"
+                        + b"Host: 127.0.0.1\r\n"
+                        + b"Authorization: Bearer " + token + b"\r\n"
+                        + b"Content-Type: application/json\r\n"
+                        + b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                        + extra_headers
+                        + b"Connection: close\r\n\r\n" + body
+                    )
+                    with socket.create_connection((host, port), timeout=10) as sock:
+                        sock.sendall(request)
+                        chunks = []
+                        while True:
+                            data = sock.recv(65536)
+                            if not data:
+                                break
+                            chunks.append(data)
+                    status = int(b"".join(chunks).split(b" ", 2)[1])
+                    self.assertNotEqual(status, 500)
+                    self.assertEqual(status, expected)
 
     def test_lone_surrogate_in_body_is_400(self):
         surrogate = "\ud800"

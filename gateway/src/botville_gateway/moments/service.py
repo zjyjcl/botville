@@ -78,14 +78,26 @@ def encode_cursor(payload: Dict[str, Any]) -> str:
 
 
 # 各列表游标的必需字段：m=动态（created_at, id），c=评论（created_at, id），
-# l=点赞（created_at, actor_id）。字段值必须是非空字符串。
+# l=点赞（created_at, actor_id）。字段值必须是非空、可 UTF-8 编码的字符串，
+# 长度上限按**字符**计（Python len，与本模块 body/comment 等长度口径一致）。
 _CURSOR_FIELDS = {"m": ("c", "i"), "c": ("c", "i"), "l": ("c", "a")}
-_CURSOR_FIELD_MAX = 512
+_CURSOR_FIELD_MAX_CHARS = 512
+
+
+def _utf8_encodable(value: str) -> bool:
+    """JSON 允许 `\\ud800` 这类孤立代理项转义；解析出的 str 无法 UTF-8 编码，
+    绑定 SQLite 参数时会抛 UnicodeEncodeError（→ 500）或与库内值比较出错。"""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def decode_cursor(cursor: str, kind: str) -> Dict[str, Any]:
-    """不透明游标解析；非法（非 base64 / 非 JSON / kind 不符 / 缺字段）→
-    400 request.invalid（契约：cursor 不透明，非法值是请求错误）。"""
+    """不透明游标解析；非法（非 base64 / 非 JSON / kind 不符 / 缺字段 /
+    类型错 / 超长 / 含孤立代理项）→ 400 request.invalid（契约：cursor 不透明，
+    非法值是请求错误）。三种列表共用本函数，口径一致。"""
     try:
         padded = cursor + "=" * (-len(cursor) % 4)
         payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
@@ -97,7 +109,12 @@ def decode_cursor(cursor: str, kind: str) -> Dict[str, Any]:
     # 不能在后续 params["c"] 取值或元组比较时抛 KeyError / TypeError → 500。
     for field in _CURSOR_FIELDS[kind]:
         value = payload.get(field)
-        if not isinstance(value, str) or not value or len(value) > _CURSOR_FIELD_MAX:
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > _CURSOR_FIELD_MAX_CHARS
+            or not _utf8_encodable(value)
+        ):
             raise ValidationError("request.invalid", "invalid cursor")
     return payload
 
@@ -241,7 +258,10 @@ class MomentsService:
         self._now = now_fn
         self._ulid = ulid_fn
         self._monotonic = monotonic_fn
-        self._idem: Dict[Tuple[str, str, str], _IdemEntry] = {}
+        # 键 = (scope, viewer, 目标资源 id 或 None, Idempotency-Key)。
+        self._idem: Dict[
+            Tuple[str, str, Optional[str], str], _IdemEntry
+        ] = {}
         self._idem_lock = threading.Lock()
         # (viewer, moment_id) → monotonic 时间：denied 审计节流。
         self._denied_last: Dict[Tuple[str, str], float] = {}

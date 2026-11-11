@@ -841,6 +841,13 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         log_startup_warnings(config)
         super().__init__((config.host, config.port), GatewayHandler)
 
+    def server_close(self) -> None:
+        """关闭监听前先停 moments 清理线程（未启用时为 no-op）。"""
+        moments = getattr(self, "moments_service", None)
+        if moments is not None:
+            moments.stop_purge_scheduler()
+        super().server_close()
+
 
 def build_transport(config: Config) -> MatrixTransport:
     """按 `GATEWAY_MATRIX_TRANSPORT` 选择传输的唯一工厂（PR #99 审查阻塞项 3）。

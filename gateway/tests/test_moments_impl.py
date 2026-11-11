@@ -1391,5 +1391,57 @@ class TestPurgeScheduler(ServiceTestBase):
                     load_config(dict(_DEV_ENV, GATEWAY_MOMENTS_PURGE_INTERVAL_SECONDS=bad))
 
 
+
+# ============================================================================
+# #184 复审：游标字段长度口径（字符）与孤立代理项；server_close 停清理线程
+# ============================================================================
+class TestCursorFieldRules(unittest.TestCase):
+    def test_length_is_counted_in_characters(self):
+        ok = encode_cursor({"k": "m", "c": "\u4e2d" * 512, "i": "x"})
+        self.assertEqual(decode_cursor(ok, "m")["c"], "\u4e2d" * 512)
+        too_long = encode_cursor({"k": "m", "c": "a" * 513, "i": "x"})
+        with self.assertRaises(ValidationError):
+            decode_cursor(too_long, "m")
+
+    def test_lone_surrogate_rejected_for_every_kind(self):
+        import base64
+        for kind, fields in (("m", ("c", "i")), ("c", ("c", "i")), ("l", ("c", "a"))):
+            for bad_field in fields:
+                payload = {"k": kind}
+                for f in fields:
+                    payload[f] = "\ud800" if f == bad_field else "x"
+                raw = json.dumps(payload).encode("ascii")  # \\ud800 转义形式
+                cursor = base64.urlsafe_b64encode(raw).decode("ascii")
+                with self.subTest(kind=kind, field=bad_field):
+                    with self.assertRaises(ValidationError):
+                        decode_cursor(cursor, kind)
+
+
+class TestServerCloseStopsPurge(unittest.TestCase):
+    def test_server_close_stops_scheduler(self):
+        from botville_gateway.http_server import build_server
+        tmp = tempfile.mkdtemp(prefix="moments-close-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        import dataclasses
+        config = dataclasses.replace(
+            load_config(dict(
+                _DEV_ENV,
+                GATEWAY_MOMENTS_DB_PATH=os.path.join(tmp, "m.db"),
+                GATEWAY_MOMENTS_PURGE_INTERVAL_SECONDS="3600",
+            )),
+            host="127.0.0.1",
+            port=0,  # 临时端口，env 不允许 0
+        )
+        server = build_server(config)
+        service = server.moments_service
+        assert service is not None
+        thread = service._purge_thread
+        self.assertTrue(thread.is_alive())
+        server.server_close()
+        self.assertFalse(thread.is_alive())
+        self.assertIsNone(service._purge_thread)
+        service.store.close()
+
+
 if __name__ == "__main__":
     unittest.main()
