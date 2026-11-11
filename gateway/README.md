@@ -286,8 +286,10 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_MOMENTS_AUDIT_RETENTION_DAYS` | `90` | `moments_events` 审计默认保留 90 天（由定时清理执行） |
 | `GATEWAY_MOMENTS_PURGE_INTERVAL_SECONDS` | `86400` | 定时清理间隔（秒）：启动先跑一次，之后后台按间隔跑，失败只记日志。`0` = 关闭（两个保留天数不生效）；非 0 时 **≥60**，否则拒绝启动 |
 | `GATEWAY_HS_TOKEN` | *(空)* | Matrix AS 回调（B 线 as-transactions）的共享密钥：必须与注册文件里的 `hs_token`（= `server/compose/.env` 的 `APPSERVICE_HS_TOKEN`）同值。只从 `Authorization: Bearer` 请求头校验（不认 `?access_token=`），恒定时间比较，不入日志。**留空 = 网关照常启动但 `/_matrix/app/v1/transactions/*` 与 `/ping` 一律 403 `M_FORBIDDEN`**（compose 从 `APPSERVICE_HS_TOKEN` 注入）。设置后要求非占位符、**≥32 字符**、无空白，且**不能等于 `GATEWAY_AS_TOKEN`**，否则拒绝启动。见 [docs/contract.md](docs/contract.md) §1.7 |
-| `GATEWAY_AS_TXN_DB_PATH` | *(空)* | AS 事务 SQLite 路径（WAL + `synchronous=FULL`，返回 200 前提交）。**留空 = 关闭接收**（transactions 返回 `500 M_UNKNOWN`，HS 重试），与 `GATEWAY_MOMENTS_DB_PATH` 的「空 = 关闭」约定一致。compose 接线时由 A 线显式设为 `/var/lib/botville-gateway/as_transactions.db`（与 `moments.db` 共用 `gateway-data` 卷）。见 [docs/contract.md](docs/contract.md) §1.7 |
+| `GATEWAY_AS_TXN_DB_PATH` | *(空)* | AS 事务 SQLite 路径（WAL + `synchronous=FULL`，返回 200 前提交；新建文件以 **0600** 创建）。**留空 = 关闭接收**（transactions 返回 `500 M_UNKNOWN`，HS 重试），与 `GATEWAY_MOMENTS_DB_PATH` 的「空 = 关闭」约定一致。`make up GATEWAY=1` 时 compose 设为 `/var/lib/botville-gateway/as_transactions.db`（与 `moments.db` 共用 `gateway-data` 卷，#193）。**库含原始事件请求体**，备份按敏感数据处理。见 [docs/contract.md](docs/contract.md) §1.7 / §1.7.7 |
 | `GATEWAY_AS_MAX_BODY_BYTES` | `16777216` | AS 回调请求体上限（字节，**16 MiB**；正整数，最大 256 MiB）。与 `/v1` 的 1 MiB 上限**相互独立**；超限 → `413 M_TOO_LARGE` |
+| `GATEWAY_AS_TXN_RETENTION_DAYS` | `90` | AS 事务库保留天数（正整数，`<1` 拒绝启动）。超过保留期的事务**不删行**：只清空原始请求体并写 `purged_at`（墓碑保留 `txn_id` / 接收时间 / `processed_at`），重放仍 `200 {}` 且不重落库；过期未消费事务按丢弃处理。只在配置了 `GATEWAY_AS_TXN_DB_PATH` 且清理间隔非 0 时生效。见 [docs/contract.md](docs/contract.md) §1.7.7 |
+| `GATEWAY_AS_TXN_PURGE_INTERVAL_SECONDS` | `86400` | AS 事务保留期清理间隔（秒）：启动先跑一次，之后后台按间隔跑，失败只记日志（不记 token / 事件体）。`0` = 关闭（库会持续增长）；非 0 时 **≥60**，否则拒绝启动 |
 
 非法配置（端口非数字、时区不存在、`HH:MM` 格式错）在 `Config` 构造时抛 `ConfigError`，
 进程以退出码 `2` 结束。

@@ -54,7 +54,8 @@ def main(argv=None) -> int:
     print("  POST /_matrix/app/v1/ping")
     if config.auth_token is None:
         print("  (dev mode: Authorization is not checked)")
-    # AS 回调：未注入 hs_token 时网关照常启动，但两条回调一律 403（compose 尚未接线）。
+    # AS 回调：未配置 hs_token 时网关照常启动，但两条回调一律 403。
+    # compose 在 `make up GATEWAY=1` 且 HS 为 synapse/tuwunel 时注入（#193）。
     if config.hs_token is None:
         print(
             "  (AS callbacks: GATEWAY_HS_TOKEN is not set — /_matrix/app/v1/* returns "
@@ -65,6 +66,13 @@ def main(argv=None) -> int:
             "  (AS transactions: GATEWAY_AS_TXN_DB_PATH is not set — transactions "
             "return 500 M_UNKNOWN instead of acknowledging)"
         )
+    elif config.as_txn_purge_interval_seconds:
+        print(
+            f"  (AS transactions: retention {config.as_txn_retention_days}d, purge every "
+            f"{config.as_txn_purge_interval_seconds}s — bodies are cleared, tombstones kept)"
+        )
+    else:
+        print("  (AS transactions: retention purge disabled — the transaction DB keeps growing)")
     print(f"transport: {type(transport).__name__} (GATEWAY_MATRIX_TRANSPORT={config.matrix_transport})")
     try:
         server.serve_forever()

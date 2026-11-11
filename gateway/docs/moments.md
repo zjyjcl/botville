@@ -5,7 +5,7 @@
 跨服只读（PR3）尚未开始。好友图在 A2.3（#8）落地前**默认为空**，影响见 §7.1。
 契约机器可读源：`gateway/openapi/gateway.v1.yaml`（`tags: [Moments]` 各路径）；
 示例：`gateway/openapi/examples/moment*.json` 等；DDL：`gateway/migrations/moments/0001_moments.sql`。
-`info.version` 本 PR 保持 `0.1.0` 不变；本特性为**只增不删**的 minor 变更，拟随合并升
+`info.version` 在 #119（PR1）保持 `0.1.0` 不变；本特性为**只增不删**的 minor 变更，拟随合并升
 `0.2.0`，版本号与 `gateway/docs/contract.md` changelog 由总管在合并时统一协调。
 
 ## 1. 概述
@@ -340,7 +340,7 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
 
 ## 8. 部署（8845 小主机，Ubuntu Server 24.04）
 
-部署目标为 8845 小主机（Ubuntu Server 24.04，**尚未装好**）。本 PR 与后续 PR 的交付
+部署目标为 8845 小主机（Ubuntu Server 24.04，**尚未装好**）。#119 与后续 PR 的交付
 边界：只改仓库内容，**不连接、不部署任何机器**，不写任何真实密钥。
 
 - 网关已作为可选 compose 服务加入：profile `gateway`，`make up GATEWAY=1`（可叠加任一
@@ -376,11 +376,11 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
 
 #117 已合入 main，本分支已 `update branch` 吸收。#117 改动的文件（`src/*.py`、
 `.env.example`、`gateway/README.md`、`gateway/docs/contract.md`、`test_b21_*` /
-`test_b22_*`，以及 `gateway.v1.yaml` 中 `peer_id` 描述）**本 PR 的 Moments 提交不改动**；
+`test_b22_*`，以及 `gateway.v1.yaml` 中 `peer_id` 描述）**#119（PR1）的 Moments 提交不改动**；
 Moments 仍只在 `tags` / `paths` 末尾 / `securitySchemes` / `schemas` 末尾**追加**，
 与 #117 的 yaml hunk 区间不重叠。
 
-- 本 PR 不修改 B2.2 实现代码与其单测。`moment.not_found` / `moment.revision_conflict`
+- #119（PR1）不修改 B2.2 实现代码与其单测。`moment.not_found` / `moment.revision_conflict`
   已在 #7 文档 PR 中登记到 `contract.md` §1.3。
 - 配置变量已随 PR2（#184）写入 `.env.example` 与 `gateway/README.md`，见 §7。
 - `info.version` 升 `0.2.0` 由总管在 Moments 合入后统一协调。
@@ -392,8 +392,8 @@ Moments 仍只在 `tags` / `paths` 末尾 / `securitySchemes` / `schemas` 末尾
 | PR1（已合入） | 契约：OpenAPI 路径 / securitySchemes / schema、示例与校验登记、DDL、本文、契约单测（`gateway/tests/test_moments_contract.py`）。 |
 | PR2（已合入，#184） | 存储（迁移执行器、SQLite 访问层）、`can_view` / `can_see_interaction` 与 `RelationProvider` 临时实现、同服 API 实现、权限矩阵与性质单测、`.env.example` 登记配置变量、软删/审计定时清理。 |
 | 卷与备份（已合入，#188） | compose 声明 `gateway-data` 卷；`backup-synapse.sh` / `restore-synapse.sh` 归档与恢复（卷不存在则跳过；旧备份无产物则不碰该卷）。见 §8。 |
-| 网关镜像与 compose（本 PR） | `gateway/Dockerfile`（镜像内带迁移目录、非 root）；compose `gateway` profile 挂载 `gateway-data`；其他 profile 的 gateway-data 备份（`backup-gateway-data.sh` / `restore-gateway-data.sh`）；CI `gateway-compose` job。见 §8。 |
-| 仍待后续 | CI `moments-e2e` job；compose 网关的 appservice 传输接线（homeserver 推事务到 `http://gateway:8080`）。 |
+| 网关镜像与 compose（#189） | `gateway/Dockerfile`（镜像内带迁移目录、非 root）；compose `gateway` profile 挂载 `gateway-data`；其他 profile 的 gateway-data 备份（`backup-gateway-data.sh` / `restore-gateway-data.sh`）；CI `gateway-compose` job。见 §8。 |
+| 仍待后续 | CI `moments-e2e` job。compose 网关的 appservice 传输接线已由 #193 完成（`GATEWAY=1` 且 HS 为 synapse/tuwunel 时，homeserver 向 `http://gateway:8080` 推事务）。 |
 | PR3 | 跨服只读 API（`/_matrix/botville/moments/v1/*` 正式入契约）、fedgate HMAC 验签、双 HS 联邦 e2e（配对可读、切断被拒）。 |
 
 每个 PR 单独送审，不自行合并。

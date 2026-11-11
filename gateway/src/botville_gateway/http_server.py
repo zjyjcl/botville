@@ -76,6 +76,9 @@ _ROUTE_MESSAGES = re.compile(r"^/v1/conversations/([^/]+)/messages$")
 # Matrix AS 回调路径（根路径，不带部署前缀；strip_path_prefix 后也能命中）。
 _ROUTE_AS_TRANSACTIONS = re.compile(r"^/_matrix/app/v1/transactions/([^/]+)$")
 _AS_APP_V1_PREFIX = "/_matrix/app/v1"
+# Matrix AS 协议 v1 之前的 legacy 根路径（契约 §1.7）：只认路径族、一律 404。
+# 这些路径与网关自身路由（`/v1/*`、`/health`）没有交集，不需要鉴权。
+_AS_LEGACY_ROOTS = ("/transactions", "/users", "/rooms", "/thirdparty")
 # txnId 合法字符集（URL 解码后）：长度 ≤ 255，
 # 只允许印刷可见 ASCII（排除控制字符和空白），避免注入 / 路径穿越。
 _TXN_ID_RE = re.compile(r"^[!-~]{1,255}$")
@@ -150,11 +153,6 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         if self.server.config.access_log:  # type: ignore[attr-defined]
             super().log_message(fmt, *_redact_args(args))
-
-    def log_request(self, code: Any = "-", size: Any = "-") -> None:
-        """覆盖 stdlib：脱敏委托给 log_message/_redact_args；access_log=false 时静默。"""
-        if self.server.config.access_log:  # type: ignore[attr-defined]
-            super().log_request(code, size)
 
     # ------------------------------------------------------------- helpers
     def parse_request(self) -> bool:  # type: ignore[override]
@@ -495,7 +493,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     def _as_auth_ok(self) -> bool:
         """校验 `Authorization: Bearer <hs_token>`（只认表头，不认查询参数）。
 
-        - 网关未配置 `GATEWAY_HS_TOKEN` → 403 M_FORBIDDEN（compose 尚未注入）。
+        - 网关未配置 `GATEWAY_HS_TOKEN` → 403 M_FORBIDDEN。
         - 缺 Authorization 头 / 非 Bearer scheme → 401 M_MISSING_TOKEN。
         - token 不匹配 → 403 M_FORBIDDEN（AS 规范 v1.4+）。
         恒定时间比较；token 值绝不写入日志或响应体。
@@ -524,10 +522,15 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         """读取 AS 回调请求体。返回 (raw, error)；error 为 (status, errcode, error)。
 
         Body 上限用 `GATEWAY_AS_MAX_BODY_BYTES`（与 /v1 的 1 MiB 独立）。
+
+        framing 错误（chunked 传输、坏的/缺失的 Content-Length、读写不完整）
+        返回 400 `M_NOT_JSON`：按 Matrix 规范，`M_NOT_JSON` 表示「请求体不是
+        合法 JSON / 无法解析」，而 `M_BAD_JSON` 只用于「JSON 合法但结构不对」。
+        读不出来的体自然属于前者。
         """
         length = self._as_content_length()
         if length is None:
-            return None, (400, "M_BAD_JSON", "unreadable request body framing")
+            return None, (400, "M_NOT_JSON", "unreadable request body framing")
         limit = self.server.config.as_max_body_bytes  # type: ignore[attr-defined]
         if length > limit:
             self.close_connection = True
@@ -540,8 +543,27 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             return b"", None
         raw = self.rfile.read(length)
         if len(raw) != length:
-            return None, (400, "M_BAD_JSON", "incomplete request body")
+            return None, (400, "M_NOT_JSON", "incomplete request body")
         return raw, None
+
+    @staticmethod
+    def _decode_json_body(raw: bytes) -> Tuple[Any, Optional[Tuple[int, str, str]]]:
+        """把请求体解码为 JSON：严格 UTF-8 → `json.loads`。
+
+        返回 (payload, error)。**先按 UTF-8 严格解码**再看 JSON：`json.loads`
+        本身也接受 UTF-16/32（BOM 嗅探），但事务要按文本落库、日志/比对都假定
+        UTF-8，放行 UTF-16 会在后面 decode 时炸成 500（HS 会无限重试）。因此
+        非 UTF-8 体一律 400 `M_NOT_JSON`，与「不是合法 JSON」同码。
+        空体按调用方语义处理（返回 None，不报错）。
+        """
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None, (400, "M_NOT_JSON", "request body is not valid UTF-8 JSON")
+        try:
+            return (json.loads(text) if text.strip() else None), None
+        except (json.JSONDecodeError, ValueError):
+            return None, (400, "M_NOT_JSON", "request body is not valid JSON")
 
     def _handle_as_request(self, path: str) -> None:
         """`/_matrix/app/v1/*` 的方法分发：未知路径 404，已知路径错误方法 405。"""
@@ -562,7 +584,18 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                     405, "M_UNRECOGNIZED", f"{self.command} is not supported on {path}"
                 )
             return
+        # 未知路径：未知的 `/_matrix/app/v1/*` 与 legacy 根路径（transactions/users/
+        # rooms/thirdparty）都按 Matrix 格式 404，不泄露路由细节、不做鉴权。
+        self._drain_as_body()
         self._send_matrix_error(404, "M_UNRECOGNIZED", "unrecognized request")
+
+    def _handle_as_matrix_path(self, path: str) -> None:
+        """统一入口：legacy 根路径直接 404，`/_matrix/app/v1/*` 走方法分发。"""
+        if _is_legacy_as_path(path):
+            self._drain_as_body()
+            self._send_matrix_error(404, "M_UNRECOGNIZED", "unrecognized request")
+            return
+        self._handle_as_request(path)
 
     def _handle_as_transactions(self, txn_id: str) -> None:
         """`PUT /_matrix/app/v1/transactions/{txnId}`：认证 → 校验 → 幂等持久化。"""
@@ -580,10 +613,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             return
 
         assert raw is not None
-        try:
-            payload = json.loads(raw) if raw else None
-        except (json.JSONDecodeError, ValueError):
-            self._send_matrix_error(400, "M_NOT_JSON", "request body is not valid JSON")
+        payload, decode_err = self._decode_json_body(raw)
+        if decode_err is not None:
+            self._send_matrix_error(*decode_err)
             return
         if not isinstance(payload, dict):
             self._send_matrix_error(400, "M_BAD_JSON", "request body must be a JSON object")
@@ -605,10 +637,11 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             )
             return
         try:
-            # 幂等：store_transaction 在锁内判重 + 插入（返回 False = 已存在），
-            # 重放直接 200 且不重复落库。
+            # 幂等：store_transaction 在锁内判重 + 插入（返回 False = 已存在，
+            # 含已清理的墓碑），重放直接 200 且不重复落库。
+            # 体已按严格 UTF-8 解码成功，这里再编码回文本按原样落库。
             store.store_transaction(txn_id, raw.decode("utf-8"))
-        except Exception as exc:  # sqlite3.Error / 解码 / IO
+        except Exception as exc:  # sqlite3.Error / IO
             if self.server.config.access_log:  # type: ignore[attr-defined]
                 self.log_error(
                     "AS transaction persist failed for txn %s: %s",
@@ -621,7 +654,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             return
         # TODO（后续 PR）：事件消费（角色引擎 / 记忆 / 主动发言）从
         # `store.get_unprocessed_transactions()` 拉取并 mark_processed；
-        # 本 PR 只做协议层接收与持久化。
+        # #192/#193 只做协议层接收与持久化；事件消费留给后续 PR。
         self._send_json(200, {})
 
     def _handle_as_ping(self) -> None:
@@ -635,15 +668,15 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         assert raw is not None
         payload: Any = {}
         if raw.strip():
-            try:
-                payload = json.loads(raw)
-            except (json.JSONDecodeError, ValueError):
-                self._send_matrix_error(400, "M_BAD_JSON", "request body is not valid JSON")
+            payload, decode_err = self._decode_json_body(raw)
+            if decode_err is not None:
+                # framing ok 但非 UTF-8 / 非 JSON：ping 也按 M_NOT_JSON 报
+                self._send_matrix_error(*decode_err)
                 return
             if not isinstance(payload, dict):
                 self._send_matrix_error(400, "M_BAD_JSON", "request body must be a JSON object")
                 return
-        transaction_id = payload.get("transaction_id")
+        transaction_id = (payload or {}).get("transaction_id")
         if transaction_id is not None and not isinstance(transaction_id, str):
             self._send_matrix_error(400, "M_BAD_JSON", "'transaction_id' must be a string")
             return
@@ -668,8 +701,8 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         self._request_id()
         try:
             _raw_path, query, path = self._route_path()
-            if _is_as_path(path):
-                self._handle_as_request(path)
+            if _is_matrix_app_path(path):
+                self._handle_as_matrix_path(path)
                 return
             if path in ("/health", "/v1/health"):
                 self._handle_health()
@@ -700,8 +733,8 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         self._request_id()
         try:
             _raw_path, _query, path = self._route_path()
-            if _is_as_path(path):
-                self._handle_as_request(path)
+            if _is_matrix_app_path(path):
+                self._handle_as_matrix_path(path)
                 return
             if _is_moments_path(path):
                 self._handle_moments()
@@ -732,12 +765,12 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         )
 
     def do_PUT(self) -> None:
-        """只有 `PUT /v1/limits` 支持 PUT；AS transactions 走 `_handle_as_request`。"""
+        """只有 `PUT /v1/limits` 支持 PUT；AS 回调走 `_handle_as_matrix_path`。"""
         self._request_id()
         try:
             _raw_path, _query, path = self._route_path()
-            if _is_as_path(path):
-                self._handle_as_request(path)
+            if _is_matrix_app_path(path):
+                self._handle_as_matrix_path(path)
                 return
             if _is_moments_path(path):
                 self._handle_moments()
@@ -767,10 +800,10 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         self._request_id()
         try:
             _raw, _query, path = self._route_path()
-            if _is_as_path(path):
-                # AS 路径上的 PATCH/DELETE：已知路径按方法不匹配处理（Matrix 405），
-                # 未知路径 404 M_UNRECOGNIZED（都是 application/json）。
-                self._handle_as_request(path)
+            if _is_matrix_app_path(path):
+                # AS 路径上的 PATCH/DELETE：legacy / 未知路径 404，
+                # 已知 v1 路径错误方法 405（都是 Matrix JSON、不做鉴权）。
+                self._handle_as_matrix_path(path)
                 return
             if _is_moments_path(path):
                 # 先校验用户身份；鉴权失败已在 _auth_user_ok 里发响应。
@@ -804,9 +837,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             _raw, _query, path = self._route_path()
         except Exception:  # pragma: no cover - 目标已在 parse_request 校验
             path = ""
-        if _is_as_path(path):
+        if _is_matrix_app_path(path):
             self._request_id()
-            self._handle_as_request(path)
+            self._handle_as_matrix_path(path)
             return
         self._method_not_allowed()
 
@@ -1115,6 +1148,23 @@ def _is_as_path(path: str) -> bool:
     return path.startswith(_AS_APP_V1_PREFIX + "/") or path == _AS_APP_V1_PREFIX
 
 
+def _is_legacy_as_path(path: str) -> bool:
+    """legacy AS 根路径族（`/transactions`、`/users`、`/rooms`、`/thirdparty`）。
+
+    契约 §1.7：只实现 `/_matrix/app/v1/*`，这些 Matrix AS v1 之前的老路径
+    （带或不带子路径）按未知路径返回 `404 M_UNRECOGNIZED`（Matrix 错误体、
+    任何方法、不做鉴权）。只按整段边界匹配，且与网关既有路由无交集。
+    """
+    for root in _AS_LEGACY_ROOTS:
+        if path == root or path.startswith(root + "/"):
+            return True
+    return False
+
+
+def _is_matrix_app_path(path: str) -> bool:
+    """AS 回调路径（新 v1 路径 + legacy 根路径），统一走 Matrix 错误体。"""
+    return _is_as_path(path) or _is_legacy_as_path(path)
+
 
 def _single(params: Dict[str, List[str]], name: str) -> Optional[str]:
     values = params.get(name)
@@ -1167,16 +1217,29 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         # （模块关闭，`/moments*` 鉴权后行为与合入前一致）。
         self.moments_service = build_moments_service(config)
         # AS 事务存储：未配置 GATEWAY_AS_TXN_DB_PATH → None
-        # （transactions 端点返回 500，让 HS 重试）。
-        self.as_txn_store: Optional[AsTransactionStore] = build_as_txn_store(config.as_txn_db_path)
+        # （transactions 端点返回 500，让 HS 重试）。配置了库与保留期时启动
+        # 保留期清理（启动跑一次 + 后台守护线程，见 as_txn_store.py）。
+        self.as_txn_store: Optional[AsTransactionStore] = build_as_txn_store(
+            config.as_txn_db_path,
+            # 间隔 0 = 关闭：启动时那一次也不跑（与 moments 清理一致）。
+            purge_retention_days=(
+                config.as_txn_retention_days
+                if config.as_txn_db_path and config.as_txn_purge_interval_seconds > 0
+                else None
+            ),
+            purge_interval_seconds=config.as_txn_purge_interval_seconds,
+        )
         log_startup_warnings(config)
         super().__init__((config.host, config.port), GatewayHandler)
 
     def server_close(self) -> None:
-        """关闭监听前先停 moments 清理线程（未启用时为 no-op）。"""
+        """关闭监听前先停后台清理线程（未启用时为 no-op）。"""
         moments = getattr(self, "moments_service", None)
         if moments is not None:
             moments.stop_purge_scheduler()
+        store = getattr(self, "as_txn_store", None)
+        if store is not None:
+            store.stop_purge_scheduler()
         super().server_close()
 
 

@@ -123,6 +123,14 @@ AI_LOOP_ON_BREAK_VALUES = frozenset({"stop", "notify"})
 DEFAULT_AS_MAX_BODY_BYTES = 16_777_216   # 16 MiB
 AS_MAX_BODY_BYTES_UPPER = 268_435_456    # 256 MiB
 
+# AS 事务库保留期与清理（contract §1.7.7）：与动态模块的保留期清理同一套约定。
+# 超过保留期的事务只清空原始请求体、保留墓碑（txn_id / 时间 / processed_at），
+# 因此重放语义不变、库仍会继续增长（墓碑永不删除）。
+DEFAULT_AS_TXN_RETENTION_DAYS = 90
+# 清理任务间隔（秒）：0 = 关闭；非 0 时至少 60 秒。
+DEFAULT_AS_TXN_PURGE_INTERVAL_SECONDS = 86_400
+AS_TXN_PURGE_INTERVAL_MIN_SECONDS = 60
+
 # 部署路径前缀（GATEWAY_HTTP_PATH_PREFIX）的禁用片段：这些要么改变路径语义
 # （`//`、`..`），要么在拼 URL / 反代重写时会被提前截断或解码（`?` `#` `%`），
 # 都会让「配置里的前缀」和「实际到达的路径」静默不一致。
@@ -445,16 +453,23 @@ class Config:
     moments_purge_interval_seconds: int = DEFAULT_MOMENTS_PURGE_INTERVAL_SECONDS
     # ---------- Matrix AS 回调（B 线 as-transactions）----------
     # HS → 网关的 hs_token（与注册文件里的 hs_token 同值）。None/空 = 未配置：
-    # 网关照常启动，但 /_matrix/app/v1/* 一律 403（compose 尚未注入）。
+    # 网关照常启动，但 /_matrix/app/v1/* 一律 403。空串在 __post_init__ 里归一
+    # 为 None（与 load_config 同语义）。compose 在 `make up GATEWAY=1` 且 HS 为
+    # synapse/tuwunel 时把 APPSERVICE_HS_TOKEN 注入为本值（#193）。
     # 不进 repr（日志/断言消息不泄露）。
     hs_token: Optional[str] = field(default=None, repr=False)
     # AS 事务 SQLite 库路径（幂等 + 200 前持久化）。None/空 = 关闭（与
     # GATEWAY_MOMENTS_DB_PATH 相同约定）：transactions 端点返回 500 M_UNKNOWN
-    # （不返回 200，让 HS 重试）。compose 接线时由 A 线显式设为
-    # /var/lib/botville-gateway/as_transactions.db（gateway-data 卷）。
+    # （不返回 200，让 HS 重试）。compose 在 `make up GATEWAY=1` 时设为
+    # /var/lib/botville-gateway/as_transactions.db（gateway-data 卷，#193）。
     as_txn_db_path: Optional[str] = None
     # AS 回调请求体上限（默认 16 MiB，与 /v1 的 1 MiB 分开）。
     as_max_body_bytes: int = DEFAULT_AS_MAX_BODY_BYTES
+    # 事务库保留期（天）与清理间隔（秒；0 = 关闭，非 0 ≥ 60）。超过保留期的
+    # 事务只清空原始请求体、保留墓碑（contract §1.7.7）。只在配置了
+    # as_txn_db_path 且间隔 > 0 时运行。
+    as_txn_retention_days: int = DEFAULT_AS_TXN_RETENTION_DAYS
+    as_txn_purge_interval_seconds: int = DEFAULT_AS_TXN_PURGE_INTERVAL_SECONDS
 
     def __post_init__(self) -> None:
         # 构造时校验，避免明显错误的配置拖到第一次请求才炸。
@@ -578,8 +593,27 @@ class Config:
                 "moments_purge_interval_seconds must be 0 (disabled) or >= "
                 f"{MOMENTS_PURGE_INTERVAL_MIN_SECONDS}, got {purge_interval}"
             )
-        # AS 回调：hs_token 强度校验（与 as_token 同规则；None = 未配置，合法）。
-        # 未配置时网关照常启动，但 /_matrix/app/v1/* 一律 403（compose 尚未注入）。
+        # B 线 as-txn-cleanup（contract §1.7.7）：AS 事务库保留期与清理间隔，
+        # 规则与上面的动态模块一致（保留期 ≥ 1 天；间隔 0 = 关闭，非 0 ≥ 60）。
+        _check_retention_days(self.as_txn_retention_days, "as_txn_retention_days")
+        as_purge_interval = self.as_txn_purge_interval_seconds
+        if not isinstance(as_purge_interval, int) or isinstance(as_purge_interval, bool):
+            raise ConfigError(
+                f"as_txn_purge_interval_seconds must be an integer, got {as_purge_interval!r}"
+            )
+        if (
+            as_purge_interval != 0
+            and as_purge_interval < AS_TXN_PURGE_INTERVAL_MIN_SECONDS
+        ):
+            raise ConfigError(
+                "as_txn_purge_interval_seconds must be 0 (disabled) or >= "
+                f"{AS_TXN_PURGE_INTERVAL_MIN_SECONDS}, got {as_purge_interval}"
+            )
+        # AS 回调：hs_token 强度校验（与 as_token 同规则；None/空串 = 未配置，合法）。
+        # 未配置时网关照常启动，但 /_matrix/app/v1/* 一律 403。空串归一为 None，
+        # 与 load_config 对 GATEWAY_HS_TOKEN="" 的处理一致（不触发下面的强度检查）。
+        if isinstance(self.hs_token, str) and self.hs_token == "":
+            object.__setattr__(self, "hs_token", None)
         if self.hs_token is not None:
             if self.hs_token in _INSECURE_TOKENS:
                 raise ConfigError(
@@ -1072,8 +1106,9 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         # 占位符是配置错误，不能静默当成「未设置」。
         hs_token=None if hs_token == "" else hs_token,
         # 事务库路径：空 → None = 关闭（与 GATEWAY_MOMENTS_DB_PATH 相同约定；
-        # transactions 返回 500 让 HS 重试）。compose 接线时由 A 线显式设为
-        # /var/lib/botville-gateway/as_transactions.db（gateway-data 卷）。
+        # transactions 返回 500 让 HS 重试）。compose 在 `make up GATEWAY=1`
+        # 且 HS 为 synapse/tuwunel 时设为
+        # /var/lib/botville-gateway/as_transactions.db（gateway-data 卷，#193）。
         as_txn_db_path=(
             _env_str(source, "GATEWAY_AS_TXN_DB_PATH", "") or None
         ),
@@ -1082,5 +1117,19 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
             "GATEWAY_AS_MAX_BODY_BYTES",
             DEFAULT_AS_MAX_BODY_BYTES,
             minimum=1,
+        ),
+        # 事务库保留期（天）：超过保留期的事务清空请求体、保留墓碑（contract §1.7.7）。
+        # 只在 as_txn_db_path 配置且间隔非 0 时生效。
+        as_txn_retention_days=_env_int(
+            source,
+            "GATEWAY_AS_TXN_RETENTION_DAYS",
+            DEFAULT_AS_TXN_RETENTION_DAYS,
+            minimum=1,
+        ),
+        as_txn_purge_interval_seconds=_env_int(
+            source,
+            "GATEWAY_AS_TXN_PURGE_INTERVAL_SECONDS",
+            DEFAULT_AS_TXN_PURGE_INTERVAL_SECONDS,
+            minimum=0,
         ),
     )
