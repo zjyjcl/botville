@@ -1301,6 +1301,178 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         XCTAssertTrue(rooms[1].isDirect)
     }
 
+    func testServerMuteDelegateFiltersSyncBannerAndLogoutClearsSharedCache() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let credentials = testCredentials(userID: "@me:matrix.test")
+        _ = try SessionStoreDirectory(baseURL: temporary).create(for: credentials.storeID)
+        let client = FakeClient(session: fakeSession(userID: "@me:matrix.test", deviceID: "C21TEST"), successfulSync: true,
+                                rooms: [FakeRoom(id: "!push:matrix.test", name: "Push")])
+        let cache = MemoryRoomMuteStore()
+        let service = makeService(sessionStore: InMemorySessionStore(credentials), directory: temporary, client: client,
+                                  sharedRoomMuteStore: cache)
+        await service.restoreSession()
+        try await waitUntil { service.connectionStatus == .connected }
+        var received = [ForegroundBannerCandidate]()
+        let observation = service.foregroundBannerCandidates.sink { received.append($0) }
+        try await client.notificationSettings.setRoomNotificationMode(roomId: "!push:matrix.test", mode: .mute)
+        try await waitUntil { service.roomNotifications.isMuted("!push:matrix.test") }
+        XCTAssertEqual(try cache.load(), [SharedRoomMuteStore.hash("!push:matrix.test")])
+        client.emit(notification: syncNotification(eventID: "$muted", body: "test", timestamp: 1_700_000_001_000), roomID: "!push:matrix.test")
+        // Drain the queued muted notification before unmuting; no wall-clock stress.
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertTrue(received.isEmpty)
+        try await client.notificationSettings.unmuteRoom(roomId: "!push:matrix.test", isEncrypted: false, isOneToOne: false)
+        try await waitUntil { !service.roomNotifications.isMuted("!push:matrix.test") }
+        client.emit(notification: syncNotification(eventID: "$unmuted", body: "test", timestamp: 1_700_000_002_000), roomID: "!push:matrix.test")
+        try await waitUntil { received.count == 1 }
+        XCTAssertEqual(received.first?.eventID, "$unmuted")
+        try await client.notificationSettings.setRoomNotificationMode(roomId: "!push:matrix.test", mode: .mute)
+        try await waitUntil { service.roomNotifications.isMuted("!push:matrix.test") }
+        await service.logout()
+        XCTAssertTrue(try cache.load().isEmpty)
+        XCTAssertTrue(service.roomNotifications.states.isEmpty)
+        withExtendedLifetime(observation) {}
+    }
+
+    func testNotificationUnmuteResolvesUnknownEncryptionThroughSDKRoom() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let room = FakeRoom(id: "!encryption:test", name: "Encryption")
+        let client = FakeClient(successfulSync: true, rooms: [room])
+        try await client.notificationSettings.setRoomNotificationMode(roomId: room.id(), mode: .mute)
+        let service = makeService(sessionStore: InMemorySessionStore(), directory: temporary, client: client)
+        try await service.login(homeserver: "https://matrix.test", username: "test", password: "test-password")
+        try await waitUntil { service.roomNotifications.state(for: room.id()).isLoaded && service.connectionStatus == .connected }
+        let unknown = MatrixRoom(id: room.id(), name: "Encryption")
+        room.encryption = .unknown
+        await service.roomNotifications.setMuted(false, room: unknown)
+        XCTAssertTrue(client.notificationSettings.unmuteEncryptionArguments.isEmpty)
+        XCTAssertTrue(service.roomNotifications.isMuted(room.id()))
+        XCTAssertTrue(service.roomNotifications.state(for: room.id()).errorMessage?.contains("加密状态") == true)
+        room.encryption = .encrypted
+        await service.roomNotifications.setMuted(false, room: unknown)
+        XCTAssertEqual(client.notificationSettings.unmuteEncryptionArguments, [true])
+        XCTAssertEqual(client.notificationSettings.roomReadEncryption.last, true)
+        XCTAssertFalse(service.roomNotifications.isMuted(room.id()))
+        await service.logout()
+    }
+
+    func testLogoutDuringNotificationEncryptionResolutionPreventsSDKUnmute() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let room = FakeRoom(id: "!blocked-encryption:test", name: "Encryption")
+        let client = FakeClient(successfulSync: true, rooms: [room])
+        try await client.notificationSettings.setRoomNotificationMode(roomId: room.id(), mode: .mute)
+        let service = makeService(sessionStore: InMemorySessionStore(), directory: temporary, client: client)
+        try await service.login(homeserver: "https://matrix.test", username: "test", password: "test-password")
+        try await waitUntil { service.roomNotifications.state(for: room.id()).isLoaded && service.connectionStatus == .connected }
+        room.suspendEncryptionRead = true
+        let operation = Task { await service.roomNotifications.setMuted(false, room: MatrixRoom(id: room.id(), name: "Encryption")) }
+        try await waitUntil { room.isEncryptionReadBlocked }
+        await service.logout()
+        room.releaseEncryptionRead()
+        await operation.value
+        XCTAssertTrue(client.notificationSettings.unmuteEncryptionArguments.isEmpty)
+        XCTAssertTrue(service.roomNotifications.states.isEmpty)
+    }
+
+    func testFailingMuteStoreDoesNotBlockLogoutLoginOrRestore() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let store = InMemorySessionStore()
+        let client = FakeClient(rooms: [FakeRoom(id: "!mute:test", name: "Test")])
+        let service = makeService(sessionStore: store, directory: temporary, client: client,
+                                  sharedRoomMuteStore: UnavailableRoomMuteStore())
+        try await client.notificationSettings.setRoomNotificationMode(roomId: "!mute:test", mode: .mute)
+        try await service.login(homeserver: "https://matrix.test", username: "test", password: "test-password")
+        try await waitUntil { service.roomNotifications.isMuted("!mute:test") }
+        await service.logout()
+        XCTAssertFalse(service.isLoggedIn)
+        XCTAssertNil(service.sessionError)
+        XCTAssertNil(try store.load())
+        XCTAssertTrue(service.roomNotifications.states.isEmpty)
+        XCTAssertFalse(service.roomNotifications.isMuted("!mute:test"))
+        XCTAssertFalse(service.canClearLocalSession)
+        try await service.login(homeserver: "https://matrix.test", username: "test", password: "test-password")
+        XCTAssertTrue(service.isLoggedIn)
+        let restored = makeService(sessionStore: store, directory: temporary, client: FakeClient(),
+                                   sharedRoomMuteStore: UnavailableRoomMuteStore())
+        await restored.restoreSession()
+        XCTAssertTrue(restored.isLoggedIn)
+        XCTAssertNil(restored.sessionError)
+        await restored.logout()
+        await service.logout()
+    }
+
+    func testCleanupRequiredLoginSucceedsDespiteFailingMuteStore() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let store = FailFirstDeleteSessionStore(testCredentials(userID: "@test:matrix.test"))
+        let service = makeService(sessionStore: store, directory: temporary, client: FakeClient(),
+                                  sharedRoomMuteStore: UnavailableRoomMuteStore())
+        do { try await service.clearLocalSession(); XCTFail("Primary store first delete must fail") }
+        catch MatrixServiceError.storageUnavailable {}
+        try await service.login(homeserver: "https://matrix.test", username: "test", password: "test-password")
+        XCTAssertTrue(service.isLoggedIn)
+        XCTAssertNil(service.sessionError)
+        XCTAssertTrue(service.roomNotifications.states.isEmpty)
+        await service.logout()
+    }
+
+    func testCleanupRequiredRestoreFinishesDespiteFailingMuteStore() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let store = FailFirstDeleteSessionStore(testCredentials(userID: "@test:matrix.test"))
+        let service = makeService(sessionStore: store, directory: temporary, client: FakeClient(),
+                                  sharedRoomMuteStore: UnavailableRoomMuteStore())
+        do { try await service.clearLocalSession(); XCTFail("Primary store first delete must fail") }
+        catch MatrixServiceError.storageUnavailable {}
+        await service.restoreSession()
+        // Pending primary cleanup deliberately removes the old session. Restore
+        // succeeds with no session, rather than reviving a logged-out account.
+        XCTAssertNil(service.sessionError)
+        XCTAssertNil(try store.load())
+        XCTAssertFalse(service.isLoggedIn)
+        XCTAssertTrue(service.roomNotifications.states.isEmpty)
+        try await service.login(homeserver: "https://matrix.test", username: "test", password: "test-password")
+        XCTAssertTrue(service.isLoggedIn)
+        await service.logout()
+    }
+
+    func testNotificationReadbackDoesNotBlockSyncAndRefreshesOnlyNewRooms() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let client = FakeClient(successfulSync: true, rooms: [FakeRoom(id: "!first:test", name: "First")])
+        client.notificationSettings.suspendRawRead = true
+        let service = makeService(sessionStore: InMemorySessionStore(), directory: temporary, client: client)
+        try await service.login(homeserver: "https://matrix.test", username: "test", password: "test-password")
+        try await waitUntil { client.notificationSettings.isRawReadBlocked && service.connectionStatus == .connected }
+        XCTAssertEqual(service.rooms.count, 1)
+        XCTAssertTrue(service.roomNotifications.states.isEmpty)
+        client.notificationSettings.suspendRawRead = false
+        client.notificationSettings.releaseRawRead()
+        try await waitUntil { service.roomNotifications.state(for: "!first:test").isLoaded }
+        let rawReads = client.notificationSettings.rawReadCount
+        let roomReads = client.notificationSettings.roomReadIDs.count
+        let syncCalls = client.syncCalls
+        try await service.sync()
+        try await waitUntil { client.syncCalls > syncCalls && service.connectionStatus == .connected }
+        XCTAssertEqual(client.notificationSettings.rawReadCount, rawReads)
+        XCTAssertEqual(client.notificationSettings.roomReadIDs.count, roomReads)
+        client.configuredRooms.append(FakeRoom(id: "!second:test", name: "Second"))
+        try await service.sync()
+        try await waitUntil { service.roomNotifications.state(for: "!second:test").isLoaded }
+        XCTAssertEqual(client.notificationSettings.rawReadCount, rawReads + 1)
+        XCTAssertEqual(client.notificationSettings.roomReadIDs.filter { $0 == "!first:test" }.count, 1)
+        XCTAssertEqual(client.notificationSettings.roomReadIDs.filter { $0 == "!second:test" }.count, 1)
+        try await client.notificationSettings.setRoomNotificationMode(roomId: "!first:test", mode: .mute)
+        try await waitUntil { service.roomNotifications.isMuted("!first:test") }
+        XCTAssertEqual(client.notificationSettings.rawReadCount, rawReads + 2)
+        XCTAssertEqual(client.notificationSettings.roomReadIDs.count, roomReads + 3)
+        await service.logout()
+    }
+
     func testOpenIDSDKBindingAndLogoutDisableRetainedGatewayClient() async throws {
         try await assertOpenIDGatewayEndsSession(clearLocal: false)
     }
@@ -1334,6 +1506,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
 
     private func makeService(sessionStore: any SessionStore, directory: URL, client: FakeClient,
                              authentication: FakePasswordAuthentication = FakePasswordAuthentication(),
+                             sharedRoomMuteStore: any SharedRoomMuteStoring = MemoryRoomMuteStore(),
                              sharedPushCredentialsStore: any SharedPushCredentialsStore = InMemorySharedPushCredentialsStore(),
                              sharedPushCredentialsCleanupStateStore: any SharedPushCredentialsCleanupStateStore = InMemorySharedPushCredentialsCleanupStateStore(),
                              pairingAuthentication: any PairingCredentialAuthenticating = MatrixPairingCredentialAuthentication()) -> MatrixService {
@@ -1346,7 +1519,8 @@ final class MatrixServiceLifecycleTests: XCTestCase {
             monitorNetwork: false,
             passwordAuthentication: authentication,
             pairingAuthentication: pairingAuthentication,
-            authenticationTimeout: 5
+            authenticationTimeout: 5,
+            sharedRoomMuteStore: sharedRoomMuteStore
         )
         service.clientFactory = { _, _, _ in client }
         return service
@@ -1443,12 +1617,15 @@ private final class BlockingPusherTransport: MatrixPusherTransport, @unchecked S
 }
 
 private final class FakeClient: Client, @unchecked Sendable {
+    let notificationSettings = TestNotificationSettings()
+    override func getNotificationSettings() async -> NotificationSettings { notificationSettings }
+    override func getRoom(roomId: String) throws -> Room? { configuredRooms.first { $0.id() == roomId } }
     private let configuredLogoutError: Error?
     private let configuredRestoreError: Error?
     @TestLocked var syncError: Error? = nil
     private let successfulSync: Bool
     private let probe: QueueProbe?
-    private let configuredRooms: [Room]
+    @TestLocked var configuredRooms: [Room]
     private let blockQueueEnable: Bool
     private let onSetDelegate: (() throws -> Void)?
     @TestLocked private(set) var syncCalls = 0
@@ -1632,7 +1809,27 @@ private final class FakeRoom: Room, @unchecked Sendable {
     override func roomInfo() async throws -> RoomInfo { throw ClientError.Generic(msg: "unused", details: nil) }
     override func latestEvent() async -> LatestEventValue { latest }
     override func isDirect() async -> Bool { false }
-    override func latestEncryptionState() async throws -> EncryptionState { .unknown }
+    @TestLocked var encryption: EncryptionState = .notEncrypted
+    @TestLocked var suspendEncryptionRead = false
+    private let encryptionReadLock = NSLock()
+    private var encryptionReadContinuation: CheckedContinuation<EncryptionState, Never>?
+    var isEncryptionReadBlocked: Bool { encryptionReadLock.withLock { encryptionReadContinuation != nil } }
+    func releaseEncryptionRead() {
+        let pending = encryptionReadLock.withLock {
+            let value = encryptionReadContinuation
+            encryptionReadContinuation = nil
+            return value
+        }
+        pending?.resume(returning: encryption)
+    }
+    override func latestEncryptionState() async throws -> EncryptionState {
+        if suspendEncryptionRead {
+            return await withCheckedContinuation { continuation in
+                encryptionReadLock.withLock { encryptionReadContinuation = continuation }
+            }
+        }
+        return encryption
+    }
 }
 
 private final class FakeTimelineEvent: TimelineEvent, @unchecked Sendable {

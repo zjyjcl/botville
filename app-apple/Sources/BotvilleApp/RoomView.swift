@@ -40,6 +40,7 @@ struct RoomView: View {
     @State private var isEnablingEncryption = false
     @State private var isPresentingEncryptionConfirmation = false
     @State private var isPresentingInvite = false
+    @State private var isPresentingSettings = false
     @State private var encryptionConsent = EncryptionConsent()
 
     private var currentRoom: MatrixRoom {
@@ -139,6 +140,9 @@ struct RoomView: View {
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Menu {
+                    Button { isPresentingSettings = true } label: {
+                        Label("房间设置", systemImage: "gearshape")
+                    }
                     Button {
                         isPresentingInvite = true
                     } label: {
@@ -169,6 +173,9 @@ struct RoomView: View {
         }
         .onChange(of: isInputFocused) { _, _ in updateInputActivity() }
         .onChange(of: draft) { _, _ in updateInputActivity() }
+        .sheet(isPresented: $isPresentingSettings) {
+            RoomNotificationSettingsSheet(controller: service.roomNotifications, room: currentRoom)
+        }
         .sheet(isPresented: $isPresentingInvite) {
             InviteMemberSheet(service: service, room: currentRoom)
         }
@@ -831,3 +838,56 @@ private struct TimelineLastRowTrace: Equatable {
     let visible: Bool
 }
 #endif
+
+@MainActor
+private struct RoomNotificationSettingsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var controller: RoomMuteController
+    let room: MatrixRoom
+    @State private var presentedError: String?
+
+    private var state: RoomMuteState { controller.state(for: room.id) }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Toggle("消息免打扰", isOn: Binding(
+                        get: { state.isMuted },
+                        set: { value in Task { await controller.setMuted(value, room: room) } }
+                    ))
+                    .tint(Color(red: 0x1A / 255.0, green: 0xAD / 255.0, blue: 0x8E / 255.0))
+                    .disabled(!state.isLoaded || state.isUpdating)
+                    if state.isUpdating { ProgressView("正在保存…") }
+                } footer: {
+                    Text("开启后不提醒此房间的新消息。会话列表保留未读红点，App 图标角标不计入此房间。")
+                }
+                if let error = state.errorMessage {
+                    Section {
+                        Text(error).font(.footnote).foregroundStyle(.red)
+                        Button("重新读取") { Task { await controller.refresh(room) } }
+                            .disabled(state.isUpdating)
+                    }
+                } else if !state.isLoaded {
+                    ProgressView("正在读取设置…")
+                }
+            }
+            .navigationTitle("房间设置")
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
+            .task(id: room.id) { await controller.refresh(room) }
+            .onChange(of: state.errorMessage, initial: true) { _, error in
+                // Keep the failure visible even if the next sync already
+                // reconciles the settings and clears the controller's error.
+                if let error { presentedError = error }
+            }
+            .alert("消息免打扰", isPresented: Binding(
+                get: { presentedError != nil },
+                set: { if !$0 { presentedError = nil } }
+            )) {
+                Button("知道了", role: .cancel) { presentedError = nil }
+            } message: {
+                Text(presentedError ?? "")
+            }
+        }
+    }
+}

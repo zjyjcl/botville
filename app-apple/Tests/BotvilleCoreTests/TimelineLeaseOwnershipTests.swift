@@ -286,7 +286,7 @@ private struct LeaseFixture {
                                     sharedPushCredentialsStore: InMemorySharedPushCredentialsStore(),
                                     sharedPushCredentialsCleanupStateStore: LeaseCleanupState(),
                                     storeDirectory: SessionStoreDirectory(baseURL: directory),
-                                    discovery: LeaseDiscovery(), monitorNetwork: false)
+                                    discovery: LeaseDiscovery(), monitorNetwork: false, sharedRoomMuteStore: MemoryRoomMuteStore())
         service.clientFactory = { _, _, _ in client }
         await service.restoreSession()
         return Self(service: service, room: room, timeline: timeline, directory: directory)
@@ -305,6 +305,8 @@ private struct LeaseDiscovery: LoginCapabilityDiscovering {
 }
 
 private final class LeaseFakeClient: Client, @unchecked Sendable {
+    let notificationSettings = TestNotificationSettings()
+    override func getNotificationSettings() async -> NotificationSettings { notificationSettings }
     private let room: LeaseFakeRoom
 
     init(room: LeaseFakeRoom) { self.room = room; super.init(noHandle: .init()) }

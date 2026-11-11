@@ -50,6 +50,10 @@ public struct PushNotificationPresentation: OptionSet, Equatable, Sendable {
     // badge updates without requesting a second system banner/list/sound.
     public static let foreground: Self = [.badge]
 
+    public static func foreground(mutedRoomHashes: Set<String>) -> Self {
+        RoomMutePushPolicy.acceptsServerBadge(hashes: mutedRoomHashes) ? foreground : []
+    }
+
     /// Bits aligned with `UNNotificationPresentationOptions` (iOS 14+ / SDK 27.2):
     /// badge=1<<0, sound=1<<1, list=1<<3, banner=1<<4. Does not set deprecated `.alert`.
     public var unNotificationPresentationRawValue: UInt {
@@ -63,6 +67,10 @@ public struct PushNotificationPresentation: OptionSet, Equatable, Sendable {
 }
 
 public enum PushBadge {
+    public static func total(rooms: [MatrixRoom], isMuted: (String) -> Bool) -> Int {
+        total(unreadCounts: rooms.filter { !isMuted($0.id) }.map(\.unreadCount))
+    }
+
     /// Saturates at Int.max so malformed or unusually large server totals
     /// cannot wrap the application icon badge.
     public static func total(unreadCounts: [UInt64]) -> Int {
@@ -78,21 +86,13 @@ public enum PushBadge {
 /// DEBUG foreground willPresent evidence. Writes only event names and option
 /// raw bits into the App Group cache — never tokens, Authorization, or bodies.
 public enum PushForegroundProbeLog {
-    public static let appGroupInfoKey = "BotvilleAppGroupIdentifier"
-    public static var appGroupIdentifier: String? {
-        appGroupIdentifier(in: Bundle.main.infoDictionary ?? [:])
-    }
+    public static let appGroupInfoKey = BotvilleAppGroup.infoKey
+    public static var appGroupIdentifier: String? { BotvilleAppGroup.identifier }
 
     // Missing/unexpanded configuration must not fall back to another account's
     // App Group. SPM tools without the app's Info.plist simply have no log URL.
     static func appGroupIdentifier(in info: [String: Any]) -> String? {
-        guard let value = info[appGroupInfoKey] as? String,
-              value.hasPrefix("group."), value.count > "group.".count,
-              !value.contains("$"),
-              value.rangeOfCharacter(from: .whitespacesAndNewlines.union(.controlCharacters)) == nil else {
-            return nil
-        }
-        return value
+        BotvilleAppGroup.identifier(in: info)
     }
     public static let fileName = "botville-willpresent-probe.log"
 
