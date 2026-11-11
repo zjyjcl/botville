@@ -251,6 +251,7 @@ for build_file_id in nse_sources_phase['files']:
         ('NotificationService.swift', '<group>'): root / 'NotificationService/NotificationService.swift',
         ('Sources/BotvilleCore/SharedPushCredentials.swift', 'SOURCE_ROOT'): root / 'Sources/BotvilleCore/SharedPushCredentials.swift',
         ('Sources/BotvilleCore/PushNotificationContent.swift', 'SOURCE_ROOT'): root / 'Sources/BotvilleCore/PushNotificationContent.swift',
+        ('Sources/BotvilleCore/SharedRoomMute.swift', 'SOURCE_ROOT'): root / 'Sources/BotvilleCore/SharedRoomMute.swift',
     }
     if (path, source_tree) not in source_paths or not source_paths[path, source_tree].is_file():
         raise SystemExit(f'NSE source path/sourceTree is not in the controlled allowlist: {path} {source_tree}')
@@ -258,8 +259,8 @@ for build_file_id in nse_sources_phase['files']:
                                             for group in objects.values() if group.get('isa') == 'PBXGroup'):
         raise SystemExit('NSE group-relative source must be in NotificationService group')
     nse_source_paths.append(source_paths[path, source_tree])
-if {path.name for path in nse_source_paths} != {'NotificationService.swift', 'SharedPushCredentials.swift', 'PushNotificationContent.swift'}:
-    raise SystemExit('NSE source set must be exactly NotificationService, SharedPushCredentials, and PushNotificationContent')
+if {path.name for path in nse_source_paths} != {'NotificationService.swift', 'SharedPushCredentials.swift', 'PushNotificationContent.swift', 'SharedRoomMute.swift'}:
+    raise SystemExit('NSE source set must be exactly NotificationService, SharedPushCredentials, PushNotificationContent, and SharedRoomMute')
 for source in nse_source_paths:
     source_text = source.read_text()
     if re.search(r'\b(?:print|debugPrint|dump|NSLog|os_log)\s*\(', source_text):
@@ -272,8 +273,23 @@ for source in nse_source_paths:
             }
             if line.strip() not in safe_logs or 'token' in line.lower():
                 raise SystemExit(f'NSE has an unsafe log statement: {source}:{number}')
+    # SharedRoomMute (#179) is the one NSE file allowed to read/write a file: the
+    # App Group cache of full SHA-256 room digests. It must hold no credentials,
+    # stay validated as 64-char lowercase hex, and make no network requests.
+    room_mute_cache = source.name == 'SharedRoomMute.swift'
+    if room_mute_cache:
+        for required in ('room-mute-sha256.json', 'SHA256.hash', 'validHash', 'BotvilleAppGroupIdentifier'):
+            if required not in source_text:
+                raise SystemExit(f'NSE room-mute cache is missing required boundary {required!r}')
+        for forbidden in ('Keychain', 'SecItem', 'accessToken', 'Authorization', 'UserDefaults', 'FileHandle'):
+            if forbidden in source_text:
+                raise SystemExit(f'NSE room-mute cache must not touch credentials or other storage ({forbidden}): {source}')
+        if source_text.count('write(to:') != 1 or source_text.count('Data(contentsOf:') != 1:
+            raise SystemExit('NSE room-mute cache may contain only its single digest read and write')
+        if re.search(r'"group\.[A-Za-z0-9]', source_text):
+            raise SystemExit('NSE room-mute cache must read the App Group from Info.plist, not hard-code it')
     for forbidden_storage in ('UserDefaults', 'FileHandle', 'write(to:', 'Data(contentsOf:'):
-        if forbidden_storage in source_text:
+        if forbidden_storage in source_text and not room_mute_cache:
             raise SystemExit(f'NSE must not use plaintext credential storage ({forbidden_storage}): {source}')
     if 'import MatrixRustSDK' in source_text or 'import BotvilleCore' in source_text:
         raise SystemExit(f'NSE must not import the Matrix SDK or BotvilleCore: {source}')

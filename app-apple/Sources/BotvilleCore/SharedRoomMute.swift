@@ -22,13 +22,37 @@ public enum SharedRoomMuteStoreError: Error {
     case containerUnavailable
 }
 
+/// Runtime App Group from the expanded `BotvilleAppGroupIdentifier` Info.plist
+/// key (`group.$(BOTVILLE_BUNDLE_ID_PREFIX)`, see Config/Signing.xcconfig).
+/// Compiled into both the app and NSE. Missing or unexpanded values return nil
+/// and never fall back to a hard-coded (possibly another account's) group.
+public enum BotvilleAppGroup {
+    public static let infoKey = "BotvilleAppGroupIdentifier"
+
+    public static var identifier: String? { identifier(in: Bundle.main.infoDictionary ?? [:]) }
+
+    public static func identifier(in info: [String: Any]) -> String? {
+        guard let value = info[infoKey] as? String,
+              value.hasPrefix("group."), value.count > "group.".count,
+              !value.contains("$"),
+              value.rangeOfCharacter(from: .whitespacesAndNewlines.union(.controlCharacters)) == nil else {
+            return nil
+        }
+        return value
+    }
+}
+
 public struct SharedRoomMuteStore: SharedRoomMuteStoring {
-    public static let appGroupIdentifier = "group.com.zjyjcl.botville"
+    static let relativePath = "Library/Application Support/room-mute-sha256.json"
     private let fileURL: URL?
 
-    public init() {
-        fileURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: Self.appGroupIdentifier)?
-            .appendingPathComponent("Library/Application Support/room-mute-sha256.json")
+    public init() { self.init(appGroupIdentifier: BotvilleAppGroup.identifier) }
+
+    /// A nil group (SPM tools, unexpanded config) is `containerUnavailable`.
+    public init(appGroupIdentifier: String?, fileManager: FileManager = .default) {
+        fileURL = appGroupIdentifier
+            .flatMap { fileManager.containerURL(forSecurityApplicationGroupIdentifier: $0) }?
+            .appendingPathComponent(Self.relativePath)
     }
 
     public init(fileURL: URL?) { self.fileURL = fileURL }

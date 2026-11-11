@@ -453,3 +453,39 @@ final class RoomMuteTests: XCTestCase {
         XCTAssertFalse(unmuted)
     }
 }
+
+/// #180: the App Group comes from the expanded `BotvilleAppGroupIdentifier`
+/// Info.plist key (`group.$(BOTVILLE_BUNDLE_ID_PREFIX)`), never a constant.
+final class SharedRoomMuteAppGroupTests: XCTestCase {
+    func testAppGroupReadsExpandedInfoPlistValueOnly() {
+        for group in ["group.com.zjyjcl.botville", "group.com.example.custom"] {
+            XCTAssertEqual(BotvilleAppGroup.identifier(in: [BotvilleAppGroup.infoKey: group]), group)
+        }
+        for invalid in ["", "group.", "com.example", "group.$(BOTVILLE_BUNDLE_ID_PREFIX)", "group.a b", "group.a\n"] {
+            XCTAssertNil(BotvilleAppGroup.identifier(in: [BotvilleAppGroup.infoKey: invalid]), invalid)
+        }
+        XCTAssertNil(BotvilleAppGroup.identifier(in: [:]))
+        XCTAssertEqual(PushForegroundProbeLog.appGroupInfoKey, BotvilleAppGroup.infoKey)
+    }
+
+    func testMissingAppGroupIsContainerUnavailableNotAnotherGroup() {
+        let store = SharedRoomMuteStore(appGroupIdentifier: nil)
+        XCTAssertThrowsError(try store.load()) { error in
+            guard case SharedRoomMuteStoreError.containerUnavailable = error else {
+                return XCTFail("unexpected error \(error)")
+            }
+        }
+        XCTAssertThrowsError(try store.save([]))
+    }
+
+    func testRuntimeSourcesDoNotHardCodeAppGroup() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        for path in ["Sources/BotvilleCore/SharedRoomMute.swift", "Sources/BotvilleCore/PushNotificationUX.swift",
+                     "NotificationService/NotificationService.swift", "Sources/BotvilleApp/BotvilleApp.swift"] {
+            let text = try String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)
+            // A literal concrete group such as "group.com…"; the bare "group." prefix check is fine.
+            XCTAssertNil(text.range(of: #""group\.[A-Za-z0-9]"#, options: .regularExpression), path)
+        }
+    }
+}
