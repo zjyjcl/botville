@@ -86,7 +86,7 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
 
     public init(baseURL: URL, allowLocalHTTP: Bool = false, token: String? = nil, session: URLSession? = nil,
                 certificateFingerprint: Data? = nil, openIDProvider: MatrixOpenIDTokenProvider? = nil,
-                retrySleep: @escaping RetrySleep = { try await Task.sleep(for: .seconds($0)) })
+                retrySleep: RetrySleep? = nil)
         throws
     {
         do {
@@ -104,7 +104,8 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         guard certificateFingerprint == nil || session == nil else { throw GatewayClientError.invalidBaseURL }
         self.token = token
         self.openIDProvider = openIDProvider
-        self.retrySleep = retrySleep
+        // Keep the async default inside this module, as with timeoutSleep.
+        self.retrySleep = retrySleep ?? { try await Task.sleep(for: .seconds($0)) }
         if let session {
             self.session = session
         } else if let certificateFingerprint {
@@ -123,7 +124,7 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
     public convenience init(
         baseURL: String, allowLocalHTTP: Bool = false, token: String? = nil, session: URLSession? = nil,
         certificateFingerprint: Data? = nil, openIDProvider: MatrixOpenIDTokenProvider? = nil,
-        retrySleep: @escaping RetrySleep = { try await Task.sleep(for: .seconds($0)) }
+        retrySleep: RetrySleep? = nil
     ) throws {
         guard let url = URL(string: baseURL.trimmingCharacters(in: .whitespacesAndNewlines)) else {
             throw GatewayClientError.invalidBaseURL
