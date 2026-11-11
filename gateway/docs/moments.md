@@ -16,9 +16,13 @@ homeserver）+ 可见范围 + 评论（≤500 字，一层回复引用）+ 点�
 - **越权与不存在不可区分**：`can_view` 为假与动态不存在统一返回 `404`
   `moment.not_found`，响应体逐字节相同，不泄露存在性。列表接口复用同一函数过滤，
   保证列表 ⊆ {GET 会 200 的动态}。
-- **身份不自报**：同服调用必须带 Matrix access token，网关经 homeserver whoami 换出
-  `user_id`；共享 gateway token 不能用于以用户身份读写动态。也可改用短时
-  `MatrixOpenID` OpenID token（App 场景，见 §3 与 `contract.md` §1.2.3）。
+- **身份不自报**：App **只**发 `Authorization: MatrixOpenID <token>`（`matrixOpenIdToken`，
+  网关经 homeserver `openid/userinfo` 取 `sub` 换出 `user_id`），无 feature flag、无回退，
+  **禁止**拿用户 Matrix access token 当 `Bearer` 兜底。网关在 `/moments*` 上**继续接受**
+  `Authorization: Bearer <Matrix access token>`（`matrixUserToken`→whoami），那是留给
+  **App 以外其他调用方**的阶段 1 共存路径（未标 `deprecated`，仍有效）；退场节奏见
+  `contract.md` §1.2.3。共享 gateway token 不能用于以用户身份读写动态。完整身份规则见
+  §3 与 `contract.md` §1.2.3。
 - 好友图归 A2.3（#8）。本项只定义 `RelationProvider.is_friend(viewer, author)` 接口，
   PR2 提供可测试的临时实现（配置/测试注入），A2.3 落地后替换，本模块代码不变。
 
@@ -54,22 +58,28 @@ SQLite，DDL：`gateway/migrations/moments/0001_moments.sql`（表名全部 `mom
 
 ## 3. 身份
 
-- **同服用户 / App（并存期两种凭据，任一即可）**：`/moments*` 的 OpenAPI `security`
-  同时列出两个方案，语义相同——换出的都是**本服 Matrix user id**：
-  - `Authorization: MatrixOpenID <token>`（契约方案 `matrixOpenIdToken`，#124 阶段 1）：
-    App 经标准 C-S API `POST /_matrix/client/v3/user/{userId}/openid/request_token` 取得
-    **短时** OpenID token（长期 access token 留在 App）；网关经 compose 内网**直连**本服
-    homeserver `GET /_matrix/federation/v1/openid/userinfo?access_token=…`（**不带 X-Matrix
-    签名**，不经 fedgate、不走公网；直连地址取自 `GATEWAY_HOMESERVER_FEDERATION_URL`，
-    空则回落 `GATEWAY_HOMESERVER_URL`），取返回的 `sub` 作为 `user_id`。`sub` 的域必须等于
-    本服 `GATEWAY_MATRIX_SERVER_NAME`，否则 401。缓存按 token 哈希（不缓存明文、不写日志），
-    TTL ≤ 60 秒且不超过剩余有效期；过期以 `expires_in` 为准，网关不自行延长。
-    不另做网关侧 nonce 防重放（持有者令牌的协议固有限制；跨服 moments 的 HMAC+ts+nonce
-    与本项无关）。
-  - `Authorization: Bearer <Matrix access token>`（契约方案 `matrixUserToken`，现行路径）：
-    网关调用本服 homeserver `GET /_matrix/client/v3/account/whoami` 换出 `user_id`，
-    按 token 哈希缓存 ≤ 60 秒。**本期未标 `deprecated`，仍完全有效**；弃用与移除须另行
-    公告并先报总管（契约 §1.2.3 阶段 2/3）。
+- **同服用户 / App（两种凭据，按调用方选用）**：`/moments*` 的 OpenAPI `security`
+  同时列出两个方案，校验结果语义相同——换出的都是**本服 Matrix user id**：
+  - **App 只走 `Authorization: MatrixOpenID <token>`**（契约方案 `matrixOpenIdToken`，
+    #124 阶段 1）：App 经标准 C-S API
+    `POST /_matrix/client/v3/user/{userId}/openid/request_token` 取得**短时** OpenID token
+    （长期 access token 留在 App，**不发给网关、不作 `Bearer` 兜底**）；网关经 compose 内网
+    **直连**本服 homeserver `GET /_matrix/federation/v1/openid/userinfo?access_token=…`
+    （**不带 X-Matrix 签名**，不经 fedgate、不走公网；直连地址取自
+    `GATEWAY_HOMESERVER_FEDERATION_URL`，空则回落 `GATEWAY_HOMESERVER_URL`），取返回的 `sub`
+    作为 `user_id`。`sub` 的域必须等于本服 `GATEWAY_MATRIX_SERVER_NAME`，否则 401。缓存按
+    token 哈希（不缓存明文、不写日志），TTL ≤ 60 秒且不超过剩余有效期；过期以 `expires_in`
+    为准，网关不自行延长。不另做网关侧 nonce 防重放（持有者令牌的协议固有限制；跨服
+    moments 的 HMAC+ts+nonce 与本项无关）。
+  - **`Authorization: Bearer <Matrix access token>`**（契约方案 `matrixUserToken`，其他
+    调用方的阶段 1 共存路径）：网关调用本服 homeserver
+    `GET /_matrix/client/v3/account/whoami` 换出 `user_id`，按 token 哈希缓存 ≤ 60 秒。
+    本路径**留给 App 以外的其他调用方**，**App 不使用**；**未标 `deprecated`，仍完全
+    有效**。退场节奏（详见 `contract.md` §1.2.3）：T1 本 PR（#7 moments CRUD）上线后观察
+    App 流量 → T2 清点 Bearer 调用方（届时「按 scheme 统计」PR）→ T3 已知调用方迁完且 Bearer
+    占比 <1%（计划值）后进**阶段 2**（标 `deprecated`，须先公告、先报总管）→ T4 至少 90 天
+    公告并加 `Deprecation`/`Sunset` 头后进**阶段 3**（从 `/moments*` security 移除
+    `matrixUserToken`，破坏性变更须另行批准）。阶段 2/3 均须先公告、先报总管。
   - **不信任调用方自报身份**；两种凭据由请求头 scheme（`MatrixOpenID` vs `Bearer`）显式
     区分，**禁止「先试 OpenID 再试 whoami」**。无效 / 过期 token → 401（`auth.missing` /
     `auth.invalid_token`，不新增错误码）。完整契约见 `contract.md` §1.2.3。
@@ -83,12 +93,12 @@ SQLite，DDL：`gateway/migrations/moments/0001_moments.sql`（表名全部 `mom
   矩阵 8 类查看者均为 Matrix 用户）。若实现层需要以 AI 身份代读，必须先 `friend_subject`
   解到 `owner_id` 再进入 `can_view` / `can_see_interaction`；公开 API 从不接受 persona 令牌。
 - **AI 评论 / 点赞的创建路径**：公开 `POST /moments/{id}/comments` 与
-  `PUT/DELETE /moments/{id}/likes/me` 的行为者**恒为**调用者本人（human，
-  userinfo `sub` / whoami 的 `user_id`）；`CreateCommentRequest` 不接受
-  `author_persona_id`。
+  `PUT/DELETE /moments/{id}/likes/me` 的行为者**恒为**调用者本人（human，即
+  `matrixOpenIdToken` 的 userinfo `sub` 或 `matrixUserToken`→whoami 的 `user_id`）；
+  `CreateCommentRequest` 不接受 `author_persona_id`。
   AI 评论/点赞与 AI 发动态一样，只经 appservice **内部调用**写入（校验
-  persona 归属后落库 `author_kind`/`actor_kind=ai` 与对应 `owner_id`），
-  不暴露为 `matrixUserToken` 公开路径。
+  persona 归属后落库 `author_kind`/`actor_kind=ai` 与对应 `owner_id`），不暴露为
+  任一用户凭据（`matrixUserToken` / `matrixOpenIdToken`）的公开路径。
 - **跨服**（PR3 入契约，本文先描述）：对端网关经 fedgate 调
   `/_matrix/botville/moments/v1/feed`、`/_matrix/botville/moments/v1/moments/{id}`，
   用配对时协商的 per-peer 密钥做 HMAC 签名（复用 #116 notify-severed 格式：
@@ -251,15 +261,18 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
 - 匿名或 Matrix token 无效：401（`auth.invalid_token`）；传输层限速 429。
 - `reply_to_comment_id`：目标评论不存在、已软删、或不在同一动态、或对当前查看者不可见（`can_view ∧ can_see_interaction` 为假）时，**统一**返回 `422` `request.invalid`（`errors[].field = reply_to_comment_id`），不区分原因，避免靠 404/422 差异探评论 ULID。
 
-## 7. 配置变量（计划，PR2 加入 `.env.example`）
+## 7. 配置变量
 
-本 PR **不**修改 `gateway/.env.example`（契约与实现拆开；#117 已合入，冲突风险已消除），
-以下变量在 PR2 实现时登记：
+`GATEWAY_OPENID_CACHE_TTL_SECONDS` **已登记**：`gateway/.env.example` 第 107 行
+（`GATEWAY_OPENID_CACHE_TTL_SECONDS=60`），并在 `gateway/README.md` 配置表登记（#170），
+随 #124 生效。
+
+其余三个 `GATEWAY_MOMENTS_*` 变量仍为**计划**，当前既不在 `gateway/.env.example`，
+也不在 `gateway/src/config.py`；随 #7（moments CRUD）实现时一并登记。
 
 | 变量 | 说明 |
 |---|---|
 | `GATEWAY_MOMENTS_DB_PATH` | 动态 SQLite 路径（compose 卷 `gateway-data` 内，WAL 模式）。 |
-| `GATEWAY_OPENID_CACHE_TTL_SECONDS` | 用户身份校验缓存 TTL，同时约束 whoami 与 OpenID userinfo 两条路径；上限 60，默认 60，`0` = 不缓存。`<0` / `>60` / 非整数拒绝启动。（原稿写作 `GATEWAY_WHOAMI_CACHE_TTL_SECONDS`，与实现不符；#124 已落地，实际变量为 `GATEWAY_OPENID_CACHE_TTL_SECONDS`。） |
 | `GATEWAY_MOMENTS_SOFT_DELETE_RETENTION_DAYS` | 软删行清理任务保留天数（默认 30）。 |
 | `GATEWAY_MOMENTS_AUDIT_RETENTION_DAYS` | `moments_events` 审计保留天数。 |
 

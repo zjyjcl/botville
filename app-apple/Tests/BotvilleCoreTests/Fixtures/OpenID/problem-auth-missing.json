@@ -1,0 +1,7 @@
+{
+  "type": "urn:botville:error:auth.missing",
+  "title": "Authorization header required",
+  "status": 401,
+  "code": "auth.missing",
+  "request_id": "req_demo_auth_missing"
+}

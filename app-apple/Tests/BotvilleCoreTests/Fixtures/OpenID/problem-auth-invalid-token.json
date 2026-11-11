@@ -1,0 +1,7 @@
+{
+  "type": "urn:botville:error:auth.invalid_token",
+  "title": "Invalid user token",
+  "status": 401,
+  "code": "auth.invalid_token",
+  "request_id": "req_demo_auth_invalid_token"
+}

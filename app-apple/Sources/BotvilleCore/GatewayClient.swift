@@ -10,9 +10,36 @@ public protocol GatewayClient: ModuleWebSessionProviding {
     func exchangeSessionCookie(capabilityID: String, code: String) async throws -> GatewayCookieExchange
 }
 
-public enum GatewayClientError: Error, Equatable {
+public enum GatewayClientError: Error, Equatable, LocalizedError {
     case invalidBaseURL, insecureBaseURL, invalidResponse, invalidAction, expiredSessionCode
     case httpStatus(Int)
+    case problem(status: Int, code: String)
+    /// Two invalid-token responses despite one refresh; no credentials/body retained.
+    case serverAuthMisconfigured
+
+    public var httpStatus: Int? {
+        switch self {
+        case .httpStatus(let status), .problem(let status, _): return status
+        case .serverAuthMisconfigured: return 401
+        default: return nil
+        }
+    }
+
+    public var problemCode: String? {
+        switch self {
+        case .problem(_, let code): return code
+        case .serverAuthMisconfigured: return "auth.invalid_token"
+        default: return nil
+        }
+    }
+
+    public var errorDescription: String? {
+        switch self {
+        case .serverAuthMisconfigured: return "服务器认证异常，请联系部署者"
+        case .problem, .httpStatus: return "网关请求失败，请稍后重试。"
+        default: return nil
+        }
+    }
 }
 
 private struct ActionIntent: Hashable {
@@ -46,15 +73,20 @@ private func validateAction(card: GatewayCard, action: GatewayCardAction) async 
 }
 
 /// Transport skeleton for the v1 contract. No credentials are read from the
-/// environment, persisted, or logged. A future gateway login may inject a token.
+/// environment, persisted, or logged. Site and end-user credentials are
+/// injected separately; moments always requires the OpenID provider.
 public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
     public let baseURL: URL
     private let token: String?
+    private let openIDProvider: MatrixOpenIDTokenProvider?
     private let session: URLSession
     private let intentKeys = ActionIntentKeys()
+    public typealias RetrySleep = @Sendable (TimeInterval) async throws -> Void
+    private let retrySleep: RetrySleep
 
     public init(baseURL: URL, allowLocalHTTP: Bool = false, token: String? = nil, session: URLSession? = nil,
-                certificateFingerprint: Data? = nil)
+                certificateFingerprint: Data? = nil, openIDProvider: MatrixOpenIDTokenProvider? = nil,
+                retrySleep: @escaping RetrySleep = { try await Task.sleep(for: .seconds($0)) })
         throws
     {
         do {
@@ -71,6 +103,8 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         // available only for unpinned clients.
         guard certificateFingerprint == nil || session == nil else { throw GatewayClientError.invalidBaseURL }
         self.token = token
+        self.openIDProvider = openIDProvider
+        self.retrySleep = retrySleep
         if let session {
             self.session = session
         } else if let certificateFingerprint {
@@ -88,13 +122,14 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
 
     public convenience init(
         baseURL: String, allowLocalHTTP: Bool = false, token: String? = nil, session: URLSession? = nil,
-        certificateFingerprint: Data? = nil
+        certificateFingerprint: Data? = nil, openIDProvider: MatrixOpenIDTokenProvider? = nil,
+        retrySleep: @escaping RetrySleep = { try await Task.sleep(for: .seconds($0)) }
     ) throws {
         guard let url = URL(string: baseURL.trimmingCharacters(in: .whitespacesAndNewlines)) else {
             throw GatewayClientError.invalidBaseURL
         }
         try self.init(baseURL: url, allowLocalHTTP: allowLocalHTTP, token: token, session: session,
-                      certificateFingerprint: certificateFingerprint)
+                      certificateFingerprint: certificateFingerprint, openIDProvider: openIDProvider, retrySleep: retrySleep)
     }
 
     public func capabilities(locale: String? = nil, appVersion: String? = nil) async throws
@@ -200,7 +235,7 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         return GatewayCookieExchange(statusCode: 204)
     }
 
-    private func request(
+    func request(
         _ segments: [String], method: String = "GET", query: [URLQueryItem] = [], body: Data? = nil,
         authorize: Bool = true, negotiateCards: Bool = false, idempotencyKey: String? = nil
     ) throws -> URLRequest {
@@ -236,17 +271,89 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         }
         if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         if let idempotencyKey { request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key") }
-        if authorize, let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        if authorize, segments.first != "moments", let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         return request
     }
 
-    private func decode<T: Decodable>(_ request: URLRequest, as: T.Type) async throws -> T {
-        let (data, response) = try await PairingURLSession.data(for: request, using: session)
-        guard let response = response as? HTTPURLResponse else { throw GatewayClientError.invalidResponse }
-        guard (200..<300).contains(response.statusCode) else {
+    /// Minimal raw-data entry point. Resource models and UI are intentionally
+    /// deferred; path components are encoded separately, never parsed as URLs.
+    public func momentsRequest(
+        subpath: [String] = [], method: String = "GET", query: [URLQueryItem] = [],
+        body: Data? = nil, idempotencyKey: String? = nil
+    ) async throws -> Data {
+        try await responseData(for: request(["moments"] + subpath, method: method,
+            query: query, body: body, idempotencyKey: idempotencyKey))
+    }
+
+    /// Match the first API path segment relative to this gateway's base prefix.
+    /// Query strings and similar names (momentsx) never select credentials.
+    func isMomentsRequest(_ request: URLRequest) throws -> Bool {
+        guard let root = try self.request(["moments"]).url?.path,
+              let path = request.url?.path else { throw GatewayClientError.invalidResponse }
+        return path == root || path.hasPrefix(root + "/")
+    }
+
+    func responseData(for request: URLRequest) async throws -> Data {
+        var outgoing = request
+        var usedToken: MatrixOpenIDToken?
+        if try isMomentsRequest(request) {
+            guard let openIDProvider else { throw MatrixOpenIDError.providerUnavailable }
+            let token = try await openIDProvider.token()
+            usedToken = token
+            outgoing.setValue("MatrixOpenID \(token.accessToken)", forHTTPHeaderField: "Authorization")
+        }
+        var refreshedOnce = false
+        var serverRetries = 0
+        // Only GET or an explicitly keyed write can be safely replayed after 500.
+        let canRetryServerError = request.httpMethod == "GET"
+            || !(request.value(forHTTPHeaderField: "Idempotency-Key")?
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        while true {
+            try Task.checkCancellation()
+            let (data, rawResponse) = try await PairingURLSession.data(for: outgoing, using: session)
+            guard let response = rawResponse as? HTTPURLResponse else { throw GatewayClientError.invalidResponse }
+            guard !(200..<300).contains(response.statusCode) else { return data }
+            let code = Self.problemCode(data: data, response: response)
+            if response.statusCode == 401, code == "auth.invalid_token",
+               let current = usedToken, let openIDProvider {
+                // Identity-scoped invalidation preserves a newer concurrent refresh.
+                await openIDProvider.invalidate(current)
+                guard !refreshedOnce else { throw GatewayClientError.serverAuthMisconfigured }
+                refreshedOnce = true
+                let refreshed = try await openIDProvider.token()
+                usedToken = refreshed
+                // Reuse URL, method, body and Idempotency-Key exactly.
+                outgoing.setValue("MatrixOpenID \(refreshed.accessToken)", forHTTPHeaderField: "Authorization")
+                continue
+            }
+            if response.statusCode == 500, code == "internal.error",
+               canRetryServerError, serverRetries < 3 {
+                let delay = TimeInterval(1 << serverRetries) // 1s, 2s, 4s; total budget per operation.
+                serverRetries += 1
+                try await retrySleep(delay)
+                continue // Preserve the current token, even across backoff.
+            }
+            if let code { throw GatewayClientError.problem(status: response.statusCode, code: code) }
             throw GatewayClientError.httpStatus(response.statusCode)
         }
-        return try GatewayCoding.decoder.decode(T.self, from: data)
+    }
+
+    private static func problemCode(data: Data, response: HTTPURLResponse) -> String? {
+        // Fail closed: absent/wrong media type, malformed JSON or absent code never
+        // triggers refresh/retry. Preserve the original HTTP status, discard body.
+        let mediaType = response.value(forHTTPHeaderField: "Content-Type")?
+            .split(separator: ";", maxSplits: 1).first?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard mediaType == "application/problem+json",
+              let problem = try? JSONDecoder().decode(ProblemCode.self, from: data),
+              !problem.code.isEmpty else { return nil }
+        return problem.code
+    }
+
+    private struct ProblemCode: Decodable { let code: String }
+
+    private func decode<T: Decodable>(_ request: URLRequest, as: T.Type) async throws -> T {
+        try GatewayCoding.decoder.decode(T.self, from: await responseData(for: request))
     }
 }
 
