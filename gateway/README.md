@@ -77,6 +77,12 @@ curl -s -X POST localhost:8080/v1/conversations/conv_demo/messages \
 需要 Python **3.9+**（用到 `zoneinfo` 与 `str.removeprefix`）。无第三方运行时依赖。
 在无系统时区库的平台（如精简容器）上需安装 `tzdata`，否则启动时校验 IANA 时区会失败。
 
+容器方式（A2.2 / #7）：`gateway/Dockerfile` 基于固定 digest 的 `python:3.12-slim`（自带
+时区库），按仓库布局放入 `src/` 与 `migrations/`，非 root（uid 10001）运行，不含密钥。
+部署栈里用 `make up GATEWAY=1` 起（compose `gateway` profile，宿主端口只绑
+`127.0.0.1:${BOTVILLE_GATEWAY_PORT:-8020}`，数据在卷 `gateway-data`），见
+[docs/moments.md](docs/moments.md) §8 与 `docs/deploy/z423-synapse.md`。
+
 ### HTTP 端点（子集）
 
 | 方法 | 路径 | 契约 operationId | 说明 |
@@ -268,7 +274,7 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_ROOM_ALIAS_PREFIX` | `botville_conv_` | conversation → 房间别名 localpart 前缀（`^[a-z0-9._=-]{1,64}$`）；改前缀须同步改部署模板的 exclusive aliases 正则（`server/compose/appservice/botville-gateway.yaml.tmpl`） |
 | `GATEWAY_ROOM_ALIAS_CACHE_TTL` | `60` | 别名 → room_id 进程内缓存 TTL（秒），过期重新 directory lookup；`0` = 不缓存，负数拒绝启动 |
 | `GATEWAY_ALLOW_INSECURE_HS` | `false` | 显式放行明文 `http://` 的跨主机 homeserver（接受 as_token 明文传输风险） |
-| `GATEWAY_MOMENTS_DB_PATH` | *(空)* | 动态（A2.2 / #7）SQLite 路径，WAL；启动时自动执行 `gateway/migrations/moments/` 迁移（幂等）。**留空 = 关闭动态模块**（`/v1/moments*` 鉴权后仍 404/405）。compose 卷 `gateway-data` 约定路径 `/var/lib/botville-gateway/moments.db`，见 [docs/moments.md](docs/moments.md) §7 / §8 |
+| `GATEWAY_MOMENTS_DB_PATH` | *(空)* | 动态（A2.2 / #7）SQLite 路径，WAL；启动时自动执行 `gateway/migrations/moments/` 迁移（幂等）。**留空 = 关闭动态模块**（`/v1/moments*` 鉴权后仍 404/405）。compose `gateway` 服务（`make up GATEWAY=1`）固定为卷 `gateway-data` 上的 `/var/lib/botville-gateway/moments.db`，见 [docs/moments.md](docs/moments.md) §7 / §8 |
 | `GATEWAY_MOMENTS_FRIENDS_FILE` | *(空)* | 临时好友图 JSON（`{"friends": [["@a:hs","@b:hs"], ...]}`，无向边，启动时读一次，结构非法拒绝启动）。**留空 = 空好友图**：A2.3（#8）落地前「好友可见」等同「仅自己」，见 moments.md §7.1 |
 | `GATEWAY_MOMENTS_SOFT_DELETE_RETENTION_DAYS` | `30` | 软删动态/评论硬删前的保留天数（由定时清理执行） |
 | `GATEWAY_MOMENTS_AUDIT_RETENTION_DAYS` | `90` | `moments_events` 审计默认保留 90 天（由定时清理执行） |

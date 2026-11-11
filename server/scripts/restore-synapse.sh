@@ -221,27 +221,12 @@ done
 
 # Optional gateway-data artifact (A2.2 / #7). If the file is present it must
 # match the manifest (when one exists); if the manifest lists it, the file
-# must be present. Either way we do this before destroying anything.
-if [[ -f "${backup_dir}/gateway-data.tar.gz" ]]; then
-    expected="$(expected_sha gateway-data.tar.gz)" || expected=""
-    if [[ -f "${backup_dir}/manifest.txt" && -z "${expected}" ]]; then
-        echo "restore-synapse.sh: manifest.txt has no sha256 entry for gateway-data.tar.gz" >&2
-        exit 1
-    fi
-    if [[ -n "${expected}" ]]; then
-        got="$(sha256_of "${backup_dir}/gateway-data.tar.gz")"
-        if [[ "${expected}" != "${got}" ]]; then
-            echo "restore-synapse.sh: sha256 mismatch for gateway-data.tar.gz: manifest ${expected}, file ${got}" >&2
-            exit 1
-        fi
-        echo "==> checksum OK: gateway-data.tar.gz"
-    fi
-elif [[ -f "${backup_dir}/manifest.txt" ]]; then
-    expected="$(expected_sha gateway-data.tar.gz)" || expected=""
-    if [[ -n "${expected}" ]]; then
-        echo "restore-synapse.sh: manifest.txt lists gateway-data.tar.gz but the file is missing" >&2
-        exit 1
-    fi
+# must be present. Either way this runs before anything destructive
+# (verify_gateway_data_artifact in lib.sh, shared with
+# restore-gateway-data.sh).
+restore_gateway=no
+if verify_gateway_data_artifact "${backup_dir}"; then
+    restore_gateway=yes
 fi
 
 echo "==> stopping synapse"
@@ -301,14 +286,9 @@ compose run --rm --no-deps --entrypoint sh \
     synapse \
     -c 'cd /data && rm -rf media_store signing.key homeserver.pid && tar -xzf /backup/synapse-data.tar.gz'
 
-if [[ -f "${backup_dir}/gateway-data.tar.gz" ]]; then
+if [[ "${restore_gateway}" == yes ]]; then
     echo "==> restoring gateway-data volume $(gateway_data_volume)"
-    ensure_gateway_data_volume
-    compose run --rm --no-deps --entrypoint sh \
-        -v "$(cd "${backup_dir}" && pwd):/backup:ro" \
-        -v "$(gateway_data_volume):/gateway-data" \
-        synapse \
-        -c 'cd /gateway-data && find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + && tar -xzf /backup/gateway-data.tar.gz'
+    restore_gateway_data "${backup_dir}" synapse
 else
     echo "==> no gateway-data.tar.gz in backup; leaving gateway-data volume untouched"
 fi

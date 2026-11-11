@@ -1,0 +1,11 @@
+# Build context for gateway/Dockerfile: only the runtime source and the
+# moments migrations go into the image (no tests, docs, .env files or keys).
+*
+!src/
+!src/**
+!migrations/
+!migrations/**
+**/__pycache__
+**/*.pyc
+**/.env
+**/*.p8
