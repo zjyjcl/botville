@@ -207,7 +207,7 @@ App                          网关                        模块网页（WKWebV
 | 凭据种类 | 请求头 | OpenAPI 方案 | 适用范围 |
 |---|---|---|---|
 | OpenID token（本节） | `Authorization: MatrixOpenID <token>` | `matrixOpenIdToken` | `/moments*` |
-| Matrix access token | `Authorization: Bearer <Matrix access token>` | `matrixUserToken` | `/moments*`（并存期） |
+| Matrix access token | `Authorization: Bearer <Matrix access token>` | `matrixUserToken` | `/moments*`（并存期，**App 以外调用方**） |
 | 站点/调用方 bearer | `Authorization: Bearer <gateway-token>` | `bearerAuth` | 其他接口；**不得用于 `/moments*`** |
 
 > **校验器提示（N1）**：`MatrixOpenID` 是自定义 http scheme，不是 RFC 登记值。
@@ -275,20 +275,30 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 语义，任一即可，校验结果语义完全相同——均为本服 Matrix user id）。**禁止「先试 OpenID
 再试 whoami」**：两种凭据由请求头 scheme（`MatrixOpenID` vs `Bearer`）显式区分。
 
-**移除 `matrixUserToken` 的条件**（本 PR 不进入阶段 2/3）：
+**退场节奏（v2）**：`matrixUserToken` 是**留给 App 以外其他调用方**的阶段 1 共存路径，
+未标 `deprecated`、仍有效。各阶段触发条件：
 
-- **阶段 2（标 deprecated）**：App 已全量切换到 OpenID token，观察期（建议 ≥ 一个
-  发布周期）旧凭据占比可接受后，在 OpenAPI 对 `matrixUserToken` 标 `deprecated: true`
-  并写入 changelog；仍接受旧凭据。需**另行公告**，且**必须先报总管**批准。
-- **阶段 3（从 security 去掉）**：再公告最低 App 版本/日期后，从 `/moments*` security
-  数组移除 `matrixUserToken`；这是破坏性契约变更，需另行批准。**移除前必须先报总管**；
-  本 PR 不进入本阶段。
+- **T1（观察）**：#7（moments CRUD）上线后观察 App 流量，确认 App 侧只出
+  `MatrixOpenID`、无 `Bearer` 兜底。
+- **T2（清点）**：清点 `Bearer` 调用方；届时另做「按 scheme 统计」PR，量化
+  `matrixUserToken` 占比。
+- **T3 → 阶段 2（标 `deprecated`）**：已知调用方全部迁完、且 `Bearer` 占比低于 **1%**
+  （计划值）后，在 OpenAPI 对 `matrixUserToken` 标 `deprecated: true` 并写入 changelog；
+  仍接受旧凭据。**须先公告、先报总管**批准。
+- **T4 → 阶段 3（从 security 移除）**：阶段 2 起至少 **90 天**公告、并在响应加
+  `Deprecation` / `Sunset` 头之后，从 `/moments*` security 数组移除 `matrixUserToken`；
+  这是破坏性契约变更，**须先公告、先报总管**、并另行批准。
+
+本 PR **不进入阶段 2/3**，也不新增错误码。
 
 **部署路径前缀**（交叉引用）：路径前缀已在 `GATEWAY_HTTP_PATH_PREFIX` 随 #165 落地
 （见 §5.5 changelog [网关路径前缀] 条目）；本节 userinfo 直连地址与前缀无关。
 
 **App 接入提示（非规范性）**：本节不新增状态码或错误码，下列内容只是客户端处理建议。
 
+- **App 只发 `MatrixOpenID`**：App 对 `/moments*` **只**发
+  `Authorization: MatrixOpenID <token>`，无 feature flag、无回退；**不得**拿用户的 Matrix
+  access token 当 `Bearer` 兜底（那是留给 App 以外调用方的阶段 1 共存路径）。
 - **示例 fixture**（与网关当前输出**除 `request_id` 外逐字段一致**）：
   - `gateway/openapi/examples/problem-auth-missing.json`（401 `auth.missing`）
   - `gateway/openapi/examples/problem-auth-invalid-token.json`（401 `auth.invalid_token`）
@@ -490,7 +500,8 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 
 - **公开路径的行为者恒为 human**。`POST /moments/{moment_id}/comments` 与
   `PUT`/`DELETE /moments/{moment_id}/likes/me` 的行为者一律是调用者本人
-  （`matrixUserToken` → whoami 的 `user_id`）；`CreateCommentRequest` **不接受**
+  （调用者本人，即 `matrixOpenIdToken` 的 userinfo `sub` 或 `matrixUserToken`→whoami
+  的 `user_id`）；`CreateCommentRequest` **不接受**
   `author_persona_id`。
 - **AI 评论 / 点赞只经 appservice 内部调用写入**（校验 persona 归属后落库
   `author_kind`/`actor_kind=ai`），不暴露为公开 HTTP 路径。本节不为此新造任何
@@ -1050,6 +1061,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.1.0 | 2026-11-11 | [#124 退场 v2 文档对齐，**纯文档**，不改字段/状态码/错误码/security] 统一「退场 v2」口径：App 对 `/moments*` 只发 `Authorization: MatrixOpenID <token>`（`matrixOpenIdToken`），无 feature flag、无回退，**禁止**以用户 Matrix access token 当 `Bearer` 兜底；网关继续接受 `Authorization: Bearer <Matrix access token>`（`matrixUserToken`→whoami），那是**留给 App 以外其他调用方**的阶段 1 共存路径，未标 `deprecated`、仍有效。改动文件与要点：**(1)** `gateway/docs/contract.md` §1.2.3 凭据表「适用范围」注明并存期为 App 以外调用方；「移除 `matrixUserToken` 的条件」改写为 v2 退场节奏 T1 观察 #7 上线后 App 流量 → T2 清点 Bearer 调用方（届时「按 scheme 统计」PR）→ T3 已知调用方迁完且 Bearer 占比 <1%（计划值）后进阶段 2（标 `deprecated`）→ T4 至少 90 天公告并加 `Deprecation`/`Sunset` 头后进阶段 3（从 security 移除），保留「先公告、先报总管」「本 PR 不进入阶段 2/3」「阶段 3 为破坏性变更需另行批准」；「App 接入提示（非规范性）」段首新增「App 只发 MatrixOpenID、不得以 Bearer 兜底」一条；§2.0 行为者表述改为中性（`matrixOpenIdToken` 的 userinfo `sub` 或 `matrixUserToken`→whoami 的 `user_id`）。**(2)** `gateway/docs/moments.md` §1「身份不自报」与 §3「身份」按 v2 重写（App 只走 OpenID、Bearer 为其他调用方阶段 1 共存、写清退场节奏并指向 contract.md §1.2.3）；§3 行为者/点赞表述改为同时涵盖两种凭据的中性写法；§7 配置变量更正为事实——`GATEWAY_OPENID_CACHE_TTL_SECONDS` 已在 `gateway/.env.example` 第 107 行并由 `gateway/README.md` 配置表登记（#170），其余三个 `GATEWAY_MOMENTS_*` 仍为计划（随 #7 实现登记），删去「本 PR 不修改 .env.example」「PR2 实现时登记」的过时说法。**(3)** `docs/contracts/pairing-qr.md` §5.1 `features_url` 行与 §11 B2 依赖栏写明 OpenID 已在 #124 落地、App 只发 MatrixOpenID 且不得 Bearer 兜底、网关继续接受 Bearer 留给其他调用方（阶段 1），移除「落地前按现行契约 / 定之前现行契约有效」的过时表述。**(4)** `docs/deploy/public-access.md` 第 21 行与「与现行网关契约的差异（待对齐）」段改为已对齐。**(5)** `gateway/openapi/gateway.v1.yaml` **只改 `description` 文字**：作者/点赞者表述改中性，`matrixOpenIdToken` / `matrixUserToken` 描述各补一句（App 只用前者，后者留给 App 以外调用方，阶段 1 共存）；**security 数组、scheme、字段一律未改**。 |
 | 0.1.0 | 2026-11-11 | [#124 OpenID App 接入配合，纯文档+fixture+测试，不改行为] 新增三个 RFC 9457 problem 示例 fixture（`gateway/openapi/examples/problem-auth-missing.json`、`problem-auth-invalid-token.json`、`problem-homeserver-unavailable.json`），内容与 `_auth_user_ok` 实际输出**除 `request_id` 外逐字段一致**（含键集合）；在 `validate_openapi.py` EXAMPLE_TARGETS 中登记，漂移可检测。新增集成测试 `gateway/tests/test_openid_app_fixtures.py`：起真实网关 + 假 homeserver，验证缺头 / 无效 OpenID token / homeserver 502 三种错误的响应 status、Content-Type，以及响应 JSON 除 `request_id` 外的键集合与值均与 fixture 完全相等（网关增删字段即失败），同时覆盖 `GATEWAY_HTTP_PATH_PREFIX` 前缀形态。`docs/moments.md` §7 配置表修正 `GATEWAY_WHOAMI_CACHE_TTL_SECONDS` 为 `GATEWAY_OPENID_CACHE_TTL_SECONDS`（实际变量，注明 #124 已落地）；§1 第 19 行补充也可用 `MatrixOpenID` OpenID token 接入（指向 §3 与 contract.md §1.2.3）。`docs/contract.md` §1.2.3 末尾新增「App 接入提示（非规范性）」：列出 fixture 路径、`auth.invalid_token` 重试建议、500 退避语义、scheme 大小写要求、CORS/OPTIONS 说明；**不新增状态码或错误码**，不改任何运行时行为。 |
 | 0.1.0 | 2026-11-10 | [#124 OpenID 网关实现已落地] `/moments*` 按 `Authorization` scheme 分流校验：`MatrixOpenID <token>` → federation `GET /_matrix/federation/v1/openid/userinfo?access_token=…`（不带 X-Matrix 签名，基址 `GATEWAY_HOMESERVER_FEDERATION_URL`，空则回落 `GATEWAY_HOMESERVER_URL`，明文 http 规则沿用 `GATEWAY_ALLOW_INSECURE_HS`）；`Bearer <Matrix access token>` → CS `GET /_matrix/client/v3/account/whoami`（始终用 `GATEWAY_HOMESERVER_URL`）。**禁止先试 OpenID 再试 whoami**；站点/调用方 bearer 不得用于 `/moments*`。`sub` / `user_id` 域须等于 `GATEWAY_MATRIX_SERVER_NAME`（大小写归一），未配置时 fail closed 为 401。缺少 `GATEWAY_MATRIX_SERVER_NAME` 不新增启动必填。缓存键为 token 的 SHA-256，成功 TTL = `min(GATEWAY_OPENID_CACHE_TTL_SECONDS, 60, 若已知的 expires_in)`，失败负缓存 5 秒且不超过成功 TTL、**仅对 401/403（及域不匹配）负缓存**；`0` = 不缓存，`<0` 或 `>60` 拒绝启动；同一 token 并发校验 single-flight 合并。homeserver 5xx / 超时 / 不可达 → 已有 `500 internal.error`（可重试，不缓存），**不新增状态码或错误码**。本 PR 只做身份校验，`/moments*` 资源 CRUD 留待后续；鉴权通过后未实现资源仍 404（PATCH/DELETE 先鉴权再 405）。配置项 `GATEWAY_HOMESERVER_FEDERATION_URL` / `GATEWAY_OPENID_CACHE_TTL_SECONDS` **自本 PR 起生效**。N1：契约与 OpenAPI 注明自定义 `MatrixOpenID` http scheme 可能触发部分校验器告警，不改名、不标 `deprecated`。`matrixUserToken` 不标 `deprecated`，仍完全有效。 |
 | 0.1.0 | 2026-11-10 | [#124 OpenID 契约加法，**只增不删，不改任何现有字段集合、状态码与错误码行为**] 新增 OpenAPI `securitySchemes.matrixOpenIdToken`（`http` + `scheme: MatrixOpenID`，头为 `Authorization: MatrixOpenID <token>`），与既有 `matrixUserToken`（`Bearer` + whoami）在 `/moments*` 上**并存**：11 个 operation 的 `security` 由 `matrixUserToken` 单项改为 `matrixOpenIdToken` / `matrixUserToken` 二者取一（OR）；`matrixUserToken` **不标 `deprecated`**，仍完全有效。校验路径：网关经 compose 内网直连本部署 homeserver `GET /_matrix/federation/v1/openid/userinfo?access_token=…`（**不带 X-Matrix 签名**，不经 fedgate、不走公网；**只这条 userinfo 直连**，其他联邦流量仍走 fedgate）；直连地址新增部署配置 `GATEWAY_HOMESERVER_FEDERATION_URL`（空则回落 `GATEWAY_HOMESERVER_URL`），不硬编码；新增 `GATEWAY_OPENID_CACHE_TTL_SECONDS`（上限 60，默认 60）。`sub` 即 Matrix `user_id` / owner，域须等于 `GATEWAY_MATRIX_SERVER_NAME` 否则 401，不另建映射表；过期以 `expires_in` 为准、网关不自行延长；缓存只按 token 哈希（不缓存明文、不入日志），TTL ≤ 60s 且不超过剩余有效期。**不做网关侧 nonce 防重放**（持有者令牌在过期前被盗即可重放，属协议固有限制；缓解为短时令牌 / TLS / 不落盘 / 哈希缓存键；跨服 moments 的 HMAC+ts+nonce 与本项无关）。错误码沿用 `401 auth.missing` / `401 auth.invalid_token` / `403 persona.not_owned`，**不新增任何 code**。§1.2.3 扩写为完整契约（scheme、头格式、校验路径、fedgate 边界、缓存、防重放限制、错误码、并存三阶段与移除条件——阶段 2 标 deprecated / 阶段 3 从 security 去掉均须另行公告，**移除前必须先报总管**，本 PR 不进入阶段 2/3）。原则：未来用户向接口默认走 OpenID，但本期只改 `/moments*`；文档级默认 `security` 仍为 `bearerAuth`，`/context/assemble`、发送路径、appservice、跨服 HMAC 的鉴权模型均不变。同步 `docs/moments.md` §3、`README.md` 配置表与 `.env.example`。实现留待下一 PR。 |

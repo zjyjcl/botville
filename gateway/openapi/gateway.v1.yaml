@@ -1544,7 +1544,7 @@ paths:
       operationId: createMoment
       summary: 发布动态
       description: |
-        发布一条动态。作者为**调用者本人**（`matrixUserToken` 换出的 Matrix 用户）；
+        发布一条动态。作者为**调用者本人**（即 `matrixOpenIdToken` 的 userinfo `sub` 或 `matrixUserToken`→whoami 的 `user_id` 校验出的本服 Matrix 用户）；
         或调用者名下的 AI persona：请求带 `author_persona_id` 时，网关校验该 persona
         归调用者所有，否则 `403`（`persona.not_owned`）。AI persona 的常规代发经
         appservice 内部调用完成，不走 Matrix 用户令牌，见 `gateway/docs/moments.md`。
@@ -1761,7 +1761,7 @@ paths:
       operationId: createMomentComment
       summary: 发表动态评论
       description: |
-        发表评论，作者为调用者本人（`matrixUserToken`→whoami 的 Matrix user）。
+        发表评论，作者为调用者本人（即 `matrixOpenIdToken` 的 userinfo `sub` 或 `matrixUserToken`→whoami 的 `user_id` 校验出的本服 Matrix 用户）。
         本公开路径**不**接受 `author_persona_id`；AI 评论只经 appservice 内部调用
         写入（校验 persona 归属后落库 `author_kind=ai` 与 `owner_id`，见
         `gateway/docs/moments.md` §3）。评论的写入以 `can_view(viewer, moment)`
@@ -1866,7 +1866,7 @@ paths:
         当前登录用户点赞（幂等：已点赞再调用返回 `liked: true`，不重复计数）。
         点赞的写入以 `can_view(viewer, moment)` 为前提：为假（越权）与动态不存在
         统一返回 `404` `moment.not_found`，响应体**逐字节相同**，不泄露存在性。
-        点赞者 `me` 即 `matrixUserToken` 换出的 Matrix 用户本人（human）。
+        点赞者 `me` 即调用者本人（`matrixOpenIdToken` 的 userinfo `sub` 或 `matrixUserToken`→whoami 的 `user_id`，human）。
         AI 点赞不走本公开路径，只经 appservice 内部调用写入（落库
         `actor_kind=ai` 与 `owner_id`，见 `gateway/docs/moments.md` §3）。
       security:
@@ -2022,6 +2022,8 @@ components:
         两者由请求头 scheme 显式区分。`matrixUserToken` 当前**未标 `deprecated`**，
         仍完全有效；移除须另行公告并先报总管。共享 gateway token（`bearerAuth`）
         **不得**用于以用户身份读写动态。完整规则见 `gateway/docs/contract.md` §1.2.3。
+        **App 只使用本方案（`matrixOpenIdToken`），不得以 `Bearer <Matrix access token>`
+        兜底；`matrixUserToken` 留给 App 以外的其他调用方（阶段 1 共存）。**
     matrixUserToken:
       type: http
       scheme: bearer
@@ -2037,6 +2039,9 @@ components:
         「本服 Matrix user id」。本方案**当前未标 `deprecated`**，仍完全有效；将来弃用与
         移除须另行公告并先报总管。**禁止**在同一请求上「先试 OpenID 再试 whoami」：
         凭据种类由请求头 scheme 区分。
+
+        **本方案留给 App 以外的其他调用方（#124 阶段 1 共存）；App 只使用
+        `matrixOpenIdToken`，不以 `Bearer <Matrix access token>` 兜底。**
 
         **共享 gateway token（`bearerAuth`）不得用于以用户身份读写动态**；它只保留给
         运维与内部服务。AI persona 代发动态经 appservice 的内部调用完成，不走本方案，
