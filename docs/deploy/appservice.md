@@ -163,6 +163,13 @@ sender → **400 `request.invalid`**；房间别名不存在 → **404
     后会从头编号；这时只恢复 gateway-data，新事务的 txnId 会撞上库里的旧 txnId，
     网关按幂等直接回 200 而不落库（数据不会坏，但新事件被当成已收到）。生产上
     HS 数据和 gateway-data 要来自同一时间点；只想清空网关事务时，连同 HS 一起重建。
+  - **保留期与清理**（contract.md §1.7.7）：`GATEWAY_AS_TXN_RETENTION_DAYS`（默认
+    90）与 `GATEWAY_AS_TXN_PURGE_INTERVAL_SECONDS`（默认 86400，`0` = 关闭，非 0
+    须 ≥60）用网关默认值即可。清理**不删行**，只把超过保留期事务的原始请求体清空并
+    保留墓碑，所以重放语义不变、库仍会缓慢增长（墓碑永不删除；需要彻底回收时停机
+    后 `VACUUM` 或连同 HS 一起重建）。该库与 `gateway-data.tar.gz` 备份都**含原始
+    事件请求体**，按敏感用户数据保管（目录 700 / 文件 600），不入库、不入工单；
+    网关新建库文件时以 0600 创建。清理日志只记条数，不记 txnId 或事件内容。
   - continuwuity：仍用 `memory`，注册 url 为 `null`。它还没有文件方式的
     appservice 注册，切到 appservice 后启动 whoami 会失败、容器会反复退出。
     （网关照样注入 `GATEWAY_HS_TOKEN`、打开事务库，只是没有 HS 会推过来。）

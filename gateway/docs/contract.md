@@ -557,11 +557,11 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 |---|---|---|
 | 401 | `M_MISSING_TOKEN` | 缺 `Authorization` 头，或 scheme 不是 `Bearer`，或 token 为空 |
 | 403 | `M_FORBIDDEN` | token 不匹配；或网关未配置 `GATEWAY_HS_TOKEN` |
-| 400 | `M_NOT_JSON` | 请求体不是合法 JSON（transactions） |
+| 400 | `M_NOT_JSON` | 请求体无法作为 JSON 读取：解码失败（非 UTF-8）、`json.loads` 失败、或 framing 错误（chunked 传输、坏的/缺失的 `Content-Length`、正文不完整）。transactions 与 ping 同规则 |
 | 400 | `M_BAD_JSON` | JSON 合法但结构不对：顶层不是对象、缺 `events` 数组、`events` 类型错、`ephemeral` 存在但不是数组；ping 的 `transaction_id` 不是字符串 |
 | 400 | `M_INVALID_PARAM` | `txnId` 非法：URL 解码后长度不在 1–255，或含非印刷可见 ASCII 字符（控制字符/空白） |
 | 413 | `M_TOO_LARGE` | 请求体超过 `GATEWAY_AS_MAX_BODY_BYTES` |
-| 404 | `M_UNRECOGNIZED` | `/v1` 下的未知路径（含 `users`/`rooms`/`thirdparty` 与 legacy `/transactions/`） |
+| 404 | `M_UNRECOGNIZED` | `/v1` 下的未知路径（含 `users`/`rooms`/`thirdparty` 与 legacy `/transactions/`）。legacy 根路径（`/transactions`、`/users`、`/rooms`、`/thirdparty`，带或不带子路径）**任何方法**都直接 404，且**不做鉴权**（不返回 401/405） |
 | 405 | `M_UNRECOGNIZED` | 已知路径用了不支持的方法 |
 | 500 | `M_UNKNOWN` | 持久化失败，或未配置 `GATEWAY_AS_TXN_DB_PATH`（**不返回 200**，让 HS 重试） |
 
@@ -572,14 +572,25 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 
 - **按 `txnId` 幂等**：同一 `txnId` 重放直接 `200 {}`，不重复写入。判重与插入在
   同一把锁、同一 SQLite 事务内完成，避免并发下的检查-写入竞态。
+- **单进程假设**：该判重锁是**进程内** `threading.Lock`，SQLite 自身只保证文件一致性、
+  不保证「先查后插」的原子性。因此同一事务库上**只允许一个**网关进程/副本接收回调；
+  多副本共用同一 `GATEWAY_AS_TXN_DB_PATH` 属**不支持的部署**（并发下可能撞
+  `UNIQUE` / `database is locked` → 500，或撞出重复处理）。需要多副本时，事务接收
+  必须收敛到单一实例。
 - **先落库，后应答**：事务提交成功才返回 `200`（`PRAGMA synchronous=FULL`）。
   持久化失败返回 `500 M_UNKNOWN`，homeserver 会按自己的重试策略重投。
-- 事务表（`as_transactions`）：`txn_id`（主键）、`body`（原始请求体文本）、
-  `received_at`（ISO 8601 UTC）、`processed_at`（可空，供后续消费者标记已处理）。
+- 事务表（`as_transactions`）：`txn_id`（主键）、`body`（原始请求体文本；保留期
+  清理后为空串，见 §1.7.7）、`received_at`（ISO 8601 UTC）、`processed_at`
+  （可空，供后续消费者标记已处理）、`purged_at`（可空，保留期清理时间戳）。
 
 #### 1.7.5 请求体与体积上限
 
 - transactions 请求体必须是 JSON 对象且含 `events` 数组（可选 `ephemeral` 数组）。
+- 请求体按**严格 UTF-8** 解码后再解析 JSON。非 UTF-8（如 UTF-16 编码的 JSON）不
+  接受，返回 `400 M_NOT_JSON`——事务按文本落库、日志与比对都假定 UTF-8，放行其他
+  编码会在后续处理阶段变成 500 让 HS 无限重试。ping 同规则。
+- framing 错误（chunked 传输编码、坏的/缺失的 `Content-Length`、正文不足声明的
+  长度）也返回 `400 M_NOT_JSON`：请求体无法作为 JSON 读取。
 - 体积上限 `GATEWAY_AS_MAX_BODY_BYTES`（默认 **16 MiB = 16777216**，正整数，
   上限 256 MiB），与面向 App 的 `/v1` 的 1 MiB 上限**相互独立**；超限 `413 M_TOO_LARGE`。
 - ping 接受空体、`{}` 或带字符串 `transaction_id`；无需 `events`。
@@ -587,13 +598,50 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 #### 1.7.6 事件消费（后续 PR）与注册状态
 
 - 存储层提供 `get_unprocessed_transactions()` / `mark_processed(txn_id)`，供后续 PR
-  读取未处理事务并交给角色引擎 / 记忆 / 主动发言；**本 PR 只做协议层接收与持久化**，
-  不触发任何业务逻辑。
-- **注册状态（A 线 compose 接线后）**：`make up GATEWAY=1`（synapse / tuwunel）时
-  注册 `url` 为 `http://gateway:8080`（无路径前缀），compose 把 `APPSERVICE_HS_TOKEN`
-  注入为 `GATEWAY_HS_TOKEN`，事务库为 gateway-data 卷里的
-  `/var/lib/botville-gateway/as_transactions.db`；其余情况（未开网关、continuwuity）
-  `url` 为 `null`。详见 `docs/deploy/appservice.md`。
+  读取未处理事务并交给角色引擎 / 记忆 / 主动发言；**#192/#193 只做协议层接收与持久化**，
+  不触发任何业务逻辑，事件消费**留给后续 PR**（见 §5.5 Changelog 0.1.0 2026-11-12 条目）。
+- **注册状态（#193 已接线）**：`make up GATEWAY=1` 且 HS 为 synapse / tuwunel 时，
+  注册 `url` 由 `init.sh` 渲染为 `http://gateway:8080`（无路径前缀），compose 把
+  `APPSERVICE_HS_TOKEN` 注入为 `GATEWAY_HS_TOKEN`、把事务库设为 gateway-data 卷里的
+  `/var/lib/botville-gateway/as_transactions.db`（#192 的协议层 + #193 的部署接线均已
+  合入）；其余情况（未开网关、continuwuity）`url` 为 `null`。事件消费仍不在本期。
+  详见 `docs/deploy/appservice.md`。
+
+#### 1.7.7 保留与清理（B 线 as-txn-cleanup，见 §5.5 Changelog 0.1.0 2026-11-12 条目）
+
+事务库会随运行时间持续增长，网关按保留期清空**原始请求体**，但**不删行**。
+
+- **配置**（只在配置了 `GATEWAY_AS_TXN_DB_PATH` 时生效）：
+  `GATEWAY_AS_TXN_RETENTION_DAYS`（默认 `90`，正整数，`<1` 拒绝启动）与
+  `GATEWAY_AS_TXN_PURGE_INTERVAL_SECONDS`（默认 `86400`；`0` = 关闭；非 `0` 必须
+  `>= 60`，否则拒绝启动）。启用时网关**启动阶段同步跑一次**，之后由后台守护线程按
+  间隔执行；任何清理失败**只记日志**（只记条数与异常类型，不记 token、不记事件体），
+  不影响接收事务。
+- **清理不删行，只留墓碑**：超过保留期的行把 `body` 置为空串并写入 `purged_at`，
+  `txn_id` / `received_at` / `processed_at` 原样保留。这是**就地迁移**（给旧库补
+  `purged_at` 列），对 #192 建出的库幂等兼容，重复执行无副作用。
+- **重放语义不变**：清理之后，homeserver 重投同一 `txnId`（例如 HS 自己的重试队列
+  晚到）仍按幂等返回 `200 {}`，**不会**重新落库、也不会被重新标记成未处理。
+- **过期未消费 = 丢弃**：清理同样作用于尚未 `mark_processed` 的过期行。它们被清空
+  请求体后不再出现在 `get_unprocessed_transactions()` 里（清理日志只记丢弃条数），
+  即保留期也是未消费事务的**上限**。消费侧启用后若需要更长窗口，请调大
+  `GATEWAY_AS_TXN_RETENTION_DAYS`。
+
+针对运维的三点硬约束：
+
+1. **库会一直变大**：墓碑**永不删除**（判重需要它们），清理只回收请求体体积。
+   需要彻底回收时由运维**停机后**归档/压缩（如一次性 `VACUUM`）或重建库——但重建
+   等于忘掉已接收的 txnId，重放会被当成新事务（见第 3 点）。
+2. **备份即敏感数据**：该库含**原始事件请求体**（消息正文等），按**用户数据/密钥同级**
+   管理。网关新建库文件时以 `0600` 创建；备份（`make backup` / `make backup-gateway`
+   打包的 `gateway-data.tar.gz`）同样是敏感产物，按密钥库保管（目录 700、文件 600），
+   不入库、不入工单。
+3. **必须与 homeserver 数据成对恢复**：`txnId` 由 HS 按自己的库分配。只把网关库恢复到
+   另一时间点/另一个 HS 状态，会出现两类问题——恢复到**更旧**的网关库：HS 认为已发过、
+   网关却没有记录，若 HS 重投会被当新事务（重复处理）或永不重投（漏处理）；恢复到
+   **更新**的网关库/换成清空重建的 HS：新事务的 `txnId` 会撞上旧墓碑，网关按幂等回
+   `200 {}` 但**不落库**，新事件被静默丢弃。生产上 `gateway-data` 与 HS 数据必须来自
+  同一时间点；只想清空网关事务时，连同 HS 一起重建。
 
 ---
 
@@ -1201,7 +1249,8 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
-| 0.1.0 | 2026-11-12 | [B 线 as-transactions，**协议层，不改 /v1 字段/状态码/错误码**] 新增 §1.7「Matrix AS 回调」：(1) `PUT /_matrix/app/v1/transactions/{txnId}` 幂等接收事务，校验 `hs_token`（`Authorization: Bearer`，不认 `?access_token=`），按 `txnId` 判重（单锁内判重+插入，无竞态），`PRAGMA synchronous=FULL` 确保 200 前落库，`GATEWAY_AS_TXN_DB_PATH` 未配置时 500 M_UNKNOWN 让 HS 重试；(2) `POST /_matrix/app/v1/ping` 探通；(3) 错误体为 Matrix 标准 `{"errcode","error"}`，`Content-Type: application/json`，不用 problem+json；(4) 路径挂域名根，不带 `GATEWAY_HTTP_PATH_PREFIX`；(5) 新增配置 `GATEWAY_HS_TOKEN`（可选，非占位符、≥32、无空白、不等于 `GATEWAY_AS_TOKEN`；未配置时端点一律 403）、`GATEWAY_AS_TXN_DB_PATH`（空/未设 = 关闭，同 `GATEWAY_MOMENTS_DB_PATH` 约定）、`GATEWAY_AS_MAX_BODY_BYTES`（默认 16 MiB，与 /v1 的 1 MiB 独立）；(6) 访问日志脱敏：带 `access_token=` 的查询串替换为 `[REDACTED]`；(7) 存储层留 `get_unprocessed_transactions()` / `mark_processed()` 钩子，**事件消费留给后续 PR**，本 PR 只做协议层；(8) 注册 `url` 仍为 `null`，compose 接线由 A 线后续 PR 完成。 |
+| 0.1.0 | 2026-11-12 | [B 线 as-txn-cleanup，**协议层 + 部署文档，不改 /v1 字段/状态码/错误码，不改 OpenAPI**] **保留与清理**：新增 §1.7.7。`as_transactions` 超过保留期**不删行**，只清空 `body` 并写 `purged_at`（墓碑保留 `txn_id`/`received_at`/`processed_at`；就地迁移给 #192 旧库补列，幂等）；清理后重放同一 `txnId` 仍 `200 {}`、不重落库、不重标未处理；过期未消费事务按丢弃处理，`get_unprocessed_transactions()` 不再返回。新增配置 `GATEWAY_AS_TXN_RETENTION_DAYS`（默认 90，≥1）、`GATEWAY_AS_TXN_PURGE_INTERVAL_SECONDS`（默认 86400；0 = 关闭；非 0 ≥ 60）；启动跑一次 + 后台守护线程，失败只记日志（不记 token/事件体）；新库文件以 0600 创建。文档写明库会持续增长、备份含事件体属敏感数据、恢复须与 HS 数据成对。**#192 审查 nits**：legacy 根路径 `/transactions`、`/users`、`/rooms`、`/thirdparty` 现在**任何方法**都返回 `404 M_UNRECOGNIZED`（Matrix JSON、不鉴权），与 §1.7.3 一致；`Config(hs_token="")` 归一为未配置；非 UTF-8 体与 framing 错误统一 `400 M_NOT_JSON`（原 framing 为 `M_BAD_JSON`），§1.7.3/§1.7.5 同步；§1.7.4 注明幂等锁为**进程内**、同一事务库只允许单进程接收；补真实 sqlite 失败与并发幂等测试。**#193 对齐**：§1.7.6 改为注册 `url` 已由 #193 在 `make up GATEWAY=1`（synapse/tuwunel）时设为 `http://gateway:8080`，compose 注入 `GATEWAY_HS_TOKEN` / `GATEWAY_AS_TXN_DB_PATH`，事件消费仍在后续 PR。见 §1.7.6 / §1.7.7。 |
+| 0.1.0 | 2026-11-12 | [B 线 as-transactions，**协议层，不改 /v1 字段/状态码/错误码**] 新增 §1.7「Matrix AS 回调」：(1) `PUT /_matrix/app/v1/transactions/{txnId}` 幂等接收事务，校验 `hs_token`（`Authorization: Bearer`，不认 `?access_token=`），按 `txnId` 判重（单锁内判重+插入，无竞态），`PRAGMA synchronous=FULL` 确保 200 前落库，`GATEWAY_AS_TXN_DB_PATH` 未配置时 500 M_UNKNOWN 让 HS 重试；(2) `POST /_matrix/app/v1/ping` 探通；(3) 错误体为 Matrix 标准 `{"errcode","error"}`，`Content-Type: application/json`，不用 problem+json；(4) 路径挂域名根，不带 `GATEWAY_HTTP_PATH_PREFIX`；(5) 新增配置 `GATEWAY_HS_TOKEN`（可选，非占位符、≥32、无空白、不等于 `GATEWAY_AS_TOKEN`；未配置时端点一律 403）、`GATEWAY_AS_TXN_DB_PATH`（空/未设 = 关闭，同 `GATEWAY_MOMENTS_DB_PATH` 约定）、`GATEWAY_AS_MAX_BODY_BYTES`（默认 16 MiB，与 /v1 的 1 MiB 独立）；(6) 访问日志脱敏：带 `access_token=` 的查询串替换为 `[REDACTED]`；(7) 存储层留 `get_unprocessed_transactions()` / `mark_processed()` 钩子，**事件消费留给后续 PR**，本 PR 只做协议层；(8) 注册 `url` 在本 PR 合入时仍为 `null`，compose 接线由 A 线后续 PR 完成（后由 #193 接线：见 §1.7.6）。 |
 | 0.1.0 | 2026-11-11 | [#7 A2.2 网关镜像 + compose `gateway` profile + 各 profile 的 gateway-data 备份，**部署侧，不改 API / 字段 / 状态码**] 新增 `gateway/Dockerfile`（固定 digest 的 `python:3.12-slim`，镜像内带 `migrations/moments/`，非 root，无密钥）；compose 新增可选 `gateway` 服务（`make up GATEWAY=1`，挂载 `gateway-data` 到 `/var/lib/botville-gateway`，`GATEWAY_MOMENTS_DB_PATH=/var/lib/botville-gateway/moments.db`，端口只绑 `127.0.0.1`，内存 Matrix 传输）；新增 `backup-gateway-data.sh` / `restore-gateway-data.sh`（tuwunel / continuwuity 等任一 profile），与 synapse 备份共用 `lib.sh` 逻辑；同步 `moments.md` §8/§10 与部署文档中 `down -v` 的删除语义。 |
 | 0.1.0 | 2026-11-11 | [#7 A2.2 compose `gateway-data` 卷与备份 + #187 审查建议] （1）`CreateCommentRequest.reply_to_comment_id` **去掉 ULID `pattern`**，与「格式不像 ULID 的字符串由服务端返回 422」对齐，避免客户端本地 schema 校验提前拦截；§1.3 / `moments.md` §6 写清校验顺序（先类型 400，后语义 422）。响应字段 pattern 保留。（2）`gateway/.env.example` 补登记 `IDEMPOTENCY_TTL_SECONDS`（默认 86400，`0` = 缓存不过期，含动态端点）。（3）compose 新增命名卷 `gateway-data`，`backup-synapse.sh` / `restore-synapse.sh` 纳入该卷（存在才归档；旧备份无此文件则恢复时不碰该卷）；同步 `moments.md` §8/§10 与部署文档。不改运行时 API 行为。 |
 | 0.1.0 | 2026-11-11 | [#7 / #187 A2.2 动态幂等 TTL=0 对齐 + 文档勘误 + OpenAPI 对齐] **行为修正**：动态端点（`POST /moments`、`POST /moments/{moment_id}/comments`）的幂等缓存在 `IDEMPOTENCY_TTL_SECONDS=0` 时改为**不过期**（此前误作立即过期、同 key 重放会再写一次），与全局约定一致；默认 86400 与正数 TTL 行为不变。**OpenAPI**（与合入后的最终状态一致，含后续提交 `fa4303a`）：`CreateCommentRequest.reply_to_comment_id` 为 `type: [string, 'null']`（OpenAPI 3.1），与实现「显式 `null` 视同省略、返回 201」对齐（`MomentComment` 响应字段原本已是 `string | null`）。**文档勘误**：§1.3 动态口径 1 写明省略/`null` → 201、其余类型错误 400；§1.3 总表 422 行补 `reply_to_comment_id`；§1.5 删去 TTL=0 已知差异。同步 `moments.md` §6（删「已知差异」、补 `null`）、§7.1（好友文件不校验 user id 格式）、§8（当时将 `gateway-data` 卷与备份标为未做）。文档保留「建议客户端省略该字段而不是发 `null`」。 |
