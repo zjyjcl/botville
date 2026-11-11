@@ -17,7 +17,8 @@ homeserver）+ 可见范围 + 评论（≤500 字，一层回复引用）+ 点�
   `moment.not_found`，响应体逐字节相同，不泄露存在性。列表接口复用同一函数过滤，
   保证列表 ⊆ {GET 会 200 的动态}。
 - **身份不自报**：同服调用必须带 Matrix access token，网关经 homeserver whoami 换出
-  `user_id`；共享 gateway token 不能用于以用户身份读写动态。
+  `user_id`；共享 gateway token 不能用于以用户身份读写动态。也可改用短时
+  `MatrixOpenID` OpenID token（App 场景，见 §3 与 `contract.md` §1.2.3）。
 - 好友图归 A2.3（#8）。本项只定义 `RelationProvider.is_friend(viewer, author)` 接口，
   PR2 提供可测试的临时实现（配置/测试注入），A2.3 落地后替换，本模块代码不变。
 
@@ -258,7 +259,7 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
 | 变量 | 说明 |
 |---|---|
 | `GATEWAY_MOMENTS_DB_PATH` | 动态 SQLite 路径（compose 卷 `gateway-data` 内，WAL 模式）。 |
-| `GATEWAY_WHOAMI_CACHE_TTL_SECONDS` | Matrix token → user_id 缓存 TTL，上限 60，默认 60。 |
+| `GATEWAY_OPENID_CACHE_TTL_SECONDS` | 用户身份校验缓存 TTL，同时约束 whoami 与 OpenID userinfo 两条路径；上限 60，默认 60，`0` = 不缓存。`<0` / `>60` / 非整数拒绝启动。（原稿写作 `GATEWAY_WHOAMI_CACHE_TTL_SECONDS`，与实现不符；#124 已落地，实际变量为 `GATEWAY_OPENID_CACHE_TTL_SECONDS`。） |
 | `GATEWAY_MOMENTS_SOFT_DELETE_RETENTION_DAYS` | 软删行清理任务保留天数（默认 30）。 |
 | `GATEWAY_MOMENTS_AUDIT_RETENTION_DAYS` | `moments_events` 审计保留天数。 |
 

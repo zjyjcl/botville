@@ -287,6 +287,27 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 **部署路径前缀**（交叉引用）：路径前缀已在 `GATEWAY_HTTP_PATH_PREFIX` 随 #165 落地
 （见 §5.5 changelog [网关路径前缀] 条目）；本节 userinfo 直连地址与前缀无关。
 
+**App 接入提示（非规范性）**：本节不新增状态码或错误码，下列内容只是客户端处理建议。
+
+- **示例 fixture**（与网关当前输出**除 `request_id` 外逐字段一致**）：
+  - `gateway/openapi/examples/problem-auth-missing.json`（401 `auth.missing`）
+  - `gateway/openapi/examples/problem-auth-invalid-token.json`（401 `auth.invalid_token`）
+  - `gateway/openapi/examples/problem-homeserver-unavailable.json`（500 `internal.error`）
+
+  `request_id` 每次请求不同，仅用于排障关联；其余字段（含键集合）与响应完全相同。
+- **`401 auth.invalid_token` 不区分原因**：过期、伪造、以及 `sub` 域不匹配本服都返回
+  同一个 401。客户端收到后应重新调用 `request_token` 换一次 token 再重试**一次**；
+  新 token 仍返回 401 就停止（不要再换、不要用同一 token 重试）。网关对失败结果有
+  最多 5 秒的负缓存，用同一 token 立刻重试不会得到不同答复。
+- **`500 internal.error`（`title: Homeserver unavailable`，`detail: user identity could
+  not be verified; retry later`）** 表示 homeserver 5xx / 超时 / 不可达，**不是** token
+  问题，可用退避策略重试；该结果不缓存，重试会真实回源。
+- **scheme 区分大小写**：必须写成 `Authorization: MatrixOpenID <token>`，`matrixopenid`
+  或其它大小写变体不会被识别为 OpenID token。
+- **网关不处理 CORS**，也不响应 `OPTIONS` 预检（`OPTIONS` 返回 405 `request.invalid`
+  的 problem+json）。原生 App 不经浏览器同源策略，不受影响；浏览器端页面需由反代或
+  独立的同源入口处理预检。
+
 
 ### 1.3 错误模型（RFC 9457）
 
@@ -1029,6 +1050,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.1.0 | 2026-11-11 | [#124 OpenID App 接入配合，纯文档+fixture+测试，不改行为] 新增三个 RFC 9457 problem 示例 fixture（`gateway/openapi/examples/problem-auth-missing.json`、`problem-auth-invalid-token.json`、`problem-homeserver-unavailable.json`），内容与 `_auth_user_ok` 实际输出**除 `request_id` 外逐字段一致**（含键集合）；在 `validate_openapi.py` EXAMPLE_TARGETS 中登记，漂移可检测。新增集成测试 `gateway/tests/test_openid_app_fixtures.py`：起真实网关 + 假 homeserver，验证缺头 / 无效 OpenID token / homeserver 502 三种错误的响应 status、Content-Type，以及响应 JSON 除 `request_id` 外的键集合与值均与 fixture 完全相等（网关增删字段即失败），同时覆盖 `GATEWAY_HTTP_PATH_PREFIX` 前缀形态。`docs/moments.md` §7 配置表修正 `GATEWAY_WHOAMI_CACHE_TTL_SECONDS` 为 `GATEWAY_OPENID_CACHE_TTL_SECONDS`（实际变量，注明 #124 已落地）；§1 第 19 行补充也可用 `MatrixOpenID` OpenID token 接入（指向 §3 与 contract.md §1.2.3）。`docs/contract.md` §1.2.3 末尾新增「App 接入提示（非规范性）」：列出 fixture 路径、`auth.invalid_token` 重试建议、500 退避语义、scheme 大小写要求、CORS/OPTIONS 说明；**不新增状态码或错误码**，不改任何运行时行为。 |
 | 0.1.0 | 2026-11-10 | [#124 OpenID 网关实现已落地] `/moments*` 按 `Authorization` scheme 分流校验：`MatrixOpenID <token>` → federation `GET /_matrix/federation/v1/openid/userinfo?access_token=…`（不带 X-Matrix 签名，基址 `GATEWAY_HOMESERVER_FEDERATION_URL`，空则回落 `GATEWAY_HOMESERVER_URL`，明文 http 规则沿用 `GATEWAY_ALLOW_INSECURE_HS`）；`Bearer <Matrix access token>` → CS `GET /_matrix/client/v3/account/whoami`（始终用 `GATEWAY_HOMESERVER_URL`）。**禁止先试 OpenID 再试 whoami**；站点/调用方 bearer 不得用于 `/moments*`。`sub` / `user_id` 域须等于 `GATEWAY_MATRIX_SERVER_NAME`（大小写归一），未配置时 fail closed 为 401。缺少 `GATEWAY_MATRIX_SERVER_NAME` 不新增启动必填。缓存键为 token 的 SHA-256，成功 TTL = `min(GATEWAY_OPENID_CACHE_TTL_SECONDS, 60, 若已知的 expires_in)`，失败负缓存 5 秒且不超过成功 TTL、**仅对 401/403（及域不匹配）负缓存**；`0` = 不缓存，`<0` 或 `>60` 拒绝启动；同一 token 并发校验 single-flight 合并。homeserver 5xx / 超时 / 不可达 → 已有 `500 internal.error`（可重试，不缓存），**不新增状态码或错误码**。本 PR 只做身份校验，`/moments*` 资源 CRUD 留待后续；鉴权通过后未实现资源仍 404（PATCH/DELETE 先鉴权再 405）。配置项 `GATEWAY_HOMESERVER_FEDERATION_URL` / `GATEWAY_OPENID_CACHE_TTL_SECONDS` **自本 PR 起生效**。N1：契约与 OpenAPI 注明自定义 `MatrixOpenID` http scheme 可能触发部分校验器告警，不改名、不标 `deprecated`。`matrixUserToken` 不标 `deprecated`，仍完全有效。 |
 | 0.1.0 | 2026-11-10 | [#124 OpenID 契约加法，**只增不删，不改任何现有字段集合、状态码与错误码行为**] 新增 OpenAPI `securitySchemes.matrixOpenIdToken`（`http` + `scheme: MatrixOpenID`，头为 `Authorization: MatrixOpenID <token>`），与既有 `matrixUserToken`（`Bearer` + whoami）在 `/moments*` 上**并存**：11 个 operation 的 `security` 由 `matrixUserToken` 单项改为 `matrixOpenIdToken` / `matrixUserToken` 二者取一（OR）；`matrixUserToken` **不标 `deprecated`**，仍完全有效。校验路径：网关经 compose 内网直连本部署 homeserver `GET /_matrix/federation/v1/openid/userinfo?access_token=…`（**不带 X-Matrix 签名**，不经 fedgate、不走公网；**只这条 userinfo 直连**，其他联邦流量仍走 fedgate）；直连地址新增部署配置 `GATEWAY_HOMESERVER_FEDERATION_URL`（空则回落 `GATEWAY_HOMESERVER_URL`），不硬编码；新增 `GATEWAY_OPENID_CACHE_TTL_SECONDS`（上限 60，默认 60）。`sub` 即 Matrix `user_id` / owner，域须等于 `GATEWAY_MATRIX_SERVER_NAME` 否则 401，不另建映射表；过期以 `expires_in` 为准、网关不自行延长；缓存只按 token 哈希（不缓存明文、不入日志），TTL ≤ 60s 且不超过剩余有效期。**不做网关侧 nonce 防重放**（持有者令牌在过期前被盗即可重放，属协议固有限制；缓解为短时令牌 / TLS / 不落盘 / 哈希缓存键；跨服 moments 的 HMAC+ts+nonce 与本项无关）。错误码沿用 `401 auth.missing` / `401 auth.invalid_token` / `403 persona.not_owned`，**不新增任何 code**。§1.2.3 扩写为完整契约（scheme、头格式、校验路径、fedgate 边界、缓存、防重放限制、错误码、并存三阶段与移除条件——阶段 2 标 deprecated / 阶段 3 从 security 去掉均须另行公告，**移除前必须先报总管**，本 PR 不进入阶段 2/3）。原则：未来用户向接口默认走 OpenID，但本期只改 `/moments*`；文档级默认 `security` 仍为 `bearerAuth`，`/context/assemble`、发送路径、appservice、跨服 HMAC 的鉴权模型均不变。同步 `docs/moments.md` §3、`README.md` 配置表与 `.env.example`。实现留待下一 PR。 |
 | 0.1.0 | 2026-11-10 | [#124 PR-D] 实现调用方身份：GATEWAY_CALLER_TOKENS、HMAC 等长比较、legacy 开关与启动告警；persona 区 owner 由 token 推出，推不出则区为空且状态码仍 200；不改字段集合、状态码与错误码。 |
