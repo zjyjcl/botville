@@ -48,6 +48,7 @@ final class PushNotificationUXTests: XCTestCase {
         XCTAssertEqual(MatrixService.roomsAfterReadReceipt(rooms, roomID: "!opened:example.test", succeeded: false), rooms)
     }
 
+#if DEBUG
     func testAppGroupUsesInjectedPrefixWithoutDefaultFallback() {
         for group in ["group.com.zjyjcl.botville", "group.com.example.custom"] {
             XCTAssertEqual(PushForegroundProbeLog.appGroupIdentifier(in: [
@@ -76,5 +77,6 @@ final class PushNotificationUXTests: XCTestCase {
         XCTAssertFalse(line.lowercased().contains("bearer"))
         XCTAssertEqual(PushForegroundProbeLog.fileName, "botville-willpresent-probe.log")
     }
+#endif
 
 }

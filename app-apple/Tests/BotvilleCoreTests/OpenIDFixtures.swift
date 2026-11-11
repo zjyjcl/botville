@@ -5,10 +5,8 @@
 import Foundation
 import XCTest
 
-// Problem fixtures copied byte-for-byte from PR #181 head e86a6a9.
-// #181 合入后改用仓库 gateway/openapi/examples/ 并参考
-// MockContractConsistencyTests 做逐字节一致性检查。request-token is an
-// App-owned Matrix C-S example; all credential/identity values are placeholders.
+// Problems are read from the checked-out gateway contract, never bundled copies.
+// The Matrix C-S request-token placeholder remains an App-owned test resource.
 enum OpenIDFixtures {
     struct TokenResponse: Decodable {
         let access_token: String
@@ -22,6 +20,13 @@ enum OpenIDFixtures {
     }
 
     static func data(_ name: String) throws -> Data {
+        if name.hasPrefix("problem-") {
+            let root = URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent().deletingLastPathComponent()
+                .deletingLastPathComponent().deletingLastPathComponent()
+            // Missing/unreadable contract files must throw and fail the test.
+            return try Data(contentsOf: root.appendingPathComponent("gateway/openapi/examples/\(name).json"))
+        }
         let url = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: "json", subdirectory: "OpenID")
                                 ?? Bundle.module.url(forResource: name, withExtension: "json"))
         return try Data(contentsOf: url)

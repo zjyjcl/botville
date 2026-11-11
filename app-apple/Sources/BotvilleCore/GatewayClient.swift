@@ -296,7 +296,8 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
     func responseData(for request: URLRequest) async throws -> Data {
         var outgoing = request
         var usedToken: MatrixOpenIDToken?
-        if try isMomentsRequest(request) {
+        let isMoments = try isMomentsRequest(request)
+        if isMoments {
             guard let openIDProvider else { throw MatrixOpenIDError.providerUnavailable }
             let token = try await openIDProvider.token()
             usedToken = token
@@ -305,7 +306,7 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         var refreshedOnce = false
         var serverRetries = 0
         // Only GET or an explicitly keyed write can be safely replayed after 500.
-        let canRetryServerError = request.httpMethod == "GET"
+        let canRetryServerError = request.httpMethod?.caseInsensitiveCompare("GET") == .orderedSame
             || !(request.value(forHTTPHeaderField: "Idempotency-Key")?
                 .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
         while true {
@@ -326,7 +327,7 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
                 outgoing.setValue("MatrixOpenID \(refreshed.accessToken)", forHTTPHeaderField: "Authorization")
                 continue
             }
-            if response.statusCode == 500, code == "internal.error",
+            if isMoments, response.statusCode == 500, code == "internal.error",
                canRetryServerError, serverRetries < 3 {
                 let delay = TimeInterval(1 << serverRetries) // 1s, 2s, 4s; total budget per operation.
                 serverRetries += 1

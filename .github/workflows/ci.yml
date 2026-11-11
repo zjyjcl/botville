@@ -297,6 +297,9 @@ jobs:
       # Run the full suite so new tests are included automatically. Synapse
       # integration tests skip unless BOTVILLE_E2E_* is explicitly configured.
       # No signing, simulator or real APNs/NSE delivery is exercised here.
+      - name: Release isolation checks
+        run: bash scripts/check-release-isolation.sh
+
       - name: Swift unit and integration tests
         run: swift test
 
