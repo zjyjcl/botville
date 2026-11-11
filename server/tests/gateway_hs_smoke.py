@@ -121,46 +121,67 @@ def wait_for_health(gateway_url, timeout):
 
 
 def register_user(hs_url, registration_token):
-    """Generic UIA register; returns (user_id, access_token) and never prints either."""
-    username = "gwsmoke_" + secrets.token_hex(4)
-    password = secrets.token_hex(16)
-    body = {"username": username, "password": password}
-    flow = None
+    """Generic UIA register; returns (user_id, access_token) and never prints either.
+
+    Retries HTTP 429/503: Synapse's default rc_registration burst is small, so a
+    smoke run right after `make e2e` seed can be rate-limited for a few seconds.
+    """
     register_url = path_of(hs_url, "/_matrix/client/v3/register")
-    for _ in range(12):
-        status, resp = request_json("POST", register_url, body=body)
-        if status == 200 and isinstance(resp, dict):
-            user_id = resp.get("user_id")
-            access_token = resp.get("access_token")
-            if not user_id or not access_token:
-                fail("register 200 missing user_id or access_token")
-            return user_id, access_token
-        if status != 401 or not isinstance(resp, dict):
-            fail("register returned HTTP {}".format(status or "unreachable"))
-        session = resp.get("session")
-        if not session:
-            fail("register 401 missing session")
-        completed = set(resp.get("completed") or [])
-        if flow is None:
-            flows = resp.get("flows") or []
-            candidates = [
-                f["stages"]
-                for f in flows
-                if f.get("stages") and all(s in SUPPORTED_STAGES for s in f["stages"])
-            ]
-            candidates.sort(key=lambda stages: "m.login.registration_token" not in stages)
-            if not candidates:
-                fail("register 401 has no supported UIA flow")
-            flow = candidates[0]
-        remaining = [s for s in flow if s not in completed]
-        if not remaining:
-            fail("UIA flow completed but register still 401")
-        stage = remaining[0]
-        auth = {"session": session, "type": stage}
-        if stage == "m.login.registration_token":
-            auth["token"] = registration_token
-        body["auth"] = auth
-    fail("register did not complete")
+    deadline = time.monotonic() + 60
+    last_status = 0
+    while time.monotonic() < deadline:
+        username = "gwsmoke_" + secrets.token_hex(4)
+        password = secrets.token_hex(16)
+        body = {"username": username, "password": password}
+        flow = None
+        rate_limited = False
+        for _ in range(12):
+            status, resp = request_json("POST", register_url, body=body)
+            last_status = status
+            if status == 200 and isinstance(resp, dict):
+                user_id = resp.get("user_id")
+                access_token = resp.get("access_token")
+                if not user_id or not access_token:
+                    fail("register 200 missing user_id or access_token")
+                return user_id, access_token
+            if status in (429, 503):
+                rate_limited = True
+                break
+            if status != 401 or not isinstance(resp, dict):
+                fail("register returned HTTP {}".format(status or "unreachable"))
+            session = resp.get("session")
+            if not session:
+                fail("register 401 missing session")
+            completed = set(resp.get("completed") or [])
+            if flow is None:
+                flows = resp.get("flows") or []
+                candidates = [
+                    f["stages"]
+                    for f in flows
+                    if f.get("stages") and all(s in SUPPORTED_STAGES for s in f["stages"])
+                ]
+                candidates.sort(key=lambda stages: "m.login.registration_token" not in stages)
+                if not candidates:
+                    fail("register 401 has no supported UIA flow")
+                flow = candidates[0]
+            remaining = [s for s in flow if s not in completed]
+            if not remaining:
+                fail("UIA flow completed but register still 401")
+            stage = remaining[0]
+            auth = {"session": session, "type": stage}
+            if stage == "m.login.registration_token":
+                auth["token"] = registration_token
+            body["auth"] = auth
+        else:
+            fail("register did not complete")
+        if not rate_limited:
+            fail("register returned HTTP {}".format(last_status or "unreachable"))
+        time.sleep(5)
+    fail(
+        "register returned HTTP {} after retrying for rate limits".format(
+            last_status or "unreachable"
+        )
+    )
 
 
 def request_openid_token(hs_url, user_id, access_token):
