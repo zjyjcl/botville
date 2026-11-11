@@ -844,6 +844,7 @@ private struct RoomNotificationSettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var controller: RoomMuteController
     let room: MatrixRoom
+    @State private var presentedError: String?
 
     private var state: RoomMuteState { controller.state(for: room.id) }
 
@@ -874,6 +875,19 @@ private struct RoomNotificationSettingsSheet: View {
             .navigationTitle("房间设置")
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
             .task(id: room.id) { await controller.refresh(room) }
+            .onChange(of: state.errorMessage, initial: true) { _, error in
+                // Keep the failure visible even if the next sync already
+                // reconciles the settings and clears the controller's error.
+                if let error { presentedError = error }
+            }
+            .alert("消息免打扰", isPresented: Binding(
+                get: { presentedError != nil },
+                set: { if !$0 { presentedError = nil } }
+            )) {
+                Button("知道了", role: .cancel) { presentedError = nil }
+            } message: {
+                Text(presentedError ?? "")
+            }
         }
     }
 }
