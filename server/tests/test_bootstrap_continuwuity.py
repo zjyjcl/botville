@@ -196,6 +196,8 @@ def run_bootstrap(tmp, base_url, log_text, *, password=ADMIN_PASSWORD, admin_use
             "COMPOSE": "bash {}".format(fake_compose),
             "BOTVILLE_BASE_URL": base_url,
             "BOTVILLE_BOOTSTRAP_TIMEOUT": "20",
+            # Single scrape: hermetic logs are already complete.
+            "BOTVILLE_BOOTSTRAP_TOKEN_WAIT": "0",
             "FAKE_LOGS_FILE": str(logs_file),
             "FAKE_COMPOSE_STATUS": str(compose_status),
         }
