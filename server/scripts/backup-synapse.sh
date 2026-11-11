@@ -9,6 +9,13 @@
 #   synapse-data.tar.gz  media_store + signing.key from the synapse-data
 #                        volume; synapse is stopped briefly so the archive
 #                        cannot drift from the dump
+#   gateway-data.tar.gz  (optional) full-volume tar of the gateway-data
+#                        volume (everything under the volume root, not just
+#                        .db / -wal / -shm). Written only if the volume
+#                        exists; omitted otherwise so a default stack still
+#                        backs up cleanly. If sqlite3 is in the image, run
+#                        PRAGMA wal_checkpoint(TRUNCATE) on top-level
+#                        /gateway-data/*.db only (not recursive) before tar.
 #   homeserver.yaml      copy of server/compose/generated/synapse/homeserver.yaml
 #   env                  copy of server/compose/.env -- CONTAINS SECRETS
 #   manifest.txt         backup time, images, sha256 + size of every file
@@ -103,12 +110,45 @@ compose run --rm --no-deps --entrypoint sh \
     synapse \
     -c 'cd /data && files=""; for f in media_store signing.key; do [ -e "$f" ] && files="$files $f"; done; [ -n "$files" ] || { echo "no data files found in /data" >&2; exit 1; }; tar -czf /backup/synapse-data.tar.gz $files && chown "$HOST_UID:$HOST_GID" /backup/synapse-data.tar.gz && chmod 600 /backup/synapse-data.tar.gz'
 
-# 3. Config copies. Everything below is secret-adjacent: force mode 600
+# 3. Optional gateway-data volume (A2.2 / #7). The volume is declared in
+#    compose but not mounted by a service yet, so a default stack will not
+#    have it — skip cleanly rather than failing. When it exists, archive
+#    the whole volume through a one-off container on the synapse image
+#    (already pulled for this backup; no extra image). Prefer a WAL
+#    checkpoint top-level *.db if sqlite3 is available (not recursive;
+#    the agreed path is /var/lib/botville-gateway/moments.db at the volume
+#    root), then tar the whole volume. Stop a host-run gateway that has
+#    this database open before backing up.
+artifacts=(synapse-db.dump synapse-data.tar.gz homeserver.yaml env)
+gateway_vol="$(gateway_data_volume)"
+if docker_volume_exists "${gateway_vol}"; then
+    echo "==> archiving gateway-data volume ${gateway_vol}"
+    # shellcheck disable=SC2016  # $db expands inside the container shell
+    compose run --rm --no-deps --entrypoint sh \
+        -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
+        -v "$(cd "${BACKUP_DIR}" && pwd):/backup" \
+        -v "${gateway_vol}:/gateway-data" \
+        synapse \
+        -c 'if command -v sqlite3 >/dev/null 2>&1; then
+                for db in /gateway-data/*.db; do
+                    [ -f "$db" ] || continue
+                    sqlite3 "$db" "PRAGMA wal_checkpoint(TRUNCATE);" || true
+                done
+            fi
+            tar -czf /backup/gateway-data.tar.gz -C /gateway-data .
+            chown "$HOST_UID:$HOST_GID" /backup/gateway-data.tar.gz
+            chmod 600 /backup/gateway-data.tar.gz'
+    artifacts+=(gateway-data.tar.gz)
+else
+    echo "==> gateway-data volume ${gateway_vol} not found; skipping (optional)"
+fi
+
+# 4. Config copies. Everything below is secret-adjacent: force mode 600
 #    regardless of what umask or a pre-existing file would give.
 cp "${generated_config}" "${BACKUP_DIR}/homeserver.yaml"
 cp "${env_file}" "${BACKUP_DIR}/env"
 
-# 4. Manifest: when, which images, and verifiable checksums.
+# 5. Manifest: when, which images, and verifiable checksums.
 {
     echo "# Botville synapse backup manifest"
     echo "backup_time_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -118,7 +158,7 @@ cp "${env_file}" "${BACKUP_DIR}/env"
     echo "${images_block}"
     echo
     echo "# files (sha256  bytes  name):"
-    for f in synapse-db.dump synapse-data.tar.gz homeserver.yaml env; do
+    for f in "${artifacts[@]}"; do
         printf '%s  %s  %s\n' \
             "$(sha256_of "${BACKUP_DIR}/${f}")" \
             "$(wc -c <"${BACKUP_DIR}/${f}" | tr -d " ")" \
@@ -126,19 +166,16 @@ cp "${env_file}" "${BACKUP_DIR}/env"
     done
 } >"${BACKUP_DIR}/manifest.txt"
 
-chmod 600 "${BACKUP_DIR}/synapse-db.dump" \
-    "${BACKUP_DIR}/synapse-data.tar.gz" \
-    "${BACKUP_DIR}/homeserver.yaml" \
-    "${BACKUP_DIR}/env" \
+chmod 600 "${artifacts[@]/#/${BACKUP_DIR}/}" \
     "${BACKUP_DIR}/manifest.txt"
 
-# 5. Self-check: the backup directory must be a real key store before the
+# 6. Self-check: the backup directory must be a real key store before the
 #    script reports success.
 [[ "$(file_mode "${BACKUP_DIR}")" == 700 ]] || {
     echo "backup-synapse.sh: ${BACKUP_DIR} has mode $(file_mode "${BACKUP_DIR}"), expected 700" >&2
     exit 1
 }
-for f in synapse-db.dump synapse-data.tar.gz homeserver.yaml env manifest.txt; do
+for f in "${artifacts[@]}" manifest.txt; do
     mode="$(file_mode "${BACKUP_DIR}/${f}")"
     [[ "${mode}" == 600 ]] || {
         echo "backup-synapse.sh: ${BACKUP_DIR}/${f} has mode ${mode}, expected 600" >&2
@@ -146,14 +183,14 @@ for f in synapse-db.dump synapse-data.tar.gz homeserver.yaml env manifest.txt; d
     }
 done
 
-# 6. Bring synapse back before reporting success (only if it was running;
+# 7. Bring synapse back before reporting success (only if it was running;
 #    a stack that was already down stays down).
 if [[ "${synapse_was_running}" == yes ]]; then
     compose up -d synapse
 fi
 trap - EXIT
 
-# 7. Record the path for scripts/CI (BACKUP_DIR may live outside ./backups,
+# 8. Record the path for scripts/CI (BACKUP_DIR may live outside ./backups,
 #    in which case ./backups was never created above).
 mkdir -p backups
 printf '%s\n' "${BACKUP_DIR}" >backups/.last-backup

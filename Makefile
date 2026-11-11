@@ -7,7 +7,7 @@
 #                        # APNs config (APNS_PLATFORM / BOTVILLE_APNS_ENABLED /
 #                        # ...) is picked up by the running gateway (PR #127 B1)
 #   make smoke           # run server/tests/smoke.py against the running stack
-#   make backup          # dump synapse DB + data volume into ./backups/<ts>/ (A1.1)
+#   make backup          # dump synapse DB + synapse-data / optional gateway-data into ./backups/<ts>/ (A1.1 / A2.2)
 #   make restore RESTORE_DIR=backups/<ts>   # destructive restore of a backup (A1.1)
 #   make e2e             # register/chat/group acceptance test; E2E_PHASE=seed|verify (A1.1)
 #   make push-e2e        # HS -> sygnal push latency acceptance (<5s, A1.2);

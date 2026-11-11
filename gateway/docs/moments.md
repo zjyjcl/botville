@@ -265,10 +265,13 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
   错误码已登记在 `contract.md` §1.3。
 - 匿名或 Matrix token 无效：401（`auth.invalid_token`）；传输层限速 429。
 - `reply_to_comment_id`：目标评论不存在、已软删、或不在同一动态、或对当前查看者不可见（`can_view ∧ can_see_interaction` 为假）时，**统一**返回 `422` `request.invalid`（`errors[].field = reply_to_comment_id`），不区分原因，避免靠 404/422 差异探评论 ULID。
-  **格式不像 ULID 的字符串**同样按「目标不存在」返回 422（类型对、值找不到属语义错误）；
-  只有**类型错误**（数字、布尔、对象、数组、空串）返回 `400` `request.invalid`。
-  显式 `null` 视同省略（顶层评论，`201`）。OpenAPI 请求 schema 为 `string | null`
-  （`type: [string, 'null']`），与实现一致；建议客户端省略该字段而不是发 `null`。
+  校验顺序：先类型、后语义。**类型错误**（数字、布尔、对象、数组、空串）返回
+  `400` `request.invalid`；显式 `null` 视同省略（顶层评论，`201`）。**语义错误**——
+  目标不存在、已软删、不在同一动态、对当前查看者不可见，以及**格式不像 ULID 的字符串**——
+  **统一** `422` `request.invalid`。OpenAPI 请求 schema 为 `string | null`
+  （`type: [string, 'null']`），**不设 ULID `pattern`**，以免客户端先做 schema 校验时
+  把非 ULID 字符串拦在本地、到不了服务端 422；响应实体 `MomentComment` 仍带 pattern。
+  建议客户端省略该字段而不是发 `null`。
 - **幂等作用域与重放**（实现口径，登记于 `contract.md` §1.5「动态端点」）：缓存键为
   `(操作, 调用者, 目标资源, key)`，评论的目标资源是 `moment_id`；persona 归属与目标动态
   可见性**先于**幂等缓存判定。因此动态被删除、或与作者解除好友后，用原
@@ -340,11 +343,23 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
 部署目标为 8845 小主机（Ubuntu Server 24.04，**尚未装好**）。本 PR 与后续 PR 的交付
 边界：只改仓库内容，**不连接、不部署任何机器**，不写任何真实密钥。
 
-- **未做（计划）**：compose 为网关新增持久化卷 `gateway-data`（挂载
-  `GATEWAY_MOMENTS_DB_PATH` 所在目录，SQLite + WAL，随容器重启保留）。当前 compose
-  尚无该卷，与 §10「未做」一致；在它落地前若在容器内开启动态模块，数据随容器删除而丢失。
-- 备份/恢复（**未做**）：计划把网关 DB 纳入既有 `backup-synapse.sh` / `restore-synapse.sh`
-  （冻结 WAL 后整库拷贝），部署手册按 A1.1 流程在 8845 上执行时补「网关数据」一节。
+- compose 已声明持久化卷 `gateway-data`（实际 docker volume 名为
+  `<COMPOSE_PROJECT_NAME>_gateway-data`，默认 `botville_gateway-data`）。约定挂载目录
+  为 `/var/lib/botville-gateway`，启用动态模块时设
+  `GATEWAY_MOMENTS_DB_PATH=/var/lib/botville-gateway/moments.db`（WAL 模式，随卷保留）。
+  **网关进程尚未作为 compose 服务加入**（无 Dockerfile；镜像内迁移目录定位仍见 §10）。
+  卷不挂在现有 homeserver 服务上，需显式创建才会出现（见 `server/compose/docker-compose.yml`
+  注释）；未创建时备份脚本跳过该卷、不失败。当前没有服务挂载，因此即使加了 compose
+  标签，`docker compose down -v` 也删不掉它（`compose config --volumes` 不会列出），
+  `make down` 也不传 `-v`。要删这个卷请执行
+  `docker volume rm -f <COMPOSE_PROJECT_NAME>_gateway-data`；等网关服务挂上该卷后，
+  标签才会让 `down -v` 一并删除。
+- 备份/恢复：已纳入既有 `backup-synapse.sh` / `restore-synapse.sh`（synapse profile）。
+  卷存在则把其中**全部文件**打成 `gateway-data.tar.gz`（整卷 `tar`，不限 `.db`）。
+  若镜像内有 `sqlite3`，打包前仅对**卷顶层** `*.db` 做 `PRAGMA wal_checkpoint(TRUNCATE)`，
+  不递归子目录。旧备份没有该文件时，恢复**不碰**已有 `gateway-data` 卷。整个备份目录仍按密钥库保管（700/600），卷内是
+  业务数据，不含网关密钥（密钥在 `env` 等既有产物里，不另存一份到本卷或仓库）。
+  部署手册见 `docs/deploy/z423-synapse.md`「备份与恢复」中的网关数据说明。
 - 跨服入口只经 fedgate 暴露 `/_matrix/botville/*`；网关 HTTP 端口只在 compose 内网或
   `127.0.0.1` 监听。
 
@@ -366,7 +381,9 @@ Moments 仍只在 `tags` / `paths` 末尾 / `securitySchemes` / `schemas` 末尾
 | PR | 内容 |
 |---|---|
 | PR1（已合入） | 契约：OpenAPI 路径 / securitySchemes / schema、示例与校验登记、DDL、本文、契约单测（`gateway/tests/test_moments_contract.py`）。 |
-| PR2（已合入，#184） | 存储（迁移执行器、SQLite 访问层）、`can_view` / `can_see_interaction` 与 `RelationProvider` 临时实现、同服 API 实现、权限矩阵与性质单测、`.env.example` 登记配置变量、软删/审计定时清理。**未做、留作后续**：CI `moments-e2e` job、compose `gateway-data` 卷与备份脚本（§8）、镜像内迁移目录定位。 |
+| PR2（已合入，#184） | 存储（迁移执行器、SQLite 访问层）、`can_view` / `can_see_interaction` 与 `RelationProvider` 临时实现、同服 API 实现、权限矩阵与性质单测、`.env.example` 登记配置变量、软删/审计定时清理。 |
+| 卷与备份（本 PR） | compose 声明 `gateway-data` 卷；`backup-synapse.sh` / `restore-synapse.sh` 归档与恢复（卷不存在则跳过；旧备份无产物则不碰该卷）。见 §8。 |
+| 仍待后续 | CI `moments-e2e` job；把网关进程加入 compose（Dockerfile、将卷挂到 `/var/lib/botville-gateway`、镜像内迁移目录定位）。 |
 | PR3 | 跨服只读 API（`/_matrix/botville/moments/v1/*` 正式入契约）、fedgate HMAC 验签、双 HS 联邦 e2e（配对可读、切断被拒）。 |
 
 每个 PR 单独送审，不自行合并。

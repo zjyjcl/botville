@@ -5,7 +5,10 @@
 #
 # DESTRUCTIVE: drops and recreates the synapse database and replaces the
 # synapse-data volume, server/compose/.env and the generated homeserver.yaml
-# with the copies from <backup_dir>. --yes is required to run; without it the
+# with the copies from <backup_dir>. If the backup contains
+# gateway-data.tar.gz, the gateway-data volume is also replaced (created
+# with compose labels if missing); if it does not, an existing gateway-data
+# volume is left untouched. --yes is required to run; without it the
 # script only prints what it would do.
 #
 # Steps: check the backup belongs to this instance (COMPOSE_PROJECT_NAME and
@@ -135,8 +138,10 @@ restore-synapse.sh: refusing to run without --yes
 This would REPLACE on this machine, using ${backup_dir}:
   - the synapse database (drop + recreate + pg_restore)
   - the synapse-data volume (media_store, signing.key)
+  - the gateway-data volume (only if ${backup_dir}/gateway-data.tar.gz exists)
   - ${env_file}
   - ${generated_config}
+Old backups without gateway-data.tar.gz leave any existing gateway-data volume untouched.
 Re-run with --yes to proceed.
 EOF
     exit 2
@@ -214,6 +219,31 @@ for f in synapse-db.dump synapse-data.tar.gz homeserver.yaml env; do
     echo "==> checksum OK: ${f}"
 done
 
+# Optional gateway-data artifact (A2.2 / #7). If the file is present it must
+# match the manifest (when one exists); if the manifest lists it, the file
+# must be present. Either way we do this before destroying anything.
+if [[ -f "${backup_dir}/gateway-data.tar.gz" ]]; then
+    expected="$(expected_sha gateway-data.tar.gz)" || expected=""
+    if [[ -f "${backup_dir}/manifest.txt" && -z "${expected}" ]]; then
+        echo "restore-synapse.sh: manifest.txt has no sha256 entry for gateway-data.tar.gz" >&2
+        exit 1
+    fi
+    if [[ -n "${expected}" ]]; then
+        got="$(sha256_of "${backup_dir}/gateway-data.tar.gz")"
+        if [[ "${expected}" != "${got}" ]]; then
+            echo "restore-synapse.sh: sha256 mismatch for gateway-data.tar.gz: manifest ${expected}, file ${got}" >&2
+            exit 1
+        fi
+        echo "==> checksum OK: gateway-data.tar.gz"
+    fi
+elif [[ -f "${backup_dir}/manifest.txt" ]]; then
+    expected="$(expected_sha gateway-data.tar.gz)" || expected=""
+    if [[ -n "${expected}" ]]; then
+        echo "restore-synapse.sh: manifest.txt lists gateway-data.tar.gz but the file is missing" >&2
+        exit 1
+    fi
+fi
+
 echo "==> stopping synapse"
 compose stop synapse
 
@@ -270,6 +300,18 @@ compose run --rm --no-deps --entrypoint sh \
     -v "$(cd "${backup_dir}" && pwd):/backup:ro" \
     synapse \
     -c 'cd /data && rm -rf media_store signing.key homeserver.pid && tar -xzf /backup/synapse-data.tar.gz'
+
+if [[ -f "${backup_dir}/gateway-data.tar.gz" ]]; then
+    echo "==> restoring gateway-data volume $(gateway_data_volume)"
+    ensure_gateway_data_volume
+    compose run --rm --no-deps --entrypoint sh \
+        -v "$(cd "${backup_dir}" && pwd):/backup:ro" \
+        -v "$(gateway_data_volume):/gateway-data" \
+        synapse \
+        -c 'cd /gateway-data && find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + && tar -xzf /backup/gateway-data.tar.gz'
+else
+    echo "==> no gateway-data.tar.gz in backup; leaving gateway-data volume untouched"
+fi
 
 echo "==> starting synapse"
 compose up -d synapse

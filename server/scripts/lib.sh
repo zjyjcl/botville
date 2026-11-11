@@ -111,3 +111,33 @@ wait_for_postgres() {
         return 1
     fi
 }
+
+# Named volume for gateway local data (A2.2 / #7). Compose declares
+# `gateway-data` but no service mounts it yet; docker names it
+# <project>_gateway-data. Used by backup-synapse.sh / restore-synapse.sh.
+gateway_data_volume() {
+    printf '%s_gateway-data' "$(project_name)"
+}
+
+docker_volume_exists() {
+    docker volume inspect "$1" >/dev/null 2>&1
+}
+
+# Create the volume with compose labels so that *after* a gateway service
+# mounts it, `docker compose down -v` can remove it. Today no service mounts
+# this volume, so down -v does not delete it and `compose config --volumes`
+# does not list it — even with the labels. Remove it with
+# `docker volume rm -f <project>_gateway-data`. `make down` does not pass -v.
+# No-op if the volume already exists (labels on an existing volume are left
+# as-is).
+ensure_gateway_data_volume() {
+    local vol
+    vol="$(gateway_data_volume)"
+    if docker_volume_exists "${vol}"; then
+        return 0
+    fi
+    docker volume create \
+        --label "com.docker.compose.project=$(project_name)" \
+        --label "com.docker.compose.volume=gateway-data" \
+        "${vol}" >/dev/null
+}

@@ -87,7 +87,13 @@ class RestoreSynapseTest(unittest.TestCase):
         self.bin_dir.mkdir()
         self.docker_log = tmp / "docker.log"
         (self.bin_dir / "docker").write_text(
-            '#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >> "${FAKE_DOCKER_LOG:?}"\nexit 0\n',
+            """#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FAKE_DOCKER_LOG:?}"
+if [ "$1" = volume ] && [ "$2" = inspect ]; then
+    if [ "${FAKE_DOCKER_VOLUME_EXISTS:-1}" = 1 ]; then exit 0; else exit 1; fi
+fi
+exit 0
+""",
             encoding="utf-8",
         )
         (self.bin_dir / "docker").chmod(0o755)
@@ -114,7 +120,8 @@ class RestoreSynapseTest(unittest.TestCase):
     # --- helpers -----------------------------------------------------------
 
     def make_backup(self, project="botville-cur", port=None, drop_manifest=False,
-                    manifest_names=ARTIFACTS, corrupt_sha_for=None):
+                    manifest_names=ARTIFACTS, corrupt_sha_for=None,
+                    with_gateway_data=False):
         """Backup dir with dummy artifacts and a (possibly partial) manifest."""
         backup = self.tmp / "backup"
         backup.mkdir()
@@ -124,6 +131,8 @@ class RestoreSynapseTest(unittest.TestCase):
             "homeserver.yaml": b"server_name: localhost\n",
             "env": env_file_content(project, self.health.port if port is None else port).encode(),
         }
+        if with_gateway_data:
+            contents["gateway-data.tar.gz"] = b"fake gateway volume tar\n"
         for name, data in contents.items():
             (backup / name).write_bytes(data)
         if not drop_manifest:
@@ -261,6 +270,85 @@ class RestoreSynapseTest(unittest.TestCase):
         self.assertIn("skipping checksum verification", proc.stderr)
         self.assertNotIn("checksum OK", proc.stdout)
         self.assertTrue(self.docker_calls())
+        self.assertIn("leaving gateway-data volume untouched", proc.stdout)
+        self.assertFalse(any("gateway-data" in c for c in self.docker_calls()))
+
+    def test_old_backup_leaves_gateway_volume_untouched(self):
+        backup = self.make_backup()
+        proc = self.run_restore(backup)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("leaving gateway-data volume untouched", proc.stdout)
+        self.assertNotIn("checksum OK: gateway-data.tar.gz", proc.stdout)
+        self.assertFalse(any("gateway-data" in c for c in self.docker_calls()))
+
+    def test_gateway_data_artifact_is_restored(self):
+        backup = self.make_backup(
+            with_gateway_data=True,
+            manifest_names=ARTIFACTS + ("gateway-data.tar.gz",),
+        )
+        proc = self.run_restore(backup)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("checksum OK: gateway-data.tar.gz", proc.stdout)
+        self.assertIn("restoring gateway-data volume botville-cur_gateway-data", proc.stdout)
+        self.assertNotIn("leaving gateway-data volume untouched", proc.stdout)
+        calls = self.docker_calls()
+        self.assertTrue(any("volume inspect" in c and "botville-cur_gateway-data" in c for c in calls))
+        # volume already "exists" (fake docker inspect exits 0), so no create.
+        self.assertTrue(any(
+            "gateway-data" in c and "tar -xzf /backup/gateway-data.tar.gz" in c
+            for c in calls
+        ))
+        self.assertFalse(any("volume create" in c for c in calls))
+
+    def test_restore_creates_volume_when_missing(self):
+        """ensure_gateway_data_volume create branch: inspect fails -> volume create."""
+        backup = self.make_backup(
+            with_gateway_data=True,
+            manifest_names=ARTIFACTS + ("gateway-data.tar.gz",),
+        )
+        proc = self.run_restore(backup, env={"FAKE_DOCKER_VOLUME_EXISTS": "0"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        calls = self.docker_calls()
+        self.assertTrue(any("volume inspect" in c and "botville-cur_gateway-data" in c for c in calls))
+        create = [c for c in calls if c.startswith("volume create") or " volume create " in c]
+        # fake docker logs "$*" of `docker volume create --label ... name`
+        create = [c for c in calls if "volume create" in c]
+        self.assertEqual(len(create), 1, calls)
+        self.assertIn("com.docker.compose.project=botville-cur", create[0])
+        self.assertIn("com.docker.compose.volume=gateway-data", create[0])
+        self.assertIn("botville-cur_gateway-data", create[0])
+
+    def test_gateway_data_sha_mismatch_fails(self):
+        backup = self.make_backup(
+            with_gateway_data=True,
+            manifest_names=ARTIFACTS + ("gateway-data.tar.gz",),
+            corrupt_sha_for="gateway-data.tar.gz",
+        )
+        proc = self.run_restore(backup)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("sha256 mismatch for gateway-data.tar.gz", proc.stderr)
+        self.assertEqual(self.docker_calls(), [])
+        self.assertEqual(self.env_file.read_text(encoding="utf-8"), self.current_env)
+
+    def test_gateway_data_file_without_manifest_entry_fails(self):
+        backup = self.make_backup(with_gateway_data=True)  # manifest lists only ARTIFACTS
+        proc = self.run_restore(backup)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("manifest.txt has no sha256 entry for gateway-data.tar.gz", proc.stderr)
+        self.assertEqual(self.docker_calls(), [])
+
+    def test_manifest_lists_gateway_data_but_file_missing_fails(self):
+        backup = self.make_backup()
+        manifest = (backup / "manifest.txt").read_text(encoding="utf-8")
+        fake = hashlib.sha256(b"missing").hexdigest()
+        (backup / "manifest.txt").write_text(
+            manifest + "{}  0  gateway-data.tar.gz\n".format(fake),
+            encoding="utf-8",
+        )
+        proc = self.run_restore(backup)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("lists gateway-data.tar.gz but the file is missing", proc.stderr)
+        self.assertEqual(self.docker_calls(), [])
 
 
 
