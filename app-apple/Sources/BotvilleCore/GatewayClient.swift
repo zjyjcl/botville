@@ -46,15 +46,17 @@ private func validateAction(card: GatewayCard, action: GatewayCardAction) async 
 }
 
 /// Transport skeleton for the v1 contract. No credentials are read from the
-/// environment, persisted, or logged. A future gateway login may inject a token.
+/// environment, persisted, or logged. Site and end-user credentials are
+/// injected separately; moments always requires the OpenID provider.
 public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
     public let baseURL: URL
     private let token: String?
+    private let openIDProvider: MatrixOpenIDTokenProvider?
     private let session: URLSession
     private let intentKeys = ActionIntentKeys()
 
     public init(baseURL: URL, allowLocalHTTP: Bool = false, token: String? = nil, session: URLSession? = nil,
-                certificateFingerprint: Data? = nil)
+                certificateFingerprint: Data? = nil, openIDProvider: MatrixOpenIDTokenProvider? = nil)
         throws
     {
         do {
@@ -71,6 +73,7 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         // available only for unpinned clients.
         guard certificateFingerprint == nil || session == nil else { throw GatewayClientError.invalidBaseURL }
         self.token = token
+        self.openIDProvider = openIDProvider
         if let session {
             self.session = session
         } else if let certificateFingerprint {
@@ -88,13 +91,13 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
 
     public convenience init(
         baseURL: String, allowLocalHTTP: Bool = false, token: String? = nil, session: URLSession? = nil,
-        certificateFingerprint: Data? = nil
+        certificateFingerprint: Data? = nil, openIDProvider: MatrixOpenIDTokenProvider? = nil
     ) throws {
         guard let url = URL(string: baseURL.trimmingCharacters(in: .whitespacesAndNewlines)) else {
             throw GatewayClientError.invalidBaseURL
         }
         try self.init(baseURL: url, allowLocalHTTP: allowLocalHTTP, token: token, session: session,
-                      certificateFingerprint: certificateFingerprint)
+                      certificateFingerprint: certificateFingerprint, openIDProvider: openIDProvider)
     }
 
     public func capabilities(locale: String? = nil, appVersion: String? = nil) async throws
@@ -200,7 +203,7 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         return GatewayCookieExchange(statusCode: 204)
     }
 
-    private func request(
+    func request(
         _ segments: [String], method: String = "GET", query: [URLQueryItem] = [], body: Data? = nil,
         authorize: Bool = true, negotiateCards: Bool = false, idempotencyKey: String? = nil
     ) throws -> URLRequest {
@@ -236,17 +239,57 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         }
         if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         if let idempotencyKey { request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key") }
-        if authorize, let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        if authorize, segments.first != "moments", let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         return request
     }
 
-    private func decode<T: Decodable>(_ request: URLRequest, as: T.Type) async throws -> T {
-        let (data, response) = try await PairingURLSession.data(for: request, using: session)
+    /// Minimal raw-data entry point. Resource models and UI are intentionally
+    /// deferred; path components are encoded separately, never parsed as URLs.
+    public func momentsRequest(
+        subpath: [String] = [], method: String = "GET", query: [URLQueryItem] = [],
+        body: Data? = nil, idempotencyKey: String? = nil
+    ) async throws -> Data {
+        try await responseData(for: request(["moments"] + subpath, method: method,
+            query: query, body: body, idempotencyKey: idempotencyKey))
+    }
+
+    /// Match the first API path segment relative to this gateway's base prefix.
+    /// Query strings and similar names (momentsx) never select credentials.
+    func isMomentsRequest(_ request: URLRequest) throws -> Bool {
+        guard let root = try self.request(["moments"]).url?.path,
+              let path = request.url?.path else { throw GatewayClientError.invalidResponse }
+        return path == root || path.hasPrefix(root + "/")
+    }
+
+    func responseData(for request: URLRequest) async throws -> Data {
+        var outgoing = request
+        var usedToken: MatrixOpenIDToken?
+        if try isMomentsRequest(request) {
+            guard let openIDProvider else { throw MatrixOpenIDError.providerUnavailable }
+            let token = try await openIDProvider.token()
+            usedToken = token
+            outgoing.setValue("MatrixOpenID \(token.accessToken)", forHTTPHeaderField: "Authorization")
+        }
+        var (data, response) = try await PairingURLSession.data(for: outgoing, using: session)
+        if let usedToken, (response as? HTTPURLResponse)?.statusCode == 401, let openIDProvider {
+            await openIDProvider.invalidate(usedToken)
+            let refreshed = try await openIDProvider.token()
+            // Reuse the exact request: body and Idempotency-Key are unchanged.
+            outgoing.setValue("MatrixOpenID \(refreshed.accessToken)", forHTTPHeaderField: "Authorization")
+            (data, response) = try await PairingURLSession.data(for: outgoing, using: session)
+            if (response as? HTTPURLResponse)?.statusCode == 401 {
+                await openIDProvider.invalidate(refreshed)
+            }
+        }
         guard let response = response as? HTTPURLResponse else { throw GatewayClientError.invalidResponse }
         guard (200..<300).contains(response.statusCode) else {
             throw GatewayClientError.httpStatus(response.statusCode)
         }
-        return try GatewayCoding.decoder.decode(T.self, from: data)
+        return data
+    }
+
+    private func decode<T: Decodable>(_ request: URLRequest, as: T.Type) async throws -> T {
+        try GatewayCoding.decoder.decode(T.self, from: await responseData(for: request))
     }
 }
 
