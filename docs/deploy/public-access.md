@@ -48,7 +48,8 @@
   `/moments*` 上继续接受 `Authorization: Bearer <Matrix access token>`
   （`matrixUserToken`→whoami），那是留给 **App 以外其他调用方**的阶段 1 共存路径，未标
   `deprecated`、仍有效。退场节奏（T1 观察 → T2 清点 → T3 进阶段 2 标 `deprecated` →
-  T4 进阶段 3 移除）见契约 §1.2.3，均须先公告、先报总管。
+  T4 进阶段 3 移除）见契约 §1.2.3；其中**阶段 2（标 `deprecated`）与阶段 3（移除
+  `matrixUserToken`）须先公告、先报总管**，阶段 1（现状，Bearer 仍有效）不受此约束。
 - 依赖：B 线网关契约与实现（#124）、C 线客户端、A 线 compose（内网可达与 listener
   配置，实现时验证）。
 

@@ -478,7 +478,7 @@ Option A 定稿（2026-11-06，#128/#132）合入后，C 线（App）须确认�
 2. chat-only 时继续丢弃 / 不使用 `features_url`（既有行为，保持不变）；
 3. 二维码带 `gw` 且兑换响应返回非 null `gateway` 时，继续按现状从
    `{gateway}/v1/capabilities` 拉取功能清单（`features_url` 仅保存，不直接请求）；
-4. 本 PR 已把 App fixture 同步为与 `docs/contracts/examples/pairing-qr/` 逐字节
+4. #149 / #151 已把 App fixture 同步为与 `docs/contracts/examples/pairing-qr/` 逐字节
    一致（含新增的 `uri-valid-no-gw.txt` / `uri-invalid-missing-hs.txt` /
    `redeem-200-no-gateway.json`）；合并后拉取即可，本地 App 测试应以该单一来源
    通过；

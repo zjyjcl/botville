@@ -78,7 +78,7 @@ SQLite，DDL：`gateway/migrations/moments/0001_moments.sql`（表名全部 `mom
     调用方的阶段 1 共存路径）：网关调用本服 homeserver
     `GET /_matrix/client/v3/account/whoami` 换出 `user_id`，按 token 哈希缓存 ≤ 60 秒。
     本路径**留给 App 以外的其他调用方**，**App 不使用**；**未标 `deprecated`，仍完全
-    有效**。退场节奏（详见 `contract.md` §1.2.3）：T1 本 PR（#7 moments CRUD）上线后观察
+    有效**。退场节奏（详见 `contract.md` §1.2.3）：T1 #7（moments CRUD）上线后观察
     App 流量 → T2 清点 Bearer 调用方（届时「按 scheme 统计」PR）→ T3 已知调用方迁完且 Bearer
     占比 <1%（计划值）后进**阶段 2**（标 `deprecated`，须先公告、先报总管）→ T4 至少 90 天
     公告并加 `Deprecation`/`Sunset` 头后进**阶段 3**（从 `/moments*` security 移除
