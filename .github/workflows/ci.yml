@@ -232,10 +232,9 @@ jobs:
       - name: Verify gateway-data survived (gateway healthy on it)
         run: |
           set -euo pipefail
-          ${STACK} exec -T gateway grep -qx botville-gateway-data-seed /var/lib/botville-gateway/ci-seed.txt
-          ${STACK} exec -T gateway python -c "import sqlite3; c = sqlite3.connect('/var/lib/botville-gateway/moments.db'); assert c.execute('select count(*) from moments_schema_migrations').fetchone()[0] >= 1"
-          # The transaction stored by the pre-backup smoke survived the restore.
-          ${STACK} exec -T gateway python -c "import sqlite3; c = sqlite3.connect('/var/lib/botville-gateway/as_transactions.db'); assert c.execute('select count(*) from as_transactions').fetchone()[0] >= 1"
+          # Wait for /health first: after the restore the gateway may still be
+          # restarting (startup whoami against the restored synapse), and
+          # `exec` into a restarting container fails.
           port="$(sed -n 's/^BOTVILLE_GATEWAY_PORT=//p' server/compose/.env | tail -n 1)"
           for _ in $(seq 1 60); do
             curl -fsS "http://127.0.0.1:${port:-8020}/health" && break
@@ -243,6 +242,10 @@ jobs:
           done
           curl -fsS "http://127.0.0.1:${port:-8020}/health" >/dev/null \
             || { echo "::error::gateway /health not OK after restore"; exit 1; }
+          ${STACK} exec -T gateway grep -qx botville-gateway-data-seed /var/lib/botville-gateway/ci-seed.txt
+          ${STACK} exec -T gateway python -c "import sqlite3; c = sqlite3.connect('/var/lib/botville-gateway/moments.db'); assert c.execute('select count(*) from moments_schema_migrations').fetchone()[0] >= 1"
+          # The transaction stored by the pre-backup smoke survived the restore.
+          ${STACK} exec -T gateway python -c "import sqlite3; c = sqlite3.connect('/var/lib/botville-gateway/as_transactions.db'); assert c.execute('select count(*) from as_transactions').fetchone()[0] >= 1"
 
       - name: Gateway homeserver smoke after restore (whoami + OpenID userinfo)
         run: make gateway-hs-smoke
