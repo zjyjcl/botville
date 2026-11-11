@@ -36,9 +36,10 @@ import json
 import re
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .config import Config, load_config
+from .as_txn_store import AsTransactionStore, build_as_txn_store
 from .caller_identity import (
     AUTH_INVALID,
     AUTH_MISSING,
@@ -72,6 +73,12 @@ from .user_identity import (
 )
 
 _ROUTE_MESSAGES = re.compile(r"^/v1/conversations/([^/]+)/messages$")
+# Matrix AS 回调路径（根路径，不带部署前缀；strip_path_prefix 后也能命中）。
+_ROUTE_AS_TRANSACTIONS = re.compile(r"^/_matrix/app/v1/transactions/([^/]+)$")
+_AS_APP_V1_PREFIX = "/_matrix/app/v1"
+# txnId 合法字符集（URL 解码后）：长度 ≤ 255，
+# 只允许印刷可见 ASCII（排除控制字符和空白），避免注入 / 路径穿越。
+_TXN_ID_RE = re.compile(r"^[!-~]{1,255}$")
 # 客户端回传的 X-Request-Id 必须短且安全，否则伪造/放大审计 ID。
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 _JSON_MEDIA_TYPE = "application/json"
@@ -142,7 +149,12 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: Any) -> None:
         if self.server.config.access_log:  # type: ignore[attr-defined]
-            super().log_message(fmt, *args)
+            super().log_message(fmt, *_redact_args(args))
+
+    def log_request(self, code: Any = "-", size: Any = "-") -> None:
+        """覆盖 stdlib：脱敏委托给 log_message/_redact_args；access_log=false 时静默。"""
+        if self.server.config.access_log:  # type: ignore[attr-defined]
+            super().log_request(code, size)
 
     # ------------------------------------------------------------- helpers
     def parse_request(self) -> bool:  # type: ignore[override]
@@ -436,6 +448,207 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         """当前请求通过校验后的 Matrix user_id（未校验时 None）。"""
         return getattr(self, "_user_id", None)
 
+    # ------------------------------------------------ Matrix AS callbacks
+    # 只处理 /_matrix/app/v1/*（协议层）；事件消费留给后续 PR。
+    def _send_matrix_error(self, status: int, errcode: str, error: str) -> None:
+        """Matrix 标准错误体（`{"errcode","error"}`，application/json）。
+
+        不用 problem+json：AS 回调的调用方是 homeserver，按 Matrix 规范解析。
+        """
+        self._send_json(status, {"errcode": errcode, "error": error})
+
+    def _drain_as_body(self) -> None:
+        """丢弃（或读完）请求体，避免连接错乱。超过上限时直接关闭连接。
+
+        认证失败也要调用：先完成认证再解析/消费 body，但 body 仍须被读出，
+        否则同一连接上的后续字节会被当成新请求行。
+        """
+        length = self._as_content_length()
+        if length is None:
+            self.close_connection = True
+            return
+        if length <= 0:
+            return
+        if length > self.server.config.as_max_body_bytes:  # type: ignore[attr-defined]
+            # 不读超大 body；直接关闭连接（HTTP/1.0 下本就逐请求关闭）。
+            self.close_connection = True
+            return
+        try:
+            self.rfile.read(length)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self.close_connection = True
+
+    def _as_content_length(self) -> Optional[int]:
+        """解析 Content-Length；非法/不支持 chunked → None。"""
+        transfer_encoding = (self.headers.get("Transfer-Encoding") or "").strip().lower()
+        if transfer_encoding and transfer_encoding != "identity":
+            return None
+        raw = (self.headers.get("Content-Length") or "0").strip() or "0"
+        try:
+            length = int(raw)
+        except ValueError:
+            return None
+        if length < 0:
+            return None
+        return length
+
+    def _as_auth_ok(self) -> bool:
+        """校验 `Authorization: Bearer <hs_token>`（只认表头，不认查询参数）。
+
+        - 网关未配置 `GATEWAY_HS_TOKEN` → 403 M_FORBIDDEN（compose 尚未注入）。
+        - 缺 Authorization 头 / 非 Bearer scheme → 401 M_MISSING_TOKEN。
+        - token 不匹配 → 403 M_FORBIDDEN（AS 规范 v1.4+）。
+        恒定时间比较；token 值绝不写入日志或响应体。
+        """
+        expected = self.server.config.hs_token  # type: ignore[attr-defined]
+        if expected is None:
+            self._drain_as_body()
+            self._send_matrix_error(
+                403, "M_FORBIDDEN", "homeserver token is not configured on this gateway"
+            )
+            return False
+        header = self.headers.get("Authorization") if self.headers else None
+        scheme, _, token = (header or "").partition(" ")
+        token = token.strip()
+        if not header or scheme.lower() != "bearer" or not token:
+            self._drain_as_body()
+            self._send_matrix_error(401, "M_MISSING_TOKEN", "missing bearer token")
+            return False
+        if not hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
+            self._drain_as_body()
+            self._send_matrix_error(403, "M_FORBIDDEN", "invalid homeserver token")
+            return False
+        return True
+
+    def _read_as_body(self) -> Tuple[Optional[bytes], Optional[Tuple[int, str, str]]]:
+        """读取 AS 回调请求体。返回 (raw, error)；error 为 (status, errcode, error)。
+
+        Body 上限用 `GATEWAY_AS_MAX_BODY_BYTES`（与 /v1 的 1 MiB 独立）。
+        """
+        length = self._as_content_length()
+        if length is None:
+            return None, (400, "M_BAD_JSON", "unreadable request body framing")
+        limit = self.server.config.as_max_body_bytes  # type: ignore[attr-defined]
+        if length > limit:
+            self.close_connection = True
+            return None, (
+                413,
+                "M_TOO_LARGE",
+                f"request body exceeds {limit} bytes",
+            )
+        if length == 0:
+            return b"", None
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            return None, (400, "M_BAD_JSON", "incomplete request body")
+        return raw, None
+
+    def _handle_as_request(self, path: str) -> None:
+        """`/_matrix/app/v1/*` 的方法分发：未知路径 404，已知路径错误方法 405。"""
+        if path == "/_matrix/app/v1/ping":
+            if self.command == "POST":
+                self._handle_as_ping()
+            else:
+                self._send_matrix_error(
+                    405, "M_UNRECOGNIZED", f"{self.command} is not supported on {path}"
+                )
+            return
+        match = _ROUTE_AS_TRANSACTIONS.match(path)
+        if match:
+            if self.command == "PUT":
+                self._handle_as_transactions(unquote(match.group(1)))
+            else:
+                self._send_matrix_error(
+                    405, "M_UNRECOGNIZED", f"{self.command} is not supported on {path}"
+                )
+            return
+        self._send_matrix_error(404, "M_UNRECOGNIZED", "unrecognized request")
+
+    def _handle_as_transactions(self, txn_id: str) -> None:
+        """`PUT /_matrix/app/v1/transactions/{txnId}`：认证 → 校验 → 幂等持久化。"""
+        if not self._as_auth_ok():
+            return
+        raw, err = self._read_as_body()
+        if err is not None:
+            self._send_matrix_error(*err)
+            return
+        # txnId 已 URL 解码；长度 ≤255、只允许印刷可见 ASCII。
+        if not _TXN_ID_RE.fullmatch(txn_id):
+            self._send_matrix_error(
+                400, "M_INVALID_PARAM", "transaction id must be 1-255 printable ASCII characters"
+            )
+            return
+
+        assert raw is not None
+        try:
+            payload = json.loads(raw) if raw else None
+        except (json.JSONDecodeError, ValueError):
+            self._send_matrix_error(400, "M_NOT_JSON", "request body is not valid JSON")
+            return
+        if not isinstance(payload, dict):
+            self._send_matrix_error(400, "M_BAD_JSON", "request body must be a JSON object")
+            return
+        events = payload.get("events")
+        if not isinstance(events, list):
+            self._send_matrix_error(400, "M_BAD_JSON", "'events' must be an array")
+            return
+        ephemeral = payload.get("ephemeral")
+        if ephemeral is not None and not isinstance(ephemeral, list):
+            self._send_matrix_error(400, "M_BAD_JSON", "'ephemeral' must be an array")
+            return
+
+        store: Optional[AsTransactionStore] = self.server.as_txn_store  # type: ignore[attr-defined]
+        if store is None:
+            # 未配置持久化路径：不能保证「200 前落库」，返回 500 让 HS 重试。
+            self._send_matrix_error(
+                500, "M_UNKNOWN", "transaction storage is not configured"
+            )
+            return
+        try:
+            # 幂等：store_transaction 在锁内判重 + 插入（返回 False = 已存在），
+            # 重放直接 200 且不重复落库。
+            store.store_transaction(txn_id, raw.decode("utf-8"))
+        except Exception as exc:  # sqlite3.Error / 解码 / IO
+            if self.server.config.access_log:  # type: ignore[attr-defined]
+                self.log_error(
+                    "AS transaction persist failed for txn %s: %s",
+                    txn_id,
+                    type(exc).__name__,
+                )
+            self._send_matrix_error(
+                500, "M_UNKNOWN", "failed to persist transaction; retry later"
+            )
+            return
+        # TODO（后续 PR）：事件消费（角色引擎 / 记忆 / 主动发言）从
+        # `store.get_unprocessed_transactions()` 拉取并 mark_processed；
+        # 本 PR 只做协议层接收与持久化。
+        self._send_json(200, {})
+
+    def _handle_as_ping(self) -> None:
+        """`POST /_matrix/app/v1/ping`：认证 → 可选 transaction_id → 200 {}。"""
+        if not self._as_auth_ok():
+            return
+        raw, err = self._read_as_body()
+        if err is not None:
+            self._send_matrix_error(*err)
+            return
+        assert raw is not None
+        payload: Any = {}
+        if raw.strip():
+            try:
+                payload = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                self._send_matrix_error(400, "M_BAD_JSON", "request body is not valid JSON")
+                return
+            if not isinstance(payload, dict):
+                self._send_matrix_error(400, "M_BAD_JSON", "request body must be a JSON object")
+                return
+        transaction_id = payload.get("transaction_id")
+        if transaction_id is not None and not isinstance(transaction_id, str):
+            self._send_matrix_error(400, "M_BAD_JSON", "'transaction_id' must be a string")
+            return
+        self._send_json(200, {})
+
     def _handle_moments(self) -> None:
         """`/moments*` 的请求入口（#124）。
 
@@ -455,6 +668,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         self._request_id()
         try:
             _raw_path, query, path = self._route_path()
+            if _is_as_path(path):
+                self._handle_as_request(path)
+                return
             if path in ("/health", "/v1/health"):
                 self._handle_health()
                 return
@@ -484,6 +700,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         self._request_id()
         try:
             _raw_path, _query, path = self._route_path()
+            if _is_as_path(path):
+                self._handle_as_request(path)
+                return
             if _is_moments_path(path):
                 self._handle_moments()
                 return
@@ -513,10 +732,13 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         )
 
     def do_PUT(self) -> None:
-        """只有 `PUT /v1/limits` 支持 PUT；`/moments*` 先做用户鉴权再 404。"""
+        """只有 `PUT /v1/limits` 支持 PUT；AS transactions 走 `_handle_as_request`。"""
         self._request_id()
         try:
             _raw_path, _query, path = self._route_path()
+            if _is_as_path(path):
+                self._handle_as_request(path)
+                return
             if _is_moments_path(path):
                 self._handle_moments()
                 return
@@ -545,6 +767,11 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         self._request_id()
         try:
             _raw, _query, path = self._route_path()
+            if _is_as_path(path):
+                # AS 路径上的 PATCH/DELETE：已知路径按方法不匹配处理（Matrix 405），
+                # 未知路径 404 M_UNRECOGNIZED（都是 application/json）。
+                self._handle_as_request(path)
+                return
             if _is_moments_path(path):
                 # 先校验用户身份；鉴权失败已在 _auth_user_ok 里发响应。
                 if not self._auth_user_ok():
@@ -571,8 +798,20 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:  # type: ignore[override]
         self._moments_method_not_allowed()
 
-    do_OPTIONS = _method_not_allowed
-    do_TRACE = _method_not_allowed
+    def _method_not_allowed_or_as(self) -> None:
+        """OPTIONS / TRACE：AS 路径走 Matrix 错误体，其余保持原 problem+json。"""
+        try:
+            _raw, _query, path = self._route_path()
+        except Exception:  # pragma: no cover - 目标已在 parse_request 校验
+            path = ""
+        if _is_as_path(path):
+            self._request_id()
+            self._handle_as_request(path)
+            return
+        self._method_not_allowed()
+
+    do_OPTIONS = _method_not_allowed_or_as
+    do_TRACE = _method_not_allowed_or_as
 
     def _internal_error(self, exc: BaseException) -> None:
         if self.server.config.access_log:  # type: ignore[attr-defined]
@@ -851,6 +1090,16 @@ def _normalize_request_target(method: str, target: str) -> Optional[str]:
     return candidate
 
 
+def _redact_args(args: tuple) -> tuple:
+    """对日志参数做脱敏：字符串里含 `access_token=` 的部分替换为 `[REDACTED]`。"""
+    out = []
+    for arg in args:
+        if isinstance(arg, str) and "access_token=" in arg:
+            arg = re.sub(r"access_token=[^&# ]*", "access_token=[REDACTED]", arg)
+        out.append(arg)
+    return tuple(out)
+
+
 def _is_moments_path(path: str) -> bool:
     """`/moments*` 路径族（部署前缀已剥离）：等于前缀或以 `前缀 + "/"` 开头。
 
@@ -859,6 +1108,12 @@ def _is_moments_path(path: str) -> bool:
     `/v1/momentsX` 不算。
     """
     return path == MOMENTS_PREFIX or path.startswith(MOMENTS_PREFIX + "/")
+
+
+def _is_as_path(path: str) -> bool:
+    """`/_matrix/app/v1/*` 路径族（部署前缀剥离后命中根路径）。"""
+    return path.startswith(_AS_APP_V1_PREFIX + "/") or path == _AS_APP_V1_PREFIX
+
 
 
 def _single(params: Dict[str, List[str]], name: str) -> Optional[str]:
@@ -911,6 +1166,9 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         # A2.2（issue #7）动态服务：未配置 GATEWAY_MOMENTS_DB_PATH → None
         # （模块关闭，`/moments*` 鉴权后行为与合入前一致）。
         self.moments_service = build_moments_service(config)
+        # AS 事务存储：未配置 GATEWAY_AS_TXN_DB_PATH → None
+        # （transactions 端点返回 500，让 HS 重试）。
+        self.as_txn_store: Optional[AsTransactionStore] = build_as_txn_store(config.as_txn_db_path)
         log_startup_warnings(config)
         super().__init__((config.host, config.port), GatewayHandler)
 

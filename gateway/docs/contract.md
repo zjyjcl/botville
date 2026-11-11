@@ -282,7 +282,7 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 | token 无效、已过期、或 `sub` 域不匹配本服 | 401 | `auth.invalid_token` |
 | token 有效但 persona 不归该 owner 所有 | 403 | `persona.not_owned` |
 
-**与 `matrixUserToken` 的并存（阶段 1，本 PR 范围）**：
+**与 `matrixUserToken` 的并存（阶段 1，#124 已落地范围）**：
 
 `/moments*` 的 security 同时列出 `matrixOpenIdToken` 与 `matrixUserToken`（OpenAPI OR
 语义，任一即可，校验结果语义完全相同——均为本服 Matrix user id）。**禁止「先试 OpenID
@@ -302,7 +302,7 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
   `Deprecation` / `Sunset` 头之后，从 `/moments*` security 数组移除 `matrixUserToken`；
   这是破坏性契约变更，**须先公告、先报总管**、并另行批准。
 
-本 PR **不进入阶段 2/3**，也不新增错误码。
+本节（#124 已落地，不进入阶段 2/3）**不新增状态码或错误码**。
 
 **部署路径前缀**（交叉引用）：路径前缀已在 `GATEWAY_HTTP_PATH_PREFIX` 随 #165 落地
 （见 §5.5 changelog [网关路径前缀] 条目）；本节 userinfo 直连地址与前缀无关。
@@ -507,7 +507,94 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
   不一致返回 `409` 并附带当前值——避免两端覆盖。
 - 接口版本规则见 [第 5 节](#5-版本规则)。
 
+### 1.7 Matrix AS 回调（homeserver → 网关）
+
+这一节描述**反向**流量：Matrix homeserver 作为 application service 推送事务给网关。
+它属于 Matrix Application Service 协议，**不是**本契约面向 App 的 `/v1` API，因此：
+
+- **不写入** `gateway/openapi/gateway.v1.yaml`（该文件是 App/服务端调用方的契约）。
+- 路径挂在**域名根**（`/_matrix/app/v1/...`），**不带**可选的
+  `GATEWAY_HTTP_PATH_PREFIX` 前缀；即使部署配置了前缀，根路径回调也必须可用
+  （前缀剥离后的形态也接受）。
+- 只实现 `/v1` 版本的这两条端点；不实现 legacy `/transactions/{txnId}` 回退路径，
+  也不实现 `users` / `rooms` / `thirdparty` 查询（它们按未知路径返回
+  `404 M_UNRECOGNIZED`）。
+
+#### 1.7.1 端点
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| PUT | `/_matrix/app/v1/transactions/{txnId}` | 接收一批事件事务（幂等） |
+| POST | `/_matrix/app/v1/ping` | 连通性探测，返回 `{}` |
+
+**只有协议层**：网关在返回 `200` 之前把**原始事务请求体**持久化到 SQLite，
+但**不**把事件交给角色引擎、记忆或主动发言逻辑。消费侧留在后续 PR（见 §1.7.6）。
+
+#### 1.7.2 认证
+
+- **只认请求头** `Authorization: Bearer <hs_token>`，用恒定时间比较
+  （`hmac.compare_digest`）。**不接受** `?access_token=` 查询参数——只带查询参数的
+  请求视作**缺凭证**。
+- 网关配置 `GATEWAY_HS_TOKEN`（与注册文件里的 `hs_token` 同值）。**未设置时网关
+  照常启动**，但这两条端点一律 `403 M_FORBIDDEN`（当前 compose 尚未注入）。
+- 设置后按与 `GATEWAY_AS_TOKEN` 相同的强度规则校验：非占位符、长度 ≥ 32、不含空白；
+  另要求它与 `GATEWAY_AS_TOKEN` **不同**（规范要求两个方向使用不同凭据）。
+  不合格 → **启动时配置报错**。
+- **认证先于读取/解析请求体**；认证失败时请求体仍会被读出或丢弃，避免连接错乱。
+- token 与 `Authorization` 头**绝不**写入日志；带 `access_token` 的查询串在访问日志
+  里脱敏为 `access_token=[REDACTED]`。
+
+#### 1.7.3 错误格式与错误码
+
+这两条端点的错误体是 **Matrix 标准格式**，`Content-Type: application/json`
+（**不是** RFC 9457 problem+json）：
+
+```json
+{"errcode": "M_FORBIDDEN", "error": "invalid homeserver token"}
+```
+
+| HTTP | `errcode` | 何时返回 |
+|---|---|---|
+| 401 | `M_MISSING_TOKEN` | 缺 `Authorization` 头，或 scheme 不是 `Bearer`，或 token 为空 |
+| 403 | `M_FORBIDDEN` | token 不匹配；或网关未配置 `GATEWAY_HS_TOKEN` |
+| 400 | `M_NOT_JSON` | 请求体不是合法 JSON（transactions） |
+| 400 | `M_BAD_JSON` | JSON 合法但结构不对：顶层不是对象、缺 `events` 数组、`events` 类型错、`ephemeral` 存在但不是数组；ping 的 `transaction_id` 不是字符串 |
+| 400 | `M_INVALID_PARAM` | `txnId` 非法：URL 解码后长度不在 1–255，或含非印刷可见 ASCII 字符（控制字符/空白） |
+| 413 | `M_TOO_LARGE` | 请求体超过 `GATEWAY_AS_MAX_BODY_BYTES` |
+| 404 | `M_UNRECOGNIZED` | `/v1` 下的未知路径（含 `users`/`rooms`/`thirdparty` 与 legacy `/transactions/`） |
+| 405 | `M_UNRECOGNIZED` | 已知路径用了不支持的方法 |
+| 500 | `M_UNKNOWN` | 持久化失败，或未配置 `GATEWAY_AS_TXN_DB_PATH`（**不返回 200**，让 HS 重试） |
+
+不新增 botville 错误码（`urn:botville:error:*` 那一套只属于 `/v1`）。
+`/v1/*` 与 `/health` 的响应格式与行为**完全不变**。
+
+#### 1.7.4 幂等与「200 前持久化」
+
+- **按 `txnId` 幂等**：同一 `txnId` 重放直接 `200 {}`，不重复写入。判重与插入在
+  同一把锁、同一 SQLite 事务内完成，避免并发下的检查-写入竞态。
+- **先落库，后应答**：事务提交成功才返回 `200`（`PRAGMA synchronous=FULL`）。
+  持久化失败返回 `500 M_UNKNOWN`，homeserver 会按自己的重试策略重投。
+- 事务表（`as_transactions`）：`txn_id`（主键）、`body`（原始请求体文本）、
+  `received_at`（ISO 8601 UTC）、`processed_at`（可空，供后续消费者标记已处理）。
+
+#### 1.7.5 请求体与体积上限
+
+- transactions 请求体必须是 JSON 对象且含 `events` 数组（可选 `ephemeral` 数组）。
+- 体积上限 `GATEWAY_AS_MAX_BODY_BYTES`（默认 **16 MiB = 16777216**，正整数，
+  上限 256 MiB），与面向 App 的 `/v1` 的 1 MiB 上限**相互独立**；超限 `413 M_TOO_LARGE`。
+- ping 接受空体、`{}` 或带字符串 `transaction_id`；无需 `events`。
+
+#### 1.7.6 事件消费（后续 PR）与注册状态
+
+- 存储层提供 `get_unprocessed_transactions()` / `mark_processed(txn_id)`，供后续 PR
+  读取未处理事务并交给角色引擎 / 记忆 / 主动发言；**本 PR 只做协议层接收与持久化**，
+  不触发任何业务逻辑。
+- **注册文件里的 `url` 仍为 `null`**：本 PR 合入后，再由 A 线单独把注册 `url` 改为
+  `http://gateway:8080` 并在 compose 里注入 `hs_token`。在此之前 homeserver 无处可推，
+  网关的这两条端点只用于集成测试与预接线。
+
 ---
+
 
 ## 2. 接口总览
 
@@ -1112,6 +1199,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.1.0 | 2026-11-12 | [B 线 as-transactions，**协议层，不改 /v1 字段/状态码/错误码**] 新增 §1.7「Matrix AS 回调」：(1) `PUT /_matrix/app/v1/transactions/{txnId}` 幂等接收事务，校验 `hs_token`（`Authorization: Bearer`，不认 `?access_token=`），按 `txnId` 判重（单锁内判重+插入，无竞态），`PRAGMA synchronous=FULL` 确保 200 前落库，`GATEWAY_AS_TXN_DB_PATH` 未配置时 500 M_UNKNOWN 让 HS 重试；(2) `POST /_matrix/app/v1/ping` 探通；(3) 错误体为 Matrix 标准 `{"errcode","error"}`，`Content-Type: application/json`，不用 problem+json；(4) 路径挂域名根，不带 `GATEWAY_HTTP_PATH_PREFIX`；(5) 新增配置 `GATEWAY_HS_TOKEN`（可选，非占位符、≥32、无空白、不等于 `GATEWAY_AS_TOKEN`；未配置时端点一律 403）、`GATEWAY_AS_TXN_DB_PATH`（空/未设 = 关闭，同 `GATEWAY_MOMENTS_DB_PATH` 约定）、`GATEWAY_AS_MAX_BODY_BYTES`（默认 16 MiB，与 /v1 的 1 MiB 独立）；(6) 访问日志脱敏：带 `access_token=` 的查询串替换为 `[REDACTED]`；(7) 存储层留 `get_unprocessed_transactions()` / `mark_processed()` 钩子，**事件消费留给后续 PR**，本 PR 只做协议层；(8) 注册 `url` 仍为 `null`，compose 接线由 A 线后续 PR 完成。 |
 | 0.1.0 | 2026-11-11 | [#7 A2.2 网关镜像 + compose `gateway` profile + 各 profile 的 gateway-data 备份，**部署侧，不改 API / 字段 / 状态码**] 新增 `gateway/Dockerfile`（固定 digest 的 `python:3.12-slim`，镜像内带 `migrations/moments/`，非 root，无密钥）；compose 新增可选 `gateway` 服务（`make up GATEWAY=1`，挂载 `gateway-data` 到 `/var/lib/botville-gateway`，`GATEWAY_MOMENTS_DB_PATH=/var/lib/botville-gateway/moments.db`，端口只绑 `127.0.0.1`，内存 Matrix 传输）；新增 `backup-gateway-data.sh` / `restore-gateway-data.sh`（tuwunel / continuwuity 等任一 profile），与 synapse 备份共用 `lib.sh` 逻辑；同步 `moments.md` §8/§10 与部署文档中 `down -v` 的删除语义。 |
 | 0.1.0 | 2026-11-11 | [#7 A2.2 compose `gateway-data` 卷与备份 + #187 审查建议] （1）`CreateCommentRequest.reply_to_comment_id` **去掉 ULID `pattern`**，与「格式不像 ULID 的字符串由服务端返回 422」对齐，避免客户端本地 schema 校验提前拦截；§1.3 / `moments.md` §6 写清校验顺序（先类型 400，后语义 422）。响应字段 pattern 保留。（2）`gateway/.env.example` 补登记 `IDEMPOTENCY_TTL_SECONDS`（默认 86400，`0` = 缓存不过期，含动态端点）。（3）compose 新增命名卷 `gateway-data`，`backup-synapse.sh` / `restore-synapse.sh` 纳入该卷（存在才归档；旧备份无此文件则恢复时不碰该卷）；同步 `moments.md` §8/§10 与部署文档。不改运行时 API 行为。 |
 | 0.1.0 | 2026-11-11 | [#7 / #187 A2.2 动态幂等 TTL=0 对齐 + 文档勘误 + OpenAPI 对齐] **行为修正**：动态端点（`POST /moments`、`POST /moments/{moment_id}/comments`）的幂等缓存在 `IDEMPOTENCY_TTL_SECONDS=0` 时改为**不过期**（此前误作立即过期、同 key 重放会再写一次），与全局约定一致；默认 86400 与正数 TTL 行为不变。**OpenAPI**（与合入后的最终状态一致，含后续提交 `fa4303a`）：`CreateCommentRequest.reply_to_comment_id` 为 `type: [string, 'null']`（OpenAPI 3.1），与实现「显式 `null` 视同省略、返回 201」对齐（`MomentComment` 响应字段原本已是 `string | null`）。**文档勘误**：§1.3 动态口径 1 写明省略/`null` → 201、其余类型错误 400；§1.3 总表 422 行补 `reply_to_comment_id`；§1.5 删去 TTL=0 已知差异。同步 `moments.md` §6（删「已知差异」、补 `null`）、§7.1（好友文件不校验 user id 格式）、§8（当时将 `gateway-data` 卷与备份标为未做）。文档保留「建议客户端省略该字段而不是发 `null`」。 |

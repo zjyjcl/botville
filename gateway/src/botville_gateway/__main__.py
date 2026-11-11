@@ -50,8 +50,21 @@ def main(argv=None) -> int:
     print("  GET  /health")
     print("  POST /v1/policy/evaluate")
     print("  POST /v1/conversations/{conversation_id}/messages")
+    print("  PUT  /_matrix/app/v1/transactions/{txnId}")
+    print("  POST /_matrix/app/v1/ping")
     if config.auth_token is None:
         print("  (dev mode: Authorization is not checked)")
+    # AS 回调：未注入 hs_token 时网关照常启动，但两条回调一律 403（compose 尚未接线）。
+    if config.hs_token is None:
+        print(
+            "  (AS callbacks: GATEWAY_HS_TOKEN is not set — /_matrix/app/v1/* returns "
+            "403 M_FORBIDDEN until the deployment injects the registration's hs_token)"
+        )
+    if config.as_txn_db_path is None:
+        print(
+            "  (AS transactions: GATEWAY_AS_TXN_DB_PATH is not set — transactions "
+            "return 500 M_UNKNOWN instead of acknowledging)"
+        )
     print(f"transport: {type(transport).__name__} (GATEWAY_MATRIX_TRANSPORT={config.matrix_transport})")
     try:
         server.serve_forever()

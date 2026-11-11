@@ -147,6 +147,14 @@ def log_startup_warnings(config: Config) -> None:
             "rejected with 401 auth.invalid_token. This is only intended for a deliberately "
             "closed deployment."
         )
+    # AS 回调（B 线 as-transactions）：hs_token 已配但事务库未配 → HS 会收到 500
+    # 并重试，接收链路实际不可用。不拒绝启动（部署可以分步接线），但必须告警。
+    if config.hs_token is not None and config.as_txn_db_path is None:
+        logger.warning(
+            "GATEWAY_HS_TOKEN is set but GATEWAY_AS_TXN_DB_PATH is empty: /_matrix/app/v1/"
+            "transactions will authenticate but answer 500 M_UNKNOWN (the homeserver will "
+            "keep retrying). Set GATEWAY_AS_TXN_DB_PATH to enable transaction receipt."
+        )
 
 
 def caller_ids(config: Config) -> List[str]:

@@ -118,6 +118,11 @@ PLATFORM_MAX_AI_MESSAGES_PER_HOUR_RANGE = (1, 1_000)
 # 枚举项没有「0 = 不设」语义；极限序 stop 严于 notify（见契约 §6.3）。
 AI_LOOP_ON_BREAK_VALUES = frozenset({"stop", "notify"})
 
+# AS 回调请求体上限（GATEWAY_AS_MAX_BODY_BYTES）：与 /v1 的 1 MiB 相互独立。
+# 默认 16 MiB；上限 256 MiB，防止误填过大导致 OOM。
+DEFAULT_AS_MAX_BODY_BYTES = 16_777_216   # 16 MiB
+AS_MAX_BODY_BYTES_UPPER = 268_435_456    # 256 MiB
+
 # 部署路径前缀（GATEWAY_HTTP_PATH_PREFIX）的禁用片段：这些要么改变路径语义
 # （`//`、`..`），要么在拼 URL / 反代重写时会被提前截断或解码（`?` `#` `%`），
 # 都会让「配置里的前缀」和「实际到达的路径」静默不一致。
@@ -438,6 +443,18 @@ class Config:
     moments_audit_retention_days: int = DEFAULT_MOMENTS_AUDIT_RETENTION_DAYS
     # purge 定时间隔（秒）：0 = 关闭；启用时启动跑一次、之后按间隔后台跑。
     moments_purge_interval_seconds: int = DEFAULT_MOMENTS_PURGE_INTERVAL_SECONDS
+    # ---------- Matrix AS 回调（B 线 as-transactions）----------
+    # HS → 网关的 hs_token（与注册文件里的 hs_token 同值）。None/空 = 未配置：
+    # 网关照常启动，但 /_matrix/app/v1/* 一律 403（compose 尚未注入）。
+    # 不进 repr（日志/断言消息不泄露）。
+    hs_token: Optional[str] = field(default=None, repr=False)
+    # AS 事务 SQLite 库路径（幂等 + 200 前持久化）。None/空 = 关闭（与
+    # GATEWAY_MOMENTS_DB_PATH 相同约定）：transactions 端点返回 500 M_UNKNOWN
+    # （不返回 200，让 HS 重试）。compose 接线时由 A 线显式设为
+    # /var/lib/botville-gateway/as_transactions.db（gateway-data 卷）。
+    as_txn_db_path: Optional[str] = None
+    # AS 回调请求体上限（默认 16 MiB，与 /v1 的 1 MiB 分开）。
+    as_max_body_bytes: int = DEFAULT_AS_MAX_BODY_BYTES
 
     def __post_init__(self) -> None:
         # 构造时校验，避免明显错误的配置拖到第一次请求才炸。
@@ -560,6 +577,45 @@ class Config:
             raise ConfigError(
                 "moments_purge_interval_seconds must be 0 (disabled) or >= "
                 f"{MOMENTS_PURGE_INTERVAL_MIN_SECONDS}, got {purge_interval}"
+            )
+        # AS 回调：hs_token 强度校验（与 as_token 同规则；None = 未配置，合法）。
+        # 未配置时网关照常启动，但 /_matrix/app/v1/* 一律 403（compose 尚未注入）。
+        if self.hs_token is not None:
+            if self.hs_token in _INSECURE_TOKENS:
+                raise ConfigError(
+                    "GATEWAY_HS_TOKEN must not use the placeholder '<change-me>'; "
+                    "set a real token or leave it unset"
+                )
+            if len(self.hs_token) < AS_TOKEN_MIN_LENGTH:
+                raise ConfigError(
+                    f"GATEWAY_HS_TOKEN must be at least {AS_TOKEN_MIN_LENGTH} characters "
+                    "(same rule as GATEWAY_AS_TOKEN); deploy with the 64-hex value "
+                    "init.sh generates"
+                )
+            if any(ch.isspace() for ch in self.hs_token):
+                raise ConfigError(
+                    "GATEWAY_HS_TOKEN must not contain whitespace "
+                    "(it would not survive env-file/HTTP-header round trips)"
+                )
+            # Matrix AS spec: hs_token 与 as_token 必须区分用途，不能相同。
+            if self.as_token is not None and self.hs_token == self.as_token:
+                raise ConfigError(
+                    "GATEWAY_HS_TOKEN and GATEWAY_AS_TOKEN must be different values; "
+                    "the two tokens serve distinct roles (HS→gateway vs gateway→HS)"
+                )
+        # as_max_body_bytes：正整数，给合理上限。
+        if not isinstance(self.as_max_body_bytes, int) or isinstance(self.as_max_body_bytes, bool):
+            raise ConfigError(
+                f"GATEWAY_AS_MAX_BODY_BYTES must be an integer, got {self.as_max_body_bytes!r}"
+            )
+        if self.as_max_body_bytes < 1:
+            raise ConfigError(
+                f"GATEWAY_AS_MAX_BODY_BYTES must be >= 1, got {self.as_max_body_bytes}"
+            )
+        if self.as_max_body_bytes > AS_MAX_BODY_BYTES_UPPER:
+            raise ConfigError(
+                f"GATEWAY_AS_MAX_BODY_BYTES must be <= {AS_MAX_BODY_BYTES_UPPER} "
+                f"(256 MiB), got {self.as_max_body_bytes}"
             )
         # #124 调用方身份（契约 §1.2.2）。校验放在这里（而非只在 load_config），
         # 保证直接构造 Config 的调用方（测试/嵌入）也走同一套规则。
@@ -851,6 +907,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
     token = _env_str(source, "GATEWAY_AUTH_TOKEN", "")
     dev_mode = _env_bool(source, "GATEWAY_DEV_MODE", False)
     as_token = _env_str(source, "GATEWAY_AS_TOKEN", "")
+    hs_token = _env_str(source, "GATEWAY_HS_TOKEN", "")
     # #114 PR-a / N10: 部署密钥（HMAC）。**只接受 hex**（#114 N10）：以前的
     # 实现把非 hex 串按 UTF-8 兜底，导致「63 个 hex 字符」被当成 63 字节密钥
     # 静默接受，与文档写的「十六进制、≥64 hex 字符」不一致。空/<change-me> →
@@ -1008,5 +1065,22 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
             "GATEWAY_MOMENTS_PURGE_INTERVAL_SECONDS",
             DEFAULT_MOMENTS_PURGE_INTERVAL_SECONDS,
             minimum=0,
+        ),
+        # ---------- Matrix AS 回调（B 线 as-transactions）----------
+        # hs_token 可选：空 → None（未配置，回调一律 403）。显式写了占位符
+        # （<change-me>）则保留原值，由 Config.__post_init__ 拒绝启动——
+        # 占位符是配置错误，不能静默当成「未设置」。
+        hs_token=None if hs_token == "" else hs_token,
+        # 事务库路径：空 → None = 关闭（与 GATEWAY_MOMENTS_DB_PATH 相同约定；
+        # transactions 返回 500 让 HS 重试）。compose 接线时由 A 线显式设为
+        # /var/lib/botville-gateway/as_transactions.db（gateway-data 卷）。
+        as_txn_db_path=(
+            _env_str(source, "GATEWAY_AS_TXN_DB_PATH", "") or None
+        ),
+        as_max_body_bytes=_env_int(
+            source,
+            "GATEWAY_AS_MAX_BODY_BYTES",
+            DEFAULT_AS_MAX_BODY_BYTES,
+            minimum=1,
         ),
     )

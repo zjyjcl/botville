@@ -116,7 +116,7 @@ sender → **400 `request.invalid`**；房间别名不存在 → **404
   | 键 | 用途 |
   | --- | --- |
   | `APPSERVICE_AS_TOKEN` | 网关 → HS：Bearer 代发/建号的凭据 |
-  | `APPSERVICE_HS_TOKEN` | HS → 网关：A2 接收事务时校验（当前未使用） |
+  | `APPSERVICE_HS_TOKEN` | HS → 网关：校验事务接收（`GATEWAY_HS_TOKEN` 同值；网关已实现，compose 尚未注入） |
 
   `.env` 首次由 init.sh 随机生成；`.env.example` 只放 `<change-me>`（CI 有
   allowlist 守卫）。渲染产物不入库。
@@ -128,11 +128,16 @@ sender → **400 `request.invalid`**；房间别名不存在 → **404
   渲染进注册文件曾被证实会让 Synapse 接受**无鉴权**的 `@ai_*` 注册，因此
   三层都不放行。init.sh 全程 `umask 077` 并无条件 `chmod 600` `.env` 与渲染
   产物。
-- `url: null` 是有意为之：网关目前不接收 HS 推送的事务，null 让 HS 无处可推、
-  也不会重试。接收事务（改注册 `url`、处理 ping / hs_token）是后续 B 线的工作，
-  **本部署不要把 `url` 改成 `http://gateway:8080`**。
+- `url: null` 是有意为之：网关**已实现**接收 HS 推送事务的协议层
+  （`PUT /_matrix/app/v1/transactions/{txnId}` + `POST /_matrix/app/v1/ping`，
+  按 `hs_token` 校验、幂等持久化，见 `gateway/docs/contract.md` §1.7），但注册
+  文件里的 `url` **仍是 `null`**、compose **尚未**向网关注入 `hs_token`，因此 HS
+  目前无处可推。**在 A 线接线 PR 合入前，不要把 `url` 改成 `http://gateway:8080`**：接线由 A 线
+  单独 PR 完成（届时同时把注册 `url` 指向 `http://gateway:8080` 并向网关注入
+  `GATEWAY_HS_TOKEN`）。
 - compose 的可选 `gateway` profile（`make up GATEWAY=1`）已经把网关接到
-  homeserver 的 Client-Server API 上（只代发、不收事务）：
+  homeserver 的 Client-Server API 上（代发已接线；事务接收的协议层已实现，
+  但尚未接线）：
   - synapse / tuwunel：`GATEWAY_MATRIX_TRANSPORT=appservice`，
     `GATEWAY_HOMESERVER_URL=http://${BOTVILLE_HOMESERVER}:8008`（服务名，不要写
     `127.0.0.1`），`GATEWAY_MATRIX_SERVER_NAME=${BOTVILLE_SERVER_NAME}`，
@@ -235,8 +240,13 @@ PYTHONPATH=gateway/src python3 -m botville_gateway
 - **`as_token` 等同整个 `@ai_*` 命名空间的管理员**：持有者可以免密注册命名
   空间内任意账号、以任意 `@ai_*` 身份发言。它与 `.env` 里其他密钥同级管理：
   渲染产物 0600、gitignore、绝不入库/入日志/入工单。
-- `hs_token` 当前未被任何组件校验（网关不收事务），但仍按密钥保管：A2 启用
-  事务接收后它就是 HS→网关的鉴权凭据。
+- `hs_token` 已被网关的 AS 回调（B 线 as-transactions）使用：`GATEWAY_HS_TOKEN`
+  与它同值，用于校验 `PUT /_matrix/app/v1/transactions/{txnId}` 与
+  `POST /_matrix/app/v1/ping`（`Authorization: Bearer`，恒定时间比较，不入日志）。
+  但**注册 `url` 仍为 `null`、compose 尚未注入 `GATEWAY_HS_TOKEN`**，因此当前
+  HS 不会推送事务；网关在未配置该变量时对上述端点一律 403。接线由 A 线后续
+  PR 完成。轮换 `hs_token` 时须同时更新注册文件与网关的 `GATEWAY_HS_TOKEN`
+  （且不能与 `as_token` 相同，网关会拒绝启动）。
 - 命名空间 exclusive 是**纵深防御的第一层**，不是唯一一层：网关在客户端侧
   也校验 sender（`@ai_` 前缀 + 本 server），homeserver 侧再拦一次越权
   masquerade。两侧拒绝行为都在 CI 断言。
