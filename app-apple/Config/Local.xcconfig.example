@@ -1,0 +1,9 @@
+// Copy to Local.xcconfig in this directory; that file is gitignored.
+// Replace these example values with your registered developer team / App IDs.
+BOTVILLE_DEVELOPMENT_TEAM = YOURTEAMID
+// DEVELOPMENT_TEAM inherits BOTVILLE_DEVELOPMENT_TEAM; this also permits a
+// direct DEVELOPMENT_TEAM override if needed.
+DEVELOPMENT_TEAM = $(BOTVILLE_DEVELOPMENT_TEAM)
+BOTVILLE_BUNDLE_ID_PREFIX = com.example.botville
+// Register the App/NSE IDs, App Group, Push Notifications and Keychain sharing
+// in your developer account. Never put certificates or profiles in this repo.

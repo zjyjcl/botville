@@ -36,7 +36,21 @@ xcodebuild -project Botville.xcodeproj \
   -sdk iphonesimulator CODE_SIGN_IDENTITY="-" build
 ```
 
-也可用 Xcode 打开 `Botville.xcodeproj`，选择 `BotvilleApp-iOS` 和一个已安装的 iPhone 模拟器，点击 Run。App target 的 Debug 与 Release 都使用 Automatic signing，开发团队由部署者/开发者在本地 Xcode 的 Signing & Capabilities 中选择（`<YOUR_TEAM_ID>`），App 与扩展应选择同一团队。已提交的工程文件仍带有开发团队值，克隆后需在本地 Xcode 中改成自己的团队，不要提交这类改动。本仓库目前没有本地 xcconfig 接入机制；不要提交本地团队选择产生的工程差异。两种配置均以 `CODE_SIGN_IDENTITY[sdk=iphonesimulator*]="-"` 保留模拟器默认 ad-hoc 签名；命令行仍可用 `CODE_SIGN_IDENTITY="-"` 覆盖。不要传 `CODE_SIGNING_ALLOWED=NO`：这会丢失 Keychain 所需的应用标识 entitlement，导致新安装后 `SecItemCopyMatching` 返回 `errSecMissingEntitlement (-34018)`。Debug 才挂 development 推送 entitlement；仓库没有加入证书、描述文件或 provisioning profile。
+也可用 Xcode 打开 `Botville.xcodeproj`，选择 `BotvilleApp-iOS` 和一个已安装的 iPhone 模拟器，点击 Run。项目级、App 与通知扩展的 Debug/Release 都读取 [`Config/Signing.xcconfig`](Config/Signing.xcconfig)：仓库默认团队为 `3Z8WP6U6F7`，Bundle ID 前缀为 `com.zjyjcl.botville`。App ID 等于前缀，NSE ID 为 `<前缀>.notification`；两个 target 继续使用 Automatic signing。
+
+换开发者账号时，在 `app-apple/` 中执行：
+
+```sh
+cp Config/Local.xcconfig.example Config/Local.xcconfig
+```
+
+编辑 `Local.xcconfig` 的 `BOTVILLE_DEVELOPMENT_TEAM` 和 `BOTVILLE_BUNDLE_ID_PREFIX`，然后按上面的命令构建。`DEVELOPMENT_TEAM` 默认引用 `BOTVILLE_DEVELOPMENT_TEAM`，也可在本地文件直接覆盖。末尾的 `#include? "Local.xcconfig"` 允许文件不存在，CI 应保持没有此文件，以验证仓库默认值；真实 `Local.xcconfig` 已精确加入 `.gitignore`，不要提交它、证书或描述文件。
+
+App Group 为 `group.<前缀>`，私有 Keychain 组为 `$(AppIdentifierPrefix)<App/NSE ID>`，共享组为 `$(AppIdentifierPrefix)<前缀>.shared`。entitlements 和四个 Info.plist 都通过构建变量展开，运行时 App Group / 共享 Keychain 从 Bundle Info 读取。换账号后须在自己的开发者账号下为新的 App ID / NSE ID / App Group 注册 App Groups、Push Notifications、Keychain 共享等相应能力；`AppIdentifierPrefix` 仍由签名系统提供，不假定它等于 Team ID。
+
+Matrix pusher `app_id` 仍是独立的推送协议标识 `com.zjyjcl.botville.apns`，不会随 Bundle 前缀自动修改。换账号/前缀时仍可能需要单独调整 Sygnal、APNs topic 和推送凭据配置，详见[真机推送说明](docs/push-device.md)。
+
+两种配置均以 `CODE_SIGN_IDENTITY[sdk=iphonesimulator*]="-"` 保留模拟器默认 ad-hoc 签名；命令行仍可用 `CODE_SIGN_IDENTITY="-"` 覆盖。不要传 `CODE_SIGNING_ALLOWED=NO`：这会丢失 Keychain 所需的应用标识 entitlement，导致新安装后 `SecItemCopyMatching` 返回 `errSecMissingEntitlement (-34018)`。Debug 才挂 development 推送 entitlement；Release 的 APNs 分发能力仍需受控配置，本改动不启用上传或分发。
 
 Keychain 诊断只记录 Security 操作名和数值 OSStatus，不记录查询、账号、令牌、密码或会话数据。用目标模拟器的 UDID 替换下方 `<UDID>`：
 

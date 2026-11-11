@@ -78,7 +78,22 @@ public enum PushBadge {
 /// DEBUG foreground willPresent evidence. Writes only event names and option
 /// raw bits into the App Group cache — never tokens, Authorization, or bodies.
 public enum PushForegroundProbeLog {
-    public static let appGroupIdentifier = "group.com.zjyjcl.botville"
+    public static let appGroupInfoKey = "BotvilleAppGroupIdentifier"
+    public static var appGroupIdentifier: String? {
+        appGroupIdentifier(in: Bundle.main.infoDictionary ?? [:])
+    }
+
+    // Missing/unexpanded configuration must not fall back to another account's
+    // App Group. SPM tools without the app's Info.plist simply have no log URL.
+    static func appGroupIdentifier(in info: [String: Any]) -> String? {
+        guard let value = info[appGroupInfoKey] as? String,
+              value.hasPrefix("group."), value.count > "group.".count,
+              !value.contains("$"),
+              value.rangeOfCharacter(from: .whitespacesAndNewlines.union(.controlCharacters)) == nil else {
+            return nil
+        }
+        return value
+    }
     public static let fileName = "botville-willpresent-probe.log"
 
     public static func makeLine(event: String, detail: String = "", at date: Date = Date(),
@@ -89,7 +104,8 @@ public enum PushForegroundProbeLog {
     }
 
     public static func logURL(fileManager: FileManager = .default) -> URL? {
-        guard let root = fileManager.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) else {
+        guard let appGroupIdentifier,
+              let root = fileManager.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) else {
             return nil
         }
         return root

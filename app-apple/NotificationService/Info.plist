@@ -21,8 +21,10 @@
     <string>$(MARKETING_VERSION)</string>
     <key>CFBundleVersion</key>
     <string>$(CURRENT_PROJECT_VERSION)</string>
+    <key>BotvilleAppGroupIdentifier</key>
+    <string>group.$(BOTVILLE_BUNDLE_ID_PREFIX)</string>
     <key>BotvilleSharedKeychainAccessGroup</key>
-    <string>$(AppIdentifierPrefix)com.zjyjcl.botville.shared</string>
+    <string>$(AppIdentifierPrefix)$(BOTVILLE_BUNDLE_ID_PREFIX).shared</string>
     <key>NSExtension</key>
     <dict>
         <key>NSExtensionPointIdentifier</key>

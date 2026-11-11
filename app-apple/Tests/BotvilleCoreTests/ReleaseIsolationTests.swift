@@ -26,15 +26,38 @@ final class ReleaseIsolationTests: XCTestCase {
         let configurations = objects.values.compactMap { $0 as? [String: Any] }.filter {
             $0["isa"] as? String == "XCBuildConfiguration"
         }
+        XCTAssertEqual(configurations.count, 6, "Project, App and NSE each need Debug/Release")
+        let signing = try signingDefaults()
+        let references = objects.filter { ($0.value as? [String: Any])?["path"] as? String == "Signing.xcconfig" }
+        XCTAssertEqual(references.count, 1)
+        let referenceID = try XCTUnwrap(references.keys.first)
+        let reference = try XCTUnwrap(references[referenceID] as? [String: Any])
+        XCTAssertEqual(reference["isa"] as? String, "PBXFileReference")
+        XCTAssertEqual(reference["sourceTree"] as? String, "<group>")
+        let groupEntry = try XCTUnwrap(objects.first {
+            let group = $0.value as? [String: Any]
+            return group?["isa"] as? String == "PBXGroup" && group?["path"] as? String == "Config"
+                && (group?["children"] as? [String])?.contains(referenceID) == true
+        })
+        let project = try XCTUnwrap(objects.values.compactMap { $0 as? [String: Any] }.first { $0["isa"] as? String == "PBXProject" })
+        let mainGroup = try XCTUnwrap(objects[try XCTUnwrap(project["mainGroup"] as? String)] as? [String: Any])
+        XCTAssertTrue((mainGroup["children"] as? [String])?.contains(groupEntry.key) == true)
+        for list in objects.values.compactMap({ $0 as? [String: Any] }) where list["isa"] as? String == "XCConfigurationList" {
+            let ids = try XCTUnwrap(list["buildConfigurations"] as? [String])
+            XCTAssertEqual(ids.count, 2)
+            XCTAssertEqual(Set(ids.compactMap { (objects[$0] as? [String: Any])?["name"] as? String }), ["Debug", "Release"])
+        }
         for config in configurations {
+            XCTAssertEqual(config["baseConfigurationReference"] as? String, referenceID)
             let settings = try XCTUnwrap(config["buildSettings"] as? [String: Any])
+            XCTAssertNil(settings["DEVELOPMENT_TEAM"], "Inherit the xcconfig team, including local direct overrides")
+            XCTAssertFalse(settings.keys.contains(where: { $0.hasPrefix("BOTVILLE_") }))
+            XCTAssertEqual(try expand(signing["DEVELOPMENT_TEAM"]!, using: signing), "3Z8WP6U6F7")
             XCTAssertFalse(settings.keys.contains(where: { $0.hasPrefix("PROVISIONING_PROFILE") }))
             for (key, value) in settings where key.hasPrefix("CODE_SIGNING_ALLOWED") || key.hasPrefix("CODE_SIGNING_REQUIRED") {
                 XCTAssertNotEqual(value as? String, "NO", key)
             }
         }
-        let teams = configurations.compactMap { ($0["buildSettings"] as? [String: Any])?["DEVELOPMENT_TEAM"] as? String }
-        XCTAssertTrue(Set(teams).count == 1, "App and extension must use the same signing team")
         try assertEveryNativeReleaseTargetIsIsolated(objects)
         try assertTarget(
             objects: objects,
@@ -60,10 +83,36 @@ final class ReleaseIsolationTests: XCTestCase {
         try assertEntitlements("BotvilleApp/BotvilleApp-Release.entitlements", privateKeychainGroup: "$(AppIdentifierPrefix)com.zjyjcl.botville", apsEnvironment: releaseAppAPSEnvironment)
         try assertEntitlements("NotificationService/NotificationService.entitlements", privateKeychainGroup: "$(AppIdentifierPrefix)com.zjyjcl.botville.notification", apsEnvironment: nil)
 
-        XCTAssertEqual(try plist("BotvilleApp/Info.plist")["BotvilleSharedKeychainAccessGroup"] as? String, "$(AppIdentifierPrefix)com.zjyjcl.botville.shared")
-        XCTAssertEqual(try plist("BotvilleApp/Info-Debug.plist")["BotvilleSharedKeychainAccessGroup"] as? String, "$(AppIdentifierPrefix)com.zjyjcl.botville.shared")
-        XCTAssertEqual(try plist("NotificationService/Info.plist")["BotvilleSharedKeychainAccessGroup"] as? String, "$(AppIdentifierPrefix)com.zjyjcl.botville.shared")
-        XCTAssertEqual(try plist("NotificationService/Info-Debug.plist")["BotvilleSharedKeychainAccessGroup"] as? String, "$(AppIdentifierPrefix)com.zjyjcl.botville.shared")
+        let defaults = try signingDefaults()
+        for relative in ["BotvilleApp/Info.plist", "BotvilleApp/Info-Debug.plist",
+                         "NotificationService/Info.plist", "NotificationService/Info-Debug.plist"] {
+            let info = try plist(relative)
+            let shared = try XCTUnwrap(info["BotvilleSharedKeychainAccessGroup"] as? String)
+            let group = try XCTUnwrap(info["BotvilleAppGroupIdentifier"] as? String)
+            XCTAssertEqual(shared, "$(AppIdentifierPrefix)$(BOTVILLE_BUNDLE_ID_PREFIX).shared")
+            XCTAssertEqual(group, "group.$(BOTVILLE_BUNDLE_ID_PREFIX)")
+            XCTAssertEqual(try expand(shared, using: defaults), "LEGACY1234.com.zjyjcl.botville.shared")
+            XCTAssertEqual(try expand(group, using: defaults), "group.com.zjyjcl.botville")
+        }
+    }
+
+    func testSigningDefaultsAndLocalOverrideContract() throws {
+        let defaults = try signingDefaults()
+        let text = try String(contentsOf: root.appendingPathComponent("Config/Signing.xcconfig"), encoding: .utf8)
+        XCTAssertEqual(text.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: "\n").last,
+                       #"#include? "Local.xcconfig""#)
+        XCTAssertEqual(defaults["BOTVILLE_DEVELOPMENT_TEAM"], "3Z8WP6U6F7")
+        XCTAssertEqual(defaults["DEVELOPMENT_TEAM"], "$(BOTVILLE_DEVELOPMENT_TEAM)")
+        XCTAssertEqual(defaults["BOTVILLE_BUNDLE_ID_PREFIX"], "com.zjyjcl.botville")
+        // Read only the example, never a developer's real Local.xcconfig.
+        let local = try xcconfigAssignments("Config/Local.xcconfig.example")
+        var overridden = defaults.merging(local) { _, local in local }
+        XCTAssertEqual(try expand(overridden["DEVELOPMENT_TEAM"]!, using: overridden), "YOURTEAMID")
+        XCTAssertEqual(try expand("group.$(BOTVILLE_BUNDLE_ID_PREFIX)", using: overridden), "group.com.example.botville")
+        XCTAssertEqual(try expand("$(AppIdentifierPrefix)$(BOTVILLE_BUNDLE_ID_PREFIX).shared", using: overridden),
+                       "LEGACY1234.com.example.botville.shared")
+        overridden["DEVELOPMENT_TEAM"] = "DIRECT1234"
+        XCTAssertEqual(try expand(overridden["DEVELOPMENT_TEAM"]!, using: overridden), "DIRECT1234")
     }
 
     func testEntitlementAndDebugViewsAreIsolated() throws {
@@ -122,12 +171,13 @@ final class ReleaseIsolationTests: XCTestCase {
             let name = try XCTUnwrap(config["name"] as? String)
             let settings = try XCTUnwrap(config["buildSettings"] as? [String: Any])
             XCTAssertEqual(settings["CODE_SIGN_STYLE"] as? String, "Automatic", name)
-            // Check device signing without embedding or printing a developer's team.
-            let team = settings["DEVELOPMENT_TEAM"] as? String ?? ""
-            XCTAssertTrue(team.range(of: "^[A-Z0-9]{10}$", options: .regularExpression) != nil,
-                          "Device signing requires a configured team")
+            let defaults = try signingDefaults()
+            XCTAssertNil(settings["DEVELOPMENT_TEAM"], "Inherit the xcconfig signing team")
+            XCTAssertEqual(try expand(defaults["DEVELOPMENT_TEAM"]!, using: defaults), "3Z8WP6U6F7")
             XCTAssertEqual(settings["CODE_SIGN_IDENTITY[sdk=iphonesimulator*]"] as? String, "-", name)
-            XCTAssertEqual(settings["PRODUCT_BUNDLE_IDENTIFIER"] as? String, bundleID, name)
+            let bundle = try XCTUnwrap(settings["PRODUCT_BUNDLE_IDENTIFIER"] as? String)
+            XCTAssertEqual(bundle, bundleID.replacingOccurrences(of: "com.zjyjcl.botville", with: "$(BOTVILLE_BUNDLE_ID_PREFIX)"), name)
+            XCTAssertEqual(try expand(bundle, using: defaults), bundleID, name)
             XCTAssertEqual(settings["CODE_SIGN_ENTITLEMENTS"] as? String, entitlements[name], name)
             XCTAssertEqual(settings["INFOPLIST_FILE"] as? String, plists[name], name)
             for (key, value) in settings where key.hasPrefix("CODE_SIGN_ENTITLEMENTS[") {
@@ -163,9 +213,54 @@ final class ReleaseIsolationTests: XCTestCase {
     }
     private func assertEntitlements(_ relative: String, privateKeychainGroup: String, apsEnvironment: String?) throws {
         let value = try plist(relative)
-        XCTAssertEqual(value["com.apple.security.application-groups"] as? [String], ["group.com.zjyjcl.botville"])
-        XCTAssertEqual(value["keychain-access-groups"] as? [String], [privateKeychainGroup, "$(AppIdentifierPrefix)com.zjyjcl.botville.shared"])
+        let groups = try XCTUnwrap(value["com.apple.security.application-groups"] as? [String])
+        let keychain = try XCTUnwrap(value["keychain-access-groups"] as? [String])
+        XCTAssertEqual(groups, ["group.$(BOTVILLE_BUNDLE_ID_PREFIX)"])
+        XCTAssertEqual(keychain, [privateKeychainGroup.replacingOccurrences(of: "com.zjyjcl.botville", with: "$(BOTVILLE_BUNDLE_ID_PREFIX)"),
+                                 "$(AppIdentifierPrefix)$(BOTVILLE_BUNDLE_ID_PREFIX).shared"])
+        let defaults = try signingDefaults()
+        XCTAssertEqual(try groups.map { try expand($0, using: defaults) }, ["group.com.zjyjcl.botville"])
+        XCTAssertEqual(try keychain.map { try expand($0, using: defaults) },
+                       [privateKeychainGroup.replacingOccurrences(of: "$(AppIdentifierPrefix)", with: "LEGACY1234."),
+                        "LEGACY1234.com.zjyjcl.botville.shared"])
         XCTAssertEqual(value["aps-environment"] as? String, apsEnvironment)
+    }
+    // Deliberately accept only this small assignment-only config contract, so
+    // additional includes/conditional signing overrides cannot evade isolation.
+    private func xcconfigAssignments(_ relative: String) throws -> [String: String] {
+        var result: [String: String] = [:]
+        for raw in try String(contentsOf: root.appendingPathComponent(relative), encoding: .utf8).components(separatedBy: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty || line.hasPrefix("//") { continue }
+            if relative == "Config/Signing.xcconfig" && line == #"#include? "Local.xcconfig""# { continue }
+            let parts = line.components(separatedBy: "=")
+            XCTAssertEqual(parts.count, 2, "Unsupported xcconfig statement: \(line)")
+            guard parts.count == 2 else { continue }
+            let key = parts[0].trimmingCharacters(in: .whitespaces)
+            XCTAssertNil(result[key], "Duplicate xcconfig assignment")
+            result[key] = parts[1].trimmingCharacters(in: .whitespaces)
+        }
+        XCTAssertEqual(Set(result.keys), ["BOTVILLE_DEVELOPMENT_TEAM", "DEVELOPMENT_TEAM", "BOTVILLE_BUNDLE_ID_PREFIX"])
+        return result
+    }
+    private func signingDefaults() throws -> [String: String] {
+        var values = try xcconfigAssignments("Config/Signing.xcconfig")
+        XCTAssertEqual(values["BOTVILLE_DEVELOPMENT_TEAM"], "3Z8WP6U6F7")
+        XCTAssertEqual(values["DEVELOPMENT_TEAM"], "$(BOTVILLE_DEVELOPMENT_TEAM)")
+        XCTAssertEqual(values["BOTVILLE_BUNDLE_ID_PREFIX"], "com.zjyjcl.botville")
+        // An independent fixture: Apple's AppIdentifierPrefix can differ from Team ID.
+        values["AppIdentifierPrefix"] = "LEGACY1234."
+        return values
+    }
+    private func expand(_ raw: String, using settings: [String: String]) throws -> String {
+        var result = raw
+        for _ in 0..<8 {
+            let previous = result
+            for (key, value) in settings { result = result.replacingOccurrences(of: "$(\(key))", with: value) }
+            if previous == result { break }
+        }
+        XCTAssertFalse(result.contains("$"), "Unresolved or cyclic build variable: \(result)")
+        return result
     }
     private func guarded(_ needle: String, at url: URL) throws {
         var stack: [Bool] = []; var found = false

@@ -48,6 +48,20 @@ final class PushNotificationUXTests: XCTestCase {
         XCTAssertEqual(MatrixService.roomsAfterReadReceipt(rooms, roomID: "!opened:example.test", succeeded: false), rooms)
     }
 
+    func testAppGroupUsesInjectedPrefixWithoutDefaultFallback() {
+        for group in ["group.com.zjyjcl.botville", "group.com.example.custom"] {
+            XCTAssertEqual(PushForegroundProbeLog.appGroupIdentifier(in: [
+                PushForegroundProbeLog.appGroupInfoKey: group
+            ]), group)
+        }
+        XCTAssertNil(PushForegroundProbeLog.appGroupIdentifier(in: [:]))
+        for invalid in ["", "group.", "group.$(BOTVILLE_BUNDLE_ID_PREFIX)", "group.${PREFIX}", "group.bad value"] {
+            XCTAssertNil(PushForegroundProbeLog.appGroupIdentifier(in: [
+                PushForegroundProbeLog.appGroupInfoKey: invalid
+            ]))
+        }
+    }
+
     func testForegroundProbeLogLineHasNoSecretPlaceholders() {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
@@ -61,7 +75,6 @@ final class PushNotificationUXTests: XCTestCase {
         XCTAssertFalse(line.lowercased().contains("token"))
         XCTAssertFalse(line.lowercased().contains("bearer"))
         XCTAssertEqual(PushForegroundProbeLog.fileName, "botville-willpresent-probe.log")
-        XCTAssertEqual(PushForegroundProbeLog.appGroupIdentifier, "group.com.zjyjcl.botville")
     }
 
 }
