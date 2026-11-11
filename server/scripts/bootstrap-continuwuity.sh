@@ -58,6 +58,13 @@ http_port="${http_port:-8008}"
 base_url="${BOTVILLE_BASE_URL:-http://127.0.0.1:${http_port}}"
 base_url="${base_url%/}"
 timeout_secs="${BOTVILLE_BOOTSTRAP_TIMEOUT:-180}"
+# Validated up front: a non-integer would abort later in $(( )) arithmetic.
+token_wait="${BOTVILLE_BOOTSTRAP_TOKEN_WAIT:-30}"
+if [[ ! "${token_wait}" =~ ^[0-9]+$ ]]; then
+    echo "bootstrap-continuwuity.sh: BOTVILLE_BOOTSTRAP_TOKEN_WAIT must be a non-negative integer (seconds)" >&2
+    exit 2
+fi
+token_wait=$((10#${token_wait}))
 
 echo "bootstrap-continuwuity.sh: waiting for ${base_url}/_matrix/client/versions"
 python3 - "${base_url}" "${timeout_secs}" <<'PY'
@@ -107,7 +114,6 @@ PY
 # default 30; 0 = a single attempt). The token value is never printed.
 token=""
 logs_status=0
-token_wait="${BOTVILLE_BOOTSTRAP_TOKEN_WAIT:-30}"
 token_deadline=$((SECONDS + token_wait))
 while :; do
     logs_status=0

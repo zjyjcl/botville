@@ -536,7 +536,7 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
   （`hmac.compare_digest`）。**不接受** `?access_token=` 查询参数——只带查询参数的
   请求视作**缺凭证**。
 - 网关配置 `GATEWAY_HS_TOKEN`（与注册文件里的 `hs_token` 同值）。**未设置时网关
-  照常启动**，但这两条端点一律 `403 M_FORBIDDEN`（当前 compose 尚未注入）。
+  照常启动**，但这两条端点一律 `403 M_FORBIDDEN`（compose 从 `APPSERVICE_HS_TOKEN` 注入，见 `docs/deploy/appservice.md`）。
 - 设置后按与 `GATEWAY_AS_TOKEN` 相同的强度规则校验：非占位符、长度 ≥ 32、不含空白；
   另要求它与 `GATEWAY_AS_TOKEN` **不同**（规范要求两个方向使用不同凭据）。
   不合格 → **启动时配置报错**。
@@ -589,9 +589,11 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 - 存储层提供 `get_unprocessed_transactions()` / `mark_processed(txn_id)`，供后续 PR
   读取未处理事务并交给角色引擎 / 记忆 / 主动发言；**本 PR 只做协议层接收与持久化**，
   不触发任何业务逻辑。
-- **注册文件里的 `url` 仍为 `null`**：本 PR 合入后，再由 A 线单独把注册 `url` 改为
-  `http://gateway:8080` 并在 compose 里注入 `hs_token`。在此之前 homeserver 无处可推，
-  网关的这两条端点只用于集成测试与预接线。
+- **注册状态（A 线 compose 接线后）**：`make up GATEWAY=1`（synapse / tuwunel）时
+  注册 `url` 为 `http://gateway:8080`（无路径前缀），compose 把 `APPSERVICE_HS_TOKEN`
+  注入为 `GATEWAY_HS_TOKEN`，事务库为 gateway-data 卷里的
+  `/var/lib/botville-gateway/as_transactions.db`；其余情况（未开网关、continuwuity）
+  `url` 为 `null`。详见 `docs/deploy/appservice.md`。
 
 ---
 

@@ -353,7 +353,8 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
   接线待后续）。
 - 持久化卷 `gateway-data`（实际名 `<COMPOSE_PROJECT_NAME>_gateway-data`，默认
   `botville_gateway-data`）由网关服务挂载到 `/var/lib/botville-gateway`，
-  `GATEWAY_MOMENTS_DB_PATH=/var/lib/botville-gateway/moments.db`（WAL 模式，随卷保留），
+  `GATEWAY_MOMENTS_DB_PATH=/var/lib/botville-gateway/moments.db`（WAL 模式，随卷保留；
+  同卷顶层还有 AS 事务库 `as_transactions.db`，一起备份恢复），
   启动时执行镜像内迁移。删除语义：`make down` 不传 `-v`，不删任何卷；带
   `--profile gateway` 的 `docker compose ... down -v` 就会删掉本卷（与网关容器是否正在运行无关）；不带该
   profile 时 compose 不认为本卷在用，`down -v` 删不掉、`compose config --volumes` 也不列；

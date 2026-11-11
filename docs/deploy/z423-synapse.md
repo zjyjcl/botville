@@ -316,28 +316,43 @@ curl -s http://127.0.0.1:8020/health   # 端口 = .env 的 BOTVILLE_GATEWAY_PORT
 - **synapse / tuwunel**：`GATEWAY_MATRIX_TRANSPORT=appservice`，
   `GATEWAY_HOMESERVER_URL=http://<服务名>:8008`（`BOTVILLE_HOMESERVER` 就是 compose
   服务名，容器里不要写 `127.0.0.1`），`GATEWAY_MATRIX_SERVER_NAME=${BOTVILLE_SERVER_NAME}`，
-  `GATEWAY_AS_TOKEN` 注入现有的 `APPSERVICE_AS_TOKEN`（同一份值，不另造一份），
+  `GATEWAY_AS_TOKEN` / `GATEWAY_HS_TOKEN` 注入现有的 `APPSERVICE_AS_TOKEN` /
+  `APPSERVICE_HS_TOKEN`（各自同一份值，不另造；init.sh 生成的两者互不相同），
   `GATEWAY_HOMESERVER_FEDERATION_URL` 留空（OpenID userinfo 回落到上面的内网地址，
-  不走 fedgate 或公网）。注册文件的 `url` 仍是 `null`（不接收 HS→AS 事务）。
-- **continuwuity**：仍用 `memory` 传输。它还没有文件方式的 appservice 注册，切到
-  appservice 后网关启动 whoami 会失败并反复退出。
+  不走 fedgate 或公网）。注册文件的 `url` 是 `http://gateway:8080`（无路径前缀），
+  HS 把 AS 事务推给网关，网关按 txnId 幂等存进
+  `GATEWAY_AS_TXN_DB_PATH=/var/lib/botville-gateway/as_transactions.db`。
+- **没开 `GATEWAY=1`，或 continuwuity**：注册 `url` 为 `null`。continuwuity 仍用
+  `memory` 传输：它还没有文件方式的 appservice 注册，切到 appservice 后网关启动
+  whoami 会失败并反复退出。
+- 注册 url 由 `make up` 决定并交给 init.sh 渲染；url 变了 `make up` 会先重启 HS
+  （它只在启动时读注册文件）。在 `make up GATEWAY=1` 与 `make up` 之间切换都会
+  自动处理；`make down` 不改 url。
+- 只用 `make up` 重建网关：`docker compose up` 直接重建会落回 compose 兜底值
+  （memory 传输、`http://synapse:8008`，兜底表见 [appservice.md](appservice.md)），
+  `make gateway-hs-smoke` 能查出这种情况。
 - 切到 appservice 后，网关启动会请求 HS 的 whoami，失败就退出；compose 里
   `restart: unless-stopped`，并对当前 HS 设了 `depends_on`（synapse 等 healthy，
   tuwunel 等 started——后者镜像没有 healthcheck）。HS 未就绪时会自动重启几次。
 - 改 `BOTVILLE_SERVER_NAME` 时，注册正则（init.sh 渲染）和
   `GATEWAY_MATRIX_SERVER_NAME` 要一起改，并重启 homeserver 与网关。
-- 轮换 `APPSERVICE_AS_TOKEN` 时必须让 HS（重新渲染注册文件并重启）和网关
-  （同一变量注入为 `GATEWAY_AS_TOKEN`）同时切换。
-- 不要跑两个会接收事务的网关副本。
+- 轮换 `APPSERVICE_AS_TOKEN` / `APPSERVICE_HS_TOKEN` 时必须让 HS（重新渲染注册
+  文件并重启）和网关（同一变量注入为 `GATEWAY_AS_TOKEN` / `GATEWAY_HS_TOKEN`）
+  同时切换。两者不能相同，网关会拒绝启动。
+- 只能跑一个网关（单进程，SQLite 库加进程内锁）：不要 `--scale gateway=2`，也
+  不要让第二个网关挂同一个卷或用同一份注册文件。
 - 明文 `http://` 时，网关只允许 loopback 或单标签服务名（`http://synapse:8008` /
   `http://tuwunel:8008` 可以；不要开 `GATEWAY_ALLOW_INSECURE_HS`）。
 
-本地或 CI 冒烟：`make gateway-hs-smoke`（`/health` 的 matrix 检查 = 启动 whoami；
-再用 OpenID token 打 `GET /v1/moments` 校验内网 userinfo）。脚本不会打印任何 token。
+本地或 CI 冒烟：`make gateway-hs-smoke`——检查容器里的传输与 HS 一致；`/health` 的
+matrix 检查 = 启动 whoami；用 OpenID token 打 `GET /v1/moments` 校验内网 userinfo；
+HS→网关 ping；`@ai_*` 所在房间的消息被推送并落进 `as_transactions.db`；重启网关后
+重放同一 txnId 只存一份。脚本不打印任何 token，失败只报 HTTP 状态和完整 URL。
 
 网关挂载 compose 卷 `gateway-data`（实际名 `<项目名>_gateway-data`）到
 `/var/lib/botville-gateway`，`GATEWAY_MOMENTS_DB_PATH=/var/lib/botville-gateway/moments.db`，
-启动时自动执行镜像内的 moments 迁移。删除语义：
+启动时自动执行镜像内的 moments 迁移；AS 事务库 `as_transactions.db` 也在卷顶层，
+随卷一起备份（备份前对顶层 `*.db` 做 WAL checkpoint）和恢复。删除语义：
 
 - `make down` **不传** `-v`，不删除任何卷（包括 `gateway-data`）。
 - `docker compose ... --profile gateway down -v`（只要带上 gateway profile，与网关

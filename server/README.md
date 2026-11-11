@@ -18,8 +18,10 @@ make up HS=tuwunel   # 换 Tuwunel（continuwuity 同理）
 make up PUSH=1       # 叠加 sygnal 推送网关（push profile，A1.2；可与任一 HS 组合）
 make up GATEWAY=1    # 叠加 botville 网关（gateway profile，A2.2；本机构建 gateway/Dockerfile，
                      # 挂 gateway-data 卷，http://127.0.0.1:8020；可与任一 HS 组合。
-                     # synapse/tuwunel 用 appservice 传输，continuwuity 仍用 memory）
-make gateway-hs-smoke # 对真实 HS 冒烟：启动 whoami + OpenID userinfo（需 GATEWAY=1 的 synapse/tuwunel 栈）
+                     # synapse/tuwunel 用 appservice 传输、注册 url=http://gateway:8080 收 AS 事务
+                     # （url 变了会重启 HS）；continuwuity 仍用 memory、url=null）
+make gateway-hs-smoke # 对真实 HS 冒烟：whoami + OpenID userinfo + AS 事务 ping/落库/重启幂等
+                     # （需 GATEWAY=1 的 synapse/tuwunel 栈；网关只能跑一个，只用 make up 重建）
 make smoke           # 标准库冒烟测试：注册→登录→建房(v10)→发消息→回读→sync
 make backup          # 备份到 ./backups/<UTC时间戳>/（目录 700、文件 600，A1.1）
 make restore RESTORE_DIR=backups/<时间戳>   # 破坏性恢复（自动 --yes）

@@ -115,8 +115,17 @@ class ComposeGatewayServiceRenderTest(unittest.TestCase):
         self.assertEqual(env.get("GATEWAY_HOMESERVER_FEDERATION_URL") or "", "")
         self.assertEqual(env["GATEWAY_MATRIX_SERVER_NAME"], "localhost")
         self.assertEqual(env.get("GATEWAY_AS_TOKEN") or "", "")
-        self.assertNotIn("GATEWAY_HS_TOKEN", env)
+        # #192 wiring: hs_token injected from APPSERVICE_HS_TOKEN (empty
+        # fallback = AS callbacks 403); raw transactions on the volume.
+        self.assertEqual(env.get("GATEWAY_HS_TOKEN") or "", "")
         self.assertNotIn("APPSERVICE_HS_TOKEN", env)
+        self.assertEqual(
+            env["GATEWAY_AS_TXN_DB_PATH"], "/var/lib/botville-gateway/as_transactions.db"
+        )
+        # Top level of the gateway-data mount, so backups checkpoint it.
+        self.assertEqual(
+            str(Path(env["GATEWAY_AS_TXN_DB_PATH"]).parent), "/var/lib/botville-gateway"
+        )
         # Secrets are interpolated from .env only; empty here (no defaults).
         self.assertEqual(env["GATEWAY_AUTH_TOKEN"], "")
         self.assertEqual(env["GATEWAY_HMAC_SECRET"], "")
@@ -155,9 +164,11 @@ class ComposeGatewayServiceRenderTest(unittest.TestCase):
 
     def test_transport_and_url_follow_homeserver_profile(self):
         """synapse/tuwunel get appservice + http://<service>:8008; continuwuity
-        stays memory. AS token is APPSERVICE_AS_TOKEN; no hs_token; federation
-        URL left empty so OpenID userinfo falls back to the CS URL."""
+        stays memory. AS/HS tokens are APPSERVICE_AS_TOKEN/APPSERVICE_HS_TOKEN
+        (same values, different from each other); federation URL left empty
+        so OpenID userinfo falls back to the CS URL."""
         as_token = "test-only-as-token"
+        hs_token = "test-only-hs-token"
         for hs, transport in (
             ("synapse", "appservice"),
             ("tuwunel", "appservice"),
@@ -171,7 +182,8 @@ class ComposeGatewayServiceRenderTest(unittest.TestCase):
                     "BOTVILLE_SERVER_NAME=localhost\n"
                     "GATEWAY_MATRIX_TRANSPORT={transport}\n"
                     "APPSERVICE_AS_TOKEN={token}\n"
-                ).format(hs=hs, transport=transport, token=as_token),
+                    "APPSERVICE_HS_TOKEN={hs_token}\n"
+                ).format(hs=hs, transport=transport, token=as_token, hs_token=hs_token),
             ))
             env = config["services"]["gateway"]["environment"]
             self.assertEqual(env["GATEWAY_MATRIX_TRANSPORT"], transport, hs)
@@ -183,29 +195,24 @@ class ComposeGatewayServiceRenderTest(unittest.TestCase):
             self.assertEqual(env.get("GATEWAY_HOMESERVER_FEDERATION_URL") or "", "")
             self.assertEqual(env["GATEWAY_MATRIX_SERVER_NAME"], "localhost")
             self.assertEqual(env["GATEWAY_AS_TOKEN"], as_token)
-            self.assertNotIn("GATEWAY_HS_TOKEN", env)
+            self.assertEqual(env["GATEWAY_HS_TOKEN"], hs_token)
+            self.assertNotEqual(env["GATEWAY_HS_TOKEN"], env["GATEWAY_AS_TOKEN"])
             self.assertNotIn("APPSERVICE_HS_TOKEN", env)
 
 
 class AppserviceRegistrationTemplateTest(unittest.TestCase):
-    def test_registration_url_stays_null(self):
+    def test_registration_url_is_rendered_by_init(self):
+        """The url line is a placeholder init.sh fills with exactly `null` or
+        `http://gateway:8080` (see InitScriptTest for the switch)."""
         tmpl = (
             REPO_ROOT / "server" / "compose" / "appservice"
             / "botville-gateway.yaml.tmpl"
         ).read_text(encoding="utf-8")
-        self.assertRegex(tmpl, r"(?m)^url: null$")
+        self.assertRegex(tmpl, r"(?m)^url: \$\{BOTVILLE_APPSERVICE_URL\}$")
         self.assertIn('as_token: "${APPSERVICE_AS_TOKEN}"', tmpl)
-        # Comments may mention a future flip to http://gateway:<port>; the
-        # active url field must stay null in this PR.
-        active = [
-            line.strip()
-            for line in tmpl.splitlines()
-            if line.strip() and not line.lstrip().startswith("#")
-        ]
-        self.assertFalse(
-            any(line.startswith("url:") and "http://gateway" in line for line in active),
-            active,
-        )
+        self.assertIn('hs_token: "${APPSERVICE_HS_TOKEN}"', tmpl)
+        # No path prefix anywhere: callbacks live at the gateway root.
+        self.assertNotIn("/_botville/gateway", tmpl)
 
 
 if __name__ == "__main__":

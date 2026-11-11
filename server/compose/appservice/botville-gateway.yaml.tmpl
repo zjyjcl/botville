@@ -12,12 +12,15 @@
 #   - continuwuity: no file-based registration yet (admin room only) — not
 #     wired up, see docs/deploy/appservice.md.
 #
-# url: null on purpose — M1 does not accept HS->AS transactions, so there is
-# no endpoint for the homeserver to push to (and nothing to retry against).
-# A2 flips this to http://gateway:<port> once the gateway starts receiving
-# transactions.
+# url: rendered by init.sh from BOTVILLE_APPSERVICE_URL, only ever `null` or
+# `http://gateway:8080` (no path prefix -- the gateway serves the AS callbacks
+# /_matrix/app/v1/{transactions,ping} at the root). `make up GATEWAY=1` on
+# synapse/tuwunel sets http://gateway:8080; every other case (no GATEWAY=1,
+# or continuwuity) is null, so the homeserver never pushes to a gateway that
+# is not there (it would back off and retry forever). The homeserver reads
+# this file only at startup: `make up` restarts it when the url changed.
 id: botville-gateway
-url: null
+url: ${BOTVILLE_APPSERVICE_URL}
 as_token: "${APPSERVICE_AS_TOKEN}"
 hs_token: "${APPSERVICE_HS_TOKEN}"
 sender_localpart: botville-gateway

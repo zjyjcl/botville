@@ -22,7 +22,15 @@
 #   3. render server/compose/appservice/botville-gateway.yaml.tmpl (A1.3,
 #      the AI gateway's appservice registration) into
 #      server/compose/generated/appservice/botville-gateway.yaml (0600 — it
-#      carries the as_token, which is full control over the @ai_* namespace);
+#      carries the as_token, which is full control over the @ai_* namespace).
+#      Its `url:` (where the homeserver pushes AS transactions) comes from
+#      BOTVILLE_APPSERVICE_URL, which must be exactly `null` or
+#      `http://gateway:8080`. `make up` sets it (http://gateway:8080 only with
+#      GATEWAY=1 on synapse/tuwunel, null otherwise). When the variable is
+#      unset (e.g. `make smoke`, which also runs init) the url already in the
+#      generated file is kept, defaulting to null. When the url changes,
+#      init.sh drops generated/appservice/.url-changed so `make up` restarts
+#      the homeserver (it reads the registration only at startup);
 #   4. render server/compose/sygnal/sygnal.yaml.tmpl into
 #      server/compose/generated/sygnal/sygnal.yaml, appending app parts:
 #      sygnal/mock-app.yaml.part (org.botville.mock) unless BOTVILLE_PUSH_MOCK
@@ -445,6 +453,10 @@ import sys
 env_path, template_path, out_path = sys.argv[1:4]
 
 values = {}
+# Appservice registration url (resolved and validated by init.sh in bash,
+# never read from .env): `null` or `http://gateway:8080`.
+import os
+_appservice_url = os.environ.get("BOTVILLE_APPSERVICE_URL_RESOLVED", "null")
 with open(env_path, encoding="utf-8") as f:
     for n, raw in enumerate(f, 1):
         line = raw.strip()
@@ -509,6 +521,8 @@ def validate_server_name(raw):
     return name
 
 
+values["BOTVILLE_APPSERVICE_URL"] = _appservice_url
+
 server_name = values.get("BOTVILLE_SERVER_NAME")
 if server_name:
     server_name = validate_server_name(server_name)
@@ -564,7 +578,37 @@ if [[ -n "$(env_value BOTVILLE_SYGNAL_IP)" ]]; then
     rm -f "${whitelist_part}"
 fi
 
-render_template "${appservice_template}" "${appservice_generated}"
+# Registration url (A2.2 + #192): only `null` or `http://gateway:8080` (no
+# path prefix: the gateway serves /_matrix/app/v1/* at the root even with
+# GATEWAY_HTTP_PATH_PREFIX set). Explicit BOTVILLE_APPSERVICE_URL wins;
+# otherwise keep what the generated file already has, defaulting to null.
+appservice_url_marker="${appservice_dir}/.url-changed"
+appservice_url_prev="null"
+if [[ -f "${appservice_generated}" ]]; then
+    prev_line="$(sed -n 's/^url:[[:space:]]*//p' "${appservice_generated}" | head -n 1)"
+    case "${prev_line}" in
+        null|http://gateway:8080) appservice_url_prev="${prev_line}" ;;
+    esac
+fi
+if [[ -n "${BOTVILLE_APPSERVICE_URL+x}" ]]; then
+    case "${BOTVILLE_APPSERVICE_URL}" in
+        null|http://gateway:8080) appservice_url="${BOTVILLE_APPSERVICE_URL}" ;;
+        *)
+            echo "init.sh: BOTVILLE_APPSERVICE_URL must be exactly 'null' or 'http://gateway:8080'" >&2
+            exit 1
+            ;;
+    esac
+else
+    appservice_url="${appservice_url_prev}"
+fi
+BOTVILLE_APPSERVICE_URL_RESOLVED="${appservice_url}" \
+    render_template "${appservice_template}" "${appservice_generated}"
+if [[ "${appservice_url}" != "${appservice_url_prev}" ]]; then
+    : > "${appservice_url_marker}"
+    echo "init.sh: appservice registration url changed (${appservice_url_prev} -> ${appservice_url});" \
+        "restart the homeserver to apply (make up does this)"
+fi
+echo "init.sh: appservice registration url: ${appservice_url}"
 # The registration file carries the as_token (full control over the @ai_*
 # namespace); keep it 0600 like .env. The homeserver containers read it as
 # root through the read-only bind mount.

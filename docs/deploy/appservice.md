@@ -116,7 +116,7 @@ sender → **400 `request.invalid`**；房间别名不存在 → **404
   | 键 | 用途 |
   | --- | --- |
   | `APPSERVICE_AS_TOKEN` | 网关 → HS：Bearer 代发/建号的凭据 |
-  | `APPSERVICE_HS_TOKEN` | HS → 网关：校验事务接收（`GATEWAY_HS_TOKEN` 同值；网关已实现，compose 尚未注入） |
+  | `APPSERVICE_HS_TOKEN` | HS → 网关：校验事务接收（compose 注入为 `GATEWAY_HS_TOKEN`，同一份值） |
 
   `.env` 首次由 init.sh 随机生成；`.env.example` 只放 `<change-me>`（CI 有
   allowlist 守卫）。渲染产物不入库。
@@ -128,30 +128,74 @@ sender → **400 `request.invalid`**；房间别名不存在 → **404
   渲染进注册文件曾被证实会让 Synapse 接受**无鉴权**的 `@ai_*` 注册，因此
   三层都不放行。init.sh 全程 `umask 077` 并无条件 `chmod 600` `.env` 与渲染
   产物。
-- `url: null` 是有意为之：网关**已实现**接收 HS 推送事务的协议层
-  （`PUT /_matrix/app/v1/transactions/{txnId}` + `POST /_matrix/app/v1/ping`，
-  按 `hs_token` 校验、幂等持久化，见 `gateway/docs/contract.md` §1.7），但注册
-  文件里的 `url` **仍是 `null`**、compose **尚未**向网关注入 `hs_token`，因此 HS
-  目前无处可推。**在 A 线接线 PR 合入前，不要把 `url` 改成 `http://gateway:8080`**：接线由 A 线
-  单独 PR 完成（届时同时把注册 `url` 指向 `http://gateway:8080` 并向网关注入
-  `GATEWAY_HS_TOKEN`）。
-- compose 的可选 `gateway` profile（`make up GATEWAY=1`）已经把网关接到
-  homeserver 的 Client-Server API 上（代发已接线；事务接收的协议层已实现，
-  但尚未接线）：
+- **注册 `url` 按开关切换**（A2.2，接 #192）：注册文件的 `url:` 由 init.sh 从
+  `BOTVILLE_APPSERVICE_URL` 渲染，只允许两个值：
+  - `http://gateway:8080`：**仅当** `make up GATEWAY=1` 且 HS 是 synapse 或
+    tuwunel。不带路径前缀——网关的 AS 回调
+    `PUT /_matrix/app/v1/transactions/{txnId}` / `POST /_matrix/app/v1/ping`
+    挂在根路径，设了 `GATEWAY_HTTP_PATH_PREFIX` 也一样（见
+    `gateway/docs/contract.md` §1.7）。
+  - `null`：其余一律如此——没开 `GATEWAY=1`，或 HS 是 continuwuity。否则 HS 会
+    往一个不存在的网关推事务，连不上就无限退避重试。
+  - 其他值 init.sh 直接报错退出。没设该变量时（`make smoke` / `make e2e` 等
+    也会跑 init）保留生成文件里已有的值，首次默认 `null`。
+  - **改了 url 必须重启 HS**（注册文件只在启动时读取）。url 变化时 init.sh 会
+    留下 `generated/appservice/.url-changed`，`make up` 看到它就先
+    `restart` 当前 HS（容器还没建时是空操作）再 `up -d`。所以从
+    `make up GATEWAY=1` 切到 `make up`（或反过来）时 HS 会自动读到新 url。绕过
+    make 手动跑 `BOTVILLE_APPSERVICE_URL=... bash server/scripts/init.sh` 时，需自己
+    `docker compose ... restart <hs>`。
+  - `make down` 不改 url；下一次 `make up` 再决定。
+- compose 的可选 `gateway` profile（`make up GATEWAY=1`）把网关接到 homeserver：
+  代发走 Client-Server API，事务接收走 AS 回调。
   - synapse / tuwunel：`GATEWAY_MATRIX_TRANSPORT=appservice`，
     `GATEWAY_HOMESERVER_URL=http://${BOTVILLE_HOMESERVER}:8008`（服务名，不要写
     `127.0.0.1`），`GATEWAY_MATRIX_SERVER_NAME=${BOTVILLE_SERVER_NAME}`，
-    `GATEWAY_AS_TOKEN=${APPSERVICE_AS_TOKEN}`（同一份 as_token，不另造），
+    `GATEWAY_AS_TOKEN=${APPSERVICE_AS_TOKEN}`、
+    `GATEWAY_HS_TOKEN=${APPSERVICE_HS_TOKEN}`（两个 token 各自同一份值，不另造），
     `GATEWAY_HOMESERVER_FEDERATION_URL` 留空（OpenID userinfo 走内网直连）。
-    `hs_token` 不进网关。
-  - continuwuity：仍用 `memory`。它还没有文件方式的 appservice 注册，切到
-    appservice 后启动 whoami 会失败、容器会反复退出。
+  - 收到的事务（原始 JSON，按 txnId 幂等）存进
+    `GATEWAY_AS_TXN_DB_PATH=/var/lib/botville-gateway/as_transactions.db`，
+    在 `gateway-data` 卷顶层，和 `moments.db` 一样随 `make backup`（synapse）/
+    `make backup-gateway`（tuwunel、continuwuity）整卷备份，备份前对顶层
+    `*.db` 做 WAL checkpoint；恢复同理。`GATEWAY_AS_MAX_BODY_BYTES` 用默认 16 MiB。
+  - continuwuity：仍用 `memory`，注册 url 为 `null`。它还没有文件方式的
+    appservice 注册，切到 appservice 后启动 whoami 会失败、容器会反复退出。
+    （网关照样注入 `GATEWAY_HS_TOKEN`、打开事务库，只是没有 HS 会推过来。）
+  - token 规则：init.sh 生成的两个值都是 64 位小写 hex，且互不相同。网关在
+    `GATEWAY_HS_TOKEN` 与 `GATEWAY_AS_TOKEN` 相同、或 hs_token 不足 32 字符 /
+    是占位值 / 含空白时拒绝启动；`GATEWAY_HS_TOKEN` 为空时照常启动，但
+    `/_matrix/app/v1/*` 一律 403。
+  - **compose 兜底值**（变量没设时才生效，例如 init 之前的 `compose config`，或
+    绕过 make 直接 `docker compose up`）：
+
+    | 网关变量 | compose 写法 | 兜底 |
+    | --- | --- | --- |
+    | `GATEWAY_MATRIX_TRANSPORT` | `${GATEWAY_MATRIX_TRANSPORT:-memory}` | `memory` |
+    | `GATEWAY_HOMESERVER_URL` | `http://${BOTVILLE_HOMESERVER:-synapse}:8008` | `http://synapse:8008` |
+    | `GATEWAY_HOMESERVER_FEDERATION_URL` | `""` | 空（回落到上一行） |
+    | `GATEWAY_MATRIX_SERVER_NAME` | `${BOTVILLE_SERVER_NAME:-localhost}` | `localhost` |
+    | `GATEWAY_AS_TOKEN` | `${APPSERVICE_AS_TOKEN:-}` | 空（appservice 模式会拒绝启动） |
+    | `GATEWAY_HS_TOKEN` | `${APPSERVICE_HS_TOKEN:-}` | 空（AS 回调一律 403） |
+    | `GATEWAY_AS_TXN_DB_PATH` | 固定 | `/var/lib/botville-gateway/as_transactions.db` |
+
+  - **只通过 `make up` 重建网关**：`BOTVILLE_HOMESERVER` / `GATEWAY_MATRIX_TRANSPORT`
+    只在 `make up` 里导出（`HS=` 可能与 `.env` 不同），注册 url 也只在
+    `make up` 里切换。直接 `docker compose up -d` / `--force-recreate gateway`
+    会回到上表的兜底值（memory 传输），HS 却可能还在往网关推事务。
+    `make gateway-hs-smoke` 会检查容器里的 `GATEWAY_MATRIX_TRANSPORT`，与 HS
+    不符时报错并提示重新 `make up`。
+  - **只能跑一个网关**：网关是单进程（SQLite 库加进程内锁）。不要
+    `--scale gateway=2`，不要让第二个网关挂同一个卷或使用同一份注册文件。
   - 运维注意：appservice 模式下网关启动会 whoami，失败即退出（`restart:
     unless-stopped`，并对当前 HS `depends_on`）；改 `BOTVILLE_SERVER_NAME` 时
     注册正则和 `GATEWAY_MATRIX_SERVER_NAME` 要同步改；轮换 `APPSERVICE_AS_TOKEN`
-    时 HS 与网关必须同时切换；不要跑两个会接收事务的网关副本；明文 `http://`
-    只允许 loopback 或单标签服务名。
-  - 验收：`make gateway-hs-smoke`（whoami + OpenID userinfo；不打印 token）。
+    或 `APPSERVICE_HS_TOKEN` 时 HS（重新渲染注册文件并重启）与网关
+    （`make up GATEWAY=1` 重建）必须同时切换；明文 `http://` 只允许 loopback
+    或单标签服务名。
+  - 验收：`make gateway-hs-smoke`——whoami、OpenID userinfo，以及 AS 事务：HS→
+    网关 ping，`@ai_*` 所在房间的消息被推送并落库，网关重启后重放同一 txnId 只存
+    一份，错误 hs_token 得 403。不打印 token；失败只报 HTTP 状态和完整 URL。
 
 ## 注册方式差异
 
@@ -230,8 +274,10 @@ PYTHONPATH=gateway/src python3 -m botville_gateway
    ```
 
 2. `bash server/scripts/init.sh`（重新渲染注册文件，仍是 0600）；
-3. 重启 homeserver 栈（`make down && make up`；Synapse/Tuwunel 都是重启生效）；
-4. 同步更新网关侧 `GATEWAY_AS_TOKEN` 并重启网关。
+3. 重启 homeserver 栈（`make down && make up`，用网关时 `make up GATEWAY=1`；
+   Synapse/Tuwunel 都是重启生效）；
+4. compose 网关从同一变量注入 `GATEWAY_AS_TOKEN` / `GATEWAY_HS_TOKEN`，第 3 步
+   的 `make up GATEWAY=1` 会一起重建网关；仓库外单独运行的网关要手动同步并重启。
 
 注意：轮换是**全量替换**，没有灰度；网关与 homeserver 必须同批切换。
 
@@ -243,10 +289,11 @@ PYTHONPATH=gateway/src python3 -m botville_gateway
 - `hs_token` 已被网关的 AS 回调（B 线 as-transactions）使用：`GATEWAY_HS_TOKEN`
   与它同值，用于校验 `PUT /_matrix/app/v1/transactions/{txnId}` 与
   `POST /_matrix/app/v1/ping`（`Authorization: Bearer`，恒定时间比较，不入日志）。
-  但**注册 `url` 仍为 `null`、compose 尚未注入 `GATEWAY_HS_TOKEN`**，因此当前
-  HS 不会推送事务；网关在未配置该变量时对上述端点一律 403。接线由 A 线后续
-  PR 完成。轮换 `hs_token` 时须同时更新注册文件与网关的 `GATEWAY_HS_TOKEN`
-  （且不能与 `as_token` 相同，网关会拒绝启动）。
+  compose 把 `APPSERVICE_HS_TOKEN` 注入为 `GATEWAY_HS_TOKEN`；注册 url 只在
+  `make up GATEWAY=1`（synapse/tuwunel）时是 `http://gateway:8080`，其余为
+  `null`。网关在未配置该变量时对上述端点一律 403。轮换 `hs_token` 时须同时更新
+  注册文件（重启 HS）与网关的 `GATEWAY_HS_TOKEN`（且不能与 `as_token` 相同，
+  网关会拒绝启动）。
 - 命名空间 exclusive 是**纵深防御的第一层**，不是唯一一层：网关在客户端侧
   也校验 sender（`@ai_` 前缀 + 本 server），homeserver 侧再拦一次越权
   masquerade。两侧拒绝行为都在 CI 断言。

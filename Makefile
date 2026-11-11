@@ -93,6 +93,18 @@ endif
 # transport match the profile actually started, even when HS= overrides a
 # stale .env value. synapse and tuwunel get appservice (file-based
 # registration); continuwuity stays memory (no file-based registration yet).
+# Only `make up` exports these: recreating the gateway with plain
+# `docker compose up` falls back to the compose defaults (memory transport,
+# http://synapse:8008) -- always go through `make up`. `make gateway-hs-smoke`
+# flags a gateway whose transport does not match HS.
+#
+# Appservice registration url (A2.2 + #192): http://gateway:8080 only with
+# GATEWAY=1 on synapse/tuwunel, null otherwise (no gateway to push to, or
+# continuwuity without file-based registration). `up` passes it to init.sh as
+# BOTVILLE_APPSERVICE_URL; when the rendered url changed, init.sh leaves
+# $(APPSERVICE_URL_MARKER) and `up` restarts the homeserver (it reads the
+# registration only at startup) before `up -d`. Other targets that run init
+# (smoke, e2e, ...) keep whatever url is already rendered.
 GATEWAY ?=
 GATEWAY_PROFILE := $(if $(filter 1 true yes,$(GATEWAY)),--profile gateway,)
 ifeq ($(HS),continuwuity)
@@ -101,6 +113,13 @@ else
 GATEWAY_TRANSPORT := appservice
 endif
 GATEWAY_HS_ENV := BOTVILLE_HOMESERVER=$(HS) GATEWAY_MATRIX_TRANSPORT=$(GATEWAY_TRANSPORT)
+APPSERVICE_URL := null
+ifneq ($(GATEWAY_PROFILE),)
+ifneq ($(filter synapse tuwunel,$(HS)),)
+APPSERVICE_URL := http://gateway:8080
+endif
+endif
+APPSERVICE_URL_MARKER := server/compose/generated/appservice/.url-changed
 GATEWAY_PORT ?= $(shell sed -n 's/^BOTVILLE_GATEWAY_PORT=//p' $(ENV_FILE) 2>/dev/null | tail -n 1)
 ifeq ($(strip $(GATEWAY_PORT)),)
 GATEWAY_PORT := 8020
@@ -129,10 +148,18 @@ init:
 # account (one-time token from the container logs; see
 # server/scripts/bootstrap-continuwuity.sh).
 up:
-	bash server/scripts/init.sh
+	BOTVILLE_APPSERVICE_URL=$(APPSERVICE_URL) bash server/scripts/init.sh
 ifneq ($(GATEWAY_PROFILE),)
 	$(COMPOSE) --profile gateway build gateway
 endif
+	@if [ -f $(APPSERVICE_URL_MARKER) ]; then \
+		case "$(HS)" in \
+		synapse|tuwunel) \
+			echo "appservice registration url changed: restarting $(HS) (no-op if not created yet)"; \
+			$(COMPOSE) --profile $(HS) restart $(HS) ;; \
+		esac; \
+		rm -f $(APPSERVICE_URL_MARKER); \
+	fi
 	$(GATEWAY_HS_ENV) $(COMPOSE) --profile $(HS) $(PUSH_PROFILE) $(GATEWAY_PROFILE) up -d
 ifneq ($(PUSH_PROFILE),)
 	$(COMPOSE) --profile $(HS) --profile push up -d --force-recreate --no-deps sygnal
@@ -219,15 +246,21 @@ appservice-e2e: init
 		--env-file $(ENV_FILE)
 
 # Compose gateway against a real homeserver (A2.2): /health matrix check
-# (startup whoami with GATEWAY_AS_TOKEN) plus OpenID userinfo via in-stack
-# GATEWAY_HOMESERVER_URL. Requires the stack up with GATEWAY=1 on synapse
-# or tuwunel (continuwuity stays on the memory transport). The script never
-# prints tokens.
+# (startup whoami with GATEWAY_AS_TOKEN), OpenID userinfo via in-stack
+# GATEWAY_HOMESERVER_URL, and AS transactions (#192): HS -> gateway ping,
+# an @ai_* room message pushed and stored in GATEWAY_AS_TXN_DB_PATH, then a
+# gateway restart and a replay of the same txnId (stored once). Requires the
+# stack up with GATEWAY=1 on synapse or tuwunel (continuwuity stays on the
+# memory transport with url null). The script never prints tokens.
+GATEWAY_STACK := $(COMPOSE) --profile $(HS) --profile gateway
 gateway-hs-smoke: init
 	python3 server/tests/gateway_hs_smoke.py \
 		--hs-url http://127.0.0.1:$(PORT) \
 		--gateway-url http://127.0.0.1:$(GATEWAY_PORT) \
-		--env-file $(ENV_FILE)
+		--env-file $(ENV_FILE) \
+		--expect-transport $(GATEWAY_TRANSPORT) \
+		--gateway-exec '$(GATEWAY_STACK) exec -T gateway' \
+		--gateway-restart '$(GATEWAY_STACK) restart gateway'
 
 # --- paired federation (A2.1, independent compose project) -----------------
 # botville-fed runs TWO Synapse instances (hs-a/hs-b), each behind its own

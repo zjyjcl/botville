@@ -318,6 +318,22 @@ class BootstrapScriptTest(unittest.TestCase):
         self.assertIn("init.sh", proc.stderr)
         self.assertEqual(hs.registered, [])
 
+    def test_token_wait_must_be_an_integer(self):
+        # #191 suggestion 4: a non-integer wait must fail with a clear message
+        # before any HTTP call or arithmetic, never deep inside $(( )).
+        for bad in ("abc", "1.5", "-3", " 5", "5s"):
+            with self.subTest(value=bad):
+                with tempfile.TemporaryDirectory() as tmp:
+                    proc = run_bootstrap(
+                        tmp,
+                        "http://127.0.0.1:9",
+                        QUIET_LOGS,
+                        env={"BOTVILLE_BOOTSTRAP_TOKEN_WAIT": bad},
+                    )
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertIn("BOTVILLE_BOOTSTRAP_TOKEN_WAIT must be a non-negative integer", proc.stderr)
+                self.assertNotIn("waiting for", proc.stdout)
+
     def test_compose_logs_failure_prints_no_raw_logs(self):
         logs = "SECRETLOGMARKER some private log line\n"
         proc, hs = self.bootstrap("fresh", logs, compose_status=1)
@@ -358,6 +374,7 @@ TEMPLATE = (
 # regex-escaped server name (also in the exclusive aliases namespace, #107).
 APPSERVICE_TEMPLATE = (
     "id: botville-gateway\n"
+    "url: ${BOTVILLE_APPSERVICE_URL}\n"
     'as_token: "${APPSERVICE_AS_TOKEN}"\n'
     'hs_token: "${APPSERVICE_HS_TOKEN}"\n'
     "namespaces:\n"
@@ -419,12 +436,17 @@ class InitScriptTest(unittest.TestCase):
             self.tmp / "compose" / "generated" / "appservice" / "botville-gateway.yaml"
         )
 
-    def run_init(self):
+    def run_init(self, appservice_url=None):
+        env = dict(os.environ)
+        env.pop("BOTVILLE_APPSERVICE_URL", None)
+        if appservice_url is not None:
+            env["BOTVILLE_APPSERVICE_URL"] = appservice_url
         return subprocess.run(
             ["bash", str(self.tmp / "scripts" / "init.sh")],
             capture_output=True,
             text=True,
             timeout=60,
+            env=env,
         )
 
     def env_value(self, key):
@@ -528,6 +550,68 @@ class InitScriptTest(unittest.TestCase):
         self.assertNotIn("${", rendered)
         # as_token = full control over the @ai_* namespace -> 0600 like .env.
         self.assertEqual(stat.S_IMODE(self.appservice.stat().st_mode), 0o600)
+
+    # ------------------ registration url switch (A2.2 + #192) ---------------
+    def _url_line(self):
+        return [
+            l for l in self.appservice.read_text(encoding="utf-8").splitlines()
+            if l.startswith("url:")
+        ]
+
+    def _marker(self):
+        return self.appservice.parent / ".url-changed"
+
+    def test_registration_url_defaults_to_null(self):
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self._url_line(), ["url: null"])
+        self.assertFalse(self._marker().exists())
+
+    def test_registration_url_gateway_and_back_marks_change(self):
+        proc = self.run_init("http://gateway:8080")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self._url_line(), ["url: http://gateway:8080"])
+        self.assertTrue(self._marker().exists())
+        self.assertIn("restart the homeserver", proc.stdout)
+        self._marker().unlink()
+        # Unset (make smoke / e2e also run init): the rendered url is kept.
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self._url_line(), ["url: http://gateway:8080"])
+        self.assertFalse(self._marker().exists())
+        # Same explicit value: no change, no marker.
+        proc = self.run_init("http://gateway:8080")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(self._marker().exists())
+        # Back to null (make up without GATEWAY=1, or continuwuity).
+        proc = self.run_init("null")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self._url_line(), ["url: null"])
+        self.assertTrue(self._marker().exists())
+
+    def test_registration_url_rejects_anything_else(self):
+        for bad in ("", "http://gateway:8080/_botville/gateway", "http://127.0.0.1:8080",
+                    "https://gateway:8080", "NULL"):
+            with self.subTest(value=bad):
+                proc = self.run_init(bad)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("BOTVILLE_APPSERVICE_URL must be exactly", proc.stderr)
+
+    def test_generated_tokens_satisfy_gateway_rules(self):
+        # #192: the gateway refuses GATEWAY_HS_TOKEN == GATEWAY_AS_TOKEN, or
+        # a value that is short (<32), a placeholder or has whitespace.
+        # init.sh's fresh values (injected as those two variables) must pass.
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        as_token = self.env_value("APPSERVICE_AS_TOKEN")
+        hs_token = self.env_value("APPSERVICE_HS_TOKEN")
+        for value in (as_token, hs_token):
+            self.assertRegex(value, "^" + HEX64 + "$")
+            self.assertGreaterEqual(len(value), 32)
+        self.assertNotEqual(as_token, hs_token)
+        # Neither value may leak to stdout/stderr.
+        self.assertNotIn(as_token, proc.stdout + proc.stderr)
+        self.assertNotIn(hs_token, proc.stdout + proc.stderr)
 
     # ------------------ appservice token gate (PR #99 review, blocker 2) ----
     def _write_env_replacing(self, replacements):
