@@ -140,6 +140,7 @@ class MomentsServer:
         self.server.server_close()
         self.thread.join(timeout=5)
         if self.server.moments_service is not None:
+            self.server.moments_service.stop_purge_scheduler()
             self.server.moments_service.store.close()
         shutil.rmtree(self.tmp, ignore_errors=True)
 

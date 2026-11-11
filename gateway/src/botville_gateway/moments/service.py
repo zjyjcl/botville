@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import threading
 import time as _time
 from dataclasses import dataclass
@@ -66,6 +67,8 @@ class PersonaNotOwned(Exception):
 class RevisionConflict(Exception):
     """PATCH 的 revision 与服务端不一致（409 moment.revision_conflict）。"""
 
+
+_log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------- 游标
 
@@ -970,13 +973,60 @@ class MomentsService:
 
     # ------------------------------------------------------------ 清理
     def purge(self, now: Optional[datetime] = None) -> Dict[str, int]:
-        """按保留天数硬删已软删的行与过期审计（无后台线程，调用方触发）。"""
+        """按保留天数硬删已软删的行与过期审计（定时调用见 `start_purge_scheduler`）。"""
         current = now if now is not None else self._now()
         soft_cutoff = iso_utc(current - timedelta(days=self._soft_days))
         audit_cutoff = iso_utc(current - timedelta(days=self._audit_days))
         return self.store.purge(
             soft_delete_cutoff=soft_cutoff, audit_cutoff=audit_cutoff
         )
+
+
+    def run_purge_safely(self) -> Optional[Dict[str, int]]:
+        """跑一次 purge；任何异常只记日志、不外抛（不能因清理失败影响服务）。"""
+        try:
+            result = self.purge()
+        except Exception as exc:  # noqa: BLE001 - 清理是尽力而为
+            _log.warning(
+                "moments purge failed: %s: %s", type(exc).__name__, exc
+            )
+            return None
+        if any(result.values()):
+            _log.info("moments purge removed %s", result)
+        return result
+
+    def start_purge_scheduler(self, interval_seconds: float) -> threading.Thread:
+        """后台守护线程：每隔 interval_seconds 跑一次 `run_purge_safely`。
+
+        首次在等待一个间隔后执行（启动时那次由 `build_moments_service`
+        同步执行）。`stop_purge_scheduler()` 可让线程尽快退出。
+        """
+        if interval_seconds <= 0:
+            raise ValueError("interval_seconds must be > 0")
+        self.stop_purge_scheduler()
+        stop = threading.Event()
+        self._purge_stop = stop
+
+        def _loop() -> None:
+            while not stop.wait(interval_seconds):
+                self.run_purge_safely()
+
+        thread = threading.Thread(
+            target=_loop, name="moments-purge", daemon=True
+        )
+        self._purge_thread = thread
+        thread.start()
+        return thread
+
+    def stop_purge_scheduler(self, timeout: Optional[float] = 5.0) -> None:
+        stop = getattr(self, "_purge_stop", None)
+        thread = getattr(self, "_purge_thread", None)
+        if stop is not None:
+            stop.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout)
+        self._purge_stop = None
+        self._purge_thread = None
 
 
 # 「allow_list 省略」的内部哨兵（PATCH 三态：省略 / null / 数组）。
@@ -1001,7 +1051,7 @@ def build_moments_service(
     else:
         # 未配置好友图 = 空图（fail-closed：friends 档下无好友可见）。
         relations = StaticRelationProvider()
-    return MomentsService(
+    service = MomentsService(
         store=store,
         relations=relations,
         persona_dir=EmptyPersonaDirectory(),
@@ -1011,3 +1061,10 @@ def build_moments_service(
         soft_delete_retention_days=config.moments_soft_delete_retention_days,
         audit_retention_days=config.moments_audit_retention_days,
     )
+    # 软删 / 审计清理（#184 审查建议）：间隔 0 = 关闭。启用时启动阶段同步跑
+    # 一次（失败只记日志），之后由守护线程按间隔执行。
+    interval = config.moments_purge_interval_seconds
+    if interval > 0:
+        service.run_purge_safely()
+        service.start_purge_scheduler(interval)
+    return service

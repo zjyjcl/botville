@@ -1227,6 +1227,7 @@ class TestMomentsConfig(unittest.TestCase):
         self.assertEqual(service._audit_days, 180)
         versions = applied_versions(service.store._conn)
         self.assertEqual(list(versions), ["0001_moments"])
+        service.stop_purge_scheduler()
         service.store.close()
 
     def test_env_friends_file(self):
@@ -1273,6 +1274,121 @@ class TestMomentsConfig(unittest.TestCase):
         ))
         with self.assertRaises(ConfigError):
             build_moments_service(config)
+
+
+# ============================================================================
+# #184 审查建议：purge 定时调用（启动一次 + 后台按间隔，可关闭，异常只记日志）
+# ============================================================================
+class TestPurgeScheduler(ServiceTestBase):
+    def _wait_until(self, predicate, timeout=3.0):
+        import time
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return predicate()
+
+    def test_scheduler_runs_repeatedly_and_survives_errors(self):
+        service = self.make_service()
+        calls = []
+
+        def flaky_purge(now=None):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("disk hiccup")
+            return {"events": 0, "posts": 0, "comments": 0}
+
+        service.purge = flaky_purge  # type: ignore[assignment]
+        with self.assertLogs("botville_gateway.moments.service", level="WARNING") as logs:
+            service.start_purge_scheduler(0.02)
+            self.addCleanup(service.stop_purge_scheduler)
+            # 第一次抛异常只记日志，线程继续跑后续轮次。
+            self.assertTrue(self._wait_until(lambda: len(calls) >= 3))
+        self.assertTrue(any("moments purge failed" in line for line in logs.output))
+        thread = service._purge_thread
+        self.assertTrue(thread.daemon)
+        service.stop_purge_scheduler()
+        self.assertFalse(thread.is_alive())
+        stopped_at = len(calls)
+        import time
+        time.sleep(0.1)
+        self.assertEqual(len(calls), stopped_at)
+
+    def test_run_purge_safely_swallows_errors(self):
+        service = self.make_service()
+
+        def boom(now=None):
+            raise ValueError("x")
+
+        service.purge = boom  # type: ignore[assignment]
+        with self.assertLogs("botville_gateway.moments.service", level="WARNING"):
+            self.assertIsNone(service.run_purge_safely())
+
+    def test_invalid_interval_rejected(self):
+        service = self.make_service()
+        with self.assertRaises(ValueError):
+            service.start_purge_scheduler(0)
+
+    def _config(self, tmp, interval):
+        return load_config(dict(
+            _DEV_ENV,
+            GATEWAY_MOMENTS_DB_PATH=os.path.join(tmp, "m.db"),
+            GATEWAY_MOMENTS_PURGE_INTERVAL_SECONDS=interval,
+        ))
+
+    def test_build_runs_startup_purge_and_starts_scheduler(self):
+        tmp = tempfile.mkdtemp(prefix="moments-purge-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        # 先用同一个库造一条早已过保留期的软删动态。
+        seed = build_moments_service(self._config(tmp, "0"))
+        assert seed is not None
+        old = seed.create_moment(ALICE, {"body": "old"})
+        seed.delete_moment(ALICE, old["id"])
+        seed.store._conn.execute(
+            "UPDATE moments_posts SET deleted_at = '2000-01-01T00:00:00Z'"
+        )
+        seed.store._conn.commit()
+        seed.store.close()
+        service = build_moments_service(self._config(tmp, "3600"))
+        assert service is not None
+        self.addCleanup(service.store.close)
+        self.addCleanup(service.stop_purge_scheduler)
+        # 启动阶段同步 purge 已经清掉过期软删行。
+        self.assertIsNone(service.store.get_post(old["id"]))
+        self.assertIsNotNone(service._purge_thread)
+        self.assertTrue(service._purge_thread.is_alive())
+
+    def test_interval_zero_disables(self):
+        tmp = tempfile.mkdtemp(prefix="moments-purge-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        seed = build_moments_service(self._config(tmp, "0"))
+        assert seed is not None
+        old = seed.create_moment(ALICE, {"body": "old"})
+        seed.delete_moment(ALICE, old["id"])
+        seed.store._conn.execute(
+            "UPDATE moments_posts SET deleted_at = '2000-01-01T00:00:00Z'"
+        )
+        seed.store._conn.commit()
+        self.assertIsNone(getattr(seed, "_purge_thread", None))
+        # 关闭时启动不 purge：过期软删行仍在。
+        self.assertIsNotNone(seed.store.get_post(old["id"]))
+        seed.store.close()
+
+    def test_config_interval_parsing(self):
+        self.assertEqual(load_config(_DEV_ENV).moments_purge_interval_seconds, 86400)
+        self.assertEqual(
+            load_config(dict(_DEV_ENV, GATEWAY_MOMENTS_PURGE_INTERVAL_SECONDS="0"))
+            .moments_purge_interval_seconds, 0,
+        )
+        self.assertEqual(
+            load_config(dict(_DEV_ENV, GATEWAY_MOMENTS_PURGE_INTERVAL_SECONDS="60"))
+            .moments_purge_interval_seconds, 60,
+        )
+        for bad in ("30", "-1", "abc", "1.5"):
+            with self.subTest(value=bad):
+                with self.assertRaises(ConfigError):
+                    load_config(dict(_DEV_ENV, GATEWAY_MOMENTS_PURGE_INTERVAL_SECONDS=bad))
 
 
 if __name__ == "__main__":

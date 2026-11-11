@@ -97,6 +97,9 @@ OPENID_CACHE_TTL_MAX_SECONDS = 60
 # A2.2（issue #7）动态模块保留天数（moments.md §7）：软删行硬删 / 审计清理。
 DEFAULT_MOMENTS_SOFT_DELETE_RETENTION_DAYS = 30
 DEFAULT_MOMENTS_AUDIT_RETENTION_DAYS = 90
+# 清理任务间隔（秒）：0 = 关闭；非 0 时至少 60 秒。
+DEFAULT_MOMENTS_PURGE_INTERVAL_SECONDS = 86_400
+MOMENTS_PURGE_INTERVAL_MIN_SECONDS = 60
 
 # N7（契约 §6.3）：平台层 anti_spam / ai_loop 的部署配置。
 # 三个数值项默认 0 = 「平台不设该项」（与 RATE_LIMIT_MESSAGES=0 同语义），
@@ -433,6 +436,8 @@ class Config:
     # 软删行动硬删保留天数（purge；默认 30）/ moments_events 审计保留天数（默认 90）。
     moments_soft_delete_retention_days: int = DEFAULT_MOMENTS_SOFT_DELETE_RETENTION_DAYS
     moments_audit_retention_days: int = DEFAULT_MOMENTS_AUDIT_RETENTION_DAYS
+    # purge 定时间隔（秒）：0 = 关闭；启用时启动跑一次、之后按间隔后台跑。
+    moments_purge_interval_seconds: int = DEFAULT_MOMENTS_PURGE_INTERVAL_SECONDS
 
     def __post_init__(self) -> None:
         # 构造时校验，避免明显错误的配置拖到第一次请求才炸。
@@ -546,6 +551,16 @@ class Config:
             self.moments_audit_retention_days,
             "moments_audit_retention_days",
         )
+        purge_interval = self.moments_purge_interval_seconds
+        if not isinstance(purge_interval, int) or isinstance(purge_interval, bool):
+            raise ConfigError(
+                f"moments_purge_interval_seconds must be an integer, got {purge_interval!r}"
+            )
+        if purge_interval != 0 and purge_interval < MOMENTS_PURGE_INTERVAL_MIN_SECONDS:
+            raise ConfigError(
+                "moments_purge_interval_seconds must be 0 (disabled) or >= "
+                f"{MOMENTS_PURGE_INTERVAL_MIN_SECONDS}, got {purge_interval}"
+            )
         # #124 调用方身份（契约 §1.2.2）。校验放在这里（而非只在 load_config），
         # 保证直接构造 Config 的调用方（测试/嵌入）也走同一套规则。
         self._validate_caller_tokens()
@@ -987,5 +1002,11 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
             "GATEWAY_MOMENTS_AUDIT_RETENTION_DAYS",
             DEFAULT_MOMENTS_AUDIT_RETENTION_DAYS,
             minimum=1,
+        ),
+        moments_purge_interval_seconds=_env_int(
+            source,
+            "GATEWAY_MOMENTS_PURGE_INTERVAL_SECONDS",
+            DEFAULT_MOMENTS_PURGE_INTERVAL_SECONDS,
+            minimum=0,
         ),
     )
