@@ -65,12 +65,14 @@ public actor MatrixOpenIDTokenProvider {
 
     public init(now: @escaping @Sendable () -> Date = { Date() },
                 requestTimeout: TimeInterval = defaultRequestTimeout,
-                timeoutSleep: @escaping TimeoutSleep = { try await Task.sleep(for: .seconds($0)) },
+                timeoutSleep: TimeoutSleep? = nil,
                 source: @escaping Source) {
         precondition(requestTimeout.isFinite && requestTimeout > 0)
         self.now = now
         self.requestTimeout = requestTimeout
-        self.timeoutSleep = timeoutSleep
+        // Keep the async closure inside this module: older Swift linkers can
+        // mix async context layouts emitted for public default-argument closures.
+        self.timeoutSleep = timeoutSleep ?? { try await Task.sleep(for: .seconds($0)) }
         self.source = source
     }
 
