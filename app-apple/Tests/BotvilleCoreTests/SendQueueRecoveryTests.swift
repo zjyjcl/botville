@@ -101,7 +101,7 @@ final class SendQueueRecoveryTests: XCTestCase {
             sessionStore: InMemorySessionStore(credentials),
             storeDirectory: SessionStoreDirectory(baseURL: directory),
             discovery: FakeDiscovery(), monitorNetwork: false
-        )
+        , sharedRoomMuteStore: MemoryRoomMuteStore())
         service.clientFactory = { _, _, _ in client }
         await service.restoreSession()
         try await waitUntil { service.connectionStatus == .connected }
@@ -151,6 +151,8 @@ private struct FakeDiscovery: LoginCapabilityDiscovering {
 }
 
 private final class FakeClient: Client, @unchecked Sendable {
+    let notificationSettings = TestNotificationSettings()
+    override func getNotificationSettings() async -> NotificationSettings { notificationSettings }
     private let room: FakeRoom
 
     init(room: FakeRoom) {

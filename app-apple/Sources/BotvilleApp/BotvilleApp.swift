@@ -123,6 +123,7 @@ struct BotvilleApp: App {
         .onChange(of: showsGatewayFeatures) { _, visible in
             if !visible && selectedTab == 1 { selectedTab = 0 }
         }
+        .onChange(of: matrixService.roomNotifications.states) { _, _ in updateBannerContext() }
         .onReceive(matrixService.foregroundBannerCandidates) { candidate in
             updateBannerContext()
             foregroundBanner.receive(candidate)
@@ -182,7 +183,8 @@ struct BotvilleApp: App {
                 isCompact: false, showsDetail: true,
                 isSceneActive: scenePhase == .active, isChatTab: chatVisible,
                 joinedRoomIDs: matrixService.rooms.filter { $0.membership == .joined }.map(\.id)),
-            isInputActive: chatVisible && visibleRoomID != nil && isRoomInputActive)
+            isInputActive: chatVisible && visibleRoomID != nil && isRoomInputActive,
+            mutedRoomIDs: Set(matrixService.rooms.filter { matrixService.roomNotifications.isMuted($0.id) }.map(\.id)))
     }
 
     var body: some Scene {
@@ -417,7 +419,7 @@ final class PushNotificationCenter: NSObject, UNUserNotificationCenterDelegate {
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
         let options = UNNotificationPresentationOptions(
-            rawValue: PushNotificationPresentation.foreground.unNotificationPresentationRawValue)
+            rawValue: PushNotificationPresentation.foreground(mutedRoomHashes: (try? SharedRoomMuteStore().load()) ?? []).unNotificationPresentationRawValue)
 #if DEBUG
         Self.probe("willPresent", detail: "optionsRaw=\(options.rawValue)")
 #endif

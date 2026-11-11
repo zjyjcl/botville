@@ -32,7 +32,7 @@ struct RoomListView: View {
                 Section("会话") {
                     ForEach(joined) { room in
                         NavigationLink(value: room.id) {
-                            RoomRow(room: room)
+                            RoomRow(room: room, isMuted: service.roomNotifications.isMuted(room.id))
                         }
                         .tag(room.id)
                     }
@@ -123,6 +123,11 @@ struct RoomListView: View {
 @MainActor
 private struct RoomRow: View {
     let room: MatrixRoom
+    let isMuted: Bool
+
+    private var notificationPresentation: RoomMuteListPresentation {
+        RoomMuteListPresentation(isMuted: isMuted, unreadCount: room.unreadCount)
+    }
 
     var body: some View {
         HStack(spacing: 10) {
@@ -134,8 +139,18 @@ private struct RoomRow: View {
                 EncryptionBadge(room: room)
             }
             Spacer()
-            if room.unreadCount > 0 {
-                Text(room.unreadCount, format: .number)
+            if let symbol = notificationPresentation.symbol {
+                Image(systemName: symbol)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("消息免打扰")
+            }
+            if notificationPresentation.showsUnreadDot {
+                Circle().fill(.red).frame(width: 8, height: 8)
+                    .accessibilityLabel("有未读消息")
+            }
+            if let count = notificationPresentation.unreadNumber {
+                Text(count, format: .number)
                     .font(.caption.bold())
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
@@ -328,7 +343,7 @@ private struct InvitationRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            RoomRow(room: room)
+            RoomRow(room: room, isMuted: service.roomNotifications.isMuted(room.id))
             HStack {
                 Button("拒绝", role: .destructive) { respond(accept: false) }
                 Button("接受") { respond(accept: true) }

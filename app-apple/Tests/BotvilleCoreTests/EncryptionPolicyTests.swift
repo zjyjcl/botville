@@ -23,9 +23,72 @@ final class EncryptionPolicyTests: XCTestCase {
         XCTAssertEqual(AIParticipantPolicy(userIDPatterns: ["^@bot", "["]).classify(memberIDs: ["@person:example.org"]), .unknown)
         XCTAssertEqual(AIParticipantPolicy.configured(environment: [AIParticipantPolicy.prefixConfigurationKey: "invalid"], infoDictionary: [AIParticipantPolicy.prefixConfigurationKey: ["@ai:"]]).classify(memberIDs: ["@person:example.org"]), .unknown)
     }
-    func testUnmergedA13NamespaceDoesNotCreateAnImplicitAIrule() {
+    func testDefaultRuleMirrorsAppserviceUsersNamespace() {
         let policy = AIParticipantPolicy.configured(environment: [:], infoDictionary: [:])
-        XCTAssertEqual(policy.classify(memberIDs: ["@ai_helper:matrix.test"]), .unknown)
+        XCTAssertTrue(policy.hasConfiguredRules)
+        XCTAssertNil(policy.configurationNotice)
+        XCTAssertEqual(AIParticipantPolicy.defaultUserIDPatterns, ["^@ai_[^:]*:"])
+        // Appservice-namespace accounts are AI; ordinary accounts count as human.
+        XCTAssertEqual(policy.classify(memberIDs: ["@ai_helper:matrix.test"]), .containsAI)
+        XCTAssertEqual(policy.classify(memberIDs: ["@alice:matrix.test", "@ai_echo:matrix.test"]), .containsAI)
+        XCTAssertEqual(policy.classify(memberIDs: ["@alice:matrix.test", "@bob:matrix.test"]), .humanOnly)
+        XCTAssertEqual(policy.classify(memberIDs: nil), .unknown)
+        // Boundaries.
+        XCTAssertEqual(policy.classify(memberIDs: ["@ai_:matrix.test"]), .containsAI, "empty remainder, like ^@ai_.*")
+        XCTAssertEqual(policy.classify(memberIDs: ["@ai_x:matrix.test:8448"]), .containsAI, "server with port")
+        XCTAssertEqual(policy.classify(memberIDs: ["@ai_helper:other.example"]), .containsAI, "federated ai_ fails safe")
+        XCTAssertEqual(policy.classify(memberIDs: ["@AI_helper:matrix.test"]), .humanOnly, "case-sensitive like appservice")
+        XCTAssertEqual(policy.classify(memberIDs: ["@Ai_helper:matrix.test"]), .humanOnly)
+        XCTAssertEqual(policy.classify(memberIDs: ["@my_ai_helper:matrix.test"]), .humanOnly, "ai_ not at localpart start")
+        XCTAssertEqual(policy.classify(memberIDs: ["@xai_bot:matrix.test"]), .humanOnly)
+        XCTAssertEqual(policy.classify(memberIDs: ["@ai-helper:matrix.test"]), .humanOnly, "hyphen is outside the namespace")
+        XCTAssertEqual(policy.classify(memberIDs: ["@aihelper:matrix.test"]), .humanOnly)
+        XCTAssertEqual(policy.classify(memberIDs: ["@alice:ai_server.test"]), .humanOnly, "ai_ in server name only")
+    }
+    func testDefaultMatchesAppserviceRegexForLocalMXIDs() throws {
+        // Template value with BOTVILLE_SERVER_NAME_REGEX substituted (init.sh escapes the server name).
+        let appservice = try NSRegularExpression(pattern: "^@ai_.*:matrix\\.test$")
+        let app = try NSRegularExpression(pattern: AIParticipantPolicy.defaultUserIDPatterns[0])
+        func matches(_ re: NSRegularExpression, _ id: String) -> Bool {
+            re.firstMatch(in: id, range: NSRange(id.startIndex..., in: id)) != nil
+        }
+        for id in ["@ai_:matrix.test", "@ai_a:matrix.test", "@ai_helper.bot=1/x:matrix.test", "@ai__x:matrix.test",
+                   "@alice:matrix.test", "@AI_x:matrix.test", "@my_ai_x:matrix.test", "@ai-x:matrix.test", "@ai:matrix.test"] {
+            XCTAssertEqual(matches(app, id), matches(appservice, id), id)
+        }
+    }
+    func testOverrideReplacesDefault() {
+        let env = AIParticipantPolicy.configured(environment: [AIParticipantPolicy.patternConfigurationKey: "[\"^@bot_[^:]+:example\\\\.org$\"]"], infoDictionary: [:])
+        XCTAssertEqual(env.classify(memberIDs: ["@bot_echo:example.org"]), .containsAI)
+        XCTAssertEqual(env.classify(memberIDs: ["@ai_helper:example.org"]), .humanOnly, "override is authoritative; default not merged")
+        let plist = AIParticipantPolicy.configured(environment: [:], infoDictionary: [AIParticipantPolicy.prefixConfigurationKey: ["@robot:"]])
+        XCTAssertEqual(plist.classify(memberIDs: ["@robot:example.org"]), .containsAI)
+        XCTAssertEqual(plist.classify(memberIDs: ["@ai_helper:example.org"]), .humanOnly)
+        // Environment wins over Info.plist.
+        let both = AIParticipantPolicy.configured(environment: [AIParticipantPolicy.prefixConfigurationKey: "[\"@env:\"]"],
+                                                  infoDictionary: [AIParticipantPolicy.prefixConfigurationKey: ["@plist:"]])
+        XCTAssertEqual(both.classify(memberIDs: ["@plist:example.org"]), .humanOnly)
+        XCTAssertEqual(both.classify(memberIDs: ["@env:example.org"]), .containsAI)
+        // An explicitly empty override has no rules: conservative unknown, not the default.
+        let empty = AIParticipantPolicy.configured(environment: [AIParticipantPolicy.patternConfigurationKey: "[]"], infoDictionary: [:])
+        XCTAssertFalse(empty.hasConfiguredRules)
+        XCTAssertNotNil(empty.configurationNotice)
+        XCTAssertEqual(empty.classify(memberIDs: ["@alice:example.org"]), .unknown)
+    }
+    func testInvalidOverrideFailsClosedInsteadOfUsingDefault() {
+        for env in [[AIParticipantPolicy.patternConfigurationKey: "[\"[\"]"],
+                    [AIParticipantPolicy.patternConfigurationKey: "not json"],
+                    [AIParticipantPolicy.prefixConfigurationKey: "{}"]] {
+            let policy = AIParticipantPolicy.configured(environment: env, infoDictionary: [:])
+            XCTAssertFalse(policy.hasConfiguredRules)
+            XCTAssertNotNil(policy.configurationNotice)
+            XCTAssertEqual(policy.classify(memberIDs: ["@alice:example.org"]), .unknown)
+            XCTAssertEqual(policy.classify(memberIDs: ["@ai_helper:example.org"]), .unknown)
+        }
+        let badPlist = AIParticipantPolicy.configured(environment: [:], infoDictionary: [AIParticipantPolicy.patternConfigurationKey: "^@ai_"])
+        XCTAssertEqual(badPlist.classify(memberIDs: ["@alice:example.org"]), .unknown)
+        let badRegex = AIParticipantPolicy.configured(environment: [:], infoDictionary: [AIParticipantPolicy.patternConfigurationKey: ["^@ok_", "("]])
+        XCTAssertEqual(badRegex.classify(memberIDs: ["@alice:example.org"]), .unknown)
     }
     func testPresentationMapsStatesWithoutColourOnlyMeaning() {
         let encrypted = EncryptionPresentation(encryption: .encrypted, participants: .humanOnly)

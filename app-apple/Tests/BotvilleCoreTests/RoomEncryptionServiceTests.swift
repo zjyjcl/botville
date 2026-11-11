@@ -185,6 +185,23 @@ final class RoomEncryptionServiceTests: XCTestCase {
         XCTAssertEqual(human.invitedUsers, ["@person:matrix.test"])
     }
 
+    func testDefaultPolicyRejectsAppserviceAIInEncryptedRoomButAllowsHuman() async throws {
+        let defaultPolicy = AIParticipantPolicy.configured(environment: [:], infoDictionary: [:])
+        let room = SecurityRoom(state: .encrypted, members: [securityMember("@owner:matrix.test", .join)], activeCount: 1)
+        let service = try await readyService(client: SecurityClient(room: room), policy: defaultPolicy)
+        for aiID in ["@ai_helper:matrix.test", "@ai_:matrix.test", "@ai_echo:other.example"] {
+            await XCTAssertThrowsErrorAsync(try await service.inviteUser(aiID, to: room.id())) { error in
+                guard case MatrixServiceError.encryptedRoomParticipantNotAllowed = error else {
+                    return XCTFail("Expected encrypted-room AI rejection for \(aiID), got \(error)")
+                }
+            }
+        }
+        XCTAssertTrue(room.invitedUsers.isEmpty)
+        try await service.inviteUser("@person:matrix.test", to: room.id())
+        try await service.inviteUser("@my_ai_fan:matrix.test", to: room.id())
+        XCTAssertEqual(room.invitedUsers, ["@person:matrix.test", "@my_ai_fan:matrix.test"])
+    }
+
     func testPlaintextRoomStillAllowsAIInvitation() async throws {
         let room = SecurityRoom(state: .notEncrypted, members: [securityMember("@owner:matrix.test", .join)], activeCount: 1)
         let service = try await readyService(client: SecurityClient(room: room), policy: AIParticipantPolicy(userIDPrefixes: ["@ai-"]))
@@ -250,7 +267,7 @@ final class RoomEncryptionServiceTests: XCTestCase {
         let baseDirectory = appDirectory.appendingPathComponent(".build/c26-service-tests/\(UUID().uuidString)")
         temporaryDirectories.append(baseDirectory)
         let directory = SessionStoreDirectory(baseURL: baseDirectory)
-        let service = MatrixService(sessionStore: store, storeDirectory: directory, monitorNetwork: false, aiParticipantPolicy: policy)
+        let service = MatrixService(sessionStore: store, storeDirectory: directory, monitorNetwork: false, aiParticipantPolicy: policy, sharedRoomMuteStore: MemoryRoomMuteStore())
         service.clientFactory = { _, _, _ in client }
         await service.restoreSession()
         XCTAssertTrue(service.isLoggedIn)
@@ -271,6 +288,8 @@ private final class SecurityStore: SessionStore, @unchecked Sendable {
 }
 
 private final class SecurityClient: Client, @unchecked Sendable {
+    let notificationSettings = TestNotificationSettings()
+    override func getNotificationSettings() async -> NotificationSettings { notificationSettings }
     let room: SecurityRoom?
     let securityEncryption: SecurityEncryption
     private(set) var createRequests: [CreateRoomParameters] = []
