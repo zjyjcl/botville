@@ -1769,7 +1769,9 @@ paths:
         响应体**逐字节相同**，不泄露存在性。动态可见即允许评论（如同服陌生人对
         `server` / `paired_servers` 动态可评论）。`reply_to_comment_id` 可选，
         类型为 `string | null`：省略或显式 `null` 均为顶层评论（建议省略该字段
-        而不是发 `null`）；非空字符串必须指向同一动态下的评论。
+        而不是发 `null`）。非空字符串必须指向同一动态下的评论；**请求 schema 不设
+        ULID pattern**，格式不像 ULID 的字符串由服务端按语义返回 422（见
+        `CreateCommentRequest`）。
 
         评论写成功后，它对其他查看者的可见性同样遵循
         `can_view(viewer, moment) ∧ can_see_interaction(viewer, moment, actor)`
@@ -4953,13 +4955,14 @@ components:
           maxLength: 500
         reply_to_comment_id:
           type: [string, 'null']
-          pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
           description: |
             可选，`string | null`。被回复评论的 ID，必须属于同一动态。省略或显式
             `null` 均为顶层评论（`null` 视同省略，与实现一致）；建议客户端省略该
-            字段而不是发 `null`。目标不存在、已软删、不在本动态、或对当前查看者不可见时，
-            统一 `422` `request.invalid`（`errors[].field = reply_to_comment_id`），
-            不区分原因。
+            字段而不是发 `null`。本字段**不设 ULID `pattern`**：格式不像 ULID 的
+            字符串与「不存在 / 已软删 / 不在本动态 / 对当前查看者不可见」一样，由
+            服务端统一返回 `422` `request.invalid`（`errors[].field =
+            reply_to_comment_id`），不区分原因——避免客户端先做 schema 校验时在本地
+            拦下，到不了 422。非字符串、非 null 的类型错误仍是 `400`。
       additionalProperties: false
 
     CommentPage:

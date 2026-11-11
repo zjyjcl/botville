@@ -267,3 +267,14 @@ volumes:
   synapse-data:
   tuwunel-data:
   continuwuity-data:
+  # 网关本地数据（A2.2 / #7）：moments SQLite 等。约定挂载路径
+  # /var/lib/botville-gateway，对应 GATEWAY_MOMENTS_DB_PATH=
+  # /var/lib/botville-gateway/moments.db。
+  # 网关进程尚未作为 compose 服务加入（无 Dockerfile；镜像内迁移目录
+  # 定位见 gateway/docs/moments.md §10），本卷先声明以便备份脚本按名
+  # 归档。卷不存在时 backup-synapse.sh 跳过、不失败；首次使用可：
+  #   docker volume create --label com.docker.compose.project=<项目名> \
+  #     --label com.docker.compose.volume=gateway-data \
+  #     <项目名>_gateway-data
+  # 带 compose 标签后 `docker compose down -v` 会一并删掉。
+  gateway-data:

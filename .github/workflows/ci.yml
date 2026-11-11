@@ -5,8 +5,9 @@
 #         All three profiles are required-green; images are pinned
 #         (tag@sha256 digest), so failures are real failures.
 # backup-restore (A1.1, synapse only): init -> open registration -> up ->
-#         e2e seed -> backup -> down -v (wipe volumes) -> up (fresh stack) ->
-#         restore -> e2e verify, proving the backup is actually restorable.
+#         e2e seed -> seed gateway-data volume -> backup (must contain
+#         gateway-data.tar.gz) -> down -v (wipe volumes) -> up (fresh stack) ->
+#         restore -> e2e verify + gateway-data marker verify.
 # push-e2e (A1.2, all three homeservers): up with the push profile (sygnal +
 #         org.botville.mock pushkin), then server/tests/push_e2e.py asserts
 #         HS -> sygnal push latency < 5s, an event_id_only payload with no
@@ -135,20 +136,50 @@ jobs:
       - name: Seed e2e data (alice/bob/carol, DM, group)
         run: make e2e E2E_PHASE=seed
 
+      - name: Seed gateway-data volume
+        run: |
+          set -euo pipefail
+          project="$(python3 -c "
+          name = 'botville'
+          for line in open('server/compose/.env', encoding='utf-8'):
+              if line.startswith('COMPOSE_PROJECT_NAME='):
+                  name = line.split('=', 1)[1].strip()
+          print(name)
+          ")"
+          vol="${project}_gateway-data"
+          docker volume create \
+            --label "com.docker.compose.project=${project}" \
+            --label "com.docker.compose.volume=gateway-data" \
+            "${vol}"
+          docker compose -p "${project}" -f server/compose/docker-compose.yml \
+            --env-file server/compose/.env --profile synapse \
+            run --rm --no-deps --entrypoint sh \
+            -v "${vol}:/gateway-data" \
+            synapse \
+            -c 'printf "botville-gateway-data-seed\n" > /gateway-data/moments.db'
+          echo "SEEDED_GATEWAY_VOLUME=${vol}" >> "$GITHUB_ENV"
+
       - name: Backup
         run: |
-          set -o pipefail
+          set -euo pipefail
           bash server/scripts/backup-synapse.sh
           # The script records its target dir in backups/.last-backup; reading
           # it from there (instead of piping to tail) cannot swallow a failure.
           backup_dir="$(cat backups/.last-backup)"
           echo "backup dir: ${backup_dir}"
+          test -f "${backup_dir}/gateway-data.tar.gz"
+          grep -q 'gateway-data.tar.gz' "${backup_dir}/manifest.txt"
           echo "RESTORE_DIR=${backup_dir}" >> "$GITHUB_ENV"
 
       - name: Wipe volumes (simulated disaster)
         run: |
           docker compose -f server/compose/docker-compose.yml \
             --env-file server/compose/.env --profile synapse down -v --remove-orphans
+          # Labelled volumes should already be gone; rm -f so verify cannot
+          # pass on leftover data if compose left the volume behind.
+          if [ -n "${SEEDED_GATEWAY_VOLUME:-}" ]; then
+            docker volume rm -f "${SEEDED_GATEWAY_VOLUME}" || true
+          fi
 
       - name: Restart empty stack
         run: make up HS=synapse
@@ -158,6 +189,19 @@ jobs:
 
       - name: Verify e2e data survived
         run: make e2e E2E_PHASE=verify
+
+      - name: Verify gateway-data survived
+        run: |
+          set -euo pipefail
+          vol="${SEEDED_GATEWAY_VOLUME:?}"
+          docker volume inspect "${vol}" >/dev/null
+          project="${vol%_gateway-data}"
+          docker compose -p "${project}" -f server/compose/docker-compose.yml \
+            --env-file server/compose/.env --profile synapse \
+            run --rm --no-deps --entrypoint sh \
+            -v "${vol}:/gateway-data:ro" \
+            synapse \
+            -c 'grep -qx botville-gateway-data-seed /gateway-data/moments.db'
 
       - name: Dump logs
         if: failure()

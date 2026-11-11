@@ -287,13 +287,28 @@ make backup
 | --- | --- |
 | `synapse-db.dump` | `pg_dump -Fc` 数据库快照（postgres 保持运行中导出） |
 | `synapse-data.tar.gz` | `media_store`、`signing.key`（短暂停 synapse 保证与数据库一致） |
+| `gateway-data.tar.gz` | （可选）compose 卷 `gateway-data` 的整卷归档：moments SQLite（尽量先 `wal_checkpoint`，否则 `moments.db` 与 `-wal`/`-shm` 一并打包）。**卷不存在则跳过，不写此文件**（网关进程尚未加入 compose，默认栈没有该卷）。旧备份没有此文件时，恢复不碰该卷 |
 | `homeserver.yaml` | 渲染后的 Synapse 配置副本 |
-| `env` | `.env` 副本，**含全部密钥** |
-| `manifest.txt` | 备份时间、镜像、每个文件的 sha256 |
+| `env` | `.env` 副本，**含全部密钥**（网关密钥若写在这份 `.env` 里会随它备份；`gateway-data` 卷只含业务数据，不另存密钥） |
+| `manifest.txt` | 备份时间、镜像、每个文件的 sha256（有 `gateway-data.tar.gz` 时也列入） |
 
 **整个备份目录等同密钥库**：脚本以 umask 077 运行，并强制**目录权限 700、
 所有文件权限 600**（含容器内生成的 tar，结束前自检，不达标即报错）；不要明文放
 公网网盘、建议至少一份离线/异地。
+
+**网关数据**（`gateway-data` 卷，A2.2 / #7）：约定目录 `/var/lib/botville-gateway`，
+动态库路径 `GATEWAY_MOMENTS_DB_PATH=/var/lib/botville-gateway/moments.db`。
+卷在 `server/compose/docker-compose.yml` 已声明，但网关还不是 compose 服务，
+默认 `make up` **不会创建**该卷。若要开始往卷里写数据（或让备份采到它），先：
+
+```bash
+# 项目名与 server/compose/.env 的 COMPOSE_PROJECT_NAME 一致，默认 botville
+docker volume create --label com.docker.compose.project=botville   --label com.docker.compose.volume=gateway-data   botville_gateway-data
+```
+
+（带 compose 标签后，`docker compose down -v` / `make down` 的 `-v` 会一并删除。）
+若网关以主机进程方式打开了该卷上的 SQLite 文件，备份前请先停掉网关，以免拷到半截 WAL。
+保留天数沿用现有备份目录清理惯例（上文 crontab 的 14 天），本卷不另设保留期。
 
 **备份介质必须支持 Unix 权限位**：备份目录 700、文件 600 这套权限要原样落在
 备份介质上。目标盘/挂载点须是 ext4、btrfs、ZFS、APFS 等保留权限的文件系统
@@ -317,7 +332,9 @@ make backup
 
 ### 恢复
 
-**恢复是破坏性操作**：会用备份覆盖当前数据库、数据卷、`.env` 和渲染配置。脚本需要
+**恢复是破坏性操作**：会用备份覆盖当前数据库、`synapse-data` 数据卷、`.env` 和渲染配置。
+若备份含 `gateway-data.tar.gz`，也会重建并覆盖 `gateway-data` 卷；若没有该文件（旧备份
+或当时卷不存在），**不碰**现有 `gateway-data` 卷。脚本需要
 `--yes` 才执行（`make restore` 目标已自动带上）。
 
 在**原机器**上恢复：

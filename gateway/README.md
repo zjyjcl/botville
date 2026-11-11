@@ -256,7 +256,7 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `USAGE_RETENTION_SECONDS` | `2592000` | 用量事件保留期（秒，≥3600）。启动校验必须 **≥ `max(RATE_LIMIT_WINDOW_SECONDS, PLATFORM_ANTI_SPAM_COOLDOWN_SECONDS)`**（平台冷却 0 不参与），否则拒绝启动（N5：保留期短于窗口/冷却会静默 fail-open） |
 | `MAX_USAGE_EVENTS` | `10000` | 内存用量事件条数上限（超出按最旧优先淘汰，≥1） |
 | `MAX_IDEMPOTENCY_ENTRIES` | `2000` | 幂等缓存条目上限（LRU 淘汰，≥1） |
-| `IDEMPOTENCY_TTL_SECONDS` | `86400` | 幂等缓存保留时长（秒，`0` = 不过期） |
+| `IDEMPOTENCY_TTL_SECONDS` | `86400` | 幂等缓存保留时长（秒，`0` = 不过期，只受容量淘汰；网关重启后清空）。全局写接口与动态端点同样生效，已在 `.env.example` 登记 |
 | `MAX_QUEUE_ENTRIES` | `1000` | deferred 排程条目上限（LRU 淘汰，≥1） |
 | `GATEWAY_ACCESS_LOG` | `false` | 是否打印访问日志 |
 | `GATEWAY_MATRIX_TRANSPORT` | `memory` | `memory`=内存假后端（B1.1 现状）；`appservice`=真实 homeserver 代发（A1.3，见 [docs/deploy/appservice.md](../docs/deploy/appservice.md)） |
@@ -268,7 +268,7 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_ROOM_ALIAS_PREFIX` | `botville_conv_` | conversation → 房间别名 localpart 前缀（`^[a-z0-9._=-]{1,64}$`）；改前缀须同步改部署模板的 exclusive aliases 正则（`server/compose/appservice/botville-gateway.yaml.tmpl`） |
 | `GATEWAY_ROOM_ALIAS_CACHE_TTL` | `60` | 别名 → room_id 进程内缓存 TTL（秒），过期重新 directory lookup；`0` = 不缓存，负数拒绝启动 |
 | `GATEWAY_ALLOW_INSECURE_HS` | `false` | 显式放行明文 `http://` 的跨主机 homeserver（接受 as_token 明文传输风险） |
-| `GATEWAY_MOMENTS_DB_PATH` | *(空)* | 动态（A2.2 / #7）SQLite 路径，WAL；启动时自动执行 `gateway/migrations/moments/` 迁移（幂等）。**留空 = 关闭动态模块**（`/v1/moments*` 鉴权后仍 404/405）。详见 [docs/moments.md](docs/moments.md) §7 |
+| `GATEWAY_MOMENTS_DB_PATH` | *(空)* | 动态（A2.2 / #7）SQLite 路径，WAL；启动时自动执行 `gateway/migrations/moments/` 迁移（幂等）。**留空 = 关闭动态模块**（`/v1/moments*` 鉴权后仍 404/405）。compose 卷 `gateway-data` 约定路径 `/var/lib/botville-gateway/moments.db`，见 [docs/moments.md](docs/moments.md) §7 / §8 |
 | `GATEWAY_MOMENTS_FRIENDS_FILE` | *(空)* | 临时好友图 JSON（`{"friends": [["@a:hs","@b:hs"], ...]}`，无向边，启动时读一次，结构非法拒绝启动）。**留空 = 空好友图**：A2.3（#8）落地前「好友可见」等同「仅自己」，见 moments.md §7.1 |
 | `GATEWAY_MOMENTS_SOFT_DELETE_RETENTION_DAYS` | `30` | 软删动态/评论硬删前的保留天数（由定时清理执行） |
 | `GATEWAY_MOMENTS_AUDIT_RETENTION_DAYS` | `90` | `moments_events` 审计默认保留 90 天（由定时清理执行） |

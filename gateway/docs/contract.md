@@ -387,13 +387,17 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 
 动态端点的三条口径（#184 已实现，此处登记）：
 
-1. **`reply_to_comment_id`**：省略或显式 `null` → 顶层评论（`null` 视同省略，返回 `201`）。
-   OpenAPI 请求 schema 为 `string | null`（`type: [string, 'null']`），与实现一致；建议
-   客户端省略该字段而不是发 `null`。其余类型错误（数字、
-   布尔、对象、数组、空串）→ **`400 request.invalid`**（结构/类型错误，§1.3）。类型正确但值找不到——包括**格式不像
-   ULID 的字符串**、评论不存在、已软删、不属于同一动态、对调用者不可见——**统一**
-   **`422 request.invalid`**（`errors[].field = reply_to_comment_id`）：类型对但值找不到算
-   语义错误，且不区分原因，避免借 400/422 差异探测评论 ULID。
+1. **`reply_to_comment_id`** 校验顺序（先类型、后语义）：
+   - **类型**：省略或显式 `null` → 顶层评论（`null` 视同省略，返回 `201`）。其余类型错误
+     （数字、布尔、对象、数组、空串）→ **`400 request.invalid`**（结构/类型错误）。
+     OpenAPI 请求 schema 为 `string | null`（`type: [string, 'null']`），**不设 ULID
+     `pattern`**，避免客户端先做 schema 校验时把「格式不像 ULID 的字符串」拦在本地、
+     到不了服务端的 422。建议客户端省略该字段而不是发 `null`。
+   - **语义**：类型正确但值找不到——包括**格式不像 ULID 的字符串**、评论不存在、已软删、
+     不属于同一动态、对调用者不可见——**统一** **`422 request.invalid`**
+     （`errors[].field = reply_to_comment_id`），不区分原因，避免借 400/422 差异探测评论 ULID。
+     响应实体 `MomentComment.reply_to_comment_id` 仍带 ULID `pattern`（服务端写出的值总是
+     合法 ULID 或 `null`）。
 2. **评论幂等重放先过可见性**：`POST /moments/{moment_id}/comments` 先做可见性检查、
    后查幂等缓存。动态被删除或作者与调用者解除好友后，用原 `Idempotency-Key` 重放同一
    评论返回 **`404 moment.not_found`**，而不是原回执（见 §1.5「动态端点」）。
@@ -1108,8 +1112,8 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
-| 0.1.0 | 2026-11-11 | [#7 A2.2 动态幂等 TTL=0 对齐（续）] `CreateCommentRequest.reply_to_comment_id` 由 `string` 改为 OpenAPI 3.1 的 `type: [string, 'null']`，与实现「显式 `null` 视同省略、返回 201」对齐（`MomentComment` 响应字段原本已是 `string | null`）。文档保留「建议客户端省略该字段而不是发 `null`」。不改运行时行为、状态码或字段集合。 |
-| 0.1.0 | 2026-11-11 | [#7 A2.2 动态幂等 TTL=0 对齐 + 文档勘误，不改字段/状态码/OpenAPI] **行为修正**：动态端点（`POST /moments`、`POST /moments/{moment_id}/comments`）的幂等缓存在 `IDEMPOTENCY_TTL_SECONDS=0` 时改为**不过期**（此前误作立即过期、同 key 重放会再写一次），与全局约定一致；默认 86400 与正数 TTL 行为不变。**文档勘误**：§1.3 动态口径 1 写明 `reply_to_comment_id` 显式 `null` 视同省略（201，与实现一致），其余类型错误 400；§1.3 总表 422 行补 `reply_to_comment_id`；§1.5 删去 TTL=0 已知差异。同步 `moments.md` §6（删「已知差异」、补 `null`）、§7.1（好友文件不校验 user id 格式）、§8（`gateway-data` 卷与备份改为未做，与 §10 一致）。 |
+| 0.1.0 | 2026-11-11 | [#7 A2.2 compose `gateway-data` 卷与备份 + #187 审查建议] （1）`CreateCommentRequest.reply_to_comment_id` **去掉 ULID `pattern`**，与「格式不像 ULID 的字符串由服务端返回 422」对齐，避免客户端本地 schema 校验提前拦截；§1.3 / `moments.md` §6 写清校验顺序（先类型 400，后语义 422）。响应字段 pattern 保留。（2）`gateway/.env.example` 补登记 `IDEMPOTENCY_TTL_SECONDS`（默认 86400，`0` = 缓存不过期，含动态端点）。（3）compose 新增命名卷 `gateway-data`，`backup-synapse.sh` / `restore-synapse.sh` 纳入该卷（存在才归档；旧备份无此文件则恢复时不碰该卷）；同步 `moments.md` §8/§10 与部署文档。不改运行时 API 行为。 |
+| 0.1.0 | 2026-11-11 | [#7 / #187 A2.2 动态幂等 TTL=0 对齐 + 文档勘误 + OpenAPI 对齐] **行为修正**：动态端点（`POST /moments`、`POST /moments/{moment_id}/comments`）的幂等缓存在 `IDEMPOTENCY_TTL_SECONDS=0` 时改为**不过期**（此前误作立即过期、同 key 重放会再写一次），与全局约定一致；默认 86400 与正数 TTL 行为不变。**OpenAPI**（与合入后的最终状态一致，含后续提交 `fa4303a`）：`CreateCommentRequest.reply_to_comment_id` 为 `type: [string, 'null']`（OpenAPI 3.1），与实现「显式 `null` 视同省略、返回 201」对齐（`MomentComment` 响应字段原本已是 `string | null`）。**文档勘误**：§1.3 动态口径 1 写明省略/`null` → 201、其余类型错误 400；§1.3 总表 422 行补 `reply_to_comment_id`；§1.5 删去 TTL=0 已知差异。同步 `moments.md` §6（删「已知差异」、补 `null`）、§7.1（好友文件不校验 user id 格式）、§8（当时将 `gateway-data` 卷与备份标为未做）。文档保留「建议客户端省略该字段而不是发 `null`」。 |
 | 0.1.0 | 2026-11-11 | [#7 A2.2 动态文档对齐，**纯文档**，不改字段/状态码/行为/OpenAPI] 登记 #184 已实现的错误码 `404 moment.not_found`、`409 moment.revision_conflict`（§1.3 总表与动态错误码小表）；写明三条口径：`reply_to_comment_id` 类型错误 400、值找不到（含非 ULID 字符串）统一 422；评论幂等重放先过可见性，删动态/解除好友后原 key 重放返回 404；非法请求目标 400 `request.invalid`（§1.1 新增「请求目标」）。§1.5 增「动态端点」幂等作用域与授权先于缓存。同步 `moments.md` §6/§7/§9/§10 与 `gateway/README.md` 配置表。 |
 | 0.1.0 | 2026-11-11 | [#124 退场 v2 文档对齐，**纯文档**，不改字段/状态码/错误码/security] 统一「退场 v2」口径：App 对 `/moments*` 只发 `Authorization: MatrixOpenID <token>`（`matrixOpenIdToken`），无 feature flag、无回退，**禁止**以用户 Matrix access token 当 `Bearer` 兜底；网关继续接受 `Authorization: Bearer <Matrix access token>`（`matrixUserToken`→whoami），那是**留给 App 以外其他调用方**的阶段 1 共存路径，未标 `deprecated`、仍有效。改动文件与要点：**(1)** `gateway/docs/contract.md` §1.2.3 凭据表「适用范围」注明并存期为 App 以外调用方；「移除 `matrixUserToken` 的条件」改写为 v2 退场节奏 T1 观察 #7 上线后 App 流量 → T2 清点 Bearer 调用方（届时「按 scheme 统计」PR）→ T3 已知调用方迁完且 Bearer 占比 <1%（计划值）后进阶段 2（标 `deprecated`）→ T4 至少 90 天公告并加 `Deprecation`/`Sunset` 头后进阶段 3（从 security 移除），保留「先公告、先报总管」「本 PR 不进入阶段 2/3」「阶段 3 为破坏性变更需另行批准」；「App 接入提示（非规范性）」段首新增「App 只发 MatrixOpenID、不得以 Bearer 兜底」一条；§2.0 行为者表述改为中性（`matrixOpenIdToken` 的 userinfo `sub` 或 `matrixUserToken`→whoami 的 `user_id`）。**(2)** `gateway/docs/moments.md` §1「身份不自报」与 §3「身份」按 v2 重写（App 只走 OpenID、Bearer 为其他调用方阶段 1 共存、写清退场节奏并指向 contract.md §1.2.3）；§3 行为者/点赞表述改为同时涵盖两种凭据的中性写法；§7 配置变量更正为事实——`GATEWAY_OPENID_CACHE_TTL_SECONDS` 已在 `gateway/.env.example` 第 107 行并由 `gateway/README.md` 配置表登记（#170），其余三个 `GATEWAY_MOMENTS_*` 仍为计划（随 #7 实现登记），删去「本 PR 不修改 .env.example」「PR2 实现时登记」的过时说法。**(3)** `docs/contracts/pairing-qr.md` §5.1 `features_url` 行与 §11 B2 依赖栏写明 OpenID 已在 #124 落地、App 只发 MatrixOpenID 且不得 Bearer 兜底、网关继续接受 Bearer 留给其他调用方（阶段 1），移除「落地前按现行契约 / 定之前现行契约有效」的过时表述。**(4)** `docs/deploy/public-access.md` 第 21 行与「与现行网关契约的差异（待对齐）」段改为已对齐。**(5)** `gateway/openapi/gateway.v1.yaml` **只改 `description` 文字**：作者/点赞者表述改中性，`matrixOpenIdToken` / `matrixUserToken` 描述各补一句（App 只用前者，后者留给 App 以外调用方，阶段 1 共存）；**security 数组、scheme、字段一律未改**。 |
 | 0.1.0 | 2026-11-11 | [#124 OpenID App 接入配合，纯文档+fixture+测试，不改行为] 新增三个 RFC 9457 problem 示例 fixture（`gateway/openapi/examples/problem-auth-missing.json`、`problem-auth-invalid-token.json`、`problem-homeserver-unavailable.json`），内容与 `_auth_user_ok` 实际输出**除 `request_id` 外逐字段一致**（含键集合）；在 `validate_openapi.py` EXAMPLE_TARGETS 中登记，漂移可检测。新增集成测试 `gateway/tests/test_openid_app_fixtures.py`：起真实网关 + 假 homeserver，验证缺头 / 无效 OpenID token / homeserver 502 三种错误的响应 status、Content-Type，以及响应 JSON 除 `request_id` 外的键集合与值均与 fixture 完全相等（网关增删字段即失败），同时覆盖 `GATEWAY_HTTP_PATH_PREFIX` 前缀形态。`docs/moments.md` §7 配置表修正 `GATEWAY_WHOAMI_CACHE_TTL_SECONDS` 为 `GATEWAY_OPENID_CACHE_TTL_SECONDS`（实际变量，注明 #124 已落地）；§1 第 19 行补充也可用 `MatrixOpenID` OpenID token 接入（指向 §3 与 contract.md §1.2.3）。`docs/contract.md` §1.2.3 末尾新增「App 接入提示（非规范性）」：列出 fixture 路径、`auth.invalid_token` 重试建议、500 退避语义、scheme 大小写要求、CORS/OPTIONS 说明；**不新增状态码或错误码**，不改任何运行时行为。 |

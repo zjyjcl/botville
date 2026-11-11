@@ -150,8 +150,8 @@ server/
 │   ├── federation-setup.py       # 联邦测试栈 Synapse 配置 + admin token 渲染（A2.1）
 │   ├── bootstrap-continuwuity.sh # continuwuity 首启引导注册（标准 UIA，仅 CS API）
 │   ├── lib.sh                    # backup/restore 共享辅助函数
-│   ├── backup-synapse.sh         # DB dump + 数据卷归档 + manifest（A1.1）
-│   └── restore-synapse.sh        # 校验 sha256 后破坏性恢复（需 --yes，A1.1）
+│   ├── backup-synapse.sh         # DB dump + synapse-data / 可选 gateway-data 归档 + manifest（A1.1 / A2.2）
+│   └── restore-synapse.sh        # 校验 sha256 后破坏性恢复（需 --yes，A1.1；可选恢复 gateway-data）
 └── tests/
     ├── smoke.py                  # 仅标准库的 CS API 冒烟测试
     ├── e2e_synapse.py            # seed/verify 两阶段验收测试（A1.1）
