@@ -1,0 +1,9 @@
+// Copyright 2026 botville contributors
+// SPDX-License-Identifier: Apache-2.0
+// Repository defaults. Override locally in Local.xcconfig (not committed).
+// Never commit certificates or provisioning profiles.
+BOTVILLE_DEVELOPMENT_TEAM = 3Z8WP6U6F7
+DEVELOPMENT_TEAM = $(BOTVILLE_DEVELOPMENT_TEAM)
+BOTVILLE_BUNDLE_ID_PREFIX = com.zjyjcl.botville
+
+#include? "Local.xcconfig"

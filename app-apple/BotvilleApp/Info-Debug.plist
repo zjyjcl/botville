@@ -21,8 +21,10 @@
     <string>$(MARKETING_VERSION)</string>
     <key>CFBundleVersion</key>
     <string>$(CURRENT_PROJECT_VERSION)</string>
+    <key>BotvilleAppGroupIdentifier</key>
+    <string>group.$(BOTVILLE_BUNDLE_ID_PREFIX)</string>
     <key>BotvilleSharedKeychainAccessGroup</key>
-    <string>$(AppIdentifierPrefix)com.zjyjcl.botville.shared</string>
+    <string>$(AppIdentifierPrefix)$(BOTVILLE_BUNDLE_ID_PREFIX).shared</string>
     <key>NSCameraUsageDescription</key>
     <string>用于扫描配对二维码，连接你确认的 botville 服务。</string>
     <!-- Debug only. With explicit HTTP opt-in, HomeserverPolicy permits loopback, local/private addresses (including link-local), *.local, and single-label hosts containing an ASCII letter. -->

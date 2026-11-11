@@ -13,9 +13,71 @@ forbidden = {'NSAppTransportSecurity', 'NSAllowsLocalNetworking', 'NSLocalNetwor
 def json_plutil(path):
     return json.loads(subprocess.check_output(['plutil', '-convert', 'json', '-o', '-', str(path)]))
 objects = json_plutil(root / 'Botville.xcodeproj/project.pbxproj')['objects']
+# Check repository defaults only. Never read a developer's Local.xcconfig.
+config_path = root / 'Config/Signing.xcconfig'
+config_lines = config_path.read_text().strip().splitlines()
+if config_lines[-1] != '#include? "Local.xcconfig"':
+    raise SystemExit('Signing.xcconfig must end with the optional local include')
+def assignments(path, optional_local=False):
+    result = {}
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith('//'): continue
+        if optional_local and line == '#include? "Local.xcconfig"': continue
+        match = re.fullmatch(r'([A-Z_]+)\s*=\s*(.+)', line)
+        if not match or match[1] in result:
+            raise SystemExit(f'Unsupported or duplicate xcconfig assignment in {path.name}')
+        result[match[1]] = match[2]
+    return result
+defaults = assignments(config_path, optional_local=True)
+if defaults != {'BOTVILLE_DEVELOPMENT_TEAM': '3Z8WP6U6F7',
+                'DEVELOPMENT_TEAM': '$(BOTVILLE_DEVELOPMENT_TEAM)',
+                'BOTVILLE_BUNDLE_ID_PREFIX': 'com.zjyjcl.botville'}:
+    raise SystemExit('Repository signing defaults changed or added signing overrides')
+# Apple may supply an AppIdentifierPrefix different from DEVELOPMENT_TEAM.
+# Use an independent fixture, not a fabricated provisioning profile.
+defaults['AppIdentifierPrefix'] = 'LEGACY1234.'
+def expand(raw, settings=defaults):
+    result = raw
+    for _ in range(8):
+        previous = result
+        for key, value in settings.items(): result = result.replace('$(' + key + ')', value)
+        if previous == result: break
+    if '$' in result: raise SystemExit('Unresolved or cyclic build variable')
+    return result
+if expand(defaults['DEVELOPMENT_TEAM']) != '3Z8WP6U6F7':
+    raise SystemExit('Default DEVELOPMENT_TEAM must remain unchanged')
+local = assignments(root / 'Config/Local.xcconfig.example')
+if set(local) != {'BOTVILLE_DEVELOPMENT_TEAM', 'DEVELOPMENT_TEAM', 'BOTVILLE_BUNDLE_ID_PREFIX'}:
+    raise SystemExit('Local example must demonstrate team and prefix overrides')
+overridden = defaults | local
+if (expand(overridden['DEVELOPMENT_TEAM'], overridden) != 'YOURTEAMID'
+        or expand('group.$(BOTVILLE_BUNDLE_ID_PREFIX)', overridden) != 'group.com.example.botville'
+        or expand('$(AppIdentifierPrefix)$(BOTVILLE_BUNDLE_ID_PREFIX).shared', overridden) != 'LEGACY1234.com.example.botville.shared'):
+    raise SystemExit('Local example must override the team and related identifiers')
+references = [key for key, obj in objects.items() if obj.get('isa') == 'PBXFileReference' and obj.get('path') == 'Signing.xcconfig']
+if len(references) != 1 or objects[references[0]].get('sourceTree') != '<group>':
+    raise SystemExit('Missing unique Signing.xcconfig reference')
+signing_ref = references[0]
+groups = [key for key, group in objects.items() if group.get('isa') == 'PBXGroup'
+          and group.get('path') == 'Config' and group.get('sourceTree') == '<group>' and signing_ref in group.get('children', [])]
+project = next(obj for obj in objects.values() if obj.get('isa') == 'PBXProject')
+if len(groups) != 1 or groups[0] not in objects[project['mainGroup']]['children']:
+    raise SystemExit('Signing.xcconfig must live in the project Config group')
+if sum(obj.get('isa') == 'XCBuildConfiguration' for obj in objects.values()) != 6:
+    raise SystemExit('Expect project, App and NSE Debug/Release configurations')
+for config_list in objects.values():
+    if config_list.get('isa') != 'XCConfigurationList': continue
+    ids = config_list['buildConfigurations']
+    if len(ids) != 2 or {objects[key]['name'] for key in ids} != {'Debug', 'Release'}:
+        raise SystemExit('Each project/target must have Debug and Release')
 for config in objects.values():
     if config.get('isa') != 'XCBuildConfiguration': continue
+    if config.get('baseConfigurationReference') != signing_ref:
+        raise SystemExit('Every project/target configuration must use Signing.xcconfig')
     settings = config.get('buildSettings', {})
+    if any(key.startswith(('DEVELOPMENT_TEAM', 'BOTVILLE_')) for key in settings):
+        raise SystemExit('Team and prefix defaults/overrides must come from xcconfig')
     if any(key.startswith('PROVISIONING_PROFILE') for key in settings):
         raise SystemExit('Signing configuration must not pin a provisioning profile')
     for key, value in settings.items():
@@ -68,10 +130,6 @@ for identifier, target in objects.items():
         if json_plutil(root / value).get('aps-environment') == 'development':
             raise SystemExit(f'{target.get("name")} Release entitlements must not use the development APNs environment')
     release_targets[identifier] = target
-# Compare configured teams without embedding or printing their values.
-teams = [settings.get('DEVELOPMENT_TEAM', '') for configs in (app, nse) for settings in configs.values()]
-if any(not isinstance(team, str) or not re.fullmatch(r'[A-Z0-9]{10}', team) for team in teams) or len(set(teams)) != 1:
-    raise SystemExit('App and extension require the same configured signing team')
 for target_name, configurations, bundle_id, entitlements, plists in (
     ('BotvilleApp-iOS', app, 'com.zjyjcl.botville',
      {'Debug': 'BotvilleApp/BotvilleApp.entitlements', 'Release': 'BotvilleApp/BotvilleApp-Release.entitlements'},
@@ -83,13 +141,17 @@ for target_name, configurations, bundle_id, entitlements, plists in (
     for name, settings in configurations.items():
         expected = {'CODE_SIGN_STYLE': 'Automatic',
                     'CODE_SIGN_IDENTITY[sdk=iphonesimulator*]': '-',
-                    'PRODUCT_BUNDLE_IDENTIFIER': bundle_id,
+                    'PRODUCT_BUNDLE_IDENTIFIER': bundle_id.replace('com.zjyjcl.botville', '$(BOTVILLE_BUNDLE_ID_PREFIX)'),
                     'CODE_SIGN_ENTITLEMENTS': entitlements[name],
                     'INFOPLIST_FILE': plists[name]}
         for key, value in expected.items():
             if settings.get(key) != value:
                 raise SystemExit(f'{name} target {target_name} requires {key}={value}')
+        if expand(settings['PRODUCT_BUNDLE_IDENTIFIER']) != bundle_id:
+            raise SystemExit(f'{target_name} default Bundle ID changed')
         for key, value in settings.items():
+            if key.startswith('PRODUCT_BUNDLE_IDENTIFIER['):
+                raise SystemExit('Bundle ID must not have a conditional override')
             if key.startswith('INFOPLIST_FILE[') and value != plists[name]:
                 raise SystemExit(f'{name} target {target_name} has unsafe plist override: {key}={value}')
             if key.startswith('CODE_SIGN_ENTITLEMENTS[') and value != entitlements[name]:
@@ -105,10 +167,14 @@ if json_plutil(root / 'BotvilleApp/BotvilleApp.entitlements').get('aps-environme
 release_app_aps_environment = None  # Controlled production signing sets this to 'production'.
 def check_groups(path, private_group, expected_aps_environment):
     value = json_plutil(path)
-    if value.get('com.apple.security.application-groups') != ['group.com.zjyjcl.botville']:
+    if value.get('com.apple.security.application-groups') != ['group.$(BOTVILLE_BUNDLE_ID_PREFIX)']:
         raise SystemExit(f'{path.name} must contain only the Botville App Group')
-    if value.get('keychain-access-groups') != [private_group, '$(AppIdentifierPrefix)com.zjyjcl.botville.shared']:
+    if value.get('keychain-access-groups') != [private_group.replace('com.zjyjcl.botville', '$(BOTVILLE_BUNDLE_ID_PREFIX)'), '$(AppIdentifierPrefix)$(BOTVILLE_BUNDLE_ID_PREFIX).shared']:
         raise SystemExit(f'{path.name} must contain its private and shared Keychain groups')
+    if [expand(group) for group in value['com.apple.security.application-groups']] != ['group.com.zjyjcl.botville']:
+        raise SystemExit(f'{path.name} default App Group changed')
+    if [expand(group) for group in value['keychain-access-groups']] != [private_group.replace('$(AppIdentifierPrefix)', 'LEGACY1234.'), 'LEGACY1234.com.zjyjcl.botville.shared']:
+        raise SystemExit(f'{path.name} default Keychain groups changed')
     aps = value.get('aps-environment')
     if aps != expected_aps_environment:
         raise SystemExit(f'{path.name} must use APNs entitlement {expected_aps_environment!r}')
@@ -117,6 +183,15 @@ check_groups(root / 'BotvilleApp/BotvilleApp.entitlements', '$(AppIdentifierPref
 # controlled production signing; the NSE intentionally remains without APNs.
 check_groups(root / 'BotvilleApp/BotvilleApp-Release.entitlements', '$(AppIdentifierPrefix)com.zjyjcl.botville', release_app_aps_environment)
 check_groups(root / 'NotificationService/NotificationService.entitlements', '$(AppIdentifierPrefix)com.zjyjcl.botville.notification', None)
+for relative in ('BotvilleApp/Info.plist', 'BotvilleApp/Info-Debug.plist',
+                 'NotificationService/Info.plist', 'NotificationService/Info-Debug.plist'):
+    info = json_plutil(root / relative)
+    for key, raw, expected in (
+        ('BotvilleSharedKeychainAccessGroup', '$(AppIdentifierPrefix)$(BOTVILLE_BUNDLE_ID_PREFIX).shared', 'LEGACY1234.com.zjyjcl.botville.shared'),
+        ('BotvilleAppGroupIdentifier', 'group.$(BOTVILLE_BUNDLE_ID_PREFIX)', 'group.com.zjyjcl.botville'),
+    ):
+        if info.get(key) != raw or expand(info[key]) != expected:
+            raise SystemExit(f'{relative} must inject the default {key} via xcconfig')
 def guarded(path, needle):
     stack, found = [], False
     for number, raw in enumerate(path.read_text().splitlines(), 1):
