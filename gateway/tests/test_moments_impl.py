@@ -998,6 +998,105 @@ class TestServiceIdempotency(ServiceTestBase):
         self.assertNotEqual(replay["id"], a["id"])  # a 已被淘汰 → 新建
 
 
+class TestIdempotencyTtlZero(ServiceTestBase):
+    """IDEMPOTENCY_TTL_SECONDS=0 = 不过期（与全局 README / service.py 约定一致）。
+
+    修复前动态端点把 0 当作「立即过期」：同 key 重放会再写一次。
+    """
+
+    YEAR = 365 * 86400
+
+    def _count(self, service: MomentsService, table: str) -> int:
+        return service.store._conn.execute(
+            f"SELECT COUNT(*) FROM {table}"
+        ).fetchone()[0]
+
+    def test_ttl_zero_moment_replay_returns_original_without_write(self):
+        service = self.make_service(idempotency_ttl_seconds=0)
+        first = service.create_moment(
+            ALICE, {"body": "a", "visibility": "server"},
+            idempotency_key="key-ttl0-moment",
+        )
+        posts = self._count(service, "moments_posts")
+        events = len(service.store.list_events())
+        self.clock.advance(self.YEAR)  # 远超默认 TTL，仍不得过期
+        replay = service.create_moment(
+            ALICE, {"body": "a", "visibility": "server"},
+            idempotency_key="key-ttl0-moment",
+        )
+        self.assertEqual(replay, first)
+        self.assertEqual(self._count(service, "moments_posts"), posts)
+        self.assertEqual(len(service.store.list_events()), events)
+        # 同 key 不同体仍 409（缓存条目还在）。
+        with self.assertRaises(IdempotencyConflict):
+            service.create_moment(
+                ALICE, {"body": "b", "visibility": "server"},
+                idempotency_key="key-ttl0-moment",
+            )
+
+    def test_ttl_zero_comment_replay_returns_original_without_write(self):
+        service = self.make_service(idempotency_ttl_seconds=0)
+        moment = service.create_moment(ALICE, {"body": "m", "visibility": "server"})
+        first = service.create_comment(
+            BOB, moment["id"], {"body": "c"}, idempotency_key="key-ttl0-comment"
+        )
+        comments = self._count(service, "moments_comments")
+        self.clock.advance(self.YEAR)
+        replay = service.create_comment(
+            BOB, moment["id"], {"body": "c"}, idempotency_key="key-ttl0-comment"
+        )
+        self.assertEqual(replay, first)
+        self.assertEqual(self._count(service, "moments_comments"), comments)
+        self.assertEqual(
+            service.get_moment(BOB, moment["id"])["comment_count"], 1
+        )
+
+    def test_ttl_zero_still_bounded_by_capacity(self):
+        service = self.make_service(
+            idempotency_ttl_seconds=0, max_idempotency_entries=2
+        )
+        a = service.create_moment(ALICE, {"body": "a"}, idempotency_key="key-cap-aaaa")
+        service.create_moment(ALICE, {"body": "b"}, idempotency_key="key-cap-bbbb")
+        service.create_moment(ALICE, {"body": "c"}, idempotency_key="key-cap-cccc")
+        replay = service.create_moment(
+            ALICE, {"body": "a"}, idempotency_key="key-cap-aaaa"
+        )
+        self.assertNotEqual(replay["id"], a["id"])  # 容量淘汰照旧
+
+    def test_positive_ttl_boundary_unchanged(self):
+        service = self.make_service(idempotency_ttl_seconds=10)
+        a = service.create_moment(ALICE, {"body": "a"}, idempotency_key="key-pos-ttl1")
+        self.clock.advance(9)  # TTL 内：命中
+        self.assertEqual(
+            service.create_moment(ALICE, {"body": "a"}, idempotency_key="key-pos-ttl1"),
+            a,
+        )
+        self.clock.advance(1)  # 恰好到期（now >= expires_at）：失效
+        b = service.create_moment(ALICE, {"body": "a"}, idempotency_key="key-pos-ttl1")
+        self.assertNotEqual(b["id"], a["id"])
+        self.assertEqual(self._count(service, "moments_posts"), 2)
+
+    def test_build_from_config_ttl_zero(self):
+        tmp = tempfile.mkdtemp(prefix="moments-ttl0-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        config = load_config(dict(
+            _DEV_ENV,
+            GATEWAY_MOMENTS_DB_PATH=os.path.join(tmp, "m.db"),
+            GATEWAY_MOMENTS_PURGE_INTERVAL_SECONDS="0",
+            IDEMPOTENCY_TTL_SECONDS="0",
+        ))
+        self.assertEqual(config.idempotency_ttl_seconds, 0)
+        service = build_moments_service(config)
+        self.addCleanup(service.store.close)
+        service._monotonic = self.clock.monotonic
+        first = service.create_moment(ALICE, {"body": "x"}, idempotency_key="key-cfg-ttl0")
+        self.clock.advance(self.YEAR)
+        self.assertEqual(
+            service.create_moment(ALICE, {"body": "x"}, idempotency_key="key-cfg-ttl0"),
+            first,
+        )
+
+
 class TestDeniedAudit(ServiceTestBase):
     def test_denied_throttled_per_viewer_moment(self):
         moment = self.service.create_moment(

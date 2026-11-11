@@ -672,6 +672,28 @@ class TestIdempotency(unittest.TestCase):
 # 7. reply_to_comment_id 四种非法情况
 # ============================================================================
 class TestReplyToInvalid(unittest.TestCase):
+    def test_null_is_omitted_and_type_errors_are_400(self):
+        """contract.md §1.3 动态口径 1：显式 null 视同省略（201）；其余类型错 400。"""
+        with MomentsServer() as fixture:
+            _s, moment = _create(
+                fixture, ALICE, {"body": "m", "visibility": "server"}
+            )
+            mid = moment["id"]
+            status, body, _ = fixture.request(
+                "POST", f"/v1/moments/{mid}/comments", BOB,
+                body={"body": "t", "reply_to_comment_id": None},
+            )
+            self.assertEqual(status, 201)
+            self.assertIsNone(body["reply_to_comment_id"])
+            for bad in (1, True, {}, [], ""):
+                with self.subTest(value=bad):
+                    status, body, _ = fixture.request(
+                        "POST", f"/v1/moments/{mid}/comments", BOB,
+                        body={"body": "t", "reply_to_comment_id": bad},
+                    )
+                    self.assertEqual(status, 400)
+                    self.assertEqual(body["code"], "request.invalid")
+
     def test_all_four_unified_422(self):
         with MomentsServer(
             pairs=[[ALICE, BOB], [ALICE, CAROL]]
