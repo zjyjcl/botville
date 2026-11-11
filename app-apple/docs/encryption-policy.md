@@ -19,23 +19,31 @@
 
 当前仓库的 [网关 OpenAPI](../../gateway/openapi/gateway.v1.yaml) 提供 `Actor.kind = human | ai` 和 `Conversation.participants`、`Conversation.encryption = none | e2ee`。苹果端目前直接读取 Matrix SDK 成员，尚未接入网关 Actor 数据；已移除未接线的 `knownAIUserIDs` 参数，不暗示有额外身份来源。
 
-2026-11-04 修订时已用 `gh pr view 99` 核对：[A1.3 / #99](https://github.com/zjyjcl/botville/pull/99) 的 `@ai_*` 命名空间仍未合入 `main`。配置继续默认**空数组占位**，不提前采用待合入规则。未配置时，即使成员已加载也按可能含 AI 处理，开启加密入口禁用；部署者必须先按本部署完整 AI 命名规则配置，#99 合入后再更新默认规则和测试。
+**默认规则（无覆盖时）**：`^@ai_[^:]*:`，与网关 appservice 的 users 命名空间对齐。命名空间定义在 [`server/compose/appservice/botville-gateway.yaml.tmpl`](../../server/compose/appservice/botville-gateway.yaml.tmpl) 的 `namespaces.users`：`^@ai_.*:${BOTVILLE_SERVER_NAME_REGEX}$`，由 homeserver 对**完整 MXID** 匹配（`init.sh` 会对服务器名做正则转义）。两者差异：
 
-可通过环境变量（JSON 字符串数组）或 App `Info.plist` 的同名 String 数组配置：
+| 情况 | appservice | App 默认 | 说明 |
+| --- | --- | --- | --- |
+| 本服 `@ai_<任意>:<本服>`，含 `@ai_:<本服>`（`ai_` 后为空） | 命中 | 命中 | localpart 不含 `:`，因此对本服 MXID 两者等价；空后缀两边都算 AI，故用 `*` 而非 `+` |
+| 带端口的服务器 `@ai_x:host:8448` | 视 server 正则 | 命中 | App 只看 localpart |
+| 其他服务器的 `@ai_*` 账号 | 不命中（不属于本部署） | **命中** | App 不知道部署服务器名，有意放宽：联邦 `ai_` 账号按 AI 处理，只会多拒绝开启加密／加密房邀请，不会放行 AI |
+| 大小写 `@AI_x` / `@Ai_x` | 不命中 | 不命中 | 与 appservice 一样区分大小写；Matrix 新注册 localpart 为小写 |
+| `ai_` 不在 localpart 开头（`@my_ai_x`、`@xai_x`）、`@ai-x`、`@aix`、仅服务器名含 `ai_` | 不命中 | 不命中 | 按真人处理 |
+
+**覆盖方式**：环境变量（JSON 字符串数组）或 App `Info.plist` 的同名 String 数组。任一配置键存在（环境变量优先于同名 Info.plist）即以覆盖为准，**不再合并默认规则**；两个键都不存在才用默认规则。
 
 | 配置键 | 作用 |
 | --- | --- |
 | `BOTVILLE_AI_USER_ID_PATTERNS` | 正则表达式列表；建议完整锚定 MXID 并限定服务器 |
 | `BOTVILLE_AI_USER_ID_PREFIXES` | MXID 前缀列表；必须覆盖部署内全部 AI 账号 |
 
-例如本地演示部署约定 AI 名称以 `demo_ai_` 开头时，可在 Xcode Scheme 的环境变量中设置：
+例如本地演示部署约定 AI 名称以 `demo_ai_` 开头时，可在 Xcode Scheme 的环境变量中设置（此时 `@ai_*` 默认规则不再生效，需要的话一并写入）：
 
 ```text
 BOTVILLE_AI_USER_ID_PATTERNS=["^@demo_ai_[^:]+:example\\.test$"]
 BOTVILLE_AI_USER_ID_PREFIXES=[]
 ```
 
-这只是**测试占位示例**，不是 A1.3 已采用的规则。环境变量优先于同名 Info.plist；格式错误、无效正则或没有有效规则均保守处理，并在界面展示配置提示。配置包含的规则被视为部署的完整 AI 命名空间，错误或不完整配置会影响判定，联邦成员也必须纳入配置。`humanOnly` 只表示完整成员列表未命中部署 AI 规则，**不是已证明账号属于真人**；未覆盖的 bot 账号可能被误判，没有身份认证保证。新建界面明确提示这一前提。重新启动 App 后生效。没有真实凭据或密钥配置项。
+格式错误（非 JSON 数组、Info.plist 非 String 数组）或任一正则无效时 fail closed：不回退到默认规则，按可能含 AI 处理，禁用开启加密并拒绝加密房邀请，界面展示配置提示。显式配置为空数组表示“无规则”，同样保守处理。配置包含的规则被视为部署的完整 AI 命名空间，错误或不完整配置会影响判定。`humanOnly` 只表示完整成员列表未命中 AI 规则，**不是已证明账号属于真人**；未覆盖的 bot 账号可能被误判，没有身份认证保证。新建界面明确提示这一前提。重新启动 App 后生效。没有真实凭据或密钥配置项。
 
 成员只计当前加入和待邀请状态，已离开/被踢成员不阻止开启；SDK service member 若没有明确 AI 命中也不能当作已确认真人。房间列表读取缓存，缓存必须与 SDK 的有效成员数量一致，否则保持待确认；不在每轮同步串行全量拉取所有房间成员。用户查看安全信息、开启或邀请时按需使用 SDK `members()` 完整迭代结果，并比对迭代器原始长度，防止转换丢失成员。`nil` 和空分块都表示遍历结束，但不跳过长度校验。标准 `/sync` 摘要人数可能为零，不能把这个零当作完整成员查询失败。
 

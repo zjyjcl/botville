@@ -119,7 +119,7 @@ Tests/BotvilleCoreTests/       认证、会话、发送和重连的单元测试
 
 新建会话支持输入 MXID 开私聊或建群，均默认不加密。成员通过部署 AI 规则检查后可二次确认开启；含 AI 或身份未知时禁用开启，编辑成员导致不再符合策略时会复位开关，仍可创建明文会话。botville 的 AI 接入目前不支持加密会话；已加密或状态未知房间拒绝 AI／身份未确认的邀请，没有确认后放行的接口。本客户端不提供关闭入口，也不保证 AI 或未验证设备无法解密。
 
-AI 判定集中在 `AIParticipantPolicy`，使用部署配置的 MXID 正则/前缀；未命中规则不等于已验证真人身份。修订时已核对 [#99](https://github.com/zjyjcl/botville/pull/99) 尚未合入，默认规则保持空占位；未配置或配置无效时保守拒绝开启。加密房显示 SDK 的设备验证/备份风险，完整恢复流程由 [C11-09 / #97](https://github.com/zjyjcl/botville/issues/97) 跟进。配置方法、数据来源和限制见[加密策略文档](docs/encryption-policy.md)。
+AI 判定集中在 `AIParticipantPolicy`，默认规则 `^@ai_[^:]*:` 与网关 appservice users 命名空间（`^@ai_.*:<server>$`）对齐，可用 `BOTVILLE_AI_USER_ID_PATTERNS` / `BOTVILLE_AI_USER_ID_PREFIXES`（环境变量 JSON 数组或 Info.plist 数组）覆盖，覆盖时以覆盖为准；配置无效时保守拒绝开启。未命中规则不等于已验证真人身份。加密房显示 SDK 的设备验证/备份风险，完整恢复流程由 [C11-09 / #97](https://github.com/zjyjcl/botville/issues/97) 跟进。配置方法、数据来源和限制见[加密策略文档](docs/encryption-policy.md)。
 
 ## 发送语义
 

@@ -4,15 +4,25 @@
 import Foundation
 
 /// Whether the client can safely treat all loaded participants as people.
-/// A1.3 has not registered an appservice namespace yet, so missing rules stay
-/// unknown instead of being silently treated as human-only.
+/// An explicitly empty override has no rules, so it stays unknown instead of
+/// being silently treated as human-only.
 public enum AIParticipantStatus: Sendable, Hashable { case humanOnly, containsAI, unknown }
 
-/// Deployment-local AI MXID recognition until A1.3 publishes its namespace.
-/// Environment values are JSON string arrays; Info.plist values are arrays.
+/// AI MXID recognition. Without any override the default mirrors the gateway
+/// appservice users namespace (`server/compose/appservice/botville-gateway.yaml.tmpl`:
+/// `^@ai_.*:<server>$`, matched against the full MXID).
+/// Overrides: environment values are JSON string arrays; Info.plist values are
+/// arrays. If either key is present (environment first, then Info.plist), only
+/// the override rules apply and the default is not merged in.
 public struct AIParticipantPolicy: Sendable {
     public static let patternConfigurationKey = "BOTVILLE_AI_USER_ID_PATTERNS"
     public static let prefixConfigurationKey = "BOTVILLE_AI_USER_ID_PREFIXES"
+    /// `@ai_` at the start of the localpart, any (possibly empty) remainder up
+    /// to the first `:`, on any server. Localparts cannot contain `:`, so for
+    /// local MXIDs this equals the appservice regex (including `@ai_:server`);
+    /// it is deliberately broader for federated `@ai_*` accounts (fail safe:
+    /// they are treated as AI). Case-sensitive like the appservice regex.
+    public static let defaultUserIDPatterns = ["^@ai_[^:]*:"]
     private let patterns: [NSRegularExpression]
     private let prefixes: [String]
     public let hasConfiguredRules: Bool
@@ -27,7 +37,7 @@ public struct AIParticipantPolicy: Sendable {
         if containsInvalidPattern {
             configurationNotice = "AI 用户 ID 正则配置无效，按可能含 AI 保守处理。"
         } else if !hasConfiguredRules {
-            configurationNotice = "尚未配置 AI 用户 ID 规则，待 A1.3 appservice 命名空间落地后设置。"
+            configurationNotice = "AI 用户 ID 覆盖配置为空，按可能含 AI 保守处理。"
         } else {
             configurationNotice = nil
         }
@@ -38,6 +48,9 @@ public struct AIParticipantPolicy: Sendable {
         let patterns = values(for: patternConfigurationKey, environment: environment, infoDictionary: infoDictionary)
         let prefixes = values(for: prefixConfigurationKey, environment: environment, infoDictionary: infoDictionary)
         guard !patterns.invalid, !prefixes.invalid else { return AIParticipantPolicy(userIDPatterns: ["["]) }
+        guard patterns.present || prefixes.present else {
+            return AIParticipantPolicy(userIDPatterns: defaultUserIDPatterns)
+        }
         return AIParticipantPolicy(userIDPatterns: patterns.values, userIDPrefixes: prefixes.values)
     }
 
@@ -53,14 +66,14 @@ public struct AIParticipantPolicy: Sendable {
         return patterns.contains { $0.firstMatch(in: userID, range: range) != nil }
     }
 
-    private static func values(for key: String, environment: [String: String], infoDictionary: [String: Any]) -> (values: [String], invalid: Bool) {
+    private static func values(for key: String, environment: [String: String], infoDictionary: [String: Any]) -> (values: [String], present: Bool, invalid: Bool) {
         if let raw = environment[key] {
-            guard let data = raw.data(using: .utf8), let values = try? JSONDecoder().decode([String].self, from: data) else { return ([], true) }
-            return (values, false)
+            guard let data = raw.data(using: .utf8), let values = try? JSONDecoder().decode([String].self, from: data) else { return ([], true, true) }
+            return (values, true, false)
         }
-        guard let value = infoDictionary[key] else { return ([], false) }
-        guard let values = value as? [String] else { return ([], true) }
-        return (values, false)
+        guard let value = infoDictionary[key] else { return ([], false, false) }
+        guard let values = value as? [String] else { return ([], true, true) }
+        return (values, true, false)
     }
 }
 
