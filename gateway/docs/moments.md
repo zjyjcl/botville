@@ -1,6 +1,8 @@
 # 动态（Moments）设计 — A2.2 / issue #7
 
-状态：**PR1 仅契约**（OpenAPI 增量 + 示例 + DDL + 本文）。服务实现见 PR2/PR3（见文末拆分）。
+状态：**PR1 契约已合入；PR2 同服实现已合入 main（#184，`e2dcf50`）**——存储与迁移、
+`can_view` / `can_see_interaction`、11 个同服操作、评论/点赞、软删清理任务均已上线代码。
+跨服只读（PR3）尚未开始。好友图在 A2.3（#8）落地前**默认为空**，影响见 §7.1。
 契约机器可读源：`gateway/openapi/gateway.v1.yaml`（`tags: [Moments]` 各路径）；
 示例：`gateway/openapi/examples/moment*.json` 等；DDL：`gateway/migrations/moments/0001_moments.sql`。
 `info.version` 本 PR 保持 `0.1.0` 不变；本特性为**只增不删**的 minor 变更，拟随合并升
@@ -24,7 +26,8 @@ homeserver）+ 可见范围 + 评论（≤500 字，一层回复引用）+ 点�
   `contract.md` §1.2.3。共享 gateway token 不能用于以用户身份读写动态。完整身份规则见
   §3 与 `contract.md` §1.2.3。
 - 好友图归 A2.3（#8）。本项只定义 `RelationProvider.is_friend(viewer, author)` 接口，
-  PR2 提供可测试的临时实现（配置/测试注入），A2.3 落地后替换，本模块代码不变。
+  PR2 已提供可测试的临时实现 `StaticRelationProvider`（配置文件
+  `GATEWAY_MOMENTS_FRIENDS_FILE` 或测试注入，见 §7.1），A2.3 落地后替换，本模块代码不变。
 
 原方案评论见 issue #7（方案 §0–§8）；本文在其基础上补充评论/点赞的可见性
 （`can_see_interaction`）与契约细节。
@@ -33,8 +36,8 @@ homeserver）+ 可见范围 + 评论（≤500 字，一层回复引用）+ 点�
 
 SQLite，DDL：`gateway/migrations/moments/0001_moments.sql`（表名全部 `moments_` 前缀；
 `IF NOT EXISTS` 幂等，可在同一库执行两遍）。迁移编号空间 `moments/NNNN` 独立于其他
-网关模块（B 线 #117 无持久化迁移）；PR2 由网关启动时按目录内文件名顺序执行并记录
-已应用编号。
+网关模块（B 线 #117 无持久化迁移）；网关启动时（`GATEWAY_MOMENTS_DB_PATH` 非空）按
+目录内文件名顺序执行，已应用编号记在 `moments_schema_migrations` 表（PR2 已实现）。
 
 | 表 | 说明 |
 |---|---|
@@ -257,24 +260,73 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
 - 越权与不存在：`404` `moment.not_found`，响应体逐字节相同（操作 description 已写明）。
 - `POST /moments`、`POST …/comments` 遵循全局 `Idempotency-Key` 约定（同 key 同体返回
   同一结果；同 key 异体 409）。点赞 `PUT/DELETE …/likes/me` 天然幂等。
-- `PATCH /moments/{id}` 必带当前 `revision`，冲突 409（复用既有 Conflict）。
+- `PATCH /moments/{id}` 必带当前 `revision`，冲突 `409` `moment.revision_conflict`（复用既有
+  Conflict 响应组件；比对与写入原子完成；响应不附带当前动态，客户端重新 `GET`）。
+  错误码已登记在 `contract.md` §1.3。
 - 匿名或 Matrix token 无效：401（`auth.invalid_token`）；传输层限速 429。
 - `reply_to_comment_id`：目标评论不存在、已软删、或不在同一动态、或对当前查看者不可见（`can_view ∧ can_see_interaction` 为假）时，**统一**返回 `422` `request.invalid`（`errors[].field = reply_to_comment_id`），不区分原因，避免靠 404/422 差异探评论 ULID。
+  **格式不像 ULID 的字符串**同样按「目标不存在」返回 422（类型对、值找不到属语义错误）；
+  只有**类型错误**（数字、对象、数组、空串）返回 `400` `request.invalid`。
+- **幂等作用域与重放**（实现口径，登记于 `contract.md` §1.5「动态端点」）：缓存键为
+  `(操作, 调用者, 目标资源, key)`，评论的目标资源是 `moment_id`；persona 归属与目标动态
+  可见性**先于**幂等缓存判定。因此动态被删除、或与作者解除好友后，用原
+  `Idempotency-Key` 重放评论返回 `404` `moment.not_found`（不是原回执）；persona 归属
+  被收回后重放 `POST /moments` 返回 `403` `persona.not_owned`。
+- 幂等缓存为进程内存，TTL 沿用 `IDEMPOTENCY_TTL_SECONDS`（默认 86400）。**已知差异**：
+  全局约定 `IDEMPOTENCY_TTL_SECONDS=0` 表示「不过期」，而动态端点当前实现把 `0` 当作
+  立即过期（等于不缓存，同 key 重放会再写一次）。默认值不受影响；修正留给后续代码 PR。
+- 非法请求目标（authority-form、其他 scheme、IPv6 括号未闭合、`*` 搭配非 `OPTIONS`）
+  在路由前即返回 `400` `request.invalid`，对所有端点生效，见 `contract.md` §1.1。
+- 结构/类型错误（未知字段、类型不符、非法 JSON、含孤立代理项的 JSON 字符串、畸形
+  `cursor`）一律 `400` `request.invalid`，不会 500。
 
 ## 7. 配置变量
 
-`GATEWAY_OPENID_CACHE_TTL_SECONDS` **已登记**：`gateway/.env.example` 第 107 行
-（`GATEWAY_OPENID_CACHE_TTL_SECONDS=60`），并在 `gateway/README.md` 配置表登记（#170），
-随 #124 生效。
+全部变量已登记在 `gateway/.env.example`（「动态 Moments」一节）与 `gateway/README.md`
+配置表，由 `gateway/src/botville_gateway/config.py` 读取并在启动时校验（非法值拒绝启动）。
+`GATEWAY_OPENID_CACHE_TTL_SECONDS`（#124/#170）见 `contract.md` §1.2.3。
 
-其余三个 `GATEWAY_MOMENTS_*` 变量仍为**计划**，当前既不在 `gateway/.env.example`，
-也不在 `gateway/src/config.py`；随 #7（moments CRUD）实现时一并登记。
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `GATEWAY_MOMENTS_DB_PATH` | *(空)* | 动态 SQLite 路径（WAL、`foreign_keys=ON`）；启动时自动执行 `gateway/migrations/moments/` 迁移（幂等）。**留空 = 关闭动态模块**：`/v1/moments*` 鉴权后仍返回模块合入前的 404/405。 |
+| `GATEWAY_MOMENTS_FRIENDS_FILE` | *(空)* | 临时好友图 JSON 文件，见 §7.1。留空 = 空好友图。 |
+| `GATEWAY_MOMENTS_SOFT_DELETE_RETENTION_DAYS` | `30` | 软删的动态（连同其评论、点赞）与软删评论，超过该天数后由清理任务硬删。 |
+| `GATEWAY_MOMENTS_AUDIT_RETENTION_DAYS` | `90` | `moments_events` 审计事件**默认保留 90 天**，超期由清理任务删除。 |
+| `GATEWAY_MOMENTS_PURGE_INTERVAL_SECONDS` | `86400` | 定时清理间隔（秒），见下。`0` = 关闭；非 0 时**至少 60**，否则拒绝启动。 |
 
-| 变量 | 说明 |
-|---|---|
-| `GATEWAY_MOMENTS_DB_PATH` | 动态 SQLite 路径（compose 卷 `gateway-data` 内，WAL 模式）。 |
-| `GATEWAY_MOMENTS_SOFT_DELETE_RETENTION_DAYS` | 软删行清理任务保留天数（默认 30）。 |
-| `GATEWAY_MOMENTS_AUDIT_RETENTION_DAYS` | `moments_events` 审计保留天数。 |
+**定时清理**：`GATEWAY_MOMENTS_PURGE_INTERVAL_SECONDS` 非 0（默认 86400，即每天）且动态模块
+开启时，网关启动先同步跑一次清理，之后由后台守护线程按间隔执行；按上面两个保留天数
+硬删软删行与过期审计。单次失败只记日志（`botville_gateway.moments.service` logger），
+不影响请求处理，下个周期重试。网关关闭（`server_close`）时停止该线程。设为 `0` 则不跑
+清理，两个保留天数**不生效**，软删行与审计会一直累积，需另行运维。
+
+### 7.1 好友图为空时的影响（A2.3 / #8 落地前）
+
+好友关系归 A2.3（#8）。在它落地前，网关只用 `StaticRelationProvider` 这个临时实现：
+
+- **默认（`GATEWAY_MOMENTS_FRIENDS_FILE` 留空）好友图为空**，`is_friend` 恒为假。于是：
+  - `visibility = friends` 的动态**等同「仅自己」**：只有作者本人（AI 动态则为其主人
+    `owner_id`）能看到，其他人一律 `404 moment.not_found`（fail-closed，不会误放行）；
+  - 评论/点赞的可见性里「与行为者是好友」一项也恒假：`friends` / `self` 动态上的交互只
+    对动态作者/所有者及行为者本人（或其主人）可见；
+  - `server` / `paired_servers` 档不依赖好友图，同服登录用户照常可见（同服判定依赖
+    `GATEWAY_MATRIX_SERVER_NAME`，未配置时 fail-closed；跨服读取待 PR3）。
+- **用文件注入好友关系**：把 `GATEWAY_MOMENTS_FRIENDS_FILE` 指向一个 JSON 文件：
+
+  ```json
+  {"friends": [["@alice:example.invalid", "@bob:example.invalid"]]}
+  ```
+
+  - 每项是两个**非空** Matrix user id 组成的数组，表示一条**无向**好友边（写一次即双向）；
+  - 两端都是 Matrix user（AI persona 没有独立好友图，AI 按其 `owner_id` 判定）；
+  - 文件只在**启动时读取一次**，改了要重启网关才生效；
+  - 文件不存在、不是合法 JSON、缺 `friends` 数组或条目畸形 → **拒绝启动**（不会静默
+    退化成空图）。
+- 该文件只是过渡与测试手段；A2.3 落地后替换 `RelationProvider` 实现，配置项随之下线，
+  本模块其余代码不变。
+
+另：persona 目录在 PR2 也是 fail-closed 的空实现，`POST /moments` 带 `author_persona_id`
+目前一律 `403 persona.not_owned`；AI 发动态 / 评论 / 点赞走 appservice 内部调用（§3）。
 
 跨服（PR3）复用 fedgate 的配对 DB 与 per-peer 密钥配置，不新增独立密钥文件；
 网关间地址等沿用 A2.1 配置。
@@ -299,18 +351,17 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
 Moments 仍只在 `tags` / `paths` 末尾 / `securitySchemes` / `schemas` 末尾**追加**，
 与 #117 的 yaml hunk 区间不重叠。
 
-- 本 PR 不修改 B2.2 实现代码与其单测；不改 `contract.md` 错误码表（`moment.not_found`
-  登记留给合并后协调，见 PR 描述）。
-- 配置变量仍按 §7：Moments 相关项在 PR2 实现时写入 `.env.example`（#117 已合，
-  不再有冲突风险，但仍把实现与契约拆开）。
+- 本 PR 不修改 B2.2 实现代码与其单测。`moment.not_found` / `moment.revision_conflict`
+  已在 #7 文档 PR 中登记到 `contract.md` §1.3。
+- 配置变量已随 PR2（#184）写入 `.env.example` 与 `gateway/README.md`，见 §7。
 - `info.version` 升 `0.2.0` 由总管在 Moments 合入后统一协调。
 
 ## 10. PR 拆分
 
 | PR | 内容 |
 |---|---|
-| PR1（本 PR） | 契约：OpenAPI 路径 / securitySchemes / schema、示例与校验登记、DDL、本文、契约单测（`gateway/tests/test_moments_contract.py`）。 |
-| PR2 | 存储（迁移执行器、SQLite 访问层）、`can_view` / `can_see_interaction` 与 `RelationProvider` 临时实现、同服 API 实现、权限矩阵与性质单测、CI `moments-e2e` job、`.env.example` 登记配置变量。 |
+| PR1（已合入） | 契约：OpenAPI 路径 / securitySchemes / schema、示例与校验登记、DDL、本文、契约单测（`gateway/tests/test_moments_contract.py`）。 |
+| PR2（已合入，#184） | 存储（迁移执行器、SQLite 访问层）、`can_view` / `can_see_interaction` 与 `RelationProvider` 临时实现、同服 API 实现、权限矩阵与性质单测、`.env.example` 登记配置变量、软删/审计定时清理。**未做、留作后续**：CI `moments-e2e` job、compose `gateway-data` 卷与备份脚本（§8）、镜像内迁移目录定位。 |
 | PR3 | 跨服只读 API（`/_matrix/botville/moments/v1/*` 正式入契约）、fedgate HMAC 验签、双 HS 联邦 e2e（配对可读、切断被拒）。 |
 
 每个 PR 单独送审，不自行合并。
