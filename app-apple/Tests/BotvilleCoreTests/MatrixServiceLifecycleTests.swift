@@ -1301,8 +1301,43 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         XCTAssertTrue(rooms[1].isDirect)
     }
 
+    func testServerMuteDelegateFiltersSyncBannerAndLogoutClearsSharedCache() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let credentials = testCredentials(userID: "@me:matrix.test")
+        _ = try SessionStoreDirectory(baseURL: temporary).create(for: credentials.storeID)
+        let client = FakeClient(session: fakeSession(userID: "@me:matrix.test", deviceID: "C21TEST"), successfulSync: true,
+                                rooms: [FakeRoom(id: "!push:matrix.test", name: "Push")])
+        let cache = MemoryRoomMuteStore()
+        let service = makeService(sessionStore: InMemorySessionStore(credentials), directory: temporary, client: client,
+                                  sharedRoomMuteStore: cache)
+        await service.restoreSession()
+        try await waitUntil { service.connectionStatus == .connected }
+        var received = [ForegroundBannerCandidate]()
+        let observation = service.foregroundBannerCandidates.sink { received.append($0) }
+        try await client.notificationSettings.setRoomNotificationMode(roomId: "!push:matrix.test", mode: .mute)
+        try await waitUntil { service.roomNotifications.isMuted("!push:matrix.test") }
+        XCTAssertEqual(try cache.load(), [SharedRoomMuteStore.hash("!push:matrix.test")])
+        client.emit(notification: syncNotification(eventID: "$muted", body: "test", timestamp: 1_700_000_001_000), roomID: "!push:matrix.test")
+        // Drain the queued muted notification before unmuting; no wall-clock stress.
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertTrue(received.isEmpty)
+        try await client.notificationSettings.unmuteRoom(roomId: "!push:matrix.test", isEncrypted: false, isOneToOne: false)
+        try await waitUntil { !service.roomNotifications.isMuted("!push:matrix.test") }
+        client.emit(notification: syncNotification(eventID: "$unmuted", body: "test", timestamp: 1_700_000_002_000), roomID: "!push:matrix.test")
+        try await waitUntil { received.count == 1 }
+        XCTAssertEqual(received.first?.eventID, "$unmuted")
+        try await client.notificationSettings.setRoomNotificationMode(roomId: "!push:matrix.test", mode: .mute)
+        try await waitUntil { service.roomNotifications.isMuted("!push:matrix.test") }
+        await service.logout()
+        XCTAssertTrue(try cache.load().isEmpty)
+        XCTAssertTrue(service.roomNotifications.states.isEmpty)
+        withExtendedLifetime(observation) {}
+    }
+
     private func makeService(sessionStore: any SessionStore, directory: URL, client: FakeClient,
                              authentication: FakePasswordAuthentication = FakePasswordAuthentication(),
+                             sharedRoomMuteStore: any SharedRoomMuteStoring = MemoryRoomMuteStore(),
                              sharedPushCredentialsStore: any SharedPushCredentialsStore = InMemorySharedPushCredentialsStore(),
                              sharedPushCredentialsCleanupStateStore: any SharedPushCredentialsCleanupStateStore = InMemorySharedPushCredentialsCleanupStateStore(),
                              pairingAuthentication: any PairingCredentialAuthenticating = MatrixPairingCredentialAuthentication()) -> MatrixService {
@@ -1315,7 +1350,8 @@ final class MatrixServiceLifecycleTests: XCTestCase {
             monitorNetwork: false,
             passwordAuthentication: authentication,
             pairingAuthentication: pairingAuthentication,
-            authenticationTimeout: 5
+            authenticationTimeout: 5,
+            sharedRoomMuteStore: sharedRoomMuteStore
         )
         service.clientFactory = { _, _, _ in client }
         return service
@@ -1412,6 +1448,8 @@ private final class BlockingPusherTransport: MatrixPusherTransport, @unchecked S
 }
 
 private final class FakeClient: Client, @unchecked Sendable {
+    let notificationSettings = TestNotificationSettings()
+    override func getNotificationSettings() async -> NotificationSettings { notificationSettings }
     private let configuredLogoutError: Error?
     private let configuredRestoreError: Error?
     @TestLocked var syncError: Error? = nil

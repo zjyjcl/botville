@@ -57,6 +57,10 @@ public final class MatrixService: ObservableObject {
     @Published public private(set) var rooms: [MatrixRoom] = []
     /// Ephemeral local-sync events, never populated from APNs/NSE payloads or logged.
     public let foregroundBannerCandidates = PassthroughSubject<ForegroundBannerCandidate, Never>()
+    public let roomNotifications: RoomMuteController
+    private var notificationSettings: NotificationSettings?
+    private var notificationSettingsBridge: RoomNotificationSettingsBridge?
+    private var notificationSettingsTask: Task<Void, Never>?
     private var bannerResumeState = ForegroundBannerResumeState()
     private var bannerResumeTask: Task<Void, Never>?
     private var deliveredBackgroundEvents = [PushEventReference]()
@@ -176,7 +180,9 @@ public final class MatrixService: ObservableObject {
                 pairingAuthentication: any PairingCredentialAuthenticating = MatrixPairingCredentialAuthentication(),
                 authenticationTimeout: TimeInterval = 60,
                 pusherTransport: any MatrixPusherTransport = URLSessionMatrixPusherTransport(),
-                aiParticipantPolicy: AIParticipantPolicy = .configured()) {
+                aiParticipantPolicy: AIParticipantPolicy = .configured(),
+                sharedRoomMuteStore: any SharedRoomMuteStoring = SharedRoomMuteStore()) {
+        self.roomNotifications = RoomMuteController(sharedStore: sharedRoomMuteStore)
         self.sessionStore = sessionStore
         self.sharedPushCredentialsStore = sharedPushCredentialsStore
         self.sharedPushCredentialsCleanupStateStore = sharedPushCredentialsCleanupStateStore
@@ -187,6 +193,10 @@ public final class MatrixService: ObservableObject {
         self.aiParticipantPolicy = aiParticipantPolicy
         self.authenticationTimeout = authenticationTimeout.isFinite && authenticationTimeout > 0 ? authenticationTimeout : 60
         self.pusherTransport = pusherTransport
+        roomNotifications.didChange = { [weak self] in
+            self?.objectWillChange.send()
+            self?.updateApplicationBadge()
+        }
         if monitorNetwork {
             let monitor = NWPathMonitor()
             networkMonitor = monitor
@@ -204,6 +214,8 @@ public final class MatrixService: ObservableObject {
         authTask?.cancel()
         pushOperation?.cancel()
         authDelegate?.continuation.finish()
+        notificationSettingsTask?.cancel()
+        notificationSettingsBridge?.continuation.finish()
         syncTask?.cancel()
         bannerResumeTask?.cancel()
         bannerNotificationListener?.continuation.finish()
@@ -625,6 +637,20 @@ public final class MatrixService: ObservableObject {
         // restore can render rooms without waiting for its first `/sync`.
         userID = stored.userID
         isLoggedIn = true
+        let settings = await client.getNotificationSettings()
+        guard generation == sessionGeneration else { throw CancellationError() }
+        notificationSettings = settings
+        roomNotifications.configure(provider: SDKRoomNotificationSettings(settings))
+        let (changes, changesContinuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let settingsBridge = RoomNotificationSettingsBridge(changesContinuation)
+        notificationSettingsBridge = settingsBridge
+        settings.setDelegate(delegate: settingsBridge)
+        notificationSettingsTask = Task { [weak self] in
+            for await _ in changes {
+                guard let self, !Task.isCancelled, generation == self.sessionGeneration else { return }
+                await self.refreshRoomNotificationSettings()
+            }
+        }
         let (notifications, notificationContinuation) = AsyncStream<ForegroundSyncEvent>.makeStream()
         let notificationListener = ForegroundSyncNotificationBridge(userID: stored.userID,
                                                                     continuation: notificationContinuation)
@@ -640,6 +666,14 @@ public final class MatrixService: ObservableObject {
                       !self.isLoggingOut, notificationListener.isCurrent(event),
                       self.bannerResumeState.shouldPresent(event.candidate, suppressedEvents: self.deliveredBackgroundEvents),
                       self.rooms.contains(where: { $0.id == event.candidate.roomID && $0.membership == .joined }) else { continue }
+                // Read the synced rules at the event boundary as well: the
+                // settings delegate and notification callback can be queued together.
+                if let room = self.rooms.first(where: { $0.id == event.candidate.roomID }) {
+                    await self.roomNotifications.refresh(room)
+                }
+                guard !Task.isCancelled, generation == self.sessionGeneration,
+                      notificationListener.isCurrent(event),
+                      !self.roomNotifications.isMuted(event.candidate.roomID) else { continue }
                 self.foregroundBannerCandidates.send(event.candidate)
             }
         }
@@ -827,6 +861,8 @@ public final class MatrixService: ObservableObject {
             // latestEvent readback here can lag this sync and must never replay it.
         }
         guard committed else { return }
+        await refreshRoomNotificationSettings()
+        guard session == sessionGeneration else { return }
         updateApplicationBadge()
         if rooms.contains(where: { $0.encryption == .encrypted }) { refreshCryptoSafety(from: client) }
         if let activeRoomID, !rooms.contains(where: { $0.id == activeRoomID && $0.membership == .joined }) {
@@ -1175,9 +1211,17 @@ public final class MatrixService: ObservableObject {
         messageActions.removeAll()
     }
 
+    private func refreshRoomNotificationSettings() async {
+        let generation = sessionGeneration
+        for room in rooms {
+            guard generation == sessionGeneration, !Task.isCancelled else { return }
+            await roomNotifications.refresh(room)
+        }
+    }
+
     private func updateApplicationBadge() {
 #if os(iOS)
-        UIApplication.shared.applicationIconBadgeNumber = PushBadge.total(unreadCounts: rooms.map(\.unreadCount))
+        UIApplication.shared.applicationIconBadgeNumber = PushBadge.total(rooms: rooms, isMuted: roomNotifications.isMuted)
 #endif
     }
 
@@ -1534,6 +1578,13 @@ public final class MatrixService: ObservableObject {
         bannerNotificationListener = nil
         bannerNotificationTask?.cancel()
         bannerNotificationTask = nil
+        notificationSettings?.setDelegate(delegate: nil)
+        notificationSettings = nil
+        notificationSettingsBridge?.continuation.finish()
+        notificationSettingsBridge = nil
+        notificationSettingsTask?.cancel()
+        notificationSettingsTask = nil
+        try? roomNotifications.reset()
         rooms = []
         updateApplicationBadge()
         userID = nil
@@ -1561,6 +1612,7 @@ public final class MatrixService: ObservableObject {
         // Try to clear extension-readable credentials first. If Keychain is
         // unavailable, a durable non-secret marker retries removal at startup.
         removeSharedPushCredentials()
+        try roomNotifications.reset()
         if let stored = try credentials ?? sessionStore.load() {
             try directory().remove(for: stored.storeID)
         }

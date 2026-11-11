@@ -20,6 +20,7 @@
 		B10000000000000000000002 /* SharedPushCredentials.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000012 /* SharedPushCredentials.swift */; };
 		B10000000000000000000003 /* BotvilleNotificationService.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = B10000000000000000000010 /* BotvilleNotificationService.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy,); }; };
 		B10000000000000000000004 /* PushNotificationContent.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000015 /* PushNotificationContent.swift */; };
+		B10000000000000000000005 /* SharedRoomMute.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000017 /* SharedRoomMute.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -65,6 +66,7 @@
 		B10000000000000000000014 /* NotificationService.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = NotificationService.entitlements; sourceTree = "<group>"; };
 		B10000000000000000000015 /* PushNotificationContent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PushNotificationContent.swift; path = Sources/BotvilleCore/PushNotificationContent.swift; sourceTree = SOURCE_ROOT; };
 		B10000000000000000000016 /* Info-Debug.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Info-Debug.plist"; sourceTree = "<group>"; };
+		B10000000000000000000017 /* SharedRoomMute.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SharedRoomMute.swift; path = Sources/BotvilleCore/SharedRoomMute.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -123,6 +125,7 @@
 				B10000000000000000000011 /* NotificationService.swift */,
 				B10000000000000000000012 /* SharedPushCredentials.swift */,
 				B10000000000000000000015 /* PushNotificationContent.swift */,
+				B10000000000000000000017 /* SharedRoomMute.swift */,
 				B10000000000000000000013 /* Info.plist */,
 				B10000000000000000000016 /* Info-Debug.plist */,
 				B10000000000000000000014 /* NotificationService.entitlements */,
@@ -189,7 +192,7 @@
 		B10000000000000000000020 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
-			files = (B10000000000000000000001 /* NotificationService.swift in Sources */, B10000000000000000000002 /* SharedPushCredentials.swift in Sources */, B10000000000000000000004 /* PushNotificationContent.swift in Sources */,);
+			files = (B10000000000000000000001 /* NotificationService.swift in Sources */, B10000000000000000000002 /* SharedPushCredentials.swift in Sources */, B10000000000000000000004 /* PushNotificationContent.swift in Sources */, B10000000000000000000005 /* SharedRoomMute.swift in Sources */,);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		A10000000000000000000020 /* Sources */ = {

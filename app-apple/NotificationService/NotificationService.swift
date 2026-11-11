@@ -16,14 +16,19 @@ final class NotificationService: UNNotificationServiceExtension {
             contentHandler(request.content)
             return
         }
+        if RoomMutePushPolicy.apply(to: content, hashes: (try? SharedRoomMuteStore().load()) ?? []) {
+            contentHandler(content)
+            return
+        }
         content.body = PushNotificationText.placeholder.body
         let loader = PushNotificationLoader(credentialsStore: KeychainSharedPushCredentialsStore())
         completionLock.withLock { self.loader = loader }
         loader.load(userInfo: request.content.userInfo) { text in
             if let title = text.title { content.title = title }
             content.body = text.body
-            // Preserve the incoming badge (including nil); unread reconciliation
-            // and foreground clearing belong to PR3, not an extension counter.
+            // Re-read after the fetch: the app may have muted this room while
+            // the extension was loading its event. Never restore alert or badge.
+            RoomMutePushPolicy.apply(to: content, hashes: (try? SharedRoomMuteStore().load()) ?? [])
             contentHandler(content)
         }
     }

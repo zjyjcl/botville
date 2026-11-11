@@ -180,7 +180,7 @@ final class ReleaseIsolationTests: XCTestCase {
     }
     private func assertNotificationServiceBoundary(_ objects: [String: Any]) throws {
         let sources = try notificationServiceSources(objects)
-        XCTAssertEqual(Set(sources.map(\.lastPathComponent)), ["NotificationService.swift", "SharedPushCredentials.swift", "PushNotificationContent.swift"])
+        XCTAssertEqual(Set(sources.map(\.lastPathComponent)), ["NotificationService.swift", "SharedPushCredentials.swift", "PushNotificationContent.swift", "SharedRoomMute.swift"])
         for source in sources {
             let text = try String(contentsOf: source, encoding: .utf8)
             XCTAssertFalse(text.contains("import MatrixRustSDK"), "NSE must not import MatrixRustSDK")
@@ -197,6 +197,15 @@ final class ReleaseIsolationTests: XCTestCase {
                     "logger.debug(\"Shared push credentials present: \\(present, privacy: .public)\")",
                     "logger.warning(\"Shared push credentials unavailable\")"
                 ].contains(String(line).trimmingCharacters(in: .whitespaces)), "NSE only permits its two safe diagnostic logs")
+            }
+            // The sole file-backed NSE data is a validated array of SHA-256 room
+            // digests. Credential sources retain the stricter no-file-I/O gate.
+            if source.lastPathComponent == "SharedRoomMute.swift" {
+                try guarded("room_mute_nse", at: source)
+                XCTAssertTrue(text.contains("import CryptoKit"))
+                XCTAssertFalse(text.contains("SharedPushCredentials"))
+                XCTAssertFalse(text.contains("accessToken"))
+                continue
             }
             for forbidden in ["UserDefaults", "FileHandle", "write(to:", "Data(contentsOf:"] {
                 XCTAssertFalse(text.contains(forbidden), "NSE must not use plaintext credential storage: \(forbidden)")
@@ -244,7 +253,8 @@ final class ReleaseIsolationTests: XCTestCase {
         let expected: [String: (String, String)] = [
             "NotificationService.swift": ("<group>", "NotificationService/NotificationService.swift"),
             "Sources/BotvilleCore/SharedPushCredentials.swift": ("SOURCE_ROOT", "Sources/BotvilleCore/SharedPushCredentials.swift"),
-            "Sources/BotvilleCore/PushNotificationContent.swift": ("SOURCE_ROOT", "Sources/BotvilleCore/PushNotificationContent.swift")
+            "Sources/BotvilleCore/PushNotificationContent.swift": ("SOURCE_ROOT", "Sources/BotvilleCore/PushNotificationContent.swift"),
+            "Sources/BotvilleCore/SharedRoomMute.swift": ("SOURCE_ROOT", "Sources/BotvilleCore/SharedRoomMute.swift")
         ]
         let value = try XCTUnwrap(expected[path], "Unexpected NSE source")
         XCTAssertEqual(sourceTree, value.0, "NSE source must use its approved source tree")

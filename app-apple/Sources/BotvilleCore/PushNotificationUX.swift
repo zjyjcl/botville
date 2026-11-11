@@ -50,6 +50,10 @@ public struct PushNotificationPresentation: OptionSet, Equatable, Sendable {
     // badge updates without requesting a second system banner/list/sound.
     public static let foreground: Self = [.badge]
 
+    public static func foreground(mutedRoomHashes: Set<String>) -> Self {
+        RoomMutePushPolicy.acceptsServerBadge(hashes: mutedRoomHashes) ? foreground : []
+    }
+
     /// Bits aligned with `UNNotificationPresentationOptions` (iOS 14+ / SDK 27.2):
     /// badge=1<<0, sound=1<<1, list=1<<3, banner=1<<4. Does not set deprecated `.alert`.
     public var unNotificationPresentationRawValue: UInt {
@@ -63,6 +67,10 @@ public struct PushNotificationPresentation: OptionSet, Equatable, Sendable {
 }
 
 public enum PushBadge {
+    public static func total(rooms: [MatrixRoom], isMuted: (String) -> Bool) -> Int {
+        total(unreadCounts: rooms.filter { !isMuted($0.id) }.map(\.unreadCount))
+    }
+
     /// Saturates at Int.max so malformed or unusually large server totals
     /// cannot wrap the application icon badge.
     public static func total(unreadCounts: [UInt64]) -> Int {

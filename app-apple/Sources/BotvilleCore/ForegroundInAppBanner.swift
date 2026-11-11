@@ -44,6 +44,7 @@ public final class ForegroundInAppBannerStore: ObservableObject {
     private var isForeground = false
     private var visibleRoomID: String?
     private var isInputActive = false
+    private var mutedRoomIDs = Set<String>()
     private var consumedKeys = Set<String>()
     private var consumedOrder = [String]()
 
@@ -60,7 +61,8 @@ public final class ForegroundInAppBannerStore: ObservableObject {
 
     deinit { dismissalTask?.cancel() }
 
-    public func updateContext(isForeground: Bool, visibleRoomID: String?, isInputActive: Bool) {
+    public func updateContext(isForeground: Bool, visibleRoomID: String?, isInputActive: Bool, mutedRoomIDs: Set<String> = []) {
+        self.mutedRoomIDs = mutedRoomIDs
         self.isForeground = isForeground
         self.visibleRoomID = visibleRoomID
         self.isInputActive = isInputActive
@@ -92,6 +94,7 @@ public final class ForegroundInAppBannerStore: ObservableObject {
 
     public func reset() {
         dismiss()
+        mutedRoomIDs.removeAll()
         consumedKeys.removeAll()
         consumedOrder.removeAll()
         isForeground = false
@@ -111,7 +114,7 @@ public final class ForegroundInAppBannerStore: ObservableObject {
     }
 
     private func shouldSuppress(_ candidate: ForegroundBannerCandidate) -> Bool {
-        !isForeground || candidate.isOwn || visibleRoomID == candidate.roomID || isInputActive
+        !isForeground || candidate.isOwn || visibleRoomID == candidate.roomID || isInputActive || mutedRoomIDs.contains(candidate.roomID)
     }
 
     private func consume(_ key: String) {

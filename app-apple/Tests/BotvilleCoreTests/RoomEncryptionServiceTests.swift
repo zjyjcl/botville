@@ -250,7 +250,7 @@ final class RoomEncryptionServiceTests: XCTestCase {
         let baseDirectory = appDirectory.appendingPathComponent(".build/c26-service-tests/\(UUID().uuidString)")
         temporaryDirectories.append(baseDirectory)
         let directory = SessionStoreDirectory(baseURL: baseDirectory)
-        let service = MatrixService(sessionStore: store, storeDirectory: directory, monitorNetwork: false, aiParticipantPolicy: policy)
+        let service = MatrixService(sessionStore: store, storeDirectory: directory, monitorNetwork: false, aiParticipantPolicy: policy, sharedRoomMuteStore: MemoryRoomMuteStore())
         service.clientFactory = { _, _, _ in client }
         await service.restoreSession()
         XCTAssertTrue(service.isLoggedIn)
@@ -271,6 +271,8 @@ private final class SecurityStore: SessionStore, @unchecked Sendable {
 }
 
 private final class SecurityClient: Client, @unchecked Sendable {
+    let notificationSettings = TestNotificationSettings()
+    override func getNotificationSettings() async -> NotificationSettings { notificationSettings }
     let room: SecurityRoom?
     let securityEncryption: SecurityEncryption
     private(set) var createRequests: [CreateRoomParameters] = []
