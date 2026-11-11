@@ -128,6 +128,7 @@ public final class MatrixService: ObservableObject {
     }
 
     private var client: Client?
+    private var gatewayOpenIDProvider: MatrixOpenIDTokenProvider?
     private var syncTask: Task<Void, Never>?
     private var syncGeneration = UUID()
     private var sessionGeneration = UUID()
@@ -570,7 +571,9 @@ public final class MatrixService: ObservableObject {
     /// into this client only after a logged-in session exists.
     public func confirmedGatewayClient() throws -> HTTPGatewayClient? {
         guard let stored = credentials, let source = stored.gatewayURL, let url = URL(string: source) else { return nil }
-        return try HTTPGatewayClient(baseURL: url, certificateFingerprint: stored.effectiveGatewayCertificateFingerprint)
+        guard !isLoggingOut, client != nil, let gatewayOpenIDProvider else { return nil }
+        return try HTTPGatewayClient(baseURL: url, certificateFingerprint: stored.effectiveGatewayCertificateFingerprint,
+                                     openIDProvider: gatewayOpenIDProvider)
     }
 
     /// Invoked only after the UI's destructive confirmation. No successful
@@ -604,6 +607,13 @@ public final class MatrixService: ObservableObject {
 
     private func activate(_ client: Client, stored: SessionCredentials) async throws {
         try Task.checkCancellation()
+        if let gatewayOpenIDProvider { await gatewayOpenIDProvider.shutdown() }
+        try Task.checkCancellation()
+        gatewayOpenIDProvider = MatrixOpenIDTokenProvider {
+            let token = try await client.requestOpenidToken()
+            return MatrixOpenIDToken(accessToken: token.accessToken, tokenType: token.tokenType,
+                matrixServerName: token.matrixServerName, expiresInSeconds: TimeInterval(token.expiresInSeconds))
+        }
         self.client = client
         credentials = stored
         sessionGeneration = UUID()
@@ -1514,6 +1524,8 @@ public final class MatrixService: ObservableObject {
     }
 
     private func detachClient() async {
+        let previousOpenIDProvider = gatewayOpenIDProvider
+        gatewayOpenIDProvider = nil
         sessionGeneration = UUID()
         syncGeneration = UUID()
         let previous = syncTask
@@ -1552,6 +1564,7 @@ public final class MatrixService: ObservableObject {
         lastRegisteredPushKey = nil
         knownPushKeys.removeAll()
         pushVerificationStatus = nil
+        await previousOpenIDProvider?.shutdown()
         await client?.enableAllSendQueues(enable: false)
         await previous?.value
         client = nil

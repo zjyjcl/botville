@@ -1301,6 +1301,37 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         XCTAssertTrue(rooms[1].isDirect)
     }
 
+    func testOpenIDSDKBindingAndLogoutDisableRetainedGatewayClient() async throws {
+        try await assertOpenIDGatewayEndsSession(clearLocal: false)
+    }
+
+    func testOpenIDSDKBindingAndLocalClearDisableRetainedGatewayClient() async throws {
+        try await assertOpenIDGatewayEndsSession(clearLocal: true)
+    }
+
+    private func assertOpenIDGatewayEndsSession(clearLocal: Bool) async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let saved = SessionCredentials(session: fakeSession(userID: "@openid-test:matrix.test", deviceID: "TEST"),
+            storeID: UUID(), storeKey: Data(repeating: 7, count: 32), gatewayURL: "https://gateway.test")
+        _ = try SessionStoreDirectory(baseURL: temporary).create(for: saved.storeID)
+        let client = FakeClient()
+        let service = makeService(sessionStore: InMemorySessionStore(saved), directory: temporary, client: client)
+        await service.restoreSession()
+        let gateway = try XCTUnwrap(service.confirmedGatewayClient())
+        // Fake SDK deliberately fails before HTTP: proves the production
+        // adapter is bound to this client without touching a real gateway.
+        do { _ = try await gateway.momentsRequest(); XCTFail("Expected SDK failure") }
+        catch { XCTAssertTrue(error as? MatrixOpenIDError == .requestFailed) }
+        XCTAssertEqual(client.openIDCalls, 1)
+        if clearLocal { try await service.clearLocalSession() }
+        else { await service.logout() }
+        XCTAssertNil(try service.confirmedGatewayClient())
+        do { _ = try await gateway.momentsRequest(); XCTFail("Expected ended session") }
+        catch { XCTAssertTrue(error as? MatrixOpenIDError == .sessionEnded) }
+        XCTAssertEqual(client.openIDCalls, 1)
+    }
+
     private func makeService(sessionStore: any SessionStore, directory: URL, client: FakeClient,
                              authentication: FakePasswordAuthentication = FakePasswordAuthentication(),
                              sharedPushCredentialsStore: any SharedPushCredentialsStore = InMemorySharedPushCredentialsStore(),
@@ -1422,6 +1453,7 @@ private final class FakeClient: Client, @unchecked Sendable {
     private let onSetDelegate: (() throws -> Void)?
     @TestLocked private(set) var syncCalls = 0
     @TestLocked private(set) var queueEnableValues: [Bool] = []
+    @TestLocked private(set) var openIDCalls = 0
     @TestLocked private(set) var didLogout = false
     @TestLocked private(set) var restoreCalls = 0
     @TestLocked private(set) var restoredSession: Session? = nil
@@ -1473,6 +1505,11 @@ private final class FakeClient: Client, @unchecked Sendable {
         restoreCalls += 1
         if let configuredRestoreError { throw configuredRestoreError }
         restoredSession = session
+    }
+
+    override func requestOpenidToken() async throws -> OpenIdToken {
+        openIDCalls += 1
+        throw MatrixServiceError.storageUnavailable
     }
 
     override func logout() async throws {
