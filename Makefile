@@ -6,9 +6,13 @@
 #                        # force-recreates ONLY sygnal so freshly rendered
 #                        # APNs config (APNS_PLATFORM / BOTVILLE_APNS_ENABLED /
 #                        # ...) is picked up by the running gateway (PR #127 B1)
+#   make up GATEWAY=1    # also build + start the botville gateway (A2.2,
+#                        # `gateway` profile, gateway-data volume), any HS
 #   make smoke           # run server/tests/smoke.py against the running stack
 #   make backup          # dump synapse DB + synapse-data / optional gateway-data into ./backups/<ts>/ (A1.1 / A2.2)
 #   make restore RESTORE_DIR=backups/<ts>   # destructive restore of a backup (A1.1)
+#   make backup-gateway  # gateway-data volume only, any HS profile (A2.2)
+#   make restore-gateway RESTORE_DIR=backups/<ts>   # restore gateway-data only
 #   make e2e             # register/chat/group acceptance test; E2E_PHASE=seed|verify (A1.1)
 #   make push-e2e        # HS -> sygnal push latency acceptance (<5s, A1.2);
 #                        # needs the stack up with PUSH=1 (mock pushkin, no APNs)
@@ -70,12 +74,22 @@ ifeq ($(strip $(PUSH_PORT)),)
 PUSH_PORT := 8019
 endif
 
+# Optional botville gateway (A2.2 / #7): GATEWAY=1 (also true/yes) on
+# up/logs/ps adds --profile gateway (built from gateway/Dockerfile; stacks
+# onto any HS profile, mounts the gateway-data volume). `up` with GATEWAY=1
+# first runs `compose build gateway` so the local image tracks the checkout
+# (cached layers make it cheap when nothing changed). Like push, `down` always
+# carries --profile gateway so a GATEWAY=1 stack tears down fully; `down`
+# never passes -v, so no volume (gateway-data included) is deleted by it.
+GATEWAY ?=
+GATEWAY_PROFILE := $(if $(filter 1 true yes,$(GATEWAY)),--profile gateway,)
+
 # Backup/restore/e2e knobs (A1.1).
 E2E_PHASE ?= seed
 E2E_STATE ?= backups/e2e-state.json
 
-.PHONY: init up down logs smoke ps backup restore e2e push-e2e appservice-e2e \
-	federation-e2e federation-down
+.PHONY: init up down logs smoke ps backup restore backup-gateway restore-gateway \
+	e2e push-e2e appservice-e2e federation-e2e federation-down
 
 init:
 	bash server/scripts/init.sh
@@ -94,7 +108,10 @@ init:
 # server/scripts/bootstrap-continuwuity.sh).
 up:
 	bash server/scripts/init.sh
-	$(COMPOSE) --profile $(HS) $(PUSH_PROFILE) up -d
+ifneq ($(GATEWAY_PROFILE),)
+	$(COMPOSE) --profile gateway build gateway
+endif
+	$(COMPOSE) --profile $(HS) $(PUSH_PROFILE) $(GATEWAY_PROFILE) up -d
 ifneq ($(PUSH_PROFILE),)
 	$(COMPOSE) --profile $(HS) --profile push up -d --force-recreate --no-deps sygnal
 endif
@@ -103,13 +120,13 @@ ifeq ($(HS),continuwuity)
 endif
 
 down:
-	$(COMPOSE) --profile $(HS) --profile push down --remove-orphans
+	$(COMPOSE) --profile $(HS) --profile push --profile gateway down --remove-orphans
 
 logs:
-	$(COMPOSE) --profile $(HS) $(PUSH_PROFILE) logs -f --tail=200
+	$(COMPOSE) --profile $(HS) $(PUSH_PROFILE) $(GATEWAY_PROFILE) logs -f --tail=200
 
 ps:
-	$(COMPOSE) --profile $(HS) $(PUSH_PROFILE) ps
+	$(COMPOSE) --profile $(HS) $(PUSH_PROFILE) $(GATEWAY_PROFILE) ps
 
 smoke: init
 	python3 server/tests/smoke.py \
@@ -128,6 +145,18 @@ backup:
 restore:
 	@test -n "$(RESTORE_DIR)" || { echo "usage: make restore RESTORE_DIR=backups/<timestamp>"; exit 2; }
 	bash server/scripts/restore-synapse.sh "$(RESTORE_DIR)" --yes
+
+# gateway-data only (A2.2 / #7), for any homeserver profile (tuwunel and
+# continuwuity have no homeserver backup script yet; synapse users get
+# gateway-data inside `make backup` already). Skips cleanly when the volume
+# does not exist; restore leaves an existing volume untouched when the backup
+# has no gateway-data.tar.gz. See server/scripts/backup-gateway-data.sh.
+backup-gateway:
+	bash server/scripts/backup-gateway-data.sh
+
+restore-gateway:
+	@test -n "$(RESTORE_DIR)" || { echo "usage: make restore-gateway RESTORE_DIR=backups/<timestamp>"; exit 2; }
+	bash server/scripts/restore-gateway-data.sh "$(RESTORE_DIR)" --yes
 
 # E2E acceptance (Element-equivalent flows via the standard API):
 #   make e2e                       # seed alice/bob/carol + DM + group, write state

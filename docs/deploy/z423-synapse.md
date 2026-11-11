@@ -287,7 +287,7 @@ make backup
 | --- | --- |
 | `synapse-db.dump` | `pg_dump -Fc` 数据库快照（postgres 保持运行中导出） |
 | `synapse-data.tar.gz` | `media_store`、`signing.key`（短暂停 synapse 保证与数据库一致） |
-| `gateway-data.tar.gz` | （可选）compose 卷 `gateway-data` 的**整卷** `tar`（卷根目录下的全部文件，不限 `.db`）。若镜像内有 `sqlite3`，打包前仅对**卷顶层** `*.db` 做 `PRAGMA wal_checkpoint(TRUNCATE)`，不递归子目录。**卷不存在则跳过，不写此文件**（网关进程尚未加入 compose，默认栈没有该卷）。旧备份没有此文件时，恢复不碰该卷 |
+| `gateway-data.tar.gz` | （可选）compose 卷 `gateway-data` 的**整卷** `tar`（卷根目录下的全部文件，不限 `.db`）。打包期间暂停正在运行的 gateway 容器；打包前仅对**卷顶层** `*.db` 做 `PRAGMA wal_checkpoint(TRUNCATE)`（sqlite3 CLI，没有则用镜像里的 python3），不递归子目录。**卷不存在则跳过，不写此文件**（没用过 `GATEWAY=1` 的栈没有该卷）。旧备份没有此文件时，恢复不碰该卷 |
 | `homeserver.yaml` | 渲染后的 Synapse 配置副本 |
 | `env` | `.env` 副本，**含全部密钥**（网关密钥若写在这份 `.env` 里会随它备份；`gateway-data` 卷只含业务数据，不另存密钥） |
 | `manifest.txt` | 备份时间、镜像、每个文件的 sha256（有 `gateway-data.tar.gz` 时也列入） |
@@ -296,27 +296,53 @@ make backup
 所有文件权限 600**（含容器内生成的 tar，结束前自检，不达标即报错）；不要明文放
 公网网盘、建议至少一份离线/异地。
 
-**网关数据**（`gateway-data` 卷，A2.2 / #7）：约定目录 `/var/lib/botville-gateway`，
-动态库路径 `GATEWAY_MOMENTS_DB_PATH=/var/lib/botville-gateway/moments.db`。
-卷在 `server/compose/docker-compose.yml` 已声明，但网关还不是 compose 服务，
-默认 `make up` **不会创建**该卷。若要开始往卷里写数据（或让备份采到它），先：
+**网关服务与网关数据**（A2.2 / #7）：网关是可选的 compose profile `gateway`，
+和 `push` 一样叠加在任一 homeserver profile 上，**默认 `make up` 不启动它**：
 
 ```bash
-# 项目名与 server/compose/.env 的 COMPOSE_PROJECT_NAME 一致，默认 botville
-docker volume create --label com.docker.compose.project=botville   --label com.docker.compose.volume=gateway-data   botville_gateway-data
+make up GATEWAY=1              # synapse + 网关；make up HS=tuwunel GATEWAY=1 同理
+curl -s http://127.0.0.1:8020/health   # 端口 = .env 的 BOTVILLE_GATEWAY_PORT，只绑 127.0.0.1
 ```
 
-当前没有服务挂载本卷，即使加了 compose 标签，`docker compose down -v` 也删不掉它
-（`docker compose config --volumes` 不会列出它）。`make down` **不传** `-v`，不会删除
-任何卷。现在要删这个卷，需要显式执行：
+镜像由 `gateway/Dockerfile` 在本机构建（固定 digest 的 `python:3.12-slim` + 网关源码 +
+`gateway/migrations/moments/`，以非 root 的 uid 10001 运行，不含任何密钥）；
+`GATEWAY_AUTH_TOKEN` / `GATEWAY_HMAC_SECRET` 由 init.sh 生成到 `.env` 的
+`BOTVILLE_GATEWAY_AUTH_TOKEN` / `BOTVILLE_GATEWAY_HMAC_SECRET`。compose 里的网关目前用
+内存 Matrix 传输（不连 homeserver；appservice 接线见 [appservice.md](appservice.md)）。
+
+网关挂载 compose 卷 `gateway-data`（实际名 `<项目名>_gateway-data`）到
+`/var/lib/botville-gateway`，`GATEWAY_MOMENTS_DB_PATH=/var/lib/botville-gateway/moments.db`，
+启动时自动执行镜像内的 moments 迁移。删除语义：
+
+- `make down` **不传** `-v`，不删除任何卷（包括 `gateway-data`）。
+- `docker compose ... --profile gateway down -v`（带上 gateway profile，此时有服务挂载
+  该卷）会连同其他卷一起删掉 `gateway-data`。**不带** `--profile gateway` 时 compose
+  不认为该卷在用，`down -v` 删不掉它，`docker compose config --volumes` 也不列它。
+- 任何时候都可以单独删除：
 
 ```bash
 docker volume rm -f botville_gateway-data   # 项目名按 .env 的 COMPOSE_PROJECT_NAME
 ```
 
-等网关服务挂上该卷后，标签才会让 `docker compose down -v` 一并删除。
-若网关以主机进程方式打开了该卷上的 SQLite 文件，备份前请先停掉网关，以免拷到半截 WAL。
-保留天数沿用现有备份目录清理惯例（上文 crontab 的 14 天），本卷不另设保留期。
+在 #188 时期手工 `docker volume create` 过、里面文件属主是 root 的旧卷，非 root 网关可能
+写不进去：先 `make backup-gateway`，再 `make restore-gateway RESTORE_DIR=…`（恢复时会把卷内
+文件交给 uid 10001），或直接删掉旧卷让网关重建。
+
+备份：synapse 用 `make backup`（上表，含 `gateway-data.tar.gz`）；tuwunel / continuwuity
+没有 homeserver 备份脚本，用只备份网关数据的
+
+```bash
+make backup-gateway                                   # 卷不存在则跳过、不写任何文件
+make restore-gateway RESTORE_DIR=backups/<时间戳>      # 备份里没有 gateway-data.tar.gz 时不碰现有卷
+```
+
+产物同样落在 `./backups/<UTC时间戳>/`（`gateway-data.tar.gz` + `manifest.txt`，目录 700、
+文件 600），**不含 `.env`**——网关密钥只在 `.env` 里，请另行保管 `.env`；卷内只有业务
+数据。两套脚本共用 `server/scripts/lib.sh` 的同一份归档/恢复逻辑（暂停网关容器、顶层
+`*.db` 的 WAL checkpoint、整卷 tar、manifest sha256 校验）。联邦栈（botville-fed）没有
+网关服务、也没有 `gateway-data` 卷，不涉及。
+保留天数沿用现有备份目录清理惯例（下文 crontab 的 14 天，同一个 `backups/` 目录），
+本卷不另设保留期。
 
 **备份介质必须支持 Unix 权限位**：备份目录 700、文件 600 这套权限要原样落在
 备份介质上。目标盘/挂载点须是 ext4、btrfs、ZFS、APFS 等保留权限的文件系统
@@ -383,11 +409,11 @@ drop/recreate 数据库（UTF8、C locale）→ `pg_restore` → 恢复数据卷
 make e2e E2E_PHASE=seed                  # ① 造数据：三用户、私聊、群、消息
 make backup                             # ② 备份（记下输出的目录）
 make down                               # ③ 停栈（make down 不删卷）
+# 带上 --profile gateway：gateway-data 有服务挂载，down -v 会一起删掉
 docker compose -f server/compose/docker-compose.yml \
-  --env-file server/compose/.env --profile synapse down -v --remove-orphans
-# gateway-data 目前没有服务挂载，上一步 down -v 删不掉它：
-docker volume rm -f botville_gateway-data   # 项目名按 COMPOSE_PROJECT_NAME
-make up                                 # ④ 起一个全新空栈
+  --env-file server/compose/.env --profile synapse --profile gateway down -v --remove-orphans
+# 没带 --profile gateway 时它不会被删，需要：docker volume rm -f <项目名>_gateway-data
+make up                                 # ④ 起一个全新空栈（用网关就 make up GATEWAY=1）
 make restore RESTORE_DIR=backups/<时间戳>  # ⑤ 恢复
 make e2e E2E_PHASE=verify               # ⑥ 用 state 文件重新登录，确认私聊/群消息都在
 ```
@@ -511,7 +537,7 @@ make e2e E2E_PHASE=verify                            #    （如做过 e2e seed�
 
 **想换 `BOTVILLE_SERVER_NAME`**
 用户 ID 里带 server_name，改了等于全新服务器，没有平滑迁移。真要换：
-备份留档 → `make down` → `docker compose ... down -v` 清已挂载的卷 → `docker volume rm -f <项目名>_gateway-data`（该卷目前无服务挂载，`down -v` 删不掉）→ 改名重来。
+备份留档 → `make down` → `docker compose ... --profile <hs> --profile gateway down -v` 清卷（带 gateway profile 才会删 `gateway-data`；否则再 `docker volume rm -f <项目名>_gateway-data`）→ 改名重来。
 
 **恢复后 synapse 起不来 / 数据库连接失败**
 确认恢复流程完整（`make restore` 日志里 `/health OK`）；若是在旧环境上恢复更早的
@@ -522,9 +548,9 @@ make e2e E2E_PHASE=verify                            #    （如做过 e2e seed�
 **先把 `backups/` 目录迁出到安全位置**（里面有全部备份和 `e2e-state.json`，
 目录一删就全没了），再 `make down`，执行 `docker compose -f
 server/compose/docker-compose.yml --env-file server/compose/.env --profile synapse
-down -v --remove-orphans`（删除已挂载的数据卷），再执行
-`docker volume rm -f <项目名>_gateway-data`（`gateway-data` 目前无服务挂载，
-`down -v` 删不掉，不删则会把 moments 数据库留在盘上），最后删掉
+--profile gateway down -v --remove-orphans`（删除数据卷；带 `--profile gateway` 才会
+连 `gateway-data` 一起删），再用 `docker volume ls` 确认没有 `<项目名>_gateway-data`
+残留（有就 `docker volume rm -f <项目名>_gateway-data`，否则 moments 数据库会留在盘上），最后删掉
 `<NAS_DATA_DIR>/botville` 目录。
 
 **备份目录能直接删吗**

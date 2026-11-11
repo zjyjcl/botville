@@ -12,10 +12,12 @@
 #   gateway-data.tar.gz  (optional) full-volume tar of the gateway-data
 #                        volume (everything under the volume root, not just
 #                        .db / -wal / -shm). Written only if the volume
-#                        exists; omitted otherwise so a default stack still
-#                        backs up cleanly. If sqlite3 is in the image, run
-#                        PRAGMA wal_checkpoint(TRUNCATE) on top-level
+#                        exists; omitted otherwise so a stack without the
+#                        gateway profile still backs up cleanly. A running
+#                        gateway container is stopped around the archive;
+#                        PRAGMA wal_checkpoint(TRUNCATE) runs on top-level
 #                        /gateway-data/*.db only (not recursive) before tar.
+#                        Same helper as backup-gateway-data.sh (lib.sh).
 #   homeserver.yaml      copy of server/compose/generated/synapse/homeserver.yaml
 #   env                  copy of server/compose/.env -- CONTAINS SECRETS
 #   manifest.txt         backup time, images, sha256 + size of every file
@@ -110,34 +112,18 @@ compose run --rm --no-deps --entrypoint sh \
     synapse \
     -c 'cd /data && files=""; for f in media_store signing.key; do [ -e "$f" ] && files="$files $f"; done; [ -n "$files" ] || { echo "no data files found in /data" >&2; exit 1; }; tar -czf /backup/synapse-data.tar.gz $files && chown "$HOST_UID:$HOST_GID" /backup/synapse-data.tar.gz && chmod 600 /backup/synapse-data.tar.gz'
 
-# 3. Optional gateway-data volume (A2.2 / #7). The volume is declared in
-#    compose but not mounted by a service yet, so a default stack will not
-#    have it — skip cleanly rather than failing. When it exists, archive
-#    the whole volume through a one-off container on the synapse image
-#    (already pulled for this backup; no extra image). Prefer a WAL
-#    checkpoint top-level *.db if sqlite3 is available (not recursive;
-#    the agreed path is /var/lib/botville-gateway/moments.db at the volume
-#    root), then tar the whole volume. Stop a host-run gateway that has
-#    this database open before backing up.
+# 3. Optional gateway-data volume (A2.2 / #7). Only present once the stack
+#    ran with the gateway profile (make up GATEWAY=1) or the volume was
+#    created by hand/restored -- skip cleanly otherwise. When it exists,
+#    archive the whole volume through a one-off container on the synapse
+#    image (already pulled for this backup; no extra image) with the shared
+#    lib.sh helper, which also stops/starts a running gateway container and
+#    does the top-level *.db WAL checkpoint (see archive_gateway_data).
 artifacts=(synapse-db.dump synapse-data.tar.gz homeserver.yaml env)
 gateway_vol="$(gateway_data_volume)"
 if docker_volume_exists "${gateway_vol}"; then
     echo "==> archiving gateway-data volume ${gateway_vol}"
-    # shellcheck disable=SC2016  # $db expands inside the container shell
-    compose run --rm --no-deps --entrypoint sh \
-        -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
-        -v "$(cd "${BACKUP_DIR}" && pwd):/backup" \
-        -v "${gateway_vol}:/gateway-data" \
-        synapse \
-        -c 'if command -v sqlite3 >/dev/null 2>&1; then
-                for db in /gateway-data/*.db; do
-                    [ -f "$db" ] || continue
-                    sqlite3 "$db" "PRAGMA wal_checkpoint(TRUNCATE);" || true
-                done
-            fi
-            tar -czf /backup/gateway-data.tar.gz -C /gateway-data .
-            chown "$HOST_UID:$HOST_GID" /backup/gateway-data.tar.gz
-            chmod 600 /backup/gateway-data.tar.gz'
+    archive_gateway_data "${BACKUP_DIR}" synapse
     artifacts+=(gateway-data.tar.gz)
 else
     echo "==> gateway-data volume ${gateway_vol} not found; skipping (optional)"

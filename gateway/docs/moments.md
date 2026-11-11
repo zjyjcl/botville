@@ -343,23 +343,31 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
 部署目标为 8845 小主机（Ubuntu Server 24.04，**尚未装好**）。本 PR 与后续 PR 的交付
 边界：只改仓库内容，**不连接、不部署任何机器**，不写任何真实密钥。
 
-- compose 已声明持久化卷 `gateway-data`（实际 docker volume 名为
-  `<COMPOSE_PROJECT_NAME>_gateway-data`，默认 `botville_gateway-data`）。约定挂载目录
-  为 `/var/lib/botville-gateway`，启用动态模块时设
-  `GATEWAY_MOMENTS_DB_PATH=/var/lib/botville-gateway/moments.db`（WAL 模式，随卷保留）。
-  **网关进程尚未作为 compose 服务加入**（无 Dockerfile；镜像内迁移目录定位仍见 §10）。
-  卷不挂在现有 homeserver 服务上，需显式创建才会出现（见 `server/compose/docker-compose.yml`
-  注释）；未创建时备份脚本跳过该卷、不失败。当前没有服务挂载，因此即使加了 compose
-  标签，`docker compose down -v` 也删不掉它（`compose config --volumes` 不会列出），
-  `make down` 也不传 `-v`。要删这个卷请执行
-  `docker volume rm -f <COMPOSE_PROJECT_NAME>_gateway-data`；等网关服务挂上该卷后，
-  标签才会让 `down -v` 一并删除。
-- 备份/恢复：已纳入既有 `backup-synapse.sh` / `restore-synapse.sh`（synapse profile）。
-  卷存在则把其中**全部文件**打成 `gateway-data.tar.gz`（整卷 `tar`，不限 `.db`）。
-  若镜像内有 `sqlite3`，打包前仅对**卷顶层** `*.db` 做 `PRAGMA wal_checkpoint(TRUNCATE)`，
-  不递归子目录。旧备份没有该文件时，恢复**不碰**已有 `gateway-data` 卷。整个备份目录仍按密钥库保管（700/600），卷内是
-  业务数据，不含网关密钥（密钥在 `env` 等既有产物里，不另存一份到本卷或仓库）。
-  部署手册见 `docs/deploy/z423-synapse.md`「备份与恢复」中的网关数据说明。
+- 网关已作为可选 compose 服务加入：profile `gateway`，`make up GATEWAY=1`（可叠加任一
+  homeserver profile；**默认 `make up` 不启动**）。镜像由 `gateway/Dockerfile` 本机构建：
+  固定 digest 的 `python:3.12-slim`，按仓库布局放 `/app/gateway/src` 与
+  `/app/gateway/migrations/moments`，因此迁移执行器的 `DEFAULT_MIGRATIONS_DIR`
+  （`moments/migrations.py` 往上三级 + `migrations/moments`）在镜像内不改代码即可定位；
+  以非 root 的 uid 10001 运行，镜像内不含任何密钥。宿主端口只绑
+  `127.0.0.1:${BOTVILLE_GATEWAY_PORT:-8020}`；compose 里暂用内存 Matrix 传输（appservice
+  接线待后续）。
+- 持久化卷 `gateway-data`（实际名 `<COMPOSE_PROJECT_NAME>_gateway-data`，默认
+  `botville_gateway-data`）由网关服务挂载到 `/var/lib/botville-gateway`，
+  `GATEWAY_MOMENTS_DB_PATH=/var/lib/botville-gateway/moments.db`（WAL 模式，随卷保留），
+  启动时执行镜像内迁移。删除语义：`make down` 不传 `-v`，不删任何卷；带
+  `--profile gateway` 的 `docker compose ... down -v` 会删掉本卷（有服务挂载它）；不带该
+  profile 时 compose 不认为本卷在用，`down -v` 删不掉、`compose config --volumes` 也不列；
+  `docker volume rm -f <COMPOSE_PROJECT_NAME>_gateway-data` 任何时候都能单独删除。
+- 备份/恢复：synapse profile 在既有 `backup-synapse.sh` / `restore-synapse.sh` 里；
+  其他 profile（tuwunel / continuwuity，无 homeserver 备份脚本）用
+  `backup-gateway-data.sh` / `restore-gateway-data.sh`（`make backup-gateway` /
+  `make restore-gateway`）。两者共用 `server/scripts/lib.sh` 的同一份逻辑：卷存在则把其中
+  **全部文件**打成 `gateway-data.tar.gz`（整卷 `tar`，不限 `.db`），打包期间暂停网关容器，
+  打包前仅对**卷顶层** `*.db` 做 `PRAGMA wal_checkpoint(TRUNCATE)`（sqlite3 CLI，没有则
+  python3），不递归子目录；卷不存在则跳过；旧备份没有该文件时，恢复**不碰**已有卷。
+  备份目录按密钥库保管（700/600）；卷内是业务数据，不含网关密钥（密钥只在
+  `server/compose/.env`，synapse 备份的 `env` 副本里有，`backup-gateway-data.sh` 不拷 `.env`）。
+  部署手册见 `docs/deploy/z423-synapse.md`「备份与恢复」中的网关服务与网关数据说明。
 - 跨服入口只经 fedgate 暴露 `/_matrix/botville/*`；网关 HTTP 端口只在 compose 内网或
   `127.0.0.1` 监听。
 
@@ -382,8 +390,9 @@ Moments 仍只在 `tags` / `paths` 末尾 / `securitySchemes` / `schemas` 末尾
 |---|---|
 | PR1（已合入） | 契约：OpenAPI 路径 / securitySchemes / schema、示例与校验登记、DDL、本文、契约单测（`gateway/tests/test_moments_contract.py`）。 |
 | PR2（已合入，#184） | 存储（迁移执行器、SQLite 访问层）、`can_view` / `can_see_interaction` 与 `RelationProvider` 临时实现、同服 API 实现、权限矩阵与性质单测、`.env.example` 登记配置变量、软删/审计定时清理。 |
-| 卷与备份（本 PR） | compose 声明 `gateway-data` 卷；`backup-synapse.sh` / `restore-synapse.sh` 归档与恢复（卷不存在则跳过；旧备份无产物则不碰该卷）。见 §8。 |
-| 仍待后续 | CI `moments-e2e` job；把网关进程加入 compose（Dockerfile、将卷挂到 `/var/lib/botville-gateway`、镜像内迁移目录定位）。 |
+| 卷与备份（已合入，#188） | compose 声明 `gateway-data` 卷；`backup-synapse.sh` / `restore-synapse.sh` 归档与恢复（卷不存在则跳过；旧备份无产物则不碰该卷）。见 §8。 |
+| 网关镜像与 compose（本 PR） | `gateway/Dockerfile`（镜像内带迁移目录、非 root）；compose `gateway` profile 挂载 `gateway-data`；其他 profile 的 gateway-data 备份（`backup-gateway-data.sh` / `restore-gateway-data.sh`）；CI `gateway-compose` job。见 §8。 |
+| 仍待后续 | CI `moments-e2e` job；compose 网关的 appservice 传输接线（homeserver 推事务到 `http://gateway:8080`）。 |
 | PR3 | 跨服只读 API（`/_matrix/botville/moments/v1/*` 正式入契约）、fedgate HMAC 验签、双 HS 联邦 e2e（配对可读、切断被拒）。 |
 
 每个 PR 单独送审，不自行合并。

@@ -129,7 +129,9 @@ sender → **400 `request.invalid`**；房间别名不存在 → **404
   三层都不放行。init.sh 全程 `umask 077` 并无条件 `chmod 600` `.env` 与渲染
   产物。
 - `url: null` 是有意为之：M1 网关不接收 HS 推送的事务，null 让 HS 无处可推、
-  也不会重试。A2 网关开始接收事务时改为 `http://gateway:<port>`。
+  也不会重试。A2 网关开始接收事务时改为 `http://gateway:<port>`。compose 的
+  可选 `gateway` profile（A2.2，`make up GATEWAY=1`）已有网关容器（容器端口
+  8080），但目前用内存传输、不接收事务，注册文件仍保持 `url: null`。
 
 ## 注册方式差异
 

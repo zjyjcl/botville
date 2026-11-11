@@ -16,9 +16,13 @@
 make up              # core 一键启动：Synapse + Postgres，http://127.0.0.1:8008
 make up HS=tuwunel   # 换 Tuwunel（continuwuity 同理）
 make up PUSH=1       # 叠加 sygnal 推送网关（push profile，A1.2；可与任一 HS 组合）
+make up GATEWAY=1    # 叠加 botville 网关（gateway profile，A2.2；本机构建 gateway/Dockerfile，
+                     # 挂 gateway-data 卷，http://127.0.0.1:8020；可与任一 HS 组合）
 make smoke           # 标准库冒烟测试：注册→登录→建房(v10)→发消息→回读→sync
 make backup          # 备份到 ./backups/<UTC时间戳>/（目录 700、文件 600，A1.1）
 make restore RESTORE_DIR=backups/<时间戳>   # 破坏性恢复（自动 --yes）
+make backup-gateway  # 只备份 gateway-data 卷（任一 HS；卷不存在则跳过，A2.2）
+make restore-gateway RESTORE_DIR=backups/<时间戳>   # 只恢复 gateway-data（无该产物则不碰卷）
 make e2e             # 验收：注册→私聊→建群；E2E_PHASE=verify 复核备份恢复
 make push-e2e        # 推送验收：HS→sygnal 时延 <5s（mock pushkin，需 PUSH=1 起栈）
 make appservice-e2e  # 验收：网关以 @ai_* 身份代发（A1.3；synapse/tuwunel）
@@ -26,7 +30,8 @@ make federation-e2e  # 配对联邦验收（A2.1；独立 botville-fed 项目，
 make federation-down # 只销毁 botville-fed 项目（down -v）
 make logs            # 跟踪日志
 make ps              # 容器状态
-make down            # 停止（保留数据卷；手动 compose down -v 清空已挂载的卷，gateway-data 目前还需 docker volume rm -f）
+make down            # 停止（不传 -v，不删任何卷）。清卷：docker compose ... --profile <hs> --profile gateway down -v
+                     # （带 gateway profile 才删 gateway-data）；单删：docker volume rm -f <项目名>_gateway-data
 ```
 
 continuwuity 默认关闭上游 announcements 检查（避免 SIGTERM 卡到 SIGKILL）：见 [docs/ops/continuwuity-announcements.md](../docs/ops/continuwuity-announcements.md)。
@@ -151,7 +156,9 @@ server/
 │   ├── bootstrap-continuwuity.sh # continuwuity 首启引导注册（标准 UIA，仅 CS API）
 │   ├── lib.sh                    # backup/restore 共享辅助函数
 │   ├── backup-synapse.sh         # DB dump + synapse-data / 可选 gateway-data 归档 + manifest（A1.1 / A2.2）
-│   └── restore-synapse.sh        # 校验 sha256 后破坏性恢复（需 --yes，A1.1；可选恢复 gateway-data）
+│   ├── restore-synapse.sh        # 校验 sha256 后破坏性恢复（需 --yes，A1.1；可选恢复 gateway-data）
+│   ├── backup-gateway-data.sh    # 只备份 gateway-data（任一 HS profile，A2.2；与上面共用 lib.sh 逻辑）
+│   └── restore-gateway-data.sh   # 只恢复 gateway-data（需 --yes；无产物则不碰卷）
 └── tests/
     ├── smoke.py                  # 仅标准库的 CS API 冒烟测试
     ├── e2e_synapse.py            # seed/verify 两阶段验收测试（A1.1）

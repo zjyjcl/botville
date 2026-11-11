@@ -41,6 +41,13 @@ Sygnal 行备注（2026-11-04，A1.2 加入）：只有开 push profile（`make 
 版本号），因此它的「同步处」仍是 §3 第 1/2/3/4 条共 4 处（第 5 条
 homeserver-compat 的版本口径不适用）。
 
+网关基础镜像备注（A2.2 / #7）：`gateway/Dockerfile` 的 `FROM
+docker.io/library/python:3.12-slim@sha256:b18b261e1b4974b4f321451ad5251ded85abb22c2b8b262da527dda1d031ab30`
+（多架构 index digest）同样遵守 tag@digest 规则。compose 的 `gateway` 服务是本机
+`build:`、没有 `image:` 行，所以它不在上表和 `.env.example` 的 `*_IMAGE` 里；CI lint
+的 pin 检查单独校验这一行，`gateway-compose` job 实际构建时会解析该 digest。升级时
+只改 Dockerfile 这一处。
+
 版本口径与 [compat/homeserver-compat.md](../compat/homeserver-compat.md) §1.2
 一致（Synapse v1.164.1 即 matrix-docker-ansible-deploy defaults 当时停留的参考
 版本；Tuwunel tag 一律带 `v` 前缀，如 v1.9.4——不带 `v` 的 tag 在 GHCR 上不存在）。

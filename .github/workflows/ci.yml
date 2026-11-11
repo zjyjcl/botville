@@ -4,10 +4,26 @@
 #         standard-library smoke test against 127.0.0.1:8008.
 #         All three profiles are required-green; images are pinned
 #         (tag@sha256 digest), so failures are real failures.
-# backup-restore (A1.1, synapse only): init -> open registration -> up ->
-#         e2e seed -> seed gateway-data volume -> backup (must contain
-#         gateway-data.tar.gz) -> down -v (wipe volumes) -> up (fresh stack) ->
-#         restore -> e2e verify + gateway-data marker verify.
+# backup-restore (A1.1, synapse only): init -> open registration -> up
+#         with GATEWAY=1 (synapse + gateway profiles) -> e2e seed -> marker
+#         in gateway-data via the running gateway -> backup (must contain
+#         gateway-data.tar.gz) -> down -v (wipe) -> up (fresh stack) ->
+#         restore -> e2e verify + gateway-data marker/migrations/health.
+# gateway-compose (A2.2, tuwunel + continuwuity): gateway image builds and
+#         ships the moments migrations (non-root), `config --volumes` lists
+#         gateway-data, up with GATEWAY=1 -> /health + migrations applied ->
+#         make backup-gateway -> down -v (wipe) -> up -> make restore-gateway
+#         -> marker + /health verify.
+# gateway-data deletion, as these jobs do it (and the docs say): the volume
+#         is deleted by `docker compose ... --profile gateway down -v`, i.e.
+#         only while the gateway service (which mounts it) is in the active
+#         profiles -- both jobs keep --profile gateway on every compose call.
+#         Without that profile compose does not consider the volume in use and
+#         down -v leaves it; then `docker volume rm -f <project>_gateway-data`
+#         is the way. `make down` never passes -v and deletes no volume. Wipe
+#         steps assert the volume is gone (fail otherwise); Teardown runs
+#         down -v, then fails (after an explicit `docker volume rm`) if any
+#         project volume is left -- runner disposal is not relied upon.
 # push-e2e (A1.2, all three homeservers): up with the push profile (sygnal +
 #         org.botville.mock pushkin), then server/tests/push_e2e.py asserts
 #         HS -> sygnal push latency < 5s, an event_id_only payload with no
@@ -33,7 +49,8 @@
 #         unpaired federation denied, pairing enables invite/join/messages
 #         both ways, and each side severing cuts traffic in both directions.
 #         Certs/configs/tokens are generated at run time (gitignored).
-# lint:   compose config for all three profiles (+ the federation stack),
+# lint:   compose config for all three profiles (each also with push and
+#         with gateway; + the federation stack),
 #         shellcheck, python syntax, stdlib unit tests for the bootstrap/
 #         init scripts and the pairing package (no Docker),
 #         notify/gateway contract validation, a guard that the App pairing-qr
@@ -42,7 +59,8 @@
 #         .env.example only ever contains placeholders, a guard that no .p8
 #         file or PEM private-key header is ever tracked (issue #4), and a
 #         guard that every image defaults to tag@sha256 digest (no :latest)
-#         identically in compose and .env.example.
+#         identically in compose and .env.example (and that gateway/Dockerfile's
+#         FROM is pinned the same way).
 name: CI
 
 on:
@@ -120,6 +138,11 @@ jobs:
     name: backup-restore (synapse)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # Every compose call in this job targets the same project/profiles;
+      # --profile gateway is always on so gateway-data counts as in use and
+      # `down -v` deletes it (see the header).
+      STACK: docker compose -f server/compose/docker-compose.yml --env-file server/compose/.env --profile synapse --profile gateway
     steps:
       - uses: actions/checkout@v4
 
@@ -129,35 +152,24 @@ jobs:
           # CI-only: open registration so e2e seed can register users
           # (same escape hatch as the smoke job).
           sed -i "s/^BOTVILLE_OPEN_REGISTRATION=.*/BOTVILLE_OPEN_REGISTRATION=true/" server/compose/.env
+          project="$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' server/compose/.env | tail -n 1)"
+          echo "GATEWAY_VOLUME=${project:-botville}_gateway-data" >> "$GITHUB_ENV"
+          echo "PROJECT=${project:-botville}" >> "$GITHUB_ENV"
 
-      - name: Start stack
-        run: make up HS=synapse
+      - name: Start stack (synapse + gateway profile)
+        run: make up HS=synapse GATEWAY=1
 
       - name: Seed e2e data (alice/bob/carol, DM, group)
         run: make e2e E2E_PHASE=seed
 
-      - name: Seed gateway-data volume
+      - name: Seed gateway-data volume (real gateway service)
         run: |
           set -euo pipefail
-          project="$(python3 -c "
-          name = 'botville'
-          for line in open('server/compose/.env', encoding='utf-8'):
-              if line.startswith('COMPOSE_PROJECT_NAME='):
-                  name = line.split('=', 1)[1].strip()
-          print(name)
-          ")"
-          vol="${project}_gateway-data"
-          docker volume create \
-            --label "com.docker.compose.project=${project}" \
-            --label "com.docker.compose.volume=gateway-data" \
-            "${vol}"
-          docker compose -p "${project}" -f server/compose/docker-compose.yml \
-            --env-file server/compose/.env --profile synapse \
-            run --rm --no-deps --entrypoint sh \
-            -v "${vol}:/gateway-data" \
-            synapse \
-            -c 'printf "botville-gateway-data-seed\n" > /gateway-data/moments.db'
-          echo "SEEDED_GATEWAY_VOLUME=${vol}" >> "$GITHUB_ENV"
+          # The gateway created moments.db and applied the moments migrations
+          # shipped in the image at startup; add a marker file next to it.
+          ${STACK} exec -T gateway python -c "import sqlite3; c = sqlite3.connect('/var/lib/botville-gateway/moments.db'); assert c.execute('select count(*) from moments_schema_migrations').fetchone()[0] >= 1"
+          ${STACK} exec -T gateway sh -c 'printf "botville-gateway-data-seed\n" > /var/lib/botville-gateway/ci-seed.txt'
+          docker volume inspect "${GATEWAY_VOLUME}" >/dev/null
 
       - name: Backup
         run: |
@@ -169,22 +181,29 @@ jobs:
           echo "backup dir: ${backup_dir}"
           test -f "${backup_dir}/gateway-data.tar.gz"
           grep -q 'gateway-data.tar.gz' "${backup_dir}/manifest.txt"
+          tar -tzf "${backup_dir}/gateway-data.tar.gz" | grep -qx './ci-seed.txt'
           echo "RESTORE_DIR=${backup_dir}" >> "$GITHUB_ENV"
 
       - name: Wipe volumes (simulated disaster)
         run: |
-          docker compose -f server/compose/docker-compose.yml \
-            --env-file server/compose/.env --profile synapse down -v --remove-orphans
-          # gateway-data has no service mount, so down -v does not remove it
-          # (compose labels do not help until a service uses the volume).
-          # Explicit rm is required; otherwise the seed file would remain
-          # and the later verify would be a false pass.
-          if [ -n "${SEEDED_GATEWAY_VOLUME:-}" ]; then
-            docker volume rm -f "${SEEDED_GATEWAY_VOLUME}" || true
+          set -euo pipefail
+          # The gateway service mounts gateway-data and --profile gateway is
+          # active, so down -v deletes it together with the other volumes.
+          ${STACK} down -v --remove-orphans
+          # Assert instead of papering over: a leftover volume would make the
+          # later verify a false pass.
+          if docker volume inspect "${GATEWAY_VOLUME}" >/dev/null 2>&1; then
+            echo "::error::down -v left ${GATEWAY_VOLUME} behind"
+            exit 1
+          fi
+          leftover="$(docker volume ls -q --filter "label=com.docker.compose.project=${PROJECT}")"
+          if [ -n "${leftover}" ]; then
+            echo "::error::down -v left volumes behind: ${leftover}"
+            exit 1
           fi
 
       - name: Restart empty stack
-        run: make up HS=synapse
+        run: make up HS=synapse GATEWAY=1
 
       - name: Restore backup
         run: make restore RESTORE_DIR="$RESTORE_DIR"
@@ -192,30 +211,151 @@ jobs:
       - name: Verify e2e data survived
         run: make e2e E2E_PHASE=verify
 
-      - name: Verify gateway-data survived
+      - name: Verify gateway-data survived (gateway healthy on it)
         run: |
           set -euo pipefail
-          vol="${SEEDED_GATEWAY_VOLUME:?}"
-          docker volume inspect "${vol}" >/dev/null
-          project="${vol%_gateway-data}"
-          docker compose -p "${project}" -f server/compose/docker-compose.yml \
-            --env-file server/compose/.env --profile synapse \
-            run --rm --no-deps --entrypoint sh \
-            -v "${vol}:/gateway-data:ro" \
-            synapse \
-            -c 'grep -qx botville-gateway-data-seed /gateway-data/moments.db'
+          ${STACK} exec -T gateway grep -qx botville-gateway-data-seed /var/lib/botville-gateway/ci-seed.txt
+          ${STACK} exec -T gateway python -c "import sqlite3; c = sqlite3.connect('/var/lib/botville-gateway/moments.db'); assert c.execute('select count(*) from moments_schema_migrations').fetchone()[0] >= 1"
+          port="$(sed -n 's/^BOTVILLE_GATEWAY_PORT=//p' server/compose/.env | tail -n 1)"
+          for _ in $(seq 1 30); do
+            curl -fsS "http://127.0.0.1:${port:-8020}/health" && exit 0
+            sleep 2
+          done
+          echo "::error::gateway /health not OK after restore"
+          exit 1
 
       - name: Dump logs
         if: failure()
-        run: |
-          docker compose -f server/compose/docker-compose.yml \
-            --env-file server/compose/.env --profile synapse logs --no-color
+        run: ${STACK} logs --no-color
 
       - name: Teardown
         if: always()
         run: |
-          docker compose -f server/compose/docker-compose.yml \
-            --env-file server/compose/.env --profile synapse down -v --remove-orphans
+          set -euo pipefail
+          ${STACK} down -v --remove-orphans
+          # Do not rely on the runner being thrown away: prove down -v removed
+          # every project volume (gateway-data included). Anything left is
+          # removed explicitly and fails the job, since it means the deletion
+          # semantics documented above are wrong.
+          leftover="$(docker volume ls -q --filter "label=com.docker.compose.project=${PROJECT}")"
+          if [ -n "${leftover}" ]; then
+            echo "::error::down -v left volumes behind: ${leftover}"
+            # shellcheck disable=SC2086
+            docker volume rm ${leftover}
+            exit 1
+          fi
+
+  gateway-compose:
+    # A2.2 / #7: gateway image + compose service + gateway-data backup on the
+    # homeserver profiles that have no homeserver backup script (synapse is
+    # covered by backup-restore above, which runs with GATEWAY=1).
+    name: gateway-compose (${{ matrix.homeserver }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        homeserver: [tuwunel, continuwuity]
+    env:
+      STACK: docker compose -f server/compose/docker-compose.yml --env-file server/compose/.env --profile ${{ matrix.homeserver }} --profile gateway
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Init .env and select homeserver
+        run: |
+          bash server/scripts/init.sh
+          sed -i "s/^BOTVILLE_HOMESERVER=.*/BOTVILLE_HOMESERVER=${{ matrix.homeserver }}/" server/compose/.env
+          project="$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' server/compose/.env | tail -n 1)"
+          echo "GATEWAY_VOLUME=${project:-botville}_gateway-data" >> "$GITHUB_ENV"
+          echo "PROJECT=${project:-botville}" >> "$GITHUB_ENV"
+          port="$(sed -n 's/^BOTVILLE_GATEWAY_PORT=//p' server/compose/.env | tail -n 1)"
+          echo "GATEWAY_PORT=${port:-8020}" >> "$GITHUB_ENV"
+
+      - name: Gateway image builds and ships the moments migrations
+        run: |
+          set -euo pipefail
+          ${STACK} build gateway
+          ${STACK} run --rm --no-deps --entrypoint sh gateway -c '
+            set -e
+            test "$(id -u)" = 10001
+            test -f /app/gateway/migrations/moments/0001_moments.sql
+            test -d /var/lib/botville-gateway
+            python -c "from botville_gateway.moments.migrations import DEFAULT_MIGRATIONS_DIR as d; assert str(d) == \"/app/gateway/migrations/moments\", d"
+            ! ls /app/gateway/tests >/dev/null 2>&1'
+
+      - name: compose config --volumes lists gateway-data with the gateway profile
+        run: |
+          set -euo pipefail
+          ${STACK} config --volumes | grep -qx gateway-data
+
+      - name: Start homeserver + gateway
+        run: make up HS=${{ matrix.homeserver }} GATEWAY=1
+
+      - name: Gateway healthy, moments migrations applied on the volume
+        run: |
+          set -euo pipefail
+          ok=0
+          for _ in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:${GATEWAY_PORT}/health"; then ok=1; break; fi
+            sleep 2
+          done
+          [ "${ok}" = 1 ] || { echo "::error::gateway /health not OK"; exit 1; }
+          ${STACK} exec -T gateway python -c "import sqlite3; c = sqlite3.connect('/var/lib/botville-gateway/moments.db'); assert c.execute('select count(*) from moments_schema_migrations').fetchone()[0] >= 1"
+          ${STACK} exec -T gateway sh -c 'printf "botville-gateway-data-seed\n" > /var/lib/botville-gateway/ci-seed.txt'
+
+      - name: Backup gateway-data (make backup-gateway)
+        run: |
+          set -euo pipefail
+          make backup-gateway
+          backup_dir="$(cat backups/.last-backup)"
+          test -f "${backup_dir}/gateway-data.tar.gz"
+          grep -q 'gateway-data.tar.gz' "${backup_dir}/manifest.txt"
+          tar -tzf "${backup_dir}/gateway-data.tar.gz" | grep -qx './ci-seed.txt'
+          test ! -e "${backup_dir}/env"
+          echo "RESTORE_DIR=${backup_dir}" >> "$GITHUB_ENV"
+
+      - name: Wipe volumes (simulated disaster)
+        run: |
+          set -euo pipefail
+          ${STACK} down -v --remove-orphans
+          if docker volume inspect "${GATEWAY_VOLUME}" >/dev/null 2>&1; then
+            echo "::error::down -v left ${GATEWAY_VOLUME} behind"
+            exit 1
+          fi
+
+      - name: Restart empty stack, restore gateway-data
+        run: |
+          set -euo pipefail
+          make up HS=${{ matrix.homeserver }} GATEWAY=1
+          make restore-gateway RESTORE_DIR="${RESTORE_DIR}"
+
+      - name: Verify gateway-data survived (gateway healthy on it)
+        run: |
+          set -euo pipefail
+          ${STACK} exec -T gateway grep -qx botville-gateway-data-seed /var/lib/botville-gateway/ci-seed.txt
+          for _ in $(seq 1 30); do
+            curl -fsS "http://127.0.0.1:${GATEWAY_PORT}/health" && exit 0
+            sleep 2
+          done
+          echo "::error::gateway /health not OK after restore"
+          exit 1
+
+      - name: Dump logs
+        if: failure()
+        run: ${STACK} logs --no-color
+
+      - name: Teardown
+        if: always()
+        run: |
+          set -euo pipefail
+          ${STACK} down -v --remove-orphans
+          leftover="$(docker volume ls -q --filter "label=com.docker.compose.project=${PROJECT}")"
+          if [ -n "${leftover}" ]; then
+            echo "::error::down -v left volumes behind: ${leftover}"
+            # shellcheck disable=SC2086
+            docker volume rm ${leftover}
+            exit 1
+          fi
 
   push-e2e:
     name: push-e2e (${{ matrix.homeserver }})
@@ -360,6 +500,7 @@ jobs:
         run: |
           shellcheck -x server/scripts/init.sh server/scripts/bootstrap-continuwuity.sh \
             server/scripts/lib.sh server/scripts/backup-synapse.sh server/scripts/restore-synapse.sh \
+            server/scripts/backup-gateway-data.sh server/scripts/restore-gateway-data.sh \
             server/scripts/federation-certs.sh server/scripts/check_no_secrets.sh \
             scripts/sync-pairing-qr-fixtures.sh scripts/test-sync-pairing-qr-fixtures.sh
 
@@ -416,6 +557,9 @@ jobs:
             echo "== docker compose config --profile ${hs} --profile push (A1.2)"
             docker compose -f server/compose/docker-compose.yml \
               --env-file server/compose/.env --profile "${hs}" --profile push config --quiet
+            echo "== docker compose config --profile ${hs} --profile gateway (A2.2)"
+            docker compose -f server/compose/docker-compose.yml \
+              --env-file server/compose/.env --profile "${hs}" --profile gateway config --quiet
           done
           echo "== docker compose config (federation, A2.1)"
           python3 server/scripts/federation-setup.py
@@ -484,6 +628,11 @@ jobs:
               # regenerates empty/<change-me> to 64-hex and refuses anything else.
               "APPSERVICE_AS_TOKEN": "<change-me>",
               "APPSERVICE_HS_TOKEN": "<change-me>",
+              # A2.2 gateway service (optional `gateway` profile): loopback
+              # host port + secrets init.sh generates (64-hex).
+              "BOTVILLE_GATEWAY_PORT": "8020",
+              "BOTVILLE_GATEWAY_AUTH_TOKEN": "<change-me>",
+              "BOTVILLE_GATEWAY_HMAC_SECRET": "<change-me>",
               "POSTGRES_IMAGE": "docker.io/library/postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab",
               "SYNAPSE_IMAGE": "docker.io/matrixdotorg/synapse:v1.164.1@sha256:fa4aa980f279bcf26d4e7ecc2a2c9a701c73f2ebe8841da9bdcf3b2fdf693d75",
               "TUWUNEL_IMAGE": "ghcr.io/matrix-construct/tuwunel:v1.9.4@sha256:0e86c6164d6c9f5b60291938eb61ad8395021c37fe58d47a963ea7edddbedaec",
@@ -600,8 +749,22 @@ jobs:
           # NOT verify the digest resolves in a registry (no network here).
           # A typo'd digest surfaces in the smoke job, which pulls every
           # image for each profile (all three profiles are required-green).
+
+          # gateway/Dockerfile (A2.2): the gateway service has no image: line
+          # (local build), so pin its base image the same way here; the
+          # gateway-compose job builds it, which resolves the digest.
+          dockerfile = "gateway/Dockerfile"
+          froms = []
+          for n, raw in enumerate(open(dockerfile, encoding="utf-8"), 1):
+              m = re.match(r"\s*FROM\s+(\S+)", raw, re.IGNORECASE)
+              if m:
+                  froms.append(m.group(1))
+                  problems += check(m.group(1), f"{dockerfile}:{n}")
+          if not froms:
+              problems.append(f"{dockerfile}: no FROM line found")
+
           if problems:
               print("\n".join(problems))
               sys.exit(1)
-          print("image pins OK (tag@sha256 digest, no :latest, compose == .env.example)")
+          print("image pins OK (tag@sha256 digest, no :latest, compose == .env.example, gateway/Dockerfile FROM)")
           EOF

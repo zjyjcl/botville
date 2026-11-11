@@ -57,10 +57,13 @@ ALL_PROFILES = [
     "--profile", "push",
     "--profile", "tuwunel",
     "--profile", "continuwuity",
+    "--profile", "gateway",
 ]
 
 # Every service the main compose file must merge x-noproxy-env into.
-TARGET_SERVICES = ("postgres", "synapse", "tuwunel", "continuwuity", "sygnal")
+TARGET_SERVICES = (
+    "postgres", "synapse", "tuwunel", "continuwuity", "sygnal", "gateway",
+)
 
 # Every service the federation compose file must merge x-noproxy-env into
 # (issue #134 PR2; no profiles there, so all six always render).
@@ -73,8 +76,8 @@ FED_SERVICES = (
 EXPECTED_DEFAULT_ENTRIES = frozenset((
     "localhost", "127.0.0.1", "::1",
     "sygnal", "postgres", "synapse", "tuwunel", "continuwuity",
-    # reserved names for services not yet in compose (gateway/admin) and
-    # the federation stack's services (PR2 keeps the same list).
+    # gateway (A2.2 `gateway` profile), admin (reserved, not yet in
+    # compose) and the federation stack's services (PR2 keeps the same list).
     "gateway", "admin",
     "synapse-a", "synapse-b", "pairing-a", "pairing-b",
     "fedgate-a", "fedgate-b",
