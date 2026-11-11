@@ -21,7 +21,8 @@
 #         transport and registration url null (no file-based appservice) ->
 #         make backup-gateway ->
 #         down -v (wipe) -> up -> make restore-gateway -> marker + /health
-#         verify (tuwunel also re-runs gateway-hs-smoke).
+#         verify (tuwunel also re-runs gateway-hs-smoke --skip-as-txn: the wiped
+#         HS restarts its txnIds, which would collide with the restored db).
 # gateway-data deletion, as these jobs do it (and the docs say): the volume
 #         is deleted by `docker compose ... --profile gateway down -v`, i.e.
 #         only while the gateway service (which mounts it) is in the active
@@ -391,7 +392,11 @@ jobs:
             || { echo "::error::gateway /health not OK after restore"; exit 1; }
           if [ "${{ matrix.homeserver }}" != continuwuity ]; then
             ${STACK} exec -T gateway python -c "import sqlite3; c = sqlite3.connect('/var/lib/botville-gateway/as_transactions.db'); assert c.execute('select count(*) from as_transactions').fetchone()[0] >= 1"
-            make gateway-hs-smoke
+            # The homeserver was wiped (down -v) but gateway-data restored, so the
+            # fresh HS restarts its txnIds and would collide with the restored
+            # ones (stored once by design). AS transactions were already
+            # covered before the backup; here check whoami + OpenID only.
+            make gateway-hs-smoke GATEWAY_HS_SMOKE_ARGS=--skip-as-txn
           fi
 
       - name: Dump logs

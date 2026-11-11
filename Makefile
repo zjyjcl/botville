@@ -252,6 +252,8 @@ appservice-e2e: init
 # gateway restart and a replay of the same txnId (stored once). Requires the
 # stack up with GATEWAY=1 on synapse or tuwunel (continuwuity stays on the
 # memory transport with url null). The script never prints tokens.
+# Extra flags for the smoke script, e.g. GATEWAY_HS_SMOKE_ARGS=--skip-as-txn.
+GATEWAY_HS_SMOKE_ARGS ?=
 GATEWAY_STACK := $(COMPOSE) --profile $(HS) --profile gateway
 gateway-hs-smoke: init
 	python3 server/tests/gateway_hs_smoke.py \
@@ -260,7 +262,8 @@ gateway-hs-smoke: init
 		--env-file $(ENV_FILE) \
 		--expect-transport $(GATEWAY_TRANSPORT) \
 		--gateway-exec '$(GATEWAY_STACK) exec -T gateway' \
-		--gateway-restart '$(GATEWAY_STACK) restart gateway'
+		--gateway-restart '$(GATEWAY_STACK) restart gateway' \
+		$(GATEWAY_HS_SMOKE_ARGS)
 
 # --- paired federation (A2.1, independent compose project) -----------------
 # botville-fed runs TWO Synapse instances (hs-a/hs-b), each behind its own

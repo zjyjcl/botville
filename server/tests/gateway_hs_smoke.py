@@ -315,17 +315,26 @@ def hs_ping(hs_url, as_token):
 
 def as_register_ai_user(hs_url, as_token):
     url = path_of(hs_url, "/_matrix/client/v3/register")
-    localpart = "ai_gwsmoke_" + secrets.token_hex(4)
-    status, resp = request_json(
-        "POST",
-        url,
-        body={
-            "type": "m.login.application_service",
-            "username": localpart,
-            "inhibit_login": True,
-        },
-        headers={"Authorization": "Bearer " + as_token},
-    )
+    # Synapse applies the per-IP rc_registration limit before the AS branch,
+    # so a smoke run right after other registrations can see 429 for a while.
+    deadline = time.monotonic() + 90
+    while True:
+        localpart = "ai_gwsmoke_" + secrets.token_hex(4)
+        status, resp = request_json(
+            "POST",
+            url,
+            body={
+                "type": "m.login.application_service",
+                "username": localpart,
+                "inhibit_login": True,
+            },
+            headers={"Authorization": "Bearer " + as_token},
+        )
+        if status not in (429, 503) or time.monotonic() >= deadline:
+            break
+        wait_ms = resp.get("retry_after_ms") if isinstance(resp, dict) else None
+        wait = wait_ms / 1000.0 if isinstance(wait_ms, (int, float)) and wait_ms > 0 else 5.0
+        time.sleep(min(max(wait, 1.0), 15.0))
     if status != 200 or not isinstance(resp, dict) or not resp.get("user_id"):
         http_fail("POST", url, status, "m.login.application_service")
     return resp["user_id"]

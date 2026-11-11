@@ -159,6 +159,10 @@ sender → **400 `request.invalid`**；房间别名不存在 → **404
     在 `gateway-data` 卷顶层，和 `moments.db` 一样随 `make backup`（synapse）/
     `make backup-gateway`（tuwunel、continuwuity）整卷备份，备份前对顶层
     `*.db` 做 WAL checkpoint；恢复同理。`GATEWAY_AS_MAX_BODY_BYTES` 用默认 16 MiB。
+    **HS 与 gateway-data 要成对恢复**：txnId 是 HS 按自己的库分配的，HS 被清空重建
+    后会从头编号；这时只恢复 gateway-data，新事务的 txnId 会撞上库里的旧 txnId，
+    网关按幂等直接回 200 而不落库（数据不会坏，但新事件被当成已收到）。生产上
+    HS 数据和 gateway-data 要来自同一时间点；只想清空网关事务时，连同 HS 一起重建。
   - continuwuity：仍用 `memory`，注册 url 为 `null`。它还没有文件方式的
     appservice 注册，切到 appservice 后启动 whoami 会失败、容器会反复退出。
     （网关照样注入 `GATEWAY_HS_TOKEN`、打开事务库，只是没有 HS 会推过来。）
