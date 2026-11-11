@@ -13,13 +13,14 @@ final class MatrixOpenIDTests: XCTestCase {
     }
 
     private func transport(_ provider: MatrixOpenIDTokenProvider? = nil,
-                           base: String = "https://gateway.test/_botville/gateway") throws -> (HTTPGatewayClient, OpenIDRecorder) {
+                           base: String = "https://gateway.test/_botville/gateway",
+                           sleep: @escaping HTTPGatewayClient.RetrySleep = { _ in }) throws -> (HTTPGatewayClient, OpenIDRecorder) {
         let recorder = OpenIDRecorder()
         OpenIDURLProtocol.recorder = recorder
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [OpenIDURLProtocol.self]
         return (try HTTPGatewayClient(baseURL: base, token: "synthetic-site",
-            session: URLSession(configuration: configuration), openIDProvider: provider), recorder)
+            session: URLSession(configuration: configuration), openIDProvider: provider, retrySleep: sleep), recorder)
     }
 
     override func tearDown() { OpenIDURLProtocol.recorder = nil; super.tearDown() }
@@ -40,7 +41,7 @@ final class MatrixOpenIDTests: XCTestCase {
     func testPathSegmentsAndQueryWithBasePrefixes() async throws {
         for base in ["https://gateway.test", "https://gateway.test/v1", "https://gateway.test/_botville/gateway", "https://gateway.test/_botville/gateway/v1/"] {
             let (client, recorder) = try transport(MatrixOpenIDTokenProvider { self.credential() }, base: base)
-            for (path, expected) in [(["moments"], true), (["moments", "id", "comments"], true), (["momentsx"], false), (["capabilities"], false)] {
+            for (path, expected) in [(["moments"], true), (["moments", "id", "comments"], true), (["momentsx"], false), (["capabilities"], false), (["cards"], false), (["context", "assemble"], false)] {
                 let request = try client.request(path, query: [URLQueryItem(name: "x", value: "moments")])
                 XCTAssertEqual(try client.isMomentsRequest(request), expected)
                 _ = try await client.responseData(for: request)
@@ -50,19 +51,41 @@ final class MatrixOpenIDTests: XCTestCase {
         }
     }
 
-    func testCacheAndSixtySecondRefreshBoundary() async throws {
+    func testCacheAndTwentyPercentRefreshBoundary() async throws {
         let clock = OpenIDClock()
         let source = OpenIDSource()
         let provider = MatrixOpenIDTokenProvider(now: { clock.now }) { try await source.issue() }
         _ = try await provider.token()
-        clock.advance(3539)
+        clock.advance(2880)
         _ = try await provider.token()
         let before = await source.count
         XCTAssertEqual(before, 1)
-        clock.advance(1)
+        clock.advance(0.01)
         _ = try await provider.token()
         let after = await source.count
         XCTAssertEqual(after, 2)
+        clock.advance(3600)
+        _ = try await provider.token()
+        let expired = await source.count
+        XCTAssertEqual(expired, 3)
+    }
+
+    func testMixedAuthAndServerRetriesHaveIndependentBoundedBudgets() async throws {
+        let waits = OpenIDWaits()
+        let source = OpenIDSource()
+        let (client, recorder) = try transport(MatrixOpenIDTokenProvider { try await source.issue() },
+            sleep: { await waits.record($0) })
+        recorder.statuses = [500, 401, 500, 500, 500]
+        let unavailable = try OpenIDFixtures.data("problem-homeserver-unavailable")
+        recorder.bodies = [unavailable, try OpenIDFixtures.data("problem-auth-invalid-token"),
+                           unavailable, unavailable, unavailable]
+        do { _ = try await client.momentsRequest(); XCTFail("Expected bounded server retries") }
+        catch { XCTAssertEqual(error as? GatewayClientError, .problem(status: 500, code: "internal.error")) }
+        let count = await source.count
+        let delays = await waits.values
+        XCTAssertEqual(count, 2)
+        XCTAssertEqual(recorder.requests.count, 5)
+        XCTAssertEqual(delays, [1, 2, 4])
     }
 
     func testShortLifetimeUsesHalfAsMargin() async throws {
@@ -70,9 +93,9 @@ final class MatrixOpenIDTests: XCTestCase {
         let source = OpenIDSource(lifetime: 20)
         let provider = MatrixOpenIDTokenProvider(now: { clock.now }) { try await source.issue() }
         _ = try await provider.token()
-        clock.advance(9)
+        clock.advance(10)
         _ = try await provider.token()
-        clock.advance(1)
+        clock.advance(0.01)
         _ = try await provider.token()
         let count = await source.count
         XCTAssertEqual(count, 2)
@@ -86,7 +109,7 @@ final class MatrixOpenIDTests: XCTestCase {
             return try await source.issue()
         }
         _ = try await provider.token()
-        clock.advance(4)
+        clock.advance(4.01)
         _ = try await provider.token()
         let count = await source.count
         XCTAssertEqual(count, 2)
@@ -167,7 +190,18 @@ final class MatrixOpenIDTests: XCTestCase {
         let (client, recorder) = try transport(MatrixOpenIDTokenProvider { try await source.issue() })
         recorder.statuses = [401, 401, 200]
         do { _ = try await client.momentsRequest(); XCTFail("Expected 401") }
-        catch { XCTAssertEqual(error as? GatewayClientError, .httpStatus(401)) }
+        catch {
+            XCTAssertEqual(error as? GatewayClientError, .serverAuthMisconfigured)
+            XCTAssertEqual((error as? GatewayClientError)?.httpStatus, 401)
+            XCTAssertEqual((error as? GatewayClientError)?.problemCode, "auth.invalid_token")
+            XCTAssertEqual((error as? LocalizedError)?.errorDescription, "服务器认证异常，请联系部署者")
+            var dumped = ""
+            dump(error, to: &dumped)
+            for output in [error.localizedDescription, String(describing: error), String(reflecting: error), dumped] {
+                XCTAssertFalse(output.contains("synthetic-openid"))
+                XCTAssertFalse(output.contains("request_id"))
+            }
+        }
         let count = await source.count
         XCTAssertEqual(count, 2)
         XCTAssertEqual(recorder.requests.count, 2)
@@ -184,6 +218,137 @@ final class MatrixOpenIDTests: XCTestCase {
             XCTAssertEqual(count, 1)
             XCTAssertEqual(recorder.requests.count, 1)
         }
+    }
+
+    func testShortTTLsAreReusableAndAlwaysRefreshAfterExpiry() async throws {
+        for lifetime in [30.0, 60, 61, 1] {
+            let clock = OpenIDClock()
+            let source = OpenIDSource(lifetime: lifetime)
+            let (client, recorder) = try transport(MatrixOpenIDTokenProvider(now: { clock.now }) { try await source.issue() })
+            for _ in 0..<10 { _ = try await client.momentsRequest() }
+            clock.advance(lifetime / 2)
+            _ = try await client.momentsRequest()
+            let atBoundary = await source.count
+            XCTAssertEqual(atBoundary, 1)
+            clock.advance(0.001)
+            _ = try await client.momentsRequest()
+            for _ in 0..<10 { _ = try await client.momentsRequest() }
+            let refreshed = await source.count
+            XCTAssertEqual(refreshed, 2)
+            clock.advance(lifetime)
+            _ = try await client.momentsRequest()
+            let expired = await source.count
+            XCTAssertEqual(expired, 3)
+            XCTAssertEqual(recorder.requests.count, 23)
+        }
+    }
+
+    func testMissingAuthAndOtherProblemCodesNeverRetryOrInvalidate() async throws {
+        let cases: [(Int, Data, String)] = [
+            (401, try OpenIDFixtures.data("problem-auth-missing"), "auth.missing"),
+            (403, Data(#"{"code":"persona.not_owned"}"#.utf8), "persona.not_owned"),
+            (404, Data(#"{"code":"not_found"}"#.utf8), "not_found"),
+            (401, Data(#"{"code":"future.code"}"#.utf8), "future.code"),
+            (500, Data(#"{"code":"auth.invalid_token"}"#.utf8), "auth.invalid_token")
+        ]
+        for (status, body, code) in cases {
+            let source = OpenIDSource()
+            let provider = MatrixOpenIDTokenProvider { try await source.issue() }
+            let (client, recorder) = try transport(provider)
+            recorder.statuses = [status]
+            recorder.bodies = [body]
+            do { _ = try await client.momentsRequest(); XCTFail("Expected problem") }
+            catch { XCTAssertEqual(error as? GatewayClientError, .problem(status: status, code: code)) }
+            _ = try await provider.token()
+            let count = await source.count
+            XCTAssertEqual(count, 1)
+            XCTAssertEqual(recorder.requests.count, 1)
+        }
+    }
+
+    func testUnparseableProblemConservativelyPreservesStatusAndToken() async throws {
+        for status in [401, 500] {
+            for (body, type) in [(Data(), "application/problem+json"),
+                                 (Data("not-json".utf8), "application/problem+json"),
+                                 (Data("{}".utf8), "application/problem+json"),
+                                 (Data(#"{"code":null}"#.utf8), "application/problem+json"),
+                                 (try OpenIDFixtures.data("problem-auth-invalid-token"), "application/json"),
+                                 (try OpenIDFixtures.data("problem-homeserver-unavailable"), "")] {
+                let source = OpenIDSource()
+                let provider = MatrixOpenIDTokenProvider { try await source.issue() }
+                let (client, recorder) = try transport(provider)
+                recorder.statuses = [status]
+                recorder.bodies = [body]
+                recorder.contentTypes = [type]
+                do { _ = try await client.momentsRequest(); XCTFail("Expected original HTTP error") }
+                catch { XCTAssertEqual(error as? GatewayClientError, .httpStatus(status)) }
+                _ = try await provider.token()
+                let count = await source.count
+                XCTAssertEqual(count, 1)
+                XCTAssertEqual(recorder.requests.count, 1)
+            }
+        }
+    }
+
+    func testServerErrorsRetryOnlyGETOrIdempotencyKeyWithExactBackoff() async throws {
+        for (method, key, retries) in [("GET", nil, 3), ("POST", "placeholder-intent", 3),
+                                       ("POST", nil, 0), ("PATCH", nil, 0), ("DELETE", nil, 0), ("HEAD", nil, 0), ("POST", " ", 0)] {
+            let waits = OpenIDWaits()
+            let source = OpenIDSource()
+            let provider = MatrixOpenIDTokenProvider { try await source.issue() }
+            let (client, recorder) = try transport(provider, sleep: { await waits.record($0) })
+            recorder.statuses = Array(repeating: 500, count: 4)
+            recorder.bodies = Array(repeating: try OpenIDFixtures.data("problem-homeserver-unavailable"), count: 4)
+            let body = Data("{}".utf8)
+            do { _ = try await client.momentsRequest(method: method, body: body, idempotencyKey: key); XCTFail("Expected server problem") }
+            catch { XCTAssertEqual(error as? GatewayClientError, .problem(status: 500, code: "internal.error")) }
+            _ = try await provider.token()
+            let count = await source.count
+            let delays = await waits.values
+            XCTAssertEqual(count, 1)
+            XCTAssertEqual(recorder.requests.count, retries + 1)
+            XCTAssertEqual(delays, retries == 3 ? [1, 2, 4] : [])
+            for request in recorder.requests {
+                XCTAssertEqual(request.httpMethod, method)
+                XCTAssertEqual(request.httpBody, body)
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Idempotency-Key"), key)
+                XCTAssertTrue(request.value(forHTTPHeaderField: "Authorization") == "MatrixOpenID synthetic-openid-1")
+            }
+        }
+    }
+
+    func testServerBackoffCanRecoverAndCancellationStopsRetry() async throws {
+        for cancel in [false, true] {
+            let waits = OpenIDWaits()
+            let source = OpenIDSource()
+            let (client, recorder) = try transport(MatrixOpenIDTokenProvider { try await source.issue() }, sleep: {
+                await waits.record($0)
+                if cancel { throw CancellationError() }
+            })
+            recorder.statuses = [500, 200]
+            recorder.bodies = [try OpenIDFixtures.data("problem-homeserver-unavailable")]
+            do {
+                _ = try await client.momentsRequest()
+                XCTAssertFalse(cancel)
+            } catch { XCTAssertTrue(cancel && error is CancellationError) }
+            let count = await source.count
+            let delays = await waits.values
+            XCTAssertEqual(count, 1)
+            XCTAssertEqual(delays, [1])
+            XCTAssertEqual(recorder.requests.count, cancel ? 1 : 2)
+        }
+    }
+
+    func testRefreshFollowedByMissingAuthDoesNotBecomeMisconfigurationError() async throws {
+        let source = OpenIDSource()
+        let (client, recorder) = try transport(MatrixOpenIDTokenProvider { try await source.issue() })
+        recorder.statuses = [401, 401]
+        recorder.bodies = [try OpenIDFixtures.data("problem-auth-invalid-token"), try OpenIDFixtures.data("problem-auth-missing")]
+        do { _ = try await client.momentsRequest(); XCTFail("Expected missing auth") }
+        catch { XCTAssertEqual(error as? GatewayClientError, .problem(status: 401, code: "auth.missing")) }
+        let count = await source.count
+        XCTAssertEqual(count, 2)
+        XCTAssertEqual(recorder.requests.count, 2)
     }
 
     func testMissingProviderDoesNotSend() async throws {
@@ -350,6 +515,8 @@ private final class OpenIDRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var captured: [URLRequest] = []
     var statuses: [Int] = []
+    var bodies: [Data] = []
+    var contentTypes: [String] = []
     var unauthorizedBarrier = 0
     private var held: [OpenIDURLProtocol] = []
     var requests: [URLRequest] { lock.lock(); defer { lock.unlock() }; return captured }
@@ -380,8 +547,10 @@ private final class OpenIDRecorder: @unchecked Sendable {
             return
         }
         let status = statuses.isEmpty ? 200 : statuses.removeFirst()
+        let body = bodies.isEmpty ? nil : bodies.removeFirst()
+        let contentType = contentTypes.isEmpty ? "application/problem+json; charset=utf-8" : contentTypes.removeFirst()
         lock.unlock()
-        loader.complete(status)
+        loader.complete(status, body: body, contentType: contentType)
     }
 }
 
@@ -390,11 +559,17 @@ private final class OpenIDURLProtocol: URLProtocol {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() { Self.recorder!.receive(self) }
-    func complete(_ status: Int) {
+    func complete(_ status: Int, body: Data? = nil, contentType: String = "application/problem+json; charset=utf-8") {
         client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: status,
-            httpVersion: "HTTP/1.1", headerFields: nil)!, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Data("{}".utf8))
+            httpVersion: "HTTP/1.1", headerFields: ["Content-Type": contentType])!, cacheStoragePolicy: .notAllowed)
+        let payload = body ?? (status == 401 ? try! OpenIDFixtures.data("problem-auth-invalid-token") : Data("{}".utf8))
+        client?.urlProtocol(self, didLoad: payload)
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
+}
+
+private actor OpenIDWaits {
+    var values: [TimeInterval] = []
+    func record(_ delay: TimeInterval) { values.append(delay) }
 }

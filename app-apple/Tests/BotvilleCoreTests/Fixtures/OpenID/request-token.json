@@ -1,0 +1,6 @@
+{
+  "access_token": "<placeholder>",
+  "token_type": "Bearer",
+  "matrix_server_name": "localhost",
+  "expires_in": 3600
+}

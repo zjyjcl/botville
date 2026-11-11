@@ -45,9 +45,14 @@ public actor MatrixOpenIDTokenProvider {
     private var flight: (id: UUID, task: Task<(MatrixOpenIDToken, Date), Error>)?
     private var generation = UUID()
 
-    /// Refresh at min(60s, lifetime / 2) before expiry: protects long-lived
-    /// tokens from network latency without consuming all of a short lifetime.
-    private static let maximumRefreshMargin: TimeInterval = 60
+    /// Refresh when remaining lifetime < max(60s, lifetime * 20%). Cap the
+    /// margin at 50% of lifetime so even 1s/30s/60s tokens can be reused for
+    /// half their lifetime instead of refreshing on every request. Lifetime
+    /// starts before the source call; responses already past this window fail
+    /// closed rather than recursively requesting another token.
+    private static let minimumRefreshMargin: TimeInterval = 60
+    private static let refreshFraction = 0.2
+    private static let maximumLifetimeFraction = 0.5
 
     public init(now: @escaping @Sendable () -> Date = { Date() }, source: @escaping Source) {
         self.now = now
@@ -56,7 +61,7 @@ public actor MatrixOpenIDTokenProvider {
 
     public func token() async throws -> MatrixOpenIDToken {
         guard let source else { throw MatrixOpenIDError.sessionEnded }
-        if let cached, now() < cached.refreshAt { return cached.token }
+        if let cached, now() <= cached.refreshAt { return cached.token }
         let currentGeneration = generation
         let active: (id: UUID, task: Task<(MatrixOpenIDToken, Date), Error>)
         if let flight {
@@ -71,9 +76,10 @@ public actor MatrixOpenIDTokenProvider {
                 do { token = try await source() }
                 catch { throw MatrixOpenIDError.requestFailed }
                 guard token.isValid else { throw MatrixOpenIDError.invalidTokenResponse }
-                let margin = min(Self.maximumRefreshMargin, token.expiresInSeconds / 2)
+                let margin = min(max(Self.minimumRefreshMargin, token.expiresInSeconds * Self.refreshFraction),
+                                 token.expiresInSeconds * Self.maximumLifetimeFraction)
                 let refreshAt = startedAt.addingTimeInterval(token.expiresInSeconds - margin)
-                guard refreshAt.timeIntervalSinceReferenceDate.isFinite, self.now() < refreshAt else {
+                guard refreshAt.timeIntervalSinceReferenceDate.isFinite, self.now() <= refreshAt else {
                     throw MatrixOpenIDError.invalidTokenResponse
                 }
                 return (token, refreshAt)
