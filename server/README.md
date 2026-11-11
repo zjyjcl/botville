@@ -17,7 +17,9 @@ make up              # core 一键启动：Synapse + Postgres，http://127.0.0.1
 make up HS=tuwunel   # 换 Tuwunel（continuwuity 同理）
 make up PUSH=1       # 叠加 sygnal 推送网关（push profile，A1.2；可与任一 HS 组合）
 make up GATEWAY=1    # 叠加 botville 网关（gateway profile，A2.2；本机构建 gateway/Dockerfile，
-                     # 挂 gateway-data 卷，http://127.0.0.1:8020；可与任一 HS 组合）
+                     # 挂 gateway-data 卷，http://127.0.0.1:8020；可与任一 HS 组合。
+                     # synapse/tuwunel 用 appservice 传输，continuwuity 仍用 memory）
+make gateway-hs-smoke # 对真实 HS 冒烟：启动 whoami + OpenID userinfo（需 GATEWAY=1 的 synapse/tuwunel 栈）
 make smoke           # 标准库冒烟测试：注册→登录→建房(v10)→发消息→回读→sync
 make backup          # 备份到 ./backups/<UTC时间戳>/（目录 700、文件 600，A1.1）
 make restore RESTORE_DIR=backups/<时间戳>   # 破坏性恢复（自动 --yes）
@@ -86,8 +88,8 @@ continuwuity 默认关闭上游 announcements 检查（避免 SIGTERM 卡到 SIG
 - 重置（仅手动，⚠️ 不可恢复：会删除该实例全部账号与消息；生产/NAS 上执行前务必先备份并二次确认，勿在已有数据的部署上执行）：bootstrap 脚本不会删除或重置任何数据。确需丢弃 continuwuity 全部数据
   从零开始时，手动执行（`make down` 不传 `-v`，不会删任何卷）：
   `docker compose -f server/compose/docker-compose.yml --env-file server/compose/.env --profile continuwuity --profile gateway down -v && make up HS=continuwuity`。
-  有网关服务挂载时，带 `--profile gateway` 的 `down -v` 会连 `gateway-data` 一起删；
-  未启用网关或需单独删除时用 `docker volume rm -f <项目名>_gateway-data`
+  带 `--profile gateway` 的 `down -v` 就会删掉 `gateway-data`（与网关容器是否正在运行无关）；
+  未启用该 profile 或需单独删除时用 `docker volume rm -f <项目名>_gateway-data`
   （项目名取 `.env` 的 `COMPOSE_PROJECT_NAME`，默认 `botville`）。要用网关再加
   `make up HS=continuwuity GATEWAY=1`。
   带 `BOTVILLE_BOOTSTRAP_RESET_CONFIRM=yes` 运行 bootstrap 脚本可以让它打印这组命令

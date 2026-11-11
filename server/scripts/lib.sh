@@ -127,9 +127,10 @@ wait_for_postgres() {
 # profile) so every homeserver profile archives/restores it the same way.
 #
 # Deletion: `make down` never passes -v. `docker compose ... --profile
-# gateway down -v` deletes the volume (a service mounts it); without the
-# gateway profile active compose does not consider it in use and down -v
-# leaves it. `docker volume rm -f <project>_gateway-data` always works.
+# gateway down -v` deletes the volume (whether or not a gateway container
+# is running); without the gateway profile active compose does not consider
+# it in use and down -v leaves it. `docker volume rm -f <project>_gateway-data`
+# always works.
 
 # uid/gid the gateway image runs as (gateway/Dockerfile USER). Restored
 # files are chowned to it so the non-root gateway can open them.

@@ -86,15 +86,18 @@ def compose_available():
 
 @unittest.skipUnless(compose_available(), "docker compose v2 not available")
 class ComposeGatewayServiceRenderTest(unittest.TestCase):
-    def compose(self, *args):
+    def compose(self, *args, extra_env=""):
         with tempfile.TemporaryDirectory() as tmp:
             env_file = Path(tmp) / "env"
-            env_file.write_text(REQUIRED_ENV, encoding="utf-8")
-            return subprocess.run(
+            env_file.write_text(REQUIRED_ENV + extra_env, encoding="utf-8")
+            proc = subprocess.run(
                 ["docker", "compose", "-p", "botville-test", "-f", str(COMPOSE),
                  "--env-file", str(env_file), *args],
-                cwd=REPO_ROOT, capture_output=True, text=True, check=True,
-            ).stdout
+                cwd=REPO_ROOT, capture_output=True, text=True,
+            )
+            if proc.returncode != 0:
+                self.fail(proc.stderr or proc.stdout or "compose failed")
+            return proc.stdout
 
     def test_gateway_service_shape(self):
         config = json.loads(self.compose("--profile", "gateway", "config", "--format", "json"))
@@ -107,9 +110,21 @@ class ComposeGatewayServiceRenderTest(unittest.TestCase):
         self.assertEqual(env["GATEWAY_MOMENTS_DB_PATH"], "/var/lib/botville-gateway/moments.db")
         self.assertEqual(env["GATEWAY_HOST"], "0.0.0.0")
         self.assertEqual(env["GATEWAY_MATRIX_TRANSPORT"], "memory")
+        # Default URL uses the compose service name, never 127.0.0.1.
+        self.assertEqual(env["GATEWAY_HOMESERVER_URL"], "http://synapse:8008")
+        self.assertEqual(env.get("GATEWAY_HOMESERVER_FEDERATION_URL") or "", "")
+        self.assertEqual(env["GATEWAY_MATRIX_SERVER_NAME"], "localhost")
+        self.assertEqual(env.get("GATEWAY_AS_TOKEN") or "", "")
+        self.assertNotIn("GATEWAY_HS_TOKEN", env)
+        self.assertNotIn("APPSERVICE_HS_TOKEN", env)
         # Secrets are interpolated from .env only; empty here (no defaults).
         self.assertEqual(env["GATEWAY_AUTH_TOKEN"], "")
         self.assertEqual(env["GATEWAY_HMAC_SECRET"], "")
+        depends = svc.get("depends_on") or {}
+        for name in ("synapse", "tuwunel", "continuwuity"):
+            self.assertIn(name, depends, name)
+            self.assertIs(depends[name].get("required"), False)
+        self.assertEqual(depends["synapse"].get("condition"), "service_healthy")
         mounts = [v for v in svc["volumes"] if v["type"] == "volume"]
         self.assertEqual(len(mounts), 1)
         self.assertEqual(mounts[0]["source"], "gateway-data")
@@ -137,6 +152,60 @@ class ComposeGatewayServiceRenderTest(unittest.TestCase):
         for hs in ("synapse", "tuwunel", "continuwuity"):
             services = self.compose("--profile", hs, "config", "--services").split()
             self.assertNotIn("gateway", services, hs)
+
+    def test_transport_and_url_follow_homeserver_profile(self):
+        """synapse/tuwunel get appservice + http://<service>:8008; continuwuity
+        stays memory. AS token is APPSERVICE_AS_TOKEN; no hs_token; federation
+        URL left empty so OpenID userinfo falls back to the CS URL."""
+        as_token = "test-only-as-token"
+        for hs, transport in (
+            ("synapse", "appservice"),
+            ("tuwunel", "appservice"),
+            ("continuwuity", "memory"),
+        ):
+            config = json.loads(self.compose(
+                "--profile", hs, "--profile", "gateway",
+                "config", "--format", "json",
+                extra_env=(
+                    "BOTVILLE_HOMESERVER={hs}\n"
+                    "BOTVILLE_SERVER_NAME=localhost\n"
+                    "GATEWAY_MATRIX_TRANSPORT={transport}\n"
+                    "APPSERVICE_AS_TOKEN={token}\n"
+                ).format(hs=hs, transport=transport, token=as_token),
+            ))
+            env = config["services"]["gateway"]["environment"]
+            self.assertEqual(env["GATEWAY_MATRIX_TRANSPORT"], transport, hs)
+            self.assertEqual(
+                env["GATEWAY_HOMESERVER_URL"],
+                "http://{}:8008".format(hs),
+                hs,
+            )
+            self.assertEqual(env.get("GATEWAY_HOMESERVER_FEDERATION_URL") or "", "")
+            self.assertEqual(env["GATEWAY_MATRIX_SERVER_NAME"], "localhost")
+            self.assertEqual(env["GATEWAY_AS_TOKEN"], as_token)
+            self.assertNotIn("GATEWAY_HS_TOKEN", env)
+            self.assertNotIn("APPSERVICE_HS_TOKEN", env)
+
+
+class AppserviceRegistrationTemplateTest(unittest.TestCase):
+    def test_registration_url_stays_null(self):
+        tmpl = (
+            REPO_ROOT / "server" / "compose" / "appservice"
+            / "botville-gateway.yaml.tmpl"
+        ).read_text(encoding="utf-8")
+        self.assertRegex(tmpl, r"(?m)^url: null$")
+        self.assertIn('as_token: "${APPSERVICE_AS_TOKEN}"', tmpl)
+        # Comments may mention a future flip to http://gateway:<port>; the
+        # active url field must stay null in this PR.
+        active = [
+            line.strip()
+            for line in tmpl.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        self.assertFalse(
+            any(line.startswith("url:") and "http://gateway" in line for line in active),
+            active,
+        )
 
 
 if __name__ == "__main__":

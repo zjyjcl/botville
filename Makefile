@@ -7,7 +7,10 @@
 #                        # APNs config (APNS_PLATFORM / BOTVILLE_APNS_ENABLED /
 #                        # ...) is picked up by the running gateway (PR #127 B1)
 #   make up GATEWAY=1    # also build + start the botville gateway (A2.2,
-#                        # `gateway` profile, gateway-data volume), any HS
+#                        # `gateway` profile, gateway-data volume), any HS;
+#                        # synapse/tuwunel use appservice transport, continuwuity stays memory
+#   make gateway-hs-smoke # OpenID userinfo + startup whoami against a real HS
+#                        # (stack already up with GATEWAY=1 on synapse or tuwunel)
 #   make smoke           # run server/tests/smoke.py against the running stack
 #   make backup          # dump synapse DB + synapse-data / optional gateway-data into ./backups/<ts>/ (A1.1 / A2.2)
 #   make restore RESTORE_DIR=backups/<ts>   # destructive restore of a backup (A1.1)
@@ -84,15 +87,31 @@ endif
 # carry --profile gateway (same as push, above) so a GATEWAY=1 stack is
 # fully visible and tears down fully without repeating the flag; `down`
 # never passes -v, so no volume (gateway-data included) is deleted by it.
+#
+# `up` also exports BOTVILLE_HOMESERVER=$(HS) (the compose service name, and
+# the in-stack DNS name) and GATEWAY_MATRIX_TRANSPORT so the gateway URL and
+# transport match the profile actually started, even when HS= overrides a
+# stale .env value. synapse and tuwunel get appservice (file-based
+# registration); continuwuity stays memory (no file-based registration yet).
 GATEWAY ?=
 GATEWAY_PROFILE := $(if $(filter 1 true yes,$(GATEWAY)),--profile gateway,)
+ifeq ($(HS),continuwuity)
+GATEWAY_TRANSPORT := memory
+else
+GATEWAY_TRANSPORT := appservice
+endif
+GATEWAY_HS_ENV := BOTVILLE_HOMESERVER=$(HS) GATEWAY_MATRIX_TRANSPORT=$(GATEWAY_TRANSPORT)
+GATEWAY_PORT ?= $(shell sed -n 's/^BOTVILLE_GATEWAY_PORT=//p' $(ENV_FILE) 2>/dev/null | tail -n 1)
+ifeq ($(strip $(GATEWAY_PORT)),)
+GATEWAY_PORT := 8020
+endif
 
 # Backup/restore/e2e knobs (A1.1).
 E2E_PHASE ?= seed
 E2E_STATE ?= backups/e2e-state.json
 
 .PHONY: init up down logs smoke ps backup restore backup-gateway restore-gateway \
-	e2e push-e2e appservice-e2e federation-e2e federation-down
+	e2e push-e2e appservice-e2e gateway-hs-smoke federation-e2e federation-down
 
 init:
 	bash server/scripts/init.sh
@@ -114,7 +133,7 @@ up:
 ifneq ($(GATEWAY_PROFILE),)
 	$(COMPOSE) --profile gateway build gateway
 endif
-	$(COMPOSE) --profile $(HS) $(PUSH_PROFILE) $(GATEWAY_PROFILE) up -d
+	$(GATEWAY_HS_ENV) $(COMPOSE) --profile $(HS) $(PUSH_PROFILE) $(GATEWAY_PROFILE) up -d
 ifneq ($(PUSH_PROFILE),)
 	$(COMPOSE) --profile $(HS) --profile push up -d --force-recreate --no-deps sygnal
 endif
@@ -197,6 +216,17 @@ push-e2e: init
 appservice-e2e: init
 	python3 server/tests/appservice_e2e.py \
 		--base-url http://127.0.0.1:$(PORT) \
+		--env-file $(ENV_FILE)
+
+# Compose gateway against a real homeserver (A2.2): /health matrix check
+# (startup whoami with GATEWAY_AS_TOKEN) plus OpenID userinfo via in-stack
+# GATEWAY_HOMESERVER_URL. Requires the stack up with GATEWAY=1 on synapse
+# or tuwunel (continuwuity stays on the memory transport). The script never
+# prints tokens.
+gateway-hs-smoke: init
+	python3 server/tests/gateway_hs_smoke.py \
+		--hs-url http://127.0.0.1:$(PORT) \
+		--gateway-url http://127.0.0.1:$(GATEWAY_PORT) \
 		--env-file $(ENV_FILE)
 
 # --- paired federation (A2.1, independent compose project) -----------------

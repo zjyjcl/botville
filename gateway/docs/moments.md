@@ -355,7 +355,7 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
   `botville_gateway-data`）由网关服务挂载到 `/var/lib/botville-gateway`，
   `GATEWAY_MOMENTS_DB_PATH=/var/lib/botville-gateway/moments.db`（WAL 模式，随卷保留），
   启动时执行镜像内迁移。删除语义：`make down` 不传 `-v`，不删任何卷；带
-  `--profile gateway` 的 `docker compose ... down -v` 会删掉本卷（有服务挂载它）；不带该
+  `--profile gateway` 的 `docker compose ... down -v` 就会删掉本卷（与网关容器是否正在运行无关）；不带该
   profile 时 compose 不认为本卷在用，`down -v` 删不掉、`compose config --volumes` 也不列；
   `docker volume rm -f <COMPOSE_PROJECT_NAME>_gateway-data` 任何时候都能单独删除。
 - 备份/恢复：synapse profile 在既有 `backup-synapse.sh` / `restore-synapse.sh` 里；

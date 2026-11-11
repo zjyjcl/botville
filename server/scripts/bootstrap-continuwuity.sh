@@ -101,26 +101,38 @@ PY
 # pipe instead of buffered into a variable (--tail keeps the scan bounded on
 # long-running servers); on failure only the command to re-run is printed,
 # never the logs themselves (they may contain live one-time tokens).
+#
+# The client API can answer /versions before continuwuity prints the one-time
+# token, so scrape more than once (BOTVILLE_BOOTSTRAP_TOKEN_WAIT seconds,
+# default 30; 0 = a single attempt). The token value is never printed.
+token=""
 logs_status=0
-# shellcheck disable=SC2086  # ${COMPOSE} is an intentionally word-split prefix
-token="$(${COMPOSE} --profile continuwuity logs --no-color --tail 2000 continuwuity 2>/dev/null \
-    | LC_ALL=C sed $'s/\x1b\\[[0-9;:?]*[ -/]*[@-~]//g' \
-    | LC_ALL=C sed -nE 's/.*using the registration token ([^[:space:]]+).*/\1/p' \
-    | tail -n 1)" || logs_status=$?
-
-if [[ "${logs_status}" -ne 0 ]]; then
-    echo "bootstrap-continuwuity.sh: could not read the continuwuity logs (exit ${logs_status}); to inspect them run:" >&2
-    # shellcheck disable=SC2086
-    echo "  ${COMPOSE} --profile continuwuity logs --no-color --tail 2000 continuwuity" >&2
-    exit 1
-fi
-
-if [[ -n "${token}" ]]; then
-    echo "bootstrap-continuwuity.sh: found one-time bootstrap token in the logs (not echoed)"
-else
-    echo "bootstrap-continuwuity.sh: no one-time bootstrap token in the last 2000 log lines;"
-    echo "  verifying the bootstrap state with the configured registration token"
-fi
+token_wait="${BOTVILLE_BOOTSTRAP_TOKEN_WAIT:-30}"
+token_deadline=$((SECONDS + token_wait))
+while :; do
+    logs_status=0
+    # shellcheck disable=SC2086  # ${COMPOSE} is an intentionally word-split prefix
+    token="$(${COMPOSE} --profile continuwuity logs --no-color --tail 2000 continuwuity 2>/dev/null \
+        | LC_ALL=C sed $'s/\x1b\\[[0-9;:?]*[ -/]*[@-~]//g' \
+        | LC_ALL=C sed -nE 's/.*using the registration token ([^[:space:]]+).*/\1/p' \
+        | tail -n 1)" || logs_status=$?
+    if [[ "${logs_status}" -ne 0 ]]; then
+        echo "bootstrap-continuwuity.sh: could not read the continuwuity logs (exit ${logs_status}); to inspect them run:" >&2
+        # shellcheck disable=SC2086
+        echo "  ${COMPOSE} --profile continuwuity logs --no-color --tail 2000 continuwuity" >&2
+        exit 1
+    fi
+    if [[ -n "${token}" ]]; then
+        echo "bootstrap-continuwuity.sh: found one-time bootstrap token in the logs (not echoed)"
+        break
+    fi
+    if (( SECONDS >= token_deadline )); then
+        echo "bootstrap-continuwuity.sh: no one-time bootstrap token in the last 2000 log lines;"
+        echo "  verifying the bootstrap state with the configured registration token"
+        break
+    fi
+    sleep 2
+done
 
 # One program handles both branches: with a scraped one-time token it
 # registers the admin account (idempotently); without one it verifies via the
@@ -325,9 +337,9 @@ if errcode == "M_FORBIDDEN":
             print("      --env-file server/compose/.env \\")
             print("      --profile continuwuity --profile gateway down -v")
             print("    # make down does not pass -v and deletes no volumes.")
-            print("    # down -v with --profile gateway also deletes gateway-data")
-            print("    # when a gateway service mounts it; without that profile,")
-            print("    # or to delete it alone:")
+            print("    # down -v with --profile gateway deletes gateway-data")
+            print("    # (whether or not a gateway container is running).")
+            print("    # Without that profile, or to delete it alone:")
             print("    #   docker volume rm -f <project>_gateway-data")
             print("    make up HS=continuwuity")
         sys.exit(0)
