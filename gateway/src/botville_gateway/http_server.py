@@ -159,7 +159,20 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         - asterisk-form `*`：只允许 OPTIONS（随后照旧 405）；
         - 其余（authority-form、相对路径、其他 scheme、解析异常）→
           400 `request.invalid`。
+
+        注：`//[x` 这类以 `//` 开头的目标通常走不到这里的 400——较新的 stdlib
+        在 `super().parse_request()` 里会把开头的多个 `/` 折叠成单个 `/`
+        （防 open redirect 的修复），于是变成普通路径 `/[x`，按路由返回 404；
+        不折叠的旧版 stdlib 上则由 `_normalize_request_target` 拒为 400。
+        两种结果都合法，测试对该用例同时接受 400 / 404。
         """
+        # TODO(HTTP/1.1)：本 handler 目前沿用 stdlib 默认 `protocol_version =
+        # "HTTP/1.0"`（每个连接只处理一个请求）。将来升级到 HTTP/1.1 keep-alive 时：
+        #   1. 所有 400 响应（这里的非法目标、请求体超限 / chunked 等）除了设
+        #      `close_connection = True`，还要显式带上 `Connection: close` 响应头；
+        #   2. `_rid`（`_request_id` 的缓存）必须在每个请求开始时重置，否则同一
+        #      连接上的后续请求会沿用上一个请求的 request_id。
+        # 本条只是注释，当前行为不变。
         if not super().parse_request():
             return False
         normalized = _normalize_request_target(self.command, self.path)

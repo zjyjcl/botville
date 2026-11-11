@@ -73,6 +73,19 @@ AI 发言（`POST /conversations/{id}/messages`）或预检（`POST /policy/eval
   `next_cursor` 为 `null` 表示到底；客户端不得构造游标。
 - 未在 schema 中声明的字段，客户端**必须忽略**（前向兼容）；服务端对请求体
   用 `additionalProperties: false` 严格拒绝未知字段，避免拼写错误被静默吞掉。
+- **请求目标（RFC 9112 §3.2，#184）**：网关在路由前统一校验请求行里的目标，
+  对所有端点生效，任何形态都不得返回 500：
+  - origin-form（`/v1/...`）照常路由；
+  - 合法 absolute-form（`http://` / `https://` + 非空 authority）取其 path（空则 `/`）
+    与 query 改写为 origin-form 后照常路由；
+  - asterisk-form `*` 只接受 `OPTIONS`（随后照旧 405，见 §1.2.3 CORS 说明）；
+  - 其余一律 **`400 request.invalid`**（`detail` 为 `invalid request target`，响应后关闭
+    连接）：authority-form（`host:port`）、相对路径、`http`/`https` 以外的 scheme、
+    authority 为空、IPv6 字面量括号未闭合（如 `http://[::1`）、`*` 搭配非 `OPTIONS` 方法。
+  - 以 `//` 开头的 origin-form（如 `//[x`）：较新的 Python 标准库在
+    `BaseHTTPRequestHandler.parse_request` 里会先把开头的多个 `/` 折叠成一个，结果按
+    普通路径路由（通常 404）；旧版标准库不折叠时由上述校验拒为 400。两种结果都合法，
+    客户端不应依赖其中任何一种。
 
 #### 1.1.1 请求体上限（B2.1 / #92）
 
@@ -345,8 +358,8 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 | 400 | `request.invalid` / `request.malformed_json` | 语法或参数错误 |
 | 401 | `auth.missing` / `auth.invalid_token` | 缺少或无效令牌（含一次性 code 重复使用） |
 | 403 | `persona.not_owned` / `relation.chat_denied` / `conversation.e2ee` / `card.step_up_required` / `card.assertion_invalid` | 身份有效但无权限 / 断言无效 |
-| 404 | `persona.not_found` / `conversation.not_found` / `capability.not_found` / `card.not_found` / `audit.not_found` | 不存在或对调用方不可见 |
-| 409 | `persona.in_use` / `conversation.exists_conflict` / `persona.revision_conflict` / `card.revision_conflict` / `idempotency.conflict` / `card.already_decided` / `card.challenge_invalid` | 状态冲突 |
+| 404 | `persona.not_found` / `conversation.not_found` / `capability.not_found` / `card.not_found` / `audit.not_found` / `moment.not_found` | 不存在或对调用方不可见 |
+| 409 | `persona.in_use` / `conversation.exists_conflict` / `persona.revision_conflict` / `card.revision_conflict` / `moment.revision_conflict` / `idempotency.conflict` / `card.already_decided` / `card.challenge_invalid` | 状态冲突 |
 | 410 | `card.challenge_expired` | challenge 或一次性 code 已过期 |
 | 422 | `limit.out_of_range` / `card.invalid_block` / `card.missing_fallback_text` / `card.source_scope_mismatch` / `card.missing_event_id` / `card.missing_expires_at` / `state.invalid_value` / `request.invalid`（createConversation 语义不合法 + peer_id 校验） | 语义不合法 |
 | 429 | `rate_limited.transport` | 传输层限流（**不是**发言额度） |
@@ -363,6 +376,27 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 | `card.revision_conflict` | 409 | `revision` 与当前值不一致（TOCTOU），响应附带最新卡片 |
 | `card.already_decided` | 409 | 卡片已被其他意图处理（同 key 幂等重放不会走到这里） |
 | `card.expired` | 409 | 卡片已过期 |
+
+动态（Moments）相关错误码（A2.2 / #7，实现见 #184；完整语义以
+[`moments.md`](moments.md) 为准）：
+
+| code | HTTP | 何时返回 |
+|---|---|---|
+| `moment.not_found` | 404 | 动态不存在、已软删，或对调用者不可见（`can_view` 为假）。越权与不存在**不可区分**，响应体除 `request_id` / `instance` 外逐字节相同（示例 `gateway/openapi/examples/problem-moment-not-found.json`）。`PATCH` / `DELETE` 由非作者/所有者发起、评论/点赞的目标动态不可见，也都返回本码 |
+| `moment.revision_conflict` | 409 | `PATCH /moments/{moment_id}` 的 `revision` 与当前值不一致（乐观并发，比对与写入在同一条 SQL 内原子完成）。响应**不附带**当前动态，客户端须重新 `GET` 取最新 `revision` 再提交 |
+
+动态端点的三条口径（#184 已实现，此处登记）：
+
+1. **`reply_to_comment_id`**：类型错误（数字、对象、数组、空串等非「非空字符串」）→
+   **`400 request.invalid`**（结构/类型错误，§1.3）。类型正确但值找不到——包括**格式不像
+   ULID 的字符串**、评论不存在、已软删、不属于同一动态、对调用者不可见——**统一**
+   **`422 request.invalid`**（`errors[].field = reply_to_comment_id`）：类型对但值找不到算
+   语义错误，且不区分原因，避免借 400/422 差异探测评论 ULID。
+2. **评论幂等重放先过可见性**：`POST /moments/{moment_id}/comments` 先做可见性检查、
+   后查幂等缓存。动态被删除或作者与调用者解除好友后，用原 `Idempotency-Key` 重放同一
+   评论返回 **`404 moment.not_found`**，而不是原回执（见 §1.5「动态端点」）。
+3. **非法请求目标**：authority-form、其他 scheme、IPv6 括号未闭合、`*` 搭配非
+   `OPTIONS` 方法等 → **`400 request.invalid`**，对所有端点生效（见 §1.1「请求目标」）。
 
 ### 1.4 ⚠️ 策略结论不是 HTTP 错误
 
@@ -449,6 +483,17 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
   **不再记 SENT 用量、不重复扣 token**，回执照常返回该 `event_id`。
   **对外去重语义**：同一会话、同一发送者、同一 `Idempotency-Key` 只产生一个事件。
   账本也被淘汰后的极端重试仍可能重复计费，属已知边界。
+- **动态端点（`POST /moments`、`POST /moments/{moment_id}/comments`，#184）**：
+  - 缓存作用域为 `(操作, 调用者, 目标资源, key)`——评论的目标资源是 `moment_id`
+    （类比上面的 `(conversation_id, sender, txnId)` 账本）。同一 key 用在**不同动态**上
+    是两次独立写入，不会互相命中或误报 409；同目标同 key 不同请求体照常 `409
+    idempotency.conflict`。
+  - **授权与可见性先于缓存**：`author_persona_id` 归属（否则 `403 persona.not_owned`）
+    与目标动态可见性（否则 `404 moment.not_found`）每次都重新判定。因此动态删除、
+    解除好友或 persona 归属收回后，同 key 重放**不再**返回原回执，而是 404 / 403。
+    这是有意为之：可见性在读取时计算，重放不得绕过（见 `moments.md` §6）。
+  - 缓存为进程内存，TTL 沿用 `IDEMPOTENCY_TTL_SECONDS`（默认 86400 秒），网关重启后
+    清空；`IDEMPOTENCY_TTL_SECONDS=0` 在动态端点上的已知差异见 `moments.md` §6。
 
 ### 1.6 版本与乐观并发
 
@@ -1061,6 +1106,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.1.0 | 2026-11-11 | [#7 A2.2 动态文档对齐，**纯文档**，不改字段/状态码/行为/OpenAPI] 登记 #184 已实现的错误码 `404 moment.not_found`、`409 moment.revision_conflict`（§1.3 总表与动态错误码小表）；写明三条口径：`reply_to_comment_id` 类型错误 400、值找不到（含非 ULID 字符串）统一 422；评论幂等重放先过可见性，删动态/解除好友后原 key 重放返回 404；非法请求目标 400 `request.invalid`（§1.1 新增「请求目标」）。§1.5 增「动态端点」幂等作用域与授权先于缓存。同步 `moments.md` §6/§7/§9/§10 与 `gateway/README.md` 配置表。 |
 | 0.1.0 | 2026-11-11 | [#124 退场 v2 文档对齐，**纯文档**，不改字段/状态码/错误码/security] 统一「退场 v2」口径：App 对 `/moments*` 只发 `Authorization: MatrixOpenID <token>`（`matrixOpenIdToken`），无 feature flag、无回退，**禁止**以用户 Matrix access token 当 `Bearer` 兜底；网关继续接受 `Authorization: Bearer <Matrix access token>`（`matrixUserToken`→whoami），那是**留给 App 以外其他调用方**的阶段 1 共存路径，未标 `deprecated`、仍有效。改动文件与要点：**(1)** `gateway/docs/contract.md` §1.2.3 凭据表「适用范围」注明并存期为 App 以外调用方；「移除 `matrixUserToken` 的条件」改写为 v2 退场节奏 T1 观察 #7 上线后 App 流量 → T2 清点 Bearer 调用方（届时「按 scheme 统计」PR）→ T3 已知调用方迁完且 Bearer 占比 <1%（计划值）后进阶段 2（标 `deprecated`）→ T4 至少 90 天公告并加 `Deprecation`/`Sunset` 头后进阶段 3（从 security 移除），保留「先公告、先报总管」「本 PR 不进入阶段 2/3」「阶段 3 为破坏性变更需另行批准」；「App 接入提示（非规范性）」段首新增「App 只发 MatrixOpenID、不得以 Bearer 兜底」一条；§2.0 行为者表述改为中性（`matrixOpenIdToken` 的 userinfo `sub` 或 `matrixUserToken`→whoami 的 `user_id`）。**(2)** `gateway/docs/moments.md` §1「身份不自报」与 §3「身份」按 v2 重写（App 只走 OpenID、Bearer 为其他调用方阶段 1 共存、写清退场节奏并指向 contract.md §1.2.3）；§3 行为者/点赞表述改为同时涵盖两种凭据的中性写法；§7 配置变量更正为事实——`GATEWAY_OPENID_CACHE_TTL_SECONDS` 已在 `gateway/.env.example` 第 107 行并由 `gateway/README.md` 配置表登记（#170），其余三个 `GATEWAY_MOMENTS_*` 仍为计划（随 #7 实现登记），删去「本 PR 不修改 .env.example」「PR2 实现时登记」的过时说法。**(3)** `docs/contracts/pairing-qr.md` §5.1 `features_url` 行与 §11 B2 依赖栏写明 OpenID 已在 #124 落地、App 只发 MatrixOpenID 且不得 Bearer 兜底、网关继续接受 Bearer 留给其他调用方（阶段 1），移除「落地前按现行契约 / 定之前现行契约有效」的过时表述。**(4)** `docs/deploy/public-access.md` 第 21 行与「与现行网关契约的差异（待对齐）」段改为已对齐。**(5)** `gateway/openapi/gateway.v1.yaml` **只改 `description` 文字**：作者/点赞者表述改中性，`matrixOpenIdToken` / `matrixUserToken` 描述各补一句（App 只用前者，后者留给 App 以外调用方，阶段 1 共存）；**security 数组、scheme、字段一律未改**。 |
 | 0.1.0 | 2026-11-11 | [#124 OpenID App 接入配合，纯文档+fixture+测试，不改行为] 新增三个 RFC 9457 problem 示例 fixture（`gateway/openapi/examples/problem-auth-missing.json`、`problem-auth-invalid-token.json`、`problem-homeserver-unavailable.json`），内容与 `_auth_user_ok` 实际输出**除 `request_id` 外逐字段一致**（含键集合）；在 `validate_openapi.py` EXAMPLE_TARGETS 中登记，漂移可检测。新增集成测试 `gateway/tests/test_openid_app_fixtures.py`：起真实网关 + 假 homeserver，验证缺头 / 无效 OpenID token / homeserver 502 三种错误的响应 status、Content-Type，以及响应 JSON 除 `request_id` 外的键集合与值均与 fixture 完全相等（网关增删字段即失败），同时覆盖 `GATEWAY_HTTP_PATH_PREFIX` 前缀形态。`docs/moments.md` §7 配置表修正 `GATEWAY_WHOAMI_CACHE_TTL_SECONDS` 为 `GATEWAY_OPENID_CACHE_TTL_SECONDS`（实际变量，注明 #124 已落地）；§1 第 19 行补充也可用 `MatrixOpenID` OpenID token 接入（指向 §3 与 contract.md §1.2.3）。`docs/contract.md` §1.2.3 末尾新增「App 接入提示（非规范性）」：列出 fixture 路径、`auth.invalid_token` 重试建议、500 退避语义、scheme 大小写要求、CORS/OPTIONS 说明；**不新增状态码或错误码**，不改任何运行时行为。 |
 | 0.1.0 | 2026-11-10 | [#124 OpenID 网关实现已落地] `/moments*` 按 `Authorization` scheme 分流校验：`MatrixOpenID <token>` → federation `GET /_matrix/federation/v1/openid/userinfo?access_token=…`（不带 X-Matrix 签名，基址 `GATEWAY_HOMESERVER_FEDERATION_URL`，空则回落 `GATEWAY_HOMESERVER_URL`，明文 http 规则沿用 `GATEWAY_ALLOW_INSECURE_HS`）；`Bearer <Matrix access token>` → CS `GET /_matrix/client/v3/account/whoami`（始终用 `GATEWAY_HOMESERVER_URL`）。**禁止先试 OpenID 再试 whoami**；站点/调用方 bearer 不得用于 `/moments*`。`sub` / `user_id` 域须等于 `GATEWAY_MATRIX_SERVER_NAME`（大小写归一），未配置时 fail closed 为 401。缺少 `GATEWAY_MATRIX_SERVER_NAME` 不新增启动必填。缓存键为 token 的 SHA-256，成功 TTL = `min(GATEWAY_OPENID_CACHE_TTL_SECONDS, 60, 若已知的 expires_in)`，失败负缓存 5 秒且不超过成功 TTL、**仅对 401/403（及域不匹配）负缓存**；`0` = 不缓存，`<0` 或 `>60` 拒绝启动；同一 token 并发校验 single-flight 合并。homeserver 5xx / 超时 / 不可达 → 已有 `500 internal.error`（可重试，不缓存），**不新增状态码或错误码**。本 PR 只做身份校验，`/moments*` 资源 CRUD 留待后续；鉴权通过后未实现资源仍 404（PATCH/DELETE 先鉴权再 405）。配置项 `GATEWAY_HOMESERVER_FEDERATION_URL` / `GATEWAY_OPENID_CACHE_TTL_SECONDS` **自本 PR 起生效**。N1：契约与 OpenAPI 注明自定义 `MatrixOpenID` http scheme 可能触发部分校验器告警，不改名、不标 `deprecated`。`matrixUserToken` 不标 `deprecated`，仍完全有效。 |

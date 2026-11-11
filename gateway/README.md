@@ -268,6 +268,11 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_ROOM_ALIAS_PREFIX` | `botville_conv_` | conversation → 房间别名 localpart 前缀（`^[a-z0-9._=-]{1,64}$`）；改前缀须同步改部署模板的 exclusive aliases 正则（`server/compose/appservice/botville-gateway.yaml.tmpl`） |
 | `GATEWAY_ROOM_ALIAS_CACHE_TTL` | `60` | 别名 → room_id 进程内缓存 TTL（秒），过期重新 directory lookup；`0` = 不缓存，负数拒绝启动 |
 | `GATEWAY_ALLOW_INSECURE_HS` | `false` | 显式放行明文 `http://` 的跨主机 homeserver（接受 as_token 明文传输风险） |
+| `GATEWAY_MOMENTS_DB_PATH` | *(空)* | 动态（A2.2 / #7）SQLite 路径，WAL；启动时自动执行 `gateway/migrations/moments/` 迁移（幂等）。**留空 = 关闭动态模块**（`/v1/moments*` 鉴权后仍 404/405）。详见 [docs/moments.md](docs/moments.md) §7 |
+| `GATEWAY_MOMENTS_FRIENDS_FILE` | *(空)* | 临时好友图 JSON（`{"friends": [["@a:hs","@b:hs"], ...]}`，无向边，启动时读一次，结构非法拒绝启动）。**留空 = 空好友图**：A2.3（#8）落地前「好友可见」等同「仅自己」，见 moments.md §7.1 |
+| `GATEWAY_MOMENTS_SOFT_DELETE_RETENTION_DAYS` | `30` | 软删动态/评论硬删前的保留天数（由定时清理执行） |
+| `GATEWAY_MOMENTS_AUDIT_RETENTION_DAYS` | `90` | `moments_events` 审计默认保留 90 天（由定时清理执行） |
+| `GATEWAY_MOMENTS_PURGE_INTERVAL_SECONDS` | `86400` | 定时清理间隔（秒）：启动先跑一次，之后后台按间隔跑，失败只记日志。`0` = 关闭（两个保留天数不生效）；非 0 时 **≥60**，否则拒绝启动 |
 
 非法配置（端口非数字、时区不存在、`HH:MM` 格式错）在 `Config` 构造时抛 `ConfigError`，
 进程以退出码 `2` 结束。

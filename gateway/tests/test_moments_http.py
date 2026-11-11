@@ -1331,8 +1331,11 @@ class TestMalformedInputs(unittest.TestCase):
                 (b"GET", b"https://[::1/v1/moments/" + mid, 400),
                 (b"PATCH", b"http://[::1/v1/moments/" + mid, 400),
                 (b"DELETE", b"http://[x", 400),
-                # 以 // 开头：较新的 stdlib 会先折叠成单个 /（→ 路由 404），
-                # 否则由我们的校验拒为 400；两者都不得 500。
+                # 以 // 开头：较新的 stdlib 在 BaseHTTPRequestHandler.parse_request
+                # 里把开头的多个 / 折叠成单个 /（防 open redirect 的修复），
+                # `//[::1/v1/moments` 变成普通路径 `/[::1/v1/moments` → 路由 404；
+                # 不折叠的旧版 stdlib 上由 _normalize_request_target 拒为 400。
+                # 两者都合法，但都不得 500。
                 (b"GET", b"//[::1/v1/moments", (400, 404)),
                 # 合法 absolute-form：取 path 照常路由。
                 (b"GET", b"http://127.0.0.1/v1/moments", 200),
