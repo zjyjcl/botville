@@ -113,6 +113,9 @@ public final class MatrixService: ObservableObject {
     private var isCreatingRoom = false
     private var observedEncryptedRooms = Set<String>()
     private var roomRefreshGeneration = UUID()
+    private var notificationRoomIDs = Set<String>()
+    private var pendingNotificationRooms: [String: MatrixRoom] = [:]
+    private var roomNotificationRefreshTask: Task<Void, Never>?
     private var securityReadGenerations: [String: UUID] = [:]
     // A room-list refresh may suspend on SDK reads while a security action
     // publishes newer state. Preserve that publication when its older snapshot
@@ -209,6 +212,7 @@ public final class MatrixService: ObservableObject {
     }
 
     deinit {
+        roomNotificationRefreshTask?.cancel()
         networkMonitor?.cancel()
         authHandle?.cancel()
         authTask?.cancel()
@@ -648,7 +652,7 @@ public final class MatrixService: ObservableObject {
         notificationSettingsTask = Task { [weak self] in
             for await _ in changes {
                 guard let self, !Task.isCancelled, generation == self.sessionGeneration else { return }
-                await self.refreshRoomNotificationSettings()
+                self.scheduleRoomNotificationRefresh(allRooms: true)
             }
         }
         let (notifications, notificationContinuation) = AsyncStream<ForegroundSyncEvent>.makeStream()
@@ -861,9 +865,10 @@ public final class MatrixService: ObservableObject {
             // latestEvent readback here can lag this sync and must never replay it.
         }
         guard committed else { return }
-        await refreshRoomNotificationSettings()
-        guard session == sessionGeneration else { return }
+        // Publish the badge from cached rules immediately; confirmed readbacks
+        // update it through roomNotifications.didChange without holding up sync.
         updateApplicationBadge()
+        scheduleRoomNotificationRefresh()
         if rooms.contains(where: { $0.encryption == .encrypted }) { refreshCryptoSafety(from: client) }
         if let activeRoomID, !rooms.contains(where: { $0.id == activeRoomID && $0.membership == .joined }) {
             closeRoom(activeRoomID)
@@ -1211,11 +1216,25 @@ public final class MatrixService: ObservableObject {
         messageActions.removeAll()
     }
 
-    private func refreshRoomNotificationSettings() async {
+    private func scheduleRoomNotificationRefresh(allRooms: Bool = false) {
+        let currentIDs = Set(rooms.map(\.id))
+        let requested = allRooms ? rooms : rooms.filter { !notificationRoomIDs.contains($0.id) }
+        notificationRoomIDs = currentIDs
+        pendingNotificationRooms = pendingNotificationRooms.filter { currentIDs.contains($0.key) }
+        for room in requested { pendingNotificationRooms[room.id] = room }
+        guard roomNotificationRefreshTask == nil, !pendingNotificationRooms.isEmpty else { return }
         let generation = sessionGeneration
-        for room in rooms {
-            guard generation == sessionGeneration, !Task.isCancelled else { return }
-            await roomNotifications.refresh(room)
+        roomNotificationRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if generation == self.sessionGeneration { self.roomNotificationRefreshTask = nil }
+            }
+            while generation == self.sessionGeneration, !Task.isCancelled,
+                  !self.pendingNotificationRooms.isEmpty {
+                let batch = Array(self.pendingNotificationRooms.values)
+                self.pendingNotificationRooms.removeAll()
+                await self.roomNotifications.refresh(batch)
+            }
         }
     }
 
@@ -1584,7 +1603,11 @@ public final class MatrixService: ObservableObject {
         notificationSettingsBridge = nil
         notificationSettingsTask?.cancel()
         notificationSettingsTask = nil
-        try? roomNotifications.reset()
+        roomNotificationRefreshTask?.cancel()
+        roomNotificationRefreshTask = nil
+        notificationRoomIDs.removeAll()
+        pendingNotificationRooms.removeAll()
+        roomNotifications.reset()
         rooms = []
         updateApplicationBadge()
         userID = nil
@@ -1612,7 +1635,7 @@ public final class MatrixService: ObservableObject {
         // Try to clear extension-readable credentials first. If Keychain is
         // unavailable, a durable non-secret marker retries removal at startup.
         removeSharedPushCredentials()
-        try roomNotifications.reset()
+        roomNotifications.reset()
         if let stored = try credentials ?? sessionStore.load() {
             try directory().remove(for: stored.storeID)
         }

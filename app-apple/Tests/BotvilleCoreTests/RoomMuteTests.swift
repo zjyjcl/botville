@@ -15,9 +15,29 @@ final class TestNotificationSettings: NotificationSettings, @unchecked Sendable 
     init() { super.init(noHandle: .init()) }
     required init(unsafeFromHandle handle: UInt64) { fatalError("Unused test initializer") }
     override func setDelegate(delegate: NotificationSettingsDelegate?) { lock.withLock { self.delegate = delegate } }
-    override func getRawPushRules() async throws -> String? { "{}" }
+    private var rawReads = 0
+    private var roomReads: [String] = []
+    private var rawReadContinuation: CheckedContinuation<String?, Error>?
+    var suspendRawRead = false
+    var missingRules = false
+    var rawReadCount: Int { lock.withLock { rawReads } }
+    var roomReadIDs: [String] { lock.withLock { roomReads } }
+    var isRawReadBlocked: Bool { lock.withLock { rawReadContinuation != nil } }
+    func releaseRawRead() {
+        let pending = lock.withLock { let value = rawReadContinuation; rawReadContinuation = nil; return value }
+        pending?.resume(returning: "{}")
+    }
+    override func getRawPushRules() async throws -> String? {
+        let blocked = lock.withLock { rawReads += 1; return suspendRawRead }
+        if blocked {
+            return try await withCheckedThrowingContinuation { continuation in
+                lock.withLock { rawReadContinuation = continuation }
+            }
+        }
+        return missingRules ? nil : "{}"
+    }
     override func getRoomNotificationSettings(roomId: String, isEncrypted: Bool, isOneToOne: Bool) async throws -> RoomNotificationSettings {
-        lock.withLock { RoomNotificationSettings(mode: muted.contains(roomId) ? .mute : .allMessages, isDefault: false) }
+        lock.withLock { roomReads.append(roomId); return RoomNotificationSettings(mode: muted.contains(roomId) ? .mute : .allMessages, isDefault: false) }
     }
     override func setRoomNotificationMode(roomId: String, mode: RoomNotificationMode) async throws {
         let callback = lock.withLock {
@@ -41,6 +61,12 @@ final class MemoryRoomMuteStore: SharedRoomMuteStoring, @unchecked Sendable {
         lock.withLock { values = hashes }
     }
     func clear() throws { try save([]) }
+}
+
+struct UnavailableRoomMuteStore: SharedRoomMuteStoring {
+    func load() throws -> Set<String> { throw CocoaError(.fileReadNoPermission) }
+    func save(_ hashes: Set<String>) throws { throw CocoaError(.fileWriteNoPermission) }
+    func clear() throws { throw CocoaError(.fileWriteNoPermission) }
 }
 
 @MainActor
@@ -204,7 +230,7 @@ final class RoomMuteTests: XCTestCase {
         provider.suspendWrite = true
         let write = Task { await controller.setMuted(true, room: room) }
         while provider.pendingWrite == nil { await Task.yield() }
-        try controller.reset()
+        controller.reset()
         provider.pendingWrite?.resume()
         await write.value
         XCTAssertTrue(controller.states.isEmpty)
@@ -216,22 +242,23 @@ final class RoomMuteTests: XCTestCase {
         provider.suspendRead = true
         let read = Task { await controller.refresh(room) }
         while provider.pendingRead == nil { await Task.yield() }
-        try controller.reset()
+        controller.reset()
         provider.pendingRead?.resume(returning: true)
         await read.value
         XCTAssertTrue(controller.states.isEmpty)
         XCTAssertTrue(try store.load().isEmpty)
     }
 
-    func testSharedCleanupFailureIsReportedAndCanRetry() async throws {
+    func testSharedCleanupFailureDoesNotThrowAndCanRetry() async throws {
         let (controller, provider, store) = fixture()
         provider.muted = true
         await controller.refresh(room)
         store.fails = true
-        XCTAssertThrowsError(try controller.reset())
+        controller.reset()
+        XCTAssertFalse(controller.isMuted(room.id))
         XCTAssertTrue(controller.states.isEmpty)
         store.fails = false
-        try controller.reset()
+        controller.reset()
         XCTAssertTrue(try store.load().isEmpty)
     }
 
@@ -242,6 +269,67 @@ final class RoomMuteTests: XCTestCase {
         await controller.refresh(room)
         XCTAssertTrue(controller.isMuted(room.id))
         XCTAssertTrue(controller.state(for: room.id).errorMessage?.contains("缓存") == true)
+    }
+
+    func testMissingContainerSilentlyDegradesConfirmedToggles() async throws {
+        let store = SharedRoomMuteStore(fileURL: nil)
+        XCTAssertThrowsError(try store.load()) { error in
+            guard case SharedRoomMuteStoreError.containerUnavailable = error else {
+                return XCTFail("Missing container must have a distinct error")
+            }
+        }
+        let controller = RoomMuteController(sharedStore: store)
+        let provider = FakeRoomNotificationProvider()
+        controller.configure(provider: provider)
+        await controller.refresh(room)
+        await controller.setMuted(true, room: room)
+        XCTAssertTrue(controller.isMuted(room.id))
+        XCTAssertNil(controller.state(for: room.id).errorMessage)
+        await controller.setMuted(false, room: room)
+        XCTAssertFalse(controller.isMuted(room.id))
+        XCTAssertNil(controller.state(for: room.id).errorMessage)
+        controller.reset()
+        XCTAssertTrue(controller.states.isEmpty)
+    }
+
+    func testSDKBatchChecksRawRulesOnceAndReadsEveryRoomFromServer() async throws {
+        let settings = TestNotificationSettings()
+        try await settings.setRoomNotificationMode(roomId: room.id, mode: .mute)
+        let other = MatrixRoom(id: "!other:test", name: "Other")
+        let values = try await SDKRoomNotificationSettings(settings).mutedStates(for: [room, other])
+        XCTAssertEqual(settings.rawReadCount, 1)
+        XCTAssertEqual(settings.roomReadIDs, [room.id, other.id])
+        XCTAssertEqual(values, [room.id: true, other.id: false])
+    }
+
+    func testMissingRawRulesCannotConfirmUnmutedBatch() async {
+        let settings = TestNotificationSettings()
+        settings.missingRules = true
+        let controller = RoomMuteController(sharedStore: MemoryRoomMuteStore())
+        controller.configure(provider: SDKRoomNotificationSettings(settings))
+        await controller.refresh([room, MatrixRoom(id: "!other:test", name: "Other")])
+        XCTAssertEqual(settings.rawReadCount, 1)
+        XCTAssertTrue(settings.roomReadIDs.isEmpty)
+        XCTAssertFalse(controller.state(for: room.id).isLoaded)
+        XCTAssertNotNil(controller.state(for: room.id).errorMessage)
+    }
+
+    func testOldBatchCannotPopulateNewSession() async {
+        let settings = TestNotificationSettings()
+        settings.suspendRawRead = true
+        let controller = RoomMuteController(sharedStore: MemoryRoomMuteStore())
+        controller.configure(provider: SDKRoomNotificationSettings(settings))
+        let oldRead = Task { await controller.refresh([room]) }
+        while !settings.isRawReadBlocked { await Task.yield() }
+        controller.reset()
+        let next = FakeRoomNotificationProvider()
+        controller.configure(provider: next)
+        await controller.refresh(room)
+        try? await settings.setRoomNotificationMode(roomId: room.id, mode: .mute)
+        settings.releaseRawRead()
+        await oldRead.value
+        XCTAssertFalse(controller.isMuted(room.id))
+        XCTAssertTrue(controller.state(for: room.id).isLoaded)
     }
 
     func testListMuteIconDotAndNormalNumericUnreadMapping() {

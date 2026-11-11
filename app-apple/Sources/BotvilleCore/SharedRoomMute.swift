@@ -18,6 +18,10 @@ public protocol SharedRoomMuteStoring: Sendable {
     func clear() throws
 }
 
+public enum SharedRoomMuteStoreError: Error {
+    case containerUnavailable
+}
+
 public struct SharedRoomMuteStore: SharedRoomMuteStoring {
     public static let appGroupIdentifier = "group.com.zjyjcl.botville"
     private let fileURL: URL?
@@ -27,14 +31,14 @@ public struct SharedRoomMuteStore: SharedRoomMuteStoring {
             .appendingPathComponent("Library/Application Support/room-mute-sha256.json")
     }
 
-    public init(fileURL: URL) { self.fileURL = fileURL }
+    public init(fileURL: URL?) { self.fileURL = fileURL }
 
     public static func hash(_ roomID: String) -> String {
         SHA256.hash(data: Data(roomID.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     public func load() throws -> Set<String> {
-        guard let fileURL else { throw CocoaError(.fileNoSuchFile) }
+        guard let fileURL else { throw SharedRoomMuteStoreError.containerUnavailable }
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
         let values = try JSONDecoder().decode([String].self, from: Data(contentsOf: fileURL))
         guard values.allSatisfy(Self.validHash) else { throw CocoaError(.fileReadCorruptFile) }
@@ -42,7 +46,7 @@ public struct SharedRoomMuteStore: SharedRoomMuteStoring {
     }
 
     public func save(_ hashes: Set<String>) throws {
-        guard let fileURL else { throw CocoaError(.fileNoSuchFile) }
+        guard let fileURL else { throw SharedRoomMuteStoreError.containerUnavailable }
         guard hashes.allSatisfy(Self.validHash) else { throw CocoaError(.fileWriteInapplicableStringEncoding) }
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try JSONEncoder().encode(hashes.sorted()).write(to: fileURL, options: .atomic)
