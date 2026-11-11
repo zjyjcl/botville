@@ -9,13 +9,13 @@
 #   synapse-data.tar.gz  media_store + signing.key from the synapse-data
 #                        volume; synapse is stopped briefly so the archive
 #                        cannot drift from the dump
-#   gateway-data.tar.gz  (optional) contents of the gateway-data volume
-#                        (moments SQLite, etc.). Written only if the volume
+#   gateway-data.tar.gz  (optional) full-volume tar of the gateway-data
+#                        volume (everything under the volume root, not just
+#                        .db / -wal / -shm). Written only if the volume
 #                        exists; omitted otherwise so a default stack still
-#                        backs up cleanly. Prefer PRAGMA wal_checkpoint
-#                        (TRUNCATE) before tar when sqlite3 is in the image;
-#                        otherwise the .db / -wal / -shm files are archived
-#                        together.
+#                        backs up cleanly. If sqlite3 is in the image, run
+#                        PRAGMA wal_checkpoint(TRUNCATE) on top-level
+#                        /gateway-data/*.db only (not recursive) before tar.
 #   homeserver.yaml      copy of server/compose/generated/synapse/homeserver.yaml
 #   env                  copy of server/compose/.env -- CONTAINS SECRETS
 #   manifest.txt         backup time, images, sha256 + size of every file
@@ -115,9 +115,10 @@ compose run --rm --no-deps --entrypoint sh \
 #    have it — skip cleanly rather than failing. When it exists, archive
 #    the whole volume through a one-off container on the synapse image
 #    (already pulled for this backup; no extra image). Prefer a WAL
-#    checkpoint if sqlite3 is available so the archive is a single consistent
-#    .db; otherwise pack .db / -wal / -shm together. Stop a host-run
-#    gateway that has this database open before backing up.
+#    checkpoint top-level *.db if sqlite3 is available (not recursive;
+#    the agreed path is /var/lib/botville-gateway/moments.db at the volume
+#    root), then tar the whole volume. Stop a host-run gateway that has
+#    this database open before backing up.
 artifacts=(synapse-db.dump synapse-data.tar.gz homeserver.yaml env)
 gateway_vol="$(gateway_data_volume)"
 if docker_volume_exists "${gateway_vol}"; then

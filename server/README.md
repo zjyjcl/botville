@@ -26,7 +26,7 @@ make federation-e2e  # 配对联邦验收（A2.1；独立 botville-fed 项目，
 make federation-down # 只销毁 botville-fed 项目（down -v）
 make logs            # 跟踪日志
 make ps              # 容器状态
-make down            # 停止（保留数据卷；手动 down -v 可清空）
+make down            # 停止（保留数据卷；手动 compose down -v 清空已挂载的卷，gateway-data 目前还需 docker volume rm -f）
 ```
 
 continuwuity 默认关闭上游 announcements 检查（避免 SIGTERM 卡到 SIGKILL）：见 [docs/ops/continuwuity-announcements.md](../docs/ops/continuwuity-announcements.md)。

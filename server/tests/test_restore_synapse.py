@@ -87,7 +87,13 @@ class RestoreSynapseTest(unittest.TestCase):
         self.bin_dir.mkdir()
         self.docker_log = tmp / "docker.log"
         (self.bin_dir / "docker").write_text(
-            '#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >> "${FAKE_DOCKER_LOG:?}"\nexit 0\n',
+            """#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FAKE_DOCKER_LOG:?}"
+if [ "$1" = volume ] && [ "$2" = inspect ]; then
+    if [ "${FAKE_DOCKER_VOLUME_EXISTS:-1}" = 1 ]; then exit 0; else exit 1; fi
+fi
+exit 0
+""",
             encoding="utf-8",
         )
         (self.bin_dir / "docker").chmod(0o755)
@@ -292,6 +298,25 @@ class RestoreSynapseTest(unittest.TestCase):
             "gateway-data" in c and "tar -xzf /backup/gateway-data.tar.gz" in c
             for c in calls
         ))
+        self.assertFalse(any("volume create" in c for c in calls))
+
+    def test_restore_creates_volume_when_missing(self):
+        """ensure_gateway_data_volume create branch: inspect fails -> volume create."""
+        backup = self.make_backup(
+            with_gateway_data=True,
+            manifest_names=ARTIFACTS + ("gateway-data.tar.gz",),
+        )
+        proc = self.run_restore(backup, env={"FAKE_DOCKER_VOLUME_EXISTS": "0"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        calls = self.docker_calls()
+        self.assertTrue(any("volume inspect" in c and "botville-cur_gateway-data" in c for c in calls))
+        create = [c for c in calls if c.startswith("volume create") or " volume create " in c]
+        # fake docker logs "$*" of `docker volume create --label ... name`
+        create = [c for c in calls if "volume create" in c]
+        self.assertEqual(len(create), 1, calls)
+        self.assertIn("com.docker.compose.project=botville-cur", create[0])
+        self.assertIn("com.docker.compose.volume=gateway-data", create[0])
+        self.assertIn("botville-cur_gateway-data", create[0])
 
     def test_gateway_data_sha_mismatch_fails(self):
         backup = self.make_backup(

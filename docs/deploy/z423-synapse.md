@@ -287,7 +287,7 @@ make backup
 | --- | --- |
 | `synapse-db.dump` | `pg_dump -Fc` 数据库快照（postgres 保持运行中导出） |
 | `synapse-data.tar.gz` | `media_store`、`signing.key`（短暂停 synapse 保证与数据库一致） |
-| `gateway-data.tar.gz` | （可选）compose 卷 `gateway-data` 的整卷归档：moments SQLite（尽量先 `wal_checkpoint`，否则 `moments.db` 与 `-wal`/`-shm` 一并打包）。**卷不存在则跳过，不写此文件**（网关进程尚未加入 compose，默认栈没有该卷）。旧备份没有此文件时，恢复不碰该卷 |
+| `gateway-data.tar.gz` | （可选）compose 卷 `gateway-data` 的**整卷** `tar`（卷根目录下的全部文件，不限 `.db`）。若镜像内有 `sqlite3`，打包前仅对**卷顶层** `*.db` 做 `PRAGMA wal_checkpoint(TRUNCATE)`，不递归子目录。**卷不存在则跳过，不写此文件**（网关进程尚未加入 compose，默认栈没有该卷）。旧备份没有此文件时，恢复不碰该卷 |
 | `homeserver.yaml` | 渲染后的 Synapse 配置副本 |
 | `env` | `.env` 副本，**含全部密钥**（网关密钥若写在这份 `.env` 里会随它备份；`gateway-data` 卷只含业务数据，不另存密钥） |
 | `manifest.txt` | 备份时间、镜像、每个文件的 sha256（有 `gateway-data.tar.gz` 时也列入） |
@@ -306,7 +306,15 @@ make backup
 docker volume create --label com.docker.compose.project=botville   --label com.docker.compose.volume=gateway-data   botville_gateway-data
 ```
 
-（带 compose 标签后，`docker compose down -v` / `make down` 的 `-v` 会一并删除。）
+当前没有服务挂载本卷，即使加了 compose 标签，`docker compose down -v` 也删不掉它
+（`docker compose config --volumes` 不会列出它）。`make down` **不传** `-v`，不会删除
+任何卷。现在要删这个卷，需要显式执行：
+
+```bash
+docker volume rm -f botville_gateway-data   # 项目名按 .env 的 COMPOSE_PROJECT_NAME
+```
+
+等网关服务挂上该卷后，标签才会让 `docker compose down -v` 一并删除。
 若网关以主机进程方式打开了该卷上的 SQLite 文件，备份前请先停掉网关，以免拷到半截 WAL。
 保留天数沿用现有备份目录清理惯例（上文 crontab 的 14 天），本卷不另设保留期。
 
@@ -374,9 +382,11 @@ drop/recreate 数据库（UTF8、C locale）→ `pg_restore` → 恢复数据卷
 # 前提：临时开放注册（seed 要注册三个用户，见上文 sed 两行），并 make up
 make e2e E2E_PHASE=seed                  # ① 造数据：三用户、私聊、群、消息
 make backup                             # ② 备份（记下输出的目录）
-make down                               # ③ 停栈并清空卷（模拟灾难）
+make down                               # ③ 停栈（make down 不删卷）
 docker compose -f server/compose/docker-compose.yml \
   --env-file server/compose/.env --profile synapse down -v --remove-orphans
+# gateway-data 目前没有服务挂载，上一步 down -v 删不掉它：
+docker volume rm -f botville_gateway-data   # 项目名按 COMPOSE_PROJECT_NAME
 make up                                 # ④ 起一个全新空栈
 make restore RESTORE_DIR=backups/<时间戳>  # ⑤ 恢复
 make e2e E2E_PHASE=verify               # ⑥ 用 state 文件重新登录，确认私聊/群消息都在
@@ -501,7 +511,7 @@ make e2e E2E_PHASE=verify                            #    （如做过 e2e seed�
 
 **想换 `BOTVILLE_SERVER_NAME`**
 用户 ID 里带 server_name，改了等于全新服务器，没有平滑迁移。真要换：
-备份留档 → `make down` → `docker compose ... down -v` 清卷 → 改名重来。
+备份留档 → `make down` → `docker compose ... down -v` 清已挂载的卷 → `docker volume rm -f <项目名>_gateway-data`（该卷目前无服务挂载，`down -v` 删不掉）→ 改名重来。
 
 **恢复后 synapse 起不来 / 数据库连接失败**
 确认恢复流程完整（`make restore` 日志里 `/health OK`）；若是在旧环境上恢复更早的
@@ -512,8 +522,10 @@ make e2e E2E_PHASE=verify                            #    （如做过 e2e seed�
 **先把 `backups/` 目录迁出到安全位置**（里面有全部备份和 `e2e-state.json`，
 目录一删就全没了），再 `make down`，执行 `docker compose -f
 server/compose/docker-compose.yml --env-file server/compose/.env --profile synapse
-down -v --remove-orphans`（删除全部数据卷），最后删掉 `<NAS_DATA_DIR>/botville`
-目录。
+down -v --remove-orphans`（删除已挂载的数据卷），再执行
+`docker volume rm -f <项目名>_gateway-data`（`gateway-data` 目前无服务挂载，
+`down -v` 删不掉，不删则会把 moments 数据库留在盘上），最后删掉
+`<NAS_DATA_DIR>/botville` 目录。
 
 **备份目录能直接删吗**
 能，但先确认不再需要（删掉前建议先做一次恢复演练）。`backups/e2e-state.json`

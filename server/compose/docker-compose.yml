@@ -276,5 +276,9 @@ volumes:
   #   docker volume create --label com.docker.compose.project=<项目名> \
   #     --label com.docker.compose.volume=gateway-data \
   #     <项目名>_gateway-data
-  # 带 compose 标签后 `docker compose down -v` 会一并删掉。
+  # 当前没有服务挂载本卷：即使加了 compose 标签，`docker compose down -v`
+  # 也删不掉它，`docker compose config --volumes` 也不会列出它。
+  # `make down` 不传 `-v`，本来就不会删任何卷。现在要删这个卷，请执行：
+  #   docker volume rm -f <项目名>_gateway-data
+  # 等网关服务挂上该卷后，标签才会让 down -v 一并删除。
   gateway-data:

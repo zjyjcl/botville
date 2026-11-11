@@ -175,8 +175,10 @@ jobs:
         run: |
           docker compose -f server/compose/docker-compose.yml \
             --env-file server/compose/.env --profile synapse down -v --remove-orphans
-          # Labelled volumes should already be gone; rm -f so verify cannot
-          # pass on leftover data if compose left the volume behind.
+          # gateway-data has no service mount, so down -v does not remove it
+          # (compose labels do not help until a service uses the volume).
+          # Explicit rm is required; otherwise the seed file would remain
+          # and the later verify would be a false pass.
           if [ -n "${SEEDED_GATEWAY_VOLUME:-}" ]; then
             docker volume rm -f "${SEEDED_GATEWAY_VOLUME}" || true
           fi

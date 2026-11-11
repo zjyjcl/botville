@@ -349,11 +349,15 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
   `GATEWAY_MOMENTS_DB_PATH=/var/lib/botville-gateway/moments.db`（WAL 模式，随卷保留）。
   **网关进程尚未作为 compose 服务加入**（无 Dockerfile；镜像内迁移目录定位仍见 §10）。
   卷不挂在现有 homeserver 服务上，需显式创建才会出现（见 `server/compose/docker-compose.yml`
-  注释）；未创建时备份脚本跳过该卷、不失败。
+  注释）；未创建时备份脚本跳过该卷、不失败。当前没有服务挂载，因此即使加了 compose
+  标签，`docker compose down -v` 也删不掉它（`compose config --volumes` 不会列出），
+  `make down` 也不传 `-v`。要删这个卷请执行
+  `docker volume rm -f <COMPOSE_PROJECT_NAME>_gateway-data`；等网关服务挂上该卷后，
+  标签才会让 `down -v` 一并删除。
 - 备份/恢复：已纳入既有 `backup-synapse.sh` / `restore-synapse.sh`（synapse profile）。
-  卷存在则把其中文件打成 `gateway-data.tar.gz`（尽量 `PRAGMA wal_checkpoint(TRUNCATE)`
-  后再打包；没有 sqlite3 时把 `moments.db` / `-wal` / `-shm` 一并归档）。旧备份没有该文件
-  时，恢复**不碰**已有 `gateway-data` 卷。整个备份目录仍按密钥库保管（700/600），卷内是
+  卷存在则把其中**全部文件**打成 `gateway-data.tar.gz`（整卷 `tar`，不限 `.db`）。
+  若镜像内有 `sqlite3`，打包前仅对**卷顶层** `*.db` 做 `PRAGMA wal_checkpoint(TRUNCATE)`，
+  不递归子目录。旧备份没有该文件时，恢复**不碰**已有 `gateway-data` 卷。整个备份目录仍按密钥库保管（700/600），卷内是
   业务数据，不含网关密钥（密钥在 `env` 等既有产物里，不另存一份到本卷或仓库）。
   部署手册见 `docs/deploy/z423-synapse.md`「备份与恢复」中的网关数据说明。
 - 跨服入口只经 fedgate 暴露 `/_matrix/botville/*`；网关 HTTP 端口只在 compose 内网或

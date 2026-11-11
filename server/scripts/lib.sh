@@ -123,8 +123,13 @@ docker_volume_exists() {
     docker volume inspect "$1" >/dev/null 2>&1
 }
 
-# Create the volume with compose labels so `docker compose down -v` removes it.
-# No-op if it already exists (labels on an existing volume are left as-is).
+# Create the volume with compose labels so that *after* a gateway service
+# mounts it, `docker compose down -v` can remove it. Today no service mounts
+# this volume, so down -v does not delete it and `compose config --volumes`
+# does not list it — even with the labels. Remove it with
+# `docker volume rm -f <project>_gateway-data`. `make down` does not pass -v.
+# No-op if the volume already exists (labels on an existing volume are left
+# as-is).
 ensure_gateway_data_volume() {
     local vol
     vol="$(gateway_data_volume)"
