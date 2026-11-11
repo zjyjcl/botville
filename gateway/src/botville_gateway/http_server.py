@@ -58,6 +58,8 @@ from .errors import (
 )
 from .limits import LimitStore
 from .matrix import InMemoryMatrixTransport, MatrixTransport
+from .moments.http_api import handle as _handle_moments_dispatch
+from .moments.service import build_moments_service
 from .service import GatewayService
 from .store import UsageStore
 from .timeutil import iso_utc
@@ -393,13 +395,16 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     def _handle_moments(self) -> None:
         """`/moments*` 的请求入口（#124）。
 
-        本 PR 只做**用户身份校验**：校验通过后动态资源尚未实现，按 404 返回
-        （契约路径均已声明，但 CRUD 留待后续 PR）。这样测试可以覆盖「成功通过
-        鉴权」与「鉴权失败的 401」两条路径，而不必实现完整 CRUD。
+        先做**用户身份校验**（401 先于业务）；通过后：moments 已启用则交给
+        新模块分发（A2.2 PR2），未配置 `GATEWAY_MOMENTS_DB_PATH` 时保持
+        原占位行为（404）。
         """
         if not self._auth_user_ok():
             return
-        self._send_problem(404, "not_found", "Not Found")
+        if self.server.moments_service is None:
+            self._send_problem(404, "not_found", "Not Found")
+            return
+        _handle_moments_dispatch(self)
 
     # ---------------------------------------------------------------- GET
     def do_GET(self) -> None:
@@ -488,20 +493,27 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             self._internal_error(exc)
 
     def _moments_method_not_allowed(self) -> None:
-        """PATCH / DELETE 在 `/moments*` 上：先鉴权再 405（本 PR 未实现 CRUD）。"""
+        """PATCH / DELETE 在 `/moments*` 上：先鉴权，再按 moments 开关分发。
+
+        moments 已启用 → 交新模块（PATCH/DELETE 是合法操作）；未启用 →
+        保持原占位 405。
+        """
         self._request_id()
         try:
-            _raw_path, _query, path = self._route_path()
+            _raw, _query, path = self._route_path()
             if _is_moments_path(path):
                 # 先校验用户身份；鉴权失败已在 _auth_user_ok 里发响应。
                 if not self._auth_user_ok():
                     return
-                self._send_problem(
-                    405,
-                    "request.invalid",
-                    "Method Not Allowed",
-                    detail=f"{self.command} is not yet supported on {path}",
-                )
+                if self.server.moments_service is None:
+                    self._send_problem(
+                        405,
+                        "request.invalid",
+                        "Method Not Allowed",
+                        detail=f"{self.command} is not yet supported on {path}",
+                    )
+                    return
+                _handle_moments_dispatch(self)
                 return
             self._method_not_allowed()
         except (BrokenPipeError, ConnectionResetError):
@@ -823,6 +835,9 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         # #124 §1.2.3：`/moments*` 的终端用户身份校验（MatrixOpenID / Matrix Bearer）。
         # 与上面的 caller/legacy authenticator 并存但互不替代：`/moments*` 只走这里。
         self.user_verifier = UserIdentityVerifier(config)
+        # A2.2（issue #7）动态服务：未配置 GATEWAY_MOMENTS_DB_PATH → None
+        # （模块关闭，`/moments*` 鉴权后行为与合入前一致）。
+        self.moments_service = build_moments_service(config)
         log_startup_warnings(config)
         super().__init__((config.host, config.port), GatewayHandler)
 
