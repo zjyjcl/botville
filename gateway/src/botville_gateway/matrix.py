@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
+from .log_redact import redact_txn_id
+
 # Matrix 事务 ID 允许的字符（spec: `[A-Za-z0-9._=-]`）。
 _TXN_ID_RE = re.compile(r"^[A-Za-z0-9._=-]{1,255}$")
 
@@ -92,9 +94,12 @@ def resolve_txn_id(txn_id: Optional[str]) -> str:
     if txn_id is None:
         return uuid.uuid4().hex
     if not txn_id or not _TXN_ID_RE.fullmatch(txn_id):
+        # 契约决定 #15：错误消息会经 `delivery failed: %s: %s` 进日志，不落原始
+        # txnId，只给可关联的短标记（见 log_redact.redact_txn_id）。
         raise DeliveryError(
             "matrix.invalid_txn_id",
-            f"txn_id must match ^[A-Za-z0-9._=-]{{1,255}}$, got {txn_id!r}",
+            "txn_id must match ^[A-Za-z0-9._=-]{1,255}$, got "
+            + redact_txn_id(txn_id),
         )
     return txn_id
 

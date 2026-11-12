@@ -8,6 +8,11 @@ backups/
 *.tar.gz
 # rendered by server/scripts/init.sh from .env + templates
 server/compose/generated/
+# real gateway personas stay local (bind-mounted read-only); only the
+# example and README are tracked
+server/compose/gateway-personas/*
+!server/compose/gateway-personas/README.md
+!server/compose/gateway-personas/personas.example.json
 # generated at run time by federation-certs.sh / federation-setup.py (A2.1):
 # self-signed fedgate certs, throwaway Synapse configs, pairing admin tokens
 server/compose/federation/generated/
