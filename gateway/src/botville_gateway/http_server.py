@@ -1289,9 +1289,11 @@ class GatewayServer(http.server.ThreadingHTTPServer):
                 # 注册唤醒钩子：事务落库成功后立即唤醒消费线程。
                 self.as_txn_store.set_on_new_transaction(consumer.wake)
                 self.as_consumer = consumer
-                consumer.start()
         log_startup_warnings(config)
         super().__init__((config.host, config.port), GatewayHandler)
+        # 监听端口绑定成功后才起消费线程：绑定失败（OSError）时不留下孤儿线程。
+        if self.as_consumer is not None:
+            self.as_consumer.start()
 
     def server_close(self) -> None:
         """关闭监听前先停消费者，再停清理线程（未启用时为 no-op）。"""
