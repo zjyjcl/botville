@@ -115,6 +115,15 @@ final class ReleaseIsolationTests: XCTestCase {
         XCTAssertEqual(try expand(overridden["DEVELOPMENT_TEAM"]!, using: overridden), "DIRECT1234")
     }
 
+    func testUnreadBannerProbeIsDebugGuarded() throws {
+        for relative in ["Sources/BotvilleCore/ForegroundInAppBanner.swift",
+                         "Sources/BotvilleCore/ForegroundSyncNotifications.swift",
+                         "Sources/BotvilleCore/MatrixService.swift",
+                         "Tests/BotvilleCoreTests/UnreadBannerProbeTests.swift"] {
+            try guarded("UnreadBannerProbeLog", at: root.appendingPathComponent(relative))
+        }
+    }
+
     func testEntitlementAndDebugViewsAreIsolated() throws {
         let project = try String(contentsOf: root.appendingPathComponent("Botville.xcodeproj/project.pbxproj"), encoding: .utf8)
         XCTAssertTrue(project.contains("CODE_SIGN_ENTITLEMENTS = BotvilleApp/BotvilleApp.entitlements;"))

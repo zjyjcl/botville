@@ -629,15 +629,16 @@ final class RoomMuteTests: XCTestCase {
         XCTAssertEqual(PushBadge.total(rooms: [MatrixRoom(id: "!large:test", name: "Large", unreadCount: .max)], isMuted: { _ in false }), Int.max)
     }
 
-    func testForegroundMutedEventConsumedAndUnmutingOnlyAllowsNewEvent() {
+    func testForegroundMutedEventDoesNotReserveStoreKeyOrReplayOnContextChange() {
         let store = ForegroundInAppBannerStore()
         let candidate = ForegroundBannerCandidate(roomID: room.id, eventID: "$old", latestActivity: Date(), title: "Test", preview: "Test")
         store.updateContext(isForeground: true, visibleRoomID: nil, isInputActive: false, mutedRoomIDs: [room.id])
         store.receive(candidate)
         XCTAssertNil(store.current)
         store.updateContext(isForeground: true, visibleRoomID: nil, isInputActive: false)
-        store.receive(candidate)
-        XCTAssertNil(store.current)
+        XCTAssertNil(store.current) // Unmuting alone never replays the old event.
+        store.receive(candidate) // Explicit fresh delivery is eligible at the Store boundary.
+        XCTAssertEqual(store.current, candidate)
         store.receive(ForegroundBannerCandidate(roomID: room.id, eventID: "$new", latestActivity: Date(), title: "Test", preview: "Test"))
         XCTAssertNotNil(store.current)
         store.reset()

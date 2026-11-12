@@ -693,15 +693,39 @@ public final class MatrixService: ObservableObject {
                 guard !Task.isCancelled, generation == self.sessionGeneration,
                       !self.isLoggingOut, notificationListener.isCurrent(event),
                       self.bannerResumeState.shouldPresent(event.candidate, suppressedEvents: self.deliveredBackgroundEvents),
-                      self.rooms.contains(where: { $0.id == event.candidate.roomID && $0.membership == .joined }) else { continue }
+                      self.rooms.contains(where: { $0.id == event.candidate.roomID && $0.membership == .joined }) else {
+#if DEBUG
+                    let reason: UnreadBannerProbeLog.BannerReason
+                    if Task.isCancelled { reason = .cancelled }
+                    else if generation != self.sessionGeneration || self.isLoggingOut { reason = .staleSession }
+                    else if !notificationListener.isCurrent(event) { reason = .staleVisibility }
+                    else if !self.bannerResumeState.isForeground { reason = .notForeground }
+                    else if !self.bannerResumeState.shouldPresent(event.candidate, suppressedEvents: self.deliveredBackgroundEvents) {
+                        reason = .deliveredInBackground
+                    } else { reason = .roomUnavailable }
+                    UnreadBannerProbeLog.banner(roomID: event.candidate.roomID, reason: reason)
+#endif
+                    continue
+                }
                 // Read the synced rules at the event boundary as well: the
                 // settings delegate and notification callback can be queued together.
                 if let room = self.rooms.first(where: { $0.id == event.candidate.roomID }) {
                     await self.roomNotifications.refresh(room)
                 }
                 guard !Task.isCancelled, generation == self.sessionGeneration,
-                      notificationListener.isCurrent(event),
-                      !self.roomNotifications.isMuted(event.candidate.roomID) else { continue }
+                      notificationListener.isCurrent(event) else {
+#if DEBUG
+                    UnreadBannerProbeLog.banner(roomID: event.candidate.roomID,
+                        reason: Task.isCancelled ? .cancelled : (generation != self.sessionGeneration ? .staleSession : .staleVisibility))
+#endif
+                    continue
+                }
+                guard !self.roomNotifications.isMuted(event.candidate.roomID) else {
+#if DEBUG
+                    UnreadBannerProbeLog.banner(roomID: event.candidate.roomID, reason: .muted)
+#endif
+                    continue
+                }
                 self.foregroundBannerCandidates.send(event.candidate)
             }
         }
@@ -831,6 +855,19 @@ public final class MatrixService: ObservableObject {
         let refresh = UUID()
         roomRefreshGeneration = refresh
         let securityRevisionsAtStart = roomSecurityRevisions
+#if DEBUG
+        // One terminal outcome per refresh, including early returns. UUIDs are
+        // hashed so SDK reads and rejected snapshots can be correlated safely.
+        var probeOutcome = UnreadBannerProbeLog.RefreshOutcome.observed
+        defer {
+            let outcome: UnreadBannerProbeLog.RefreshOutcome
+            if session != sessionGeneration { outcome = .sessionChanged }
+            else if refresh != roomRefreshGeneration { outcome = .superseded }
+            else if !isLoggedIn || isLoggingOut { outcome = .inactiveSession }
+            else { outcome = probeOutcome }
+            UnreadBannerProbeLog.refresh(refresh, online: onlineSyncGeneration != nil, outcome: outcome)
+        }
+#endif
         var updated: [MatrixRoom] = []
         for room in client.rooms() {
             let membership: MatrixRoomMembership
@@ -840,6 +877,17 @@ public final class MatrixService: ObservableObject {
             default: continue
             }
             let info = try? await room.roomInfo()
+#if DEBUG
+            let previousUnread = rooms.first(where: { $0.id == room.id() })?.unreadCount
+            if info?.numUnreadMessages == 0 {
+                UnreadBannerProbeLog.unread(.sdkUnreadZero, roomID: room.id(), before: previousUnread, after: 0,
+                    muted: roomNotifications.isMuted(room.id()), refresh: refresh, online: onlineSyncGeneration != nil)
+            }
+            if info == nil {
+                UnreadBannerProbeLog.unread(.sdkInfoUnavailable, roomID: room.id(), before: previousUnread,
+                    after: 0, refresh: refresh, online: onlineSyncGeneration != nil)
+            }
+#endif
             let latest = await room.latestEvent()
             let timestamp: UInt64?
             switch latest {
@@ -879,6 +927,16 @@ public final class MatrixService: ObservableObject {
         let committed = RoomRefreshCommitGate.commit(onlineGeneration: onlineSyncGeneration,
                                      currentGeneration: syncGeneration,
                                      isCancelled: Task.isCancelled) {
+#if DEBUG
+            probeOutcome = .committed
+            for room in updated where room.unreadCount == 0 {
+                if let before = rooms.first(where: { $0.id == room.id })?.unreadCount, before > 0 {
+                    UnreadBannerProbeLog.unread(.refreshCommitZero, roomID: room.id, before: before, after: 0,
+                        muted: roomNotifications.isMuted(room.id), refresh: refresh,
+                        online: onlineSyncGeneration != nil, outcome: .committed)
+                }
+            }
+#endif
             rooms = MatrixRoom.sortedByActivity(Self.mergingSecurityUpdates(
                 refreshed: updated, current: rooms,
                 revisionsAtStart: securityRevisionsAtStart,
@@ -888,7 +946,12 @@ public final class MatrixService: ObservableObject {
             // Banner events come only from SyncNotificationListener. A derived
             // latestEvent readback here can lag this sync and must never replay it.
         }
-        guard committed else { return }
+        guard committed else {
+#if DEBUG
+            probeOutcome = .gateRejected
+#endif
+            return
+        }
         // Publish the badge from cached rules immediately; confirmed readbacks
         // update it through roomNotifications.didChange without holding up sync.
         updateApplicationBadge()
@@ -1287,7 +1350,13 @@ public final class MatrixService: ObservableObject {
 
     static func roomsAfterReadReceipt(_ rooms: [MatrixRoom], roomID: String, succeeded: Bool) -> [MatrixRoom] {
         guard succeeded else { return rooms }
-        return rooms.map { $0.id == roomID ? $0.withUnreadCount(0) : $0 }
+        return rooms.map { room in
+            guard room.id == roomID else { return room }
+#if DEBUG
+            UnreadBannerProbeLog.unread(.readReceiptLocalZero, roomID: roomID, before: room.unreadCount, after: 0)
+#endif
+            return room.withUnreadCount(0)
+        }
     }
 
     @discardableResult
