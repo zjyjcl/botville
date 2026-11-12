@@ -34,9 +34,9 @@ final class SDKRoomNotificationSettings: RoomNotificationSettingsProviding {
     private let resolveEncryption: (MatrixRoom) async throws -> RoomEncryptionState
 
     init(_ settings: NotificationSettings,
-         resolveEncryption: @escaping (MatrixRoom) async throws -> RoomEncryptionState = { _ in .unknown }) {
+         resolveEncryption: ((MatrixRoom) async throws -> RoomEncryptionState)? = nil) {
         self.settings = settings
-        self.resolveEncryption = resolveEncryption
+        self.resolveEncryption = resolveEncryption ?? { _ in .unknown }
     }
 
     func isMuted(_ room: MatrixRoom) async throws -> Bool {

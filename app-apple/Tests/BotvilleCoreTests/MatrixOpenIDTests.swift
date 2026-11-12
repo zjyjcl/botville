@@ -14,13 +14,13 @@ final class MatrixOpenIDTests: XCTestCase {
 
     private func transport(_ provider: MatrixOpenIDTokenProvider? = nil,
                            base: String = "https://gateway.test/_botville/gateway",
-                           sleep: @escaping HTTPGatewayClient.RetrySleep = { _ in }) throws -> (HTTPGatewayClient, OpenIDRecorder) {
+                           sleep: HTTPGatewayClient.RetrySleep? = nil) throws -> (HTTPGatewayClient, OpenIDRecorder) {
         let recorder = OpenIDRecorder()
         OpenIDURLProtocol.recorder = recorder
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [OpenIDURLProtocol.self]
         return (try HTTPGatewayClient(baseURL: base, token: "synthetic-site",
-            session: URLSession(configuration: configuration), openIDProvider: provider, retrySleep: sleep), recorder)
+            session: URLSession(configuration: configuration), openIDProvider: provider, retrySleep: sleep ?? { _ in }), recorder)
     }
 
     override func tearDown() { OpenIDURLProtocol.recorder = nil; super.tearDown() }
@@ -533,6 +533,122 @@ final class MatrixOpenIDTests: XCTestCase {
         XCTAssertTrue(token.isValid)
         let count = await source.count
         XCTAssertEqual(count, 1)
+        await provider.shutdown()
+    }
+
+    func testRequestTimeoutConfigurationIsNormalized() async throws {
+        let cases: [(TimeInterval, TimeInterval)] = [
+            (.nan, 30), (.infinity, 30), (-.infinity, 30), (0, 30), (-1, 30),
+            (.greatestFiniteMagnitude, 300), (301, 300), (300, 300), (30, 30), (0.001, 0.001)
+        ]
+        for (input, expected) in cases {
+            let gate = OpenIDGate()
+            let durations = OpenIDWaits()
+            let provider = MatrixOpenIDTokenProvider(requestTimeout: input, timeoutSleep: {
+                await durations.record($0)
+                await gate.waitUntilStarted()
+            }) { await gate.issue() }
+            do { _ = try await provider.token(); XCTFail("Expected normalized deadline") }
+            catch { XCTAssertTrue(error as? MatrixOpenIDError == .requestTimedOut) }
+            let observed = await durations.values
+            XCTAssertEqual(observed, [expected])
+            await gate.release()
+            await provider.shutdown()
+        }
+    }
+
+    func testNilTimeoutSleepUsesDefaultImplementation() async throws {
+        let gate = OpenIDGate()
+        let provider = MatrixOpenIDTokenProvider(requestTimeout: 0.05, timeoutSleep: nil) {
+            await gate.issue()
+        }
+        do { _ = try await provider.token(); XCTFail("Expected real deadline") }
+        catch { XCTAssertTrue(error as? MatrixOpenIDError == .requestTimedOut) }
+        await gate.release()
+        await provider.shutdown()
+    }
+
+    func testTimeoutSleepFailureReleasesAllWaitersAndAllowsRetry() async throws {
+        let gate = OpenIDGate() // Source ignores cancellation until explicitly released.
+        let deadline = OpenIDGate()
+        let source = OpenIDSource()
+        let sleeps = OpenIDSource()
+        let provider = MatrixOpenIDTokenProvider(timeoutSleep: { _ in
+            _ = try await sleeps.issue()
+            if await sleeps.count == 1 {
+                _ = await deadline.issue()
+                throw SensitiveSyntheticError()
+            }
+            try await Task.sleep(for: .seconds(3600))
+        }) {
+            let value = try await source.issue()
+            if await source.count == 1 { return await gate.issue() }
+            return value
+        }
+        let completions = OpenIDWaits()
+        let started = expectation(description: "All callers launched")
+        started.expectedFulfillmentCount = 20
+        let returned = expectation(description: "All callers released by scheduler failure")
+        returned.expectedFulfillmentCount = 20
+        let callers = (0..<20).map { _ in Task {
+            started.fulfill()
+            let failed: Bool
+            do { _ = try await provider.token(); failed = false }
+            catch {
+                failed = error as? MatrixOpenIDError == .requestFailed
+                    && !String(reflecting: error).contains("synthetic-sensitive")
+            }
+            await completions.record(1)
+            returned.fulfill()
+            return failed
+        } }
+        await fulfillment(of: [started], timeout: 2)
+        await gate.waitUntilStarted()
+        await deadline.waitUntilStarted()
+        // Give launched callers time to join the suspended flight, as in the
+        // existing concurrent source-failure test. The source count below also
+        // checks that no caller accidentally started another flight.
+        try await Task.sleep(for: .milliseconds(100))
+        await deadline.release()
+        await fulfillment(of: [returned], timeout: 2)
+        // On a regression release hung callers before awaiting their results.
+        let completed = await completions.values.count
+        guard completed == 20 else {
+            await provider.shutdown()
+            await gate.release()
+            for caller in callers { _ = await caller.value }
+            return
+        }
+        let recovered = try await provider.token()
+        XCTAssertTrue(recovered.isValid)
+        await gate.release()
+        for caller in callers { let failed = await caller.value; XCTAssertTrue(failed) }
+        let cached = try await provider.token()
+        XCTAssertTrue(cached.identity == recovered.identity)
+        let count = await source.count
+        XCTAssertEqual(count, 2)
+        await provider.shutdown()
+    }
+
+    func testTimeoutSleepCancellationLeavesSourceFlightAlive() async throws {
+        let gate = OpenIDGate()
+        let slept = expectation(description: "Injected sleeper cancelled")
+        let returned = expectation(description: "Cancellation must not finish the flight")
+        returned.isInverted = true
+        let provider = MatrixOpenIDTokenProvider(timeoutSleep: { _ in
+            slept.fulfill()
+            throw CancellationError()
+        }) { await gate.issue() }
+        let pending = Task {
+            defer { returned.fulfill() }
+            return try await provider.token()
+        }
+        await gate.waitUntilStarted()
+        await fulfillment(of: [slept], timeout: 2)
+        await fulfillment(of: [returned], timeout: 0.05)
+        await gate.release()
+        let value = try await pending.value
+        XCTAssertTrue(value.isValid)
         await provider.shutdown()
     }
 

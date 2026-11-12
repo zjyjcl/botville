@@ -551,6 +551,24 @@ final class RoomMuteTests: XCTestCase {
         } catch { XCTAssertTrue(error is RoomNotificationSettingsError) }
     }
 
+    func testNilEncryptionResolverKeepsUnknownRoomsFailClosed() async throws {
+        let settings = TestNotificationSettings()
+        let provider = SDKRoomNotificationSettings(settings, resolveEncryption: nil)
+        let unknown = room.withSecurity(encryption: .unknown, participants: .unknown)
+        do {
+            _ = try await provider.isMuted(unknown)
+            XCTFail("Unknown encryption must reject reads")
+        } catch { XCTAssertTrue(error is RoomNotificationSettingsError) }
+        do {
+            try await provider.setMuted(false, room: unknown)
+            XCTFail("Unknown encryption must reject unmute")
+        } catch { XCTAssertTrue(error is RoomNotificationSettingsError) }
+        XCTAssertTrue(settings.roomReadEncryption.isEmpty)
+        XCTAssertTrue(settings.unmuteEncryptionArguments.isEmpty)
+        let muted = try await provider.isMuted(room)
+        XCTAssertFalse(muted)
+    }
+
     func testResolvedEncryptionIsPassedToUnmuteAndReadback() async throws {
         for encryption in [RoomEncryptionState.encrypted, .unencrypted] {
             let settings = TestNotificationSettings()
