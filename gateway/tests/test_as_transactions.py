@@ -530,7 +530,12 @@ class TestAsLogRedaction(_Base):
                 f"{s.base}/health?access_token={HS_TOKEN}-evil",
             )
         joined = buf.getvalue()
-        self.assertIn("PUT /_matrix/app/v1/transactions/log1", joined)  # 确有日志
+        # 契约决定 #15：路径里的 txnId 段被替换为 `<redacted>`（端点仍在日志里）。
+        self.assertIn(
+            'PUT /_matrix/app/v1/transactions/<redacted>', joined
+        )  # 确有日志
+        self.assertNotIn("log1", joined)
+        self.assertNotIn("log2", joined)
         self.assertNotIn(HS_TOKEN, joined)
         self.assertNotIn(f"Bearer {HS_TOKEN}", joined)
         self.assertIn("access_token=[REDACTED]", joined)
