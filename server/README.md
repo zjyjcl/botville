@@ -21,10 +21,9 @@ make up GATEWAY=1    # 叠加 botville 网关（gateway profile，A2.2；本机�
                      # synapse/tuwunel 用 appservice 传输、注册 url=http://gateway:8080 收 AS 事务
                      # （url 变了会重启 HS）；continuwuity 仍用 memory、url=null）
 make gateway-hs-smoke # 对真实 HS 冒烟：whoami + OpenID userinfo + AS 事务 ping/落库/重启幂等
-                     # （测试用户/房间跨次复用，记在 generated/gateway-hs-smoke.json）
-# 角色引擎：GATEWAY_MODEL_* / GATEWAY_PERSONAS_FILE / GATEWAY_CONSUMER_ENABLED 写进
-# compose/.env 后 make up GATEWAY=1；人设放 compose/gateway-personas/（只读挂载，真实文件不进仓库）
-                     # （需 GATEWAY=1 的 synapse/tuwunel 栈；网关只能跑一个，只用 make up 重建）
+                     # （需 GATEWAY=1 的 synapse/tuwunel 栈；网关只能跑一个，只用 make up 重建；
+                     # 测试用户/房间跨次复用，记在 generated/gateway-hs-smoke.json）
+make config          # 只校验：init + 网关预检 + compose config --quiet（不打印插值后的值）
 make smoke           # 标准库冒烟测试：注册→登录→建房(v10)→发消息→回读→sync
 make backup          # 备份到 ./backups/<UTC时间戳>/（目录 700、文件 600，A1.1）
 make restore RESTORE_DIR=backups/<时间戳>   # 破坏性恢复（自动 --yes）
@@ -41,6 +40,13 @@ make ps              # 容器状态（同上）
 make down            # 停止（不传 -v，不删任何卷）。清卷：docker compose ... --profile <hs> --profile gateway down -v
                      # （带 gateway profile 才删 gateway-data）；单删：docker volume rm -f <项目名>_gateway-data
 ```
+
+角色引擎（B 线 PR2）：把 `GATEWAY_MODEL_*` / `GATEWAY_PERSONAS_FILE` / `GATEWAY_CONSUMER_ENABLED`
+写进 `server/compose/.env` 后 `make up GATEWAY=1`；人设放 `server/compose/gateway-personas/`
+（只读挂载，真实文件不进仓库；自定义目录用 `BOTVILLE_GATEWAY_PERSONAS_DIR`，不存在时
+`make up GATEWAY=1` / `make config` 预检就报错）。详见
+[docs/deploy/appservice.md](../docs/deploy/appservice.md#角色引擎模型与人设)。
+
 
 continuwuity 默认关闭上游 announcements 检查（避免 SIGTERM 卡到 SIGKILL）：见 [docs/ops/continuwuity-announcements.md](../docs/ops/continuwuity-announcements.md)。
 

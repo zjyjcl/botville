@@ -409,6 +409,10 @@ fi
 chmod 600 "${env_file}"
 
 mkdir -p "${generated_dir}" "${sygnal_generated_dir}" "${appservice_dir}"
+# generated/ holds 0600 secrets (rendered configs with tokens, the gateway
+# smoke fixture); keep the directory itself private too. Bind mounts of its
+# subpaths are resolved by the docker daemon, so containers are unaffected.
+chmod 700 "${compose_dir}/generated"
 
 # Push denylist for tuwunel/continuwuity: their outbound HTTP (pushes to
 # sygnal) refuses private ranges by default. render_push_denylist.py writes
@@ -585,7 +589,7 @@ fi
 appservice_url_marker="${appservice_dir}/.url-changed"
 appservice_url_prev="null"
 if [[ -f "${appservice_generated}" ]]; then
-    prev_line="$(sed -n 's/^url:[[:space:]]*//p' "${appservice_generated}" | head -n 1)"
+    prev_line="$(sed -n '/^url:[[:space:]]*/{s///p;q;}' "${appservice_generated}")"
     case "${prev_line}" in
         null|http://gateway:8080) appservice_url_prev="${prev_line}" ;;
     esac

@@ -261,7 +261,9 @@ restore_gateway_data() {
 # sha256 recorded for <name> in <backup_dir>/manifest.txt (empty if absent).
 manifest_sha() { # manifest_sha <backup_dir> <name>
     [[ -f "$1/manifest.txt" ]] || return 0
-    sed -n "s/^\([0-9a-f]\{64\}\)  [0-9][0-9]*  $2\$/\1/p" "$1/manifest.txt" | head -n 1
+    # First match only, via sed's own q (no `| head`: an early-exit consumer
+    # under pipefail can fail the producer with EPIPE).
+    sed -n "/^\([0-9a-f]\{64\}\)  [0-9][0-9]*  $2\$/{s//\1/p;q;}" "$1/manifest.txt"
 }
 
 # verify_gateway_data_artifact <backup_dir>

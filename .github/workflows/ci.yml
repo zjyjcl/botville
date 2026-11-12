@@ -119,7 +119,7 @@ jobs:
           cid="$(docker compose -f server/compose/docker-compose.yml --env-file server/compose/.env --profile "${{ matrix.homeserver }}" ps -q "${{ matrix.homeserver }}")"
           if [[ "${{ matrix.homeserver }}" == "continuwuity" ]]; then
             env_dump="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$cid")"
-            echo "$env_dump" | grep -Fqx 'CONTINUWUITY_ALLOW_ANNOUNCEMENTS_CHECK=false'
+            grep -Fqx 'CONTINUWUITY_ALLOW_ANNOUNCEMENTS_CHECK=false' <<<"$env_dump"
             echo "continuwuity env asserts CONTINUWUITY_ALLOW_ANNOUNCEMENTS_CHECK=false"
           fi
           start=$(date +%s)
@@ -197,9 +197,17 @@ jobs:
           echo "backup dir: ${backup_dir}"
           test -f "${backup_dir}/gateway-data.tar.gz"
           grep -q 'gateway-data.tar.gz' "${backup_dir}/manifest.txt"
-          tar -tzf "${backup_dir}/gateway-data.tar.gz" | grep -qx './ci-seed.txt'
+          # List the archive into a file first, then grep the file. Never
+          # `tar -t | grep -q` under pipefail: grep -q exits on the first
+          # match, tar's next write hits a closed pipe, and because Actions
+          # steps inherit SIGPIPE=ignored tar fails with "stdout: write error"
+          # (exit 2) -- a timing race that depends on the entry order.
+          listing="$(mktemp)"
+          trap 'rm -f "${listing}"' EXIT
+          tar -tzf "${backup_dir}/gateway-data.tar.gz" > "${listing}"
+          grep -qx './ci-seed.txt' "${listing}"
           # AS transactions (#192) live on the same volume, top level.
-          tar -tzf "${backup_dir}/gateway-data.tar.gz" | grep -qx './as_transactions.db'
+          grep -qx './as_transactions.db' "${listing}"
           echo "RESTORE_DIR=${backup_dir}" >> "$GITHUB_ENV"
 
       - name: Wipe volumes (simulated disaster)
@@ -312,7 +320,9 @@ jobs:
       - name: compose config --volumes lists gateway-data with the gateway profile
         run: |
           set -euo pipefail
-          ${STACK} config --volumes | grep -qx gateway-data
+          # Capture first, then grep (no `| grep -q` under pipefail).
+          volumes="$(${STACK} config --volumes)"
+          grep -qx gateway-data <<<"${volumes}"
 
       - name: Start homeserver + gateway
         run: make up HS=${{ matrix.homeserver }} GATEWAY=1
@@ -357,9 +367,14 @@ jobs:
           backup_dir="$(cat backups/.last-backup)"
           test -f "${backup_dir}/gateway-data.tar.gz"
           grep -q 'gateway-data.tar.gz' "${backup_dir}/manifest.txt"
-          tar -tzf "${backup_dir}/gateway-data.tar.gz" | grep -qx './ci-seed.txt'
+          # List to a file, then grep it (no `tar -t | grep -q` under
+          # pipefail: SIGPIPE race, see the backup-restore job).
+          listing="$(mktemp)"
+          trap 'rm -f "${listing}"' EXIT
+          tar -tzf "${backup_dir}/gateway-data.tar.gz" > "${listing}"
+          grep -qx './ci-seed.txt' "${listing}"
           # The gateway opens as_transactions.db at startup on every profile.
-          tar -tzf "${backup_dir}/gateway-data.tar.gz" | grep -qx './as_transactions.db'
+          grep -qx './as_transactions.db' "${listing}"
           test ! -e "${backup_dir}/env"
           echo "RESTORE_DIR=${backup_dir}" >> "$GITHUB_ENV"
 
@@ -567,6 +582,7 @@ jobs:
             server/scripts/lib.sh server/scripts/backup-synapse.sh server/scripts/restore-synapse.sh \
             server/scripts/backup-gateway-data.sh server/scripts/restore-gateway-data.sh \
             server/scripts/federation-certs.sh server/scripts/check_no_secrets.sh \
+            server/scripts/gateway-preflight.sh \
             scripts/sync-pairing-qr-fixtures.sh scripts/test-sync-pairing-qr-fixtures.sh
 
       # The docs examples dir is the single source of truth for the App-side
@@ -645,9 +661,11 @@ jobs:
           # used in CI or the docs.
           sentinel="ci-model-key-sentinel-not-a-secret"
           env_copy="$(mktemp)"
+          log="$(mktemp)"
+          # Remove both temp files on every exit path (failure included).
+          trap 'rm -f "${env_copy}" "${log}"' EXIT
           cp server/compose/.env "${env_copy}"
           echo "GATEWAY_MODEL_API_KEY=${sentinel}" >> "${env_copy}"
-          log="$(mktemp)"
           for hs in synapse tuwunel continuwuity; do
             for extra in "" "--profile push" "--profile gateway" "--profile push --profile gateway"; do
               # shellcheck disable=SC2086
@@ -659,7 +677,6 @@ jobs:
             echo "::error::compose config --quiet printed GATEWAY_MODEL_API_KEY"
             exit 1
           fi
-          rm -f "${env_copy}" "${log}"
           echo "GATEWAY_MODEL_API_KEY not printed (12 combinations)"
 
       - name: .env.example contains placeholders only
