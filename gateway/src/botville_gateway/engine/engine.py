@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections import OrderedDict, deque
 from datetime import datetime, timedelta
@@ -48,6 +49,7 @@ MAX_CONTEXT_MESSAGES = 20
 MAX_ROOM_BUFFERS = 1000
 # 进 ring buffer 的单条消息正文上限（已截断的；与 as_consumer 的截断同量级）。
 _RING_TEXT_LIMIT = 8000
+_LOG = logging.getLogger(__name__)
 
 
 def estimate_tokens(text: str) -> int:
@@ -252,13 +254,13 @@ class EngineHooks(ConsumerHooks):
                 raise self._deferred_until(decision, persona, room_id, receipt)
             self.stats.inc("send_blocked")
             return
+        if self._dedupe is not None:
+            self._dedupe.mark(idem_key)
         if self._memory_store is not None and ctx is not None:
             self._record_memory(
                 persona, ctx, "assistant", reply_text,
-                str((receipt.get("delivery") or {}).get("matrix_event_id") or ""),
+                str((receipt.get("delivery") or {}).get("matrix_event_id") or "spk:" + idem_key),
             )
-        if self._dedupe is not None:
-            self._dedupe.mark(idem_key)
         if buf is not None:
             buf.append("assistant", truncate_text(reply_text, _RING_TEXT_LIMIT))
 
@@ -280,8 +282,6 @@ class EngineHooks(ConsumerHooks):
     def _record_memory(self, persona: Persona, ctx: ConsumerContext, role: str,
                        text: str, event_id: str) -> None:
         scope_kind, scope_key, counterpart = self._memory_scope(persona, ctx)
-        if role == "assistant" and not event_id:
-            raise TransientUnavailable("memory delivery receipt unavailable")
         try:
             self._memory_store.add_item(
                 persona_id=persona.user_id, scope_kind=scope_kind, scope_key=scope_key,
@@ -291,8 +291,12 @@ class EngineHooks(ConsumerHooks):
                 role=role, trust=ctx.trust if role == "user" else "trusted",
                 text=truncate_text(text, _RING_TEXT_LIMIT), source="event",
             )
-        except Exception:
+        except Exception as exc:
             self.stats.inc("memory_write_errors")
+            if role == "assistant":
+                # Delivery already succeeded; memory must not trigger a resend.
+                _LOG.warning("%s", type(exc).__name__)
+                return
             raise TransientUnavailable("memory write unavailable") from None
 
     def _deferred_until(

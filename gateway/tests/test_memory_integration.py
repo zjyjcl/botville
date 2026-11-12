@@ -7,11 +7,13 @@ import os
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
+from unittest.mock import Mock, patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
-from botville_gateway.as_consumer import ConsumerContext
+from botville_gateway.as_consumer import ConsumerContext, InMemorySpeechDedupe, speech_idempotency_key
 from botville_gateway.as_consumer import TransientUnavailable
 from botville_gateway.config import Config, ConfigError
 from botville_gateway.engine import EngineHooks, ModelClient, ModelConfig, Persona
@@ -134,6 +136,66 @@ class IntegrationTests(unittest.TestCase):
             service=GatewayService(config(), InMemoryMatrixTransport()), memory_store=BrokenStore())
         with self.assertRaises(TransientUnavailable):
             hooks.on_human_text(context(event="$retry"))
+
+    def test_assistant_memory_failure_does_not_retry_delivery(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = MemoryStore(os.path.join(d, "memory.db"))
+            transport = InMemoryMatrixTransport()
+            dedupe = InMemorySpeechDedupe()
+            ctx = context(event="$delivered")
+            key = speech_idempotency_key(AI, ctx.event_id)
+            hooks = EngineHooks(personas={AI: Persona(AI, "brief")},
+                client=ModelClient(ModelConfig("https://example.invalid", "fake", 1)),
+                service=GatewayService(config(), transport), memory_store=store, dedupe=dedupe)
+            hooks._client.complete = Mock(return_value="answer")
+            add_item = store.add_item
+
+            def fail_assistant(**kwargs):
+                if kwargs["role"] == "assistant":
+                    self.assertTrue(dedupe.seen(key))
+                    self.assertEqual(len(transport.sent), 1)
+                    raise OSError("private message must not be logged")
+                return add_item(**kwargs)
+
+            with patch.object(store, "add_item", side_effect=fail_assistant):
+                with self.assertLogs("botville_gateway.engine.engine", level="WARNING") as logs:
+                    hooks.on_human_text(ctx)
+                hooks.on_human_text(ctx)
+            self.assertEqual([r.getMessage() for r in logs.records], ["OSError"])
+            self.assertIsNone(logs.records[0].exc_info)
+            self.assertEqual(hooks.stats.snapshot()["memory_write_errors"], 1)
+            self.assertTrue(dedupe.seen(key))
+            hooks._client.complete.assert_called_once()
+            self.assertEqual(len(transport.sent), 1)
+
+    def test_missing_delivery_event_id_uses_stable_memory_identity(self):
+        class NoEventIdTransport(InMemoryMatrixTransport):
+            def send_text(self, **kwargs):
+                return replace(super().send_text(**kwargs), event_id="")
+
+        with tempfile.TemporaryDirectory() as d:
+            store = MemoryStore(os.path.join(d, "memory.db"))
+            transport = NoEventIdTransport()
+            dedupe = InMemorySpeechDedupe()
+            ctx = context(event="$synthetic")
+            key = speech_idempotency_key(AI, ctx.event_id)
+            persona = Persona(AI, "brief")
+            hooks = EngineHooks(personas={AI: persona},
+                client=ModelClient(ModelConfig("https://example.invalid", "fake", 1)),
+                service=GatewayService(config(), transport), memory_store=store, dedupe=dedupe)
+            hooks._client.complete = Mock(return_value="answer")
+            hooks.on_human_text(ctx)
+            hooks.on_human_text(ctx)
+            self.assertTrue(dedupe.seen(key))
+            hooks._client.complete.assert_called_once()
+            self.assertEqual(len(transport.sent), 1)
+            # Even a repeated memory write uses the store's unique event identity.
+            hooks._record_memory(persona, ctx, "assistant", "answer", "spk:" + key)
+            rows = store.items(AI)
+            replies = [row for row in rows if row["role"] == "assistant"]
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(len(replies), 1)
+            self.assertEqual(replies[0]["event_id"], "spk:" + key)
 
     def test_owner_validation_rejects_foreign_ai_and_malformed(self):
         import json
