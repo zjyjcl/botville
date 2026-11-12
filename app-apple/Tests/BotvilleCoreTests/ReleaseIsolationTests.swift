@@ -289,6 +289,16 @@ final class ReleaseIsolationTests: XCTestCase {
         }.count
     }
 
+    func testForegroundProbeImplementationAndReferencesAreDebugGuarded() throws {
+        // Mirror check-release-isolation.sh without changing its shared checks.
+        for relative in ["Sources/BotvilleCore/PushNotificationUX.swift",
+                         "Sources/BotvilleApp/BotvilleApp.swift",
+                         "Sources/BotvilleApp/PushDiagnosticsView.swift",
+                         "Tests/BotvilleCoreTests/PushNotificationUXTests.swift"] {
+            try guarded("PushForegroundProbeLog", at: root.appendingPathComponent(relative))
+        }
+    }
+
     func testNSELogScannerCatchesLeadingDotMultilineAndAdditionalArguments() throws {
         for level in ["trace", "debug", "info", "notice", "warning", "error", "fault", "critical", "log"] {
             XCTAssertEqual(try unsafeNotificationLogs(in: "Logger()\n    .\n \(level) (\"unsafe\")", source: "SharedRoomMute.swift"), 1)

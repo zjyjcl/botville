@@ -41,6 +41,7 @@ public actor MatrixOpenIDTokenProvider {
     public typealias Source = @Sendable () async throws -> MatrixOpenIDToken
     public typealias TimeoutSleep = @Sendable (TimeInterval) async throws -> Void
     public static let defaultRequestTimeout: TimeInterval = 30
+    public static let maximumRequestTimeout: TimeInterval = 300
     private var source: Source?
     private let now: @Sendable () -> Date
     private let requestTimeout: TimeInterval
@@ -63,13 +64,16 @@ public actor MatrixOpenIDTokenProvider {
     private static let refreshFraction = 0.2
     private static let maximumLifetimeFraction = 0.5
 
+    /// Invalid (nonfinite or nonpositive) deadlines use 30s. Positive finite
+    /// deadlines are capped at 5 minutes: a refresh must stay bounded, and an
+    /// accidentally huge value must not overflow the sleep duration conversion.
     public init(now: @escaping @Sendable () -> Date = { Date() },
                 requestTimeout: TimeInterval = defaultRequestTimeout,
                 timeoutSleep: TimeoutSleep? = nil,
                 source: @escaping Source) {
-        precondition(requestTimeout.isFinite && requestTimeout > 0)
         self.now = now
-        self.requestTimeout = requestTimeout
+        self.requestTimeout = requestTimeout.isFinite && requestTimeout > 0
+            ? min(requestTimeout, Self.maximumRequestTimeout) : Self.defaultRequestTimeout
         // Keep the async closure inside this module: older Swift linkers can
         // mix async context layouts emitted for public default-argument closures.
         self.timeoutSleep = timeoutSleep ?? { try await Task.sleep(for: .seconds($0)) }
@@ -129,7 +133,14 @@ public actor MatrixOpenIDTokenProvider {
         }
         let timeout = Task { [weak self, timeoutSleep, requestTimeout] in
             do { try await timeoutSleep(requestTimeout) }
-            catch { return }
+            catch is CancellationError { return }
+            catch {
+                guard !Task.isCancelled else { return }
+                // Never retain an injected scheduler error or leave callers
+                // waiting forever when the deadline mechanism itself fails.
+                await self?.finish(id, result: .failure(MatrixOpenIDError.requestFailed))
+                return
+            }
             guard !Task.isCancelled else { return }
             await self?.finish(id, result: .failure(MatrixOpenIDError.requestTimedOut))
         }
