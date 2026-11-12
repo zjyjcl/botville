@@ -565,7 +565,7 @@ class TestEngineServicePath(unittest.TestCase):
     def test_character_token_budget_allows_prompt_and_max_reply(self):
         from botville_gateway.engine.engine import estimate_tokens
 
-        for text, expected in [("", 1), ("abc", 1), ("abcd", 2), ("你好世界", 2), ("😀" * 8, 3)]:
+        for text, expected in [("", 0), ("abc", 1), ("abcd", 2), ("你好世界", 5), ("😀" * 8, 3)]:
             with self.subTest(text=text):
                 self.assertEqual(estimate_tokens(text), expected)
 
@@ -575,7 +575,7 @@ class TestEngineServicePath(unittest.TestCase):
         client._post.assert_called_once()
         self.assertEqual(len(transport.sent), 1)
         messages = client._post.call_args.args[0]["messages"]
-        expected = sum(len(m["content"]) // 4 + 1 for m in messages)
+        expected = sum(estimate_tokens(m["content"]) for m in messages)
         expected += _make_persona().max_reply_chars // 4 + 1
         self.assertEqual(service.evaluate_policy.call_args.args[0]["token_estimate"], expected)
         self.assertEqual(service.get_usage(persona_id=AI_A)["totals"]["tokens_total"], 2)

@@ -92,6 +92,14 @@ class TransientUnavailable(Exception):
     """
 
 
+class MemoryDBUnavailable(TransientUnavailable):
+    """Memory failure with a bounded retry hint; carries no database contents."""
+
+    def __init__(self, retry_seconds: float) -> None:
+        super().__init__("memory database unavailable")
+        self.retry_seconds = retry_seconds
+
+
 class DeferredUntil(TransientUnavailable):
     """策略暂不可用；在指定窗口结束时重试，不消耗 attempts。"""
 
@@ -377,6 +385,10 @@ class ConsumerStats:
         with self._lock:
             self._counters[name] = self._counters.get(name, 0) + amount
 
+    def set(self, name: str, value: float) -> None:
+        with self._lock:
+            self._counters[name] = value
+
     def add_seconds(self, name: str, seconds: float) -> None:
         with self._lock:
             self._counters[name] = self._counters.get(name, 0.0) + float(seconds)
@@ -586,7 +598,10 @@ class AsTransactionConsumer:
             self._stats.inc("deferred")
             return
         if isinstance(exc, TransientUnavailable):
-            delay = min(TRANSIENT_BACKOFF_SECONDS, MAX_BACKOFF_SECONDS)
+            delay = TRANSIENT_BACKOFF_SECONDS
+            if isinstance(exc, MemoryDBUnavailable):
+                delay = max(delay, exc.retry_seconds)
+            delay = min(delay, MAX_BACKOFF_SECONDS)
             self._store.record_transient(txn_id, now + timedelta(seconds=delay))
             self._stats.inc("transient")
             self._stats.inc(f"errors.{type(exc).__name__}")

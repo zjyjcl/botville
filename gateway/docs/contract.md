@@ -934,7 +934,7 @@ ephemeral 不在 AS 注册里开启，忽略。
   仅配置 embedding 模型时生效。
 - **R6 存储与开关（PR3a）**：`GATEWAY_MEMORY_DB_PATH` 默认空 = 模块关闭，
   引擎继续 PR2 进程内 ring buffer。启用后独立 SQLite memory.db，WAL，版本化增量
-  幂等迁移；新库以 0600 创建。`GATEWAY_MEMORY_RETENTION_DAYS` 默认 90，必须 ≥1；
+  幂等迁移；schema 版本表在 BEGIN IMMEDIATE 下迁移为单行并折叠旧重复行；新库以 0600 创建，旧库及现存 WAL/SHM 打开时收紧为 0600。`GATEWAY_MEMORY_RETENTION_DAYS` 默认 90，必须 ≥1；
   pinned 永不过期。`GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS` 默认 86400，0 = 关闭清理，
   非零必须 ≥60；非法配置即使模块关闭也拒绝启动。启用时启动先清一次，随后 daemon
   按间隔清理；失败仅记录异常类型。**备份属于敏感数据**。Compose 透传后续由 A 线完成。
@@ -944,21 +944,35 @@ ephemeral 不在 AS 注册里开启，忽略。
   layer / time / trust，全部进入不可信数据区，永不进入 system。日志不含记忆正文、
   消息正文、原始 txn ID、token 或密钥。PR3a SummaryProvider / VectorRecall 可插拔接口
   默认返回空，不建摘要 / 向量数据。当前真人输入另外隔离追加，不计入历史召回预算，
-  但完整提示词和预留回复均参与既有 token 预算预检。记忆失败不回退房间 ring buffer。
+  但完整提示词和预留回复均参与既有 token 预算预检。记忆 DB 读写错误延后事件，不回退房间 ring buffer。
+  连续记忆 DB 瞬态失败按 30 秒倍增、上限 1 小时重试，不消耗 attempts；完整记忆操作成功后重置连续计数。
+  引擎 stats 暴露 `memory_db_unavailable_consecutive`，每次连续失败达到 5 时增加
+  `memory_db_alerts`；达到阈值后 warning 每小时最多一次，仅含异常类型名（进程重启重置这些状态）。
+  召回 SQL 按 pinned 优先限取 200 条对话、每对象 100 条事实，最多 100 个对象；
+  CJK 汉字（含扩展）、假名、韩文、全角与 CJK 标点约按每字 1 token，其余保持 len/4+1 估算，
+  发送、预检与召回预算共用引擎估算 helper。
 - **R8 范围与可见性（PR3a）**：DM 依本轮已确认房间恰好一个本服 AI 判定，按
   (persona, counterpart) 隔离，只在该 DM 对象上下文召回；否则按群 (persona, room)
   隔离，只在该群召回。事实 visibility=dm_only|shared，默认 dm_only。群里仅召回
   该群记忆及当前 sender / 被提及对象的 shared 事实；不召回 dm_only 事实，
   **DM 原文绝不进入群上下文（B12）**。
+  DM 判定严格依赖成员确认，成员查询失败时存为本房间的群记忆；群真人消息为房间内
+  每个已确认且已配置的本服 AI 各存一份，群对话召回仅限原房间。
 - **R9 Redaction（PR3a；②④处理 PR3b）**：硬删除该事件的①及④向量；含该事件的②
   标 dirty 待重算；③仅有该事件为来源的事实删除，多来源保留其他来源。撤回 event_id
   写 tombstone，重放不得重新插入；墓碑也按保留期清理。pinned 只豁免到期清理，
-  不豁免撤回。PR3a 实现①、③、墓碑；PR3b 补② dirty 重算和④删除。
+  不豁免撤回。主人删除条目时为 event_id、删除事实时为其来源事件写永久墓碑，
+  主人墓碑不随保留期清理，防止重放复活；set-fact 的 counterpart 必须是格式合法的
+  本服真人 ID（域名与 GATEWAY_MATRIX_SERVER_NAME 大小写不敏感相等，localpart 不以 ai_ 开头）。
+  PR3a 实现①、③、墓碑；PR3b 补② dirty 重算和④删除。
 - **R10 Trust（PR3a；④ PR3b）**：任何入站文本都可进①（及未来④）并携带 trust，
   召回始终放数据区；③只来自 trusted 本服发送者。引擎成功发送后立即标记发言去重键，
   再尽力将自身回复记录到①；写入失败仅增加 `memory_write_errors` 并记录异常类型名，
   不抛出异常或触发重发。回执缺少 `matrix_event_id` 时使用稳定的 `spk:` + 发言幂等键，
   按 event_id 去重并尊重墓碑，不抽取为事实。人类消息仍在模型调用前写入，失败可重试。
+  `memory_write_errors` 在引擎 stats 可见；接受的取舍是已标记发送后的记忆写入失败，
+  该条助手记忆永久缺失，重放不会补写。当前不回填 `spk:` 占位的真实 event_id；
+  若回执缺 ID，后续对真实 Matrix 事件的撤回无法匹配该占位记忆，需主人删除或到期清理。
 - **R11 空闲 worker（PR3b）**：独立 daemon 线程，与消费者共享空闲信号，遵守 §1.7.4
   单进程假设；模型 / embedding 瞬态失败退避，每轮有最大批量。
 - **R12 拆分顺序**：PR3a 为本 PR（存储、档案规则、隔离召回、主人内部 API/CLI、接线及
@@ -1604,6 +1618,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.1.0 | 2026-11-13 | [B 线 #205 nits，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 主人删除永久墓碑、记忆读取失败延后、DB 指数退避与告警计数、本服真人 counterpart 校验、旧库权限收紧、召回 SQL 上限、CJK token 估算及并发单行 schema 迁移；明确助手记忆尽力写入与 spk 占位撤回限制。 |
 | 0.1.0 | 2026-11-13 | [B 线 PR3a memory，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] B2.6 可选 SQLite 记忆基础：①持久化对话、③档案规则、scope 隔离与预算召回、主人内部 Python API / CLI、owner_user_id 校验、撤回墓碑及保留清理；三个 memory 配置默认关闭并保持 PR2 ring buffer。⑩写明完整批准规则及 PR3b 摘要/向量/空闲整理、PR3c HTTP 边界；无热路径模型抽取，不改 compose。 |
 | 0.1.0 | 2026-11-13 | [B 线 #203 复审 nits，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 成员查询增加有界负缓存、全局熔断与 5 秒超时；独立验证 LRU、TTL、拒绝重定向和错误脱敏；静默重放上下文按 event_id 去重；处理时间使用注入时钟；公开只读 persona_ids；补充稳定 HMAC 密钥及重启窗口内模型重复调用和计费限制。 |
 | 0.1.0 | 2026-11-13 | [B 线 PR2 engine-reply 审查修复] 静默时段 `defer` 在预检时不调模型；发送边界竞态时不投递；两者都不消耗发言去重键、不计 attempts/failed。消费者把事务定时到静默窗口结束后重试，深夜人类消息于早晨继续回复。发言去重只在 `sent`/`delivered` 后写入，移除会在崩溃时吞回复的 `claim` 占位；`credential_ref` 的规则明确为只接受 `env:NAME`，不再作密钥字形猜测。 |

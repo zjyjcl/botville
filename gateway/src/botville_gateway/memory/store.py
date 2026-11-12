@@ -12,6 +12,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -81,28 +82,54 @@ class MemoryStore:
                 pass
             else:
                 os.close(fd)
+        self._tighten_permissions()
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         try:
-            self._db.execute('PRAGMA journal_mode=WAL')
+            # SQLite can reject concurrent journal-mode changes without honoring
+            # busy_timeout. Bound retries for that startup-only lock race.
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    self._db.execute('PRAGMA journal_mode=WAL')
+                    break
+                except sqlite3.OperationalError as exc:
+                    if str(exc) != 'database is locked' or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
             self._db.execute('PRAGMA synchronous=FULL')
             self._db.execute('PRAGMA foreign_keys=ON')
             self._migrate()
+            self._tighten_permissions()
         except Exception:
             self._db.close()
             raise
 
+    def _tighten_permissions(self) -> None:
+        if self.path == ':memory:':
+            return
+        for name in (self.path, self.path + '-wal', self.path + '-shm'):
+            try:
+                os.chmod(name, 0o600)
+            except FileNotFoundError:
+                if name == self.path:
+                    raise
+
     def _migrate(self) -> None:
         with self._lock, self._db:
+            self._db.execute('BEGIN IMMEDIATE')
             self._db.execute('CREATE TABLE IF NOT EXISTS memory_schema(version INTEGER NOT NULL)')
-            versions = self._db.execute('SELECT version FROM memory_schema').fetchall()
-            if len(versions) > 1:
-                raise RuntimeError('invalid memory schema version')
-            version = versions[0][0] if versions else 0
-            if not isinstance(version, int) or version < 0 or version > SCHEMA_VERSION:
+            versions = [row[0] for row in self._db.execute('SELECT version FROM memory_schema')]
+            if any(not isinstance(v, int) or v < 0 or v > SCHEMA_VERSION for v in versions):
                 raise RuntimeError('unsupported memory schema version')
-            if not versions:
-                self._db.execute('INSERT INTO memory_schema VALUES(0)')
+            # Legacy duplicate rows can reflect an interrupted concurrent first open.
+            # Replay additive migrations from the oldest marker under a write lock.
+            version = min(versions, default=0)
+            columns = {row[1] for row in self._db.execute('PRAGMA table_info(memory_schema)')}
+            if 'id' not in columns:
+                self._db.execute('DROP TABLE memory_schema')
+                self._db.execute('CREATE TABLE memory_schema(id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL)')
+            self._db.execute('INSERT OR IGNORE INTO memory_schema(id,version) VALUES(1,?)', (version,))
             for next_version in range(version + 1, SCHEMA_VERSION + 1):
                 for statement in _MIGRATIONS[next_version]:
                     self._db.execute(statement)
@@ -112,6 +139,10 @@ class MemoryStore:
                         self._db.execute("ALTER TABLE memory_items ADD COLUMN visibility TEXT NOT NULL DEFAULT 'dm_only'")
                         self._db.execute("UPDATE memory_items SET visibility='shared' WHERE scope_kind='group'")
                 self._db.execute('UPDATE memory_schema SET version=?', (next_version,))
+
+            columns = {row[1] for row in self._db.execute('PRAGMA table_info(memory_tombstones)')}
+            if 'permanent' not in columns:
+                self._db.execute('ALTER TABLE memory_tombstones ADD COLUMN permanent INTEGER NOT NULL DEFAULT 0')
 
     def close(self) -> None:
         with self._lock:
@@ -147,6 +178,7 @@ class MemoryStore:
         source = (event_id or 'owner') if source == 'event' else source
         visibility = 'dm_only' if scope_kind == 'dm' else 'shared'
         with self._lock, self._db:
+            self._db.execute('BEGIN IMMEDIATE')
             if self.is_tombstoned(event_id):
                 return False
             cursor = self._db.execute('''INSERT INTO memory_items
@@ -159,7 +191,7 @@ class MemoryStore:
             return bool(cursor.rowcount)
 
     def items(self, persona_id: str, *, scope_kind: Optional[str] = None,
-              scope_key: Optional[str] = None) -> List[Dict[str, Any]]:
+              scope_key: Optional[str] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         query = 'SELECT * FROM memory_items WHERE persona_id=?'
         args = [persona_id]
         if scope_kind is not None:
@@ -168,19 +200,29 @@ class MemoryStore:
         if scope_key is not None:
             query += ' AND scope_key=?'
             args.append(scope_key)
+        query += ' ORDER BY pinned DESC,created_at DESC,id DESC'
+        if limit is not None:
+            query += ' LIMIT ?'
+            args.append(limit)
         with self._lock:
-            return [dict(row) for row in self._db.execute(
-                query + ' ORDER BY created_at DESC,id DESC', args)]
+            return [dict(row) for row in self._db.execute(query, args)]
 
-    def facts(self, persona_id: str, counterpart: Optional[str] = None) -> List[Dict[str, Any]]:
+    def facts(self, persona_id: str, counterpart: Optional[str] = None, *,
+              limit: Optional[int] = None, visibility: Optional[str] = None) -> List[Dict[str, Any]]:
         query = 'SELECT * FROM memory_facts WHERE persona_id=?'
         args = [persona_id]
         if counterpart is not None:
             query += ' AND counterpart=?'
             args.append(counterpart)
+        if visibility is not None:
+            query += ' AND visibility=?'
+            args.append(visibility)
+        query += ' ORDER BY pinned DESC,updated_at DESC,id DESC'
+        if limit is not None:
+            query += ' LIMIT ?'
+            args.append(limit)
         with self._lock:
-            return [dict(row) for row in self._db.execute(
-                query + ' ORDER BY updated_at DESC,id DESC', args)]
+            return [dict(row) for row in self._db.execute(query, args)]
 
     def upsert_fact(
         self, persona_id: str, counterpart: str, key: str, value: str,
@@ -200,6 +242,7 @@ class MemoryStore:
         if source == 'extraction' and not ids:
             raise ValueError('extracted memory requires an event source')
         with self._lock, self._db:
+            self._db.execute('BEGIN IMMEDIATE')
             if any(self.is_tombstoned(event) for event in ids):
                 return False
             old = self._db.execute('''SELECT source,pinned FROM memory_facts
@@ -223,6 +266,11 @@ class MemoryStore:
 
     def delete_item(self, persona_id: str, item_id: int) -> bool:
         with self._lock, self._db:
+            self._db.execute('BEGIN IMMEDIATE')
+            row = self._db.execute('SELECT event_id FROM memory_items WHERE persona_id=? AND id=?',
+                                   (persona_id, item_id)).fetchone()
+            if row and row['event_id']:
+                self._owner_tombstone(row['event_id'], persona_id)
             return bool(self._db.execute('DELETE FROM memory_items WHERE persona_id=? AND id=?',
                                         (persona_id, item_id)).rowcount)
 
@@ -233,8 +281,20 @@ class MemoryStore:
 
     def delete_fact(self, persona_id: str, key: str, counterpart: str) -> bool:
         with self._lock, self._db:
+            self._db.execute('BEGIN IMMEDIATE')
+            row = self._db.execute('SELECT source_event_ids FROM memory_facts WHERE persona_id=? AND counterpart=? AND key=?',
+                                   (persona_id, counterpart, key)).fetchone()
+            if row:
+                for event in json.loads(row['source_event_ids']):
+                    self._owner_tombstone(event, persona_id)
             return bool(self._db.execute('DELETE FROM memory_facts WHERE persona_id=? AND counterpart=? AND key=?',
                                         (persona_id, counterpart, key)).rowcount)
+
+    def _owner_tombstone(self, event_id: str, persona_id: str) -> None:
+        self._db.execute("""INSERT INTO memory_tombstones
+            (event_id,persona_id,created_at,permanent) VALUES(?,?,?,1)
+            ON CONFLICT(event_id) DO UPDATE SET permanent=1""",
+            (event_id, persona_id, _now()))
 
     def pin_fact(self, persona_id: str, key: str, counterpart: str, pinned: bool) -> bool:
         with self._lock, self._db:
@@ -270,7 +330,7 @@ class MemoryStore:
             for table, timestamp, pin_filter in (
                     ('memory_items', 'created_at', ' AND pinned=0'),
                     ('memory_facts', 'updated_at', ' AND pinned=0'),
-                    ('memory_tombstones', 'created_at', '')):
+                    ('memory_tombstones', 'created_at', ' AND permanent=0')):
                 count += self._db.execute(
                     f'DELETE FROM {table} WHERE {timestamp} < ?{pin_filter}', (cutoff,)).rowcount
             return count
