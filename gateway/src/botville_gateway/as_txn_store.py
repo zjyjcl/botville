@@ -271,6 +271,7 @@ class AsTransactionStore:
         新写入成功后在**锁外**触发 `on_new_transaction` 回调（若已注册），
         用于立即唤醒进程内消费者；回调异常吞掉，不影响返回值。
         """
+        # Actual persistence time for audit/retention, independent of consumer scheduling.
         now_str = iso_utc(utcnow())
         with self._lock:
             existing = self._conn.execute(
@@ -429,9 +430,10 @@ class AsTransactionStore:
             ).fetchall()
             return [(r["txn_id"], r["body"], r["received_at"]) for r in rows]
 
-    def mark_processed(self, txn_id: str, processed_at: Optional[str] = None) -> None:
-        """标记事务已处理；processed_at 缺省时用当前 UTC 时间。"""
-        ts = processed_at or iso_utc(utcnow())
+    def mark_processed(self, txn_id: str, processed_at: Optional[str] = None,
+                       *, now: Optional[datetime] = None) -> None:
+        """标记事务已处理；优先 processed_at，其次注入 now，缺省用当前 UTC 时间。"""
+        ts = processed_at or iso_utc(now if now is not None else utcnow())
         with self._lock:
             with self._conn:
                 self._conn.execute(
@@ -567,6 +569,7 @@ class AsTransactionStore:
 
     def speech_dedupe_mark(self, key: str) -> None:
         """成功发言后写入幂等键；重复写入保持幂等。"""
+        # Actual persistence time for audit/retention, independent of consumer scheduling.
         now_str = iso_utc(utcnow())
         with self._lock:
             with self._conn:

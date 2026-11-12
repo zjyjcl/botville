@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 botville contributors
+"""Profile validation and extraction application, never scheduled on reply paths."""
+from __future__ import annotations
+
+import re
+from typing import Iterable, Mapping, Protocol
+
+from .store import MemoryStore
+
+FACT_KEYS = frozenset({
+    'name', 'nickname', 'birthday', 'likes', 'dislikes', 'location',
+    'occupation', 'language', 'pronouns', 'notes',
+})
+
+
+class Extractor(Protocol):
+    """PR3b worker contract; callers must isolate inputs and evaluate budget first."""
+
+    def extract(self, text: str) -> Iterable[Mapping[str, str]]: ...
+
+
+def is_trusted_local_sender(sender: str, server_name: str, trust: str) -> bool:
+    if trust != 'trusted' or not server_name or not isinstance(sender, str):
+        return False
+    if not sender.startswith('@'):
+        return False
+    localpart, separator, domain = sender[1:].partition(':')
+    return bool(separator and re.fullmatch(r'[A-Za-z0-9._=/\-]+', localpart)
+                and not localpart.lower().startswith('ai_')
+                and domain.lower() == server_name.lower())
+
+
+def apply_extractions(
+    store: MemoryStore, *, persona_id: str, counterpart: str,
+    trusted_local: bool, role: str, facts: Iterable[Mapping[str, str]],
+    event_id: str, sender: str = '', server_name: str = '', trust: str = 'trusted',
+) -> int:
+    """Apply trusted human extractions; unknown provenance fails closed.
+
+    Sender/server/trust are supplied by the consumer/worker, never the model.
+    Store enforcement makes precedence and the tombstone check atomic with each
+    fact write. This function does not call a model or consume any token budget.
+    """
+    if (not trusted_local or role != 'user' or not event_id
+            or sender != counterpart
+            or not is_trusted_local_sender(sender, server_name, trust)
+            or store.is_tombstoned(event_id)):
+        return 0
+    count = 0
+    for fact in facts:
+        key, value = fact.get('key'), fact.get('value')
+        if key not in FACT_KEYS or not isinstance(value, str) or not value:
+            continue
+        count += int(store.upsert_fact(
+            persona_id, counterpart, key, value, 'dm_only', 'extraction',
+            [event_id], 'trusted',
+        ))
+    return count

@@ -303,6 +303,9 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_AS_TXN_RETENTION_DAYS` | `90` | AS 事务库保留天数（正整数，`<1` 拒绝启动）。超过保留期的事务**不删行**：只清空原始请求体并写 `purged_at`（墓碑保留 `txn_id` / 接收时间 / `processed_at`），重放仍 `200 {}` 且不重落库；过期未消费事务按丢弃处理。**校验与 `GATEWAY_AS_TXN_DB_PATH` 是否配置无关**——非法值在任何情况下都拒绝启动。清理只在同时配置了库路径且间隔非 0 时运行。见 [docs/contract.md](docs/contract.md) §1.7.7 |
 | `GATEWAY_AS_TXN_PURGE_INTERVAL_SECONDS` | `86400` | AS 事务保留期清理间隔（秒）：启动先跑一次，之后后台按间隔跑，失败只记日志（不记 token / 事件体）。`0` = 关闭（启动不跑、不起线程，库会持续增长）；非 0 时 **≥60**，否则拒绝启动。**校验与 `GATEWAY_AS_TXN_DB_PATH` 是否配置无关**。见 [docs/contract.md](docs/contract.md) §1.7.7 |
 | `GATEWAY_CONSUMER_ENABLED` | `false` | 进程内 AS 事务消费者（B 线 PR1，契约 §1.7.8）总开关。**默认 false = 行为与之前完全一致**（不起线程、不唤醒）。开启后：事务落库立即唤醒 + 5 秒兜底轮询，按 rowid 顺序消费，做事件分类 / trust / 防循环 / 计数并调用钩子。开启但 `GATEWAY_AS_TXN_DB_PATH` 未配置 → 启动 warning 且不起线程（不拒绝启动）；开启但未配置模型/人设 → 只记录计数，`/health` 不 degraded |
+| `GATEWAY_MEMORY_DB_PATH` | 空 | 可选记忆 SQLite 路径；空 = 关闭，继续 ring buffer；新库 0600、WAL，备份敏感 |
+| `GATEWAY_MEMORY_RETENTION_DAYS` | `90` | 保留天数 ≥1；pinned 不到期，撤回仍删除 |
+| `GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS` | `86400` | 启动清理及后台间隔（秒）；0 关闭清理，非零 ≥60；模块关闭也校验 |
 | `GATEWAY_PERSONAS_FILE` | 空 | 只读人设 JSON（B2.4，契约 §1.7.8 ②）。空 = 无人设 → 内置引擎**永不发言**（消费者仍记录/计数）。启动期校验 schema / 本服 `@ai_*` / `credential_ref` 形状 / `max_reply_chars` 范围，非法**拒绝启动**（错误信息不回显文件内容）。示例见 [`examples/personas.example.json`](examples/personas.example.json)；**真实人设不进仓库** |
 | `GATEWAY_MODEL_BASE_URL` | 空 | OpenAI 兼容模型基址（B2.4，契约 §1.7.8 ⑫）。空 = **未配置模型**：引擎不发言、`/health` 不 degraded。非空时必须是 `http://` / `https://` URL。请求形如 `POST {BASE_URL}/chat/completions` |
 | `GATEWAY_MODEL_NAME` | 空 | 模型名。配置了 `GATEWAY_MODEL_BASE_URL` 时**必填**，否则拒绝启动。人设可用 `model` 字段覆盖 |
@@ -314,6 +317,39 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 
 `.env.example` 只是占位，本雏形**不读取 `.env` 文件**（避免引入 python-dotenv）；
 由部署侧注入环境变量。
+
+### 可选持久化记忆（B2.6 PR3a）
+
+设置 `GATEWAY_MEMORY_DB_PATH` 启用持久化最近对话与档案；空则保留 PR2 ring buffer。
+保留期默认 90 天，清理间隔默认 86400 秒（0 关闭清理）。记忆按 persona 与 DM 对象 /
+群房间隔离；群里不召回 DM 原文，仅带入当前发送者或被提及对象的 shared 档案。
+召回约 2000 tokens，pinned 优先，全部隔离包裹，不进 system。
+数据库、WAL 与备份均应作为敏感数据保护。
+
+人设可选 `owner_user_id`（例如 `@owner:example.org`），必须是
+`GATEWAY_MATRIX_SERVER_NAME` 对应本服非 ai_ 用户；非法拒绝启动。未设 owner 则无主人
+API 权限。CLI 的 `--as-owner` 是可信本机管理员声明的身份，不是远程认证入口；仅向
+授权管理员开放数据库和人设文件。JSON 输出可能含请求查看的正文，应按敏感数据处理；
+日志不含正文。
+
+仓库根可用 `PYTHONPATH=gateway/src python3 -m botville_gateway.memory --help` 查看 CLI；
+子命令 list/show/delete/pin/unpin/set-fact 使用 `--db`、`--persona`、`--as-owner`、
+`--personas-file`，服务器域通过 `GATEWAY_MATRIX_SERVER_NAME` 配置。
+条目命令使用 `--id`；事实命令使用 `--kind fact --key name --counterpart @human:example.org`，
+set-fact 另需 `--value`，可用 `--visibility shared` 显式共享（默认 dm_only）。
+CLI 是离线管理工具，请在网关停止后使用；单进程部署假设同 AS 消费者。
+完整规则见 [contract.md §1.7.8 ⑩](docs/contract.md)。
+
+Schema 版本表为 `memory_schema`；v1 建立 `memory_items`、`memory_facts`、
+`memory_tombstones`，v2 增量加入条目的显式 visibility 及清理索引，重复打开幂等。
+摘要、向量表尚未创建。撤回按事件全局删除各 persona 副本，墓碑也按保留期清理。
+当前真人输入另作隔离段附在召回之后，不挤占 2000-token 历史预算；完整提示词仍参与
+既有策略预算预检。记忆读写失败会重试，不回退到可能混合作用域的房间历史。
+
+PR3a 不在回复热路径调用档案抽取模型；自动抽取、摘要、向量和空闲 worker 留 PR3b。
+无 embedding 不影响 health。未来 embedding 若复用模型端点与密钥，**DM 原文将发送到
+同一个模型提供方**；当前启用模型回复时，召回的 DM 内容也随上下文发送给配置的模型
+提供方。PR3c 才增加主人 HTTP 端点，需先获总管批准。Compose 透传由 A 线后续完成。
 
 ### 测试
 
@@ -426,3 +462,13 @@ npx --yes @redocly/cli lint gateway/openapi/gateway.v1.yaml
   （见 [`docs/contract.md#14-️-策略结论不是-http-错误`](docs/contract.md#14-️-策略结论不是-http-错误)）。
 - 不写任何真实密钥、token、密码，只用 `<change-me>` 占位（见 `CONTRIBUTING.md`）。
 - 新文件加 Apache-2.0 SPDX 头。
+
+### 引擎配置与运维补充（#203 复审）
+
+**#203 复审补充（运行与时钟）**
+
+- 生产必须通过 `GATEWAY_HMAC_SECRET` 配置跨重启保持稳定的部署 HMAC 密钥（至少 64 个十六进制字符，拒绝全零）；`service._txn_id_for` 据此推导 Matrix txnId。dev 未配置时使用每进程随机密钥，重启后 txnId 会改变，不能保证跨重启去重。
+- 已知限制：在“消息已发送，但 speech key 尚未写入”的窄窗口崩溃并重启，可能多调一次模型、产生双次模型用量计费；进程内 usage ledger 也无法跨重启保留去重记账。稳定 HMAC 密钥确保重放使用相同 txnId，由 homeserver 去重，不会重复发送消息。
+- 成员查询单次超时 5 秒；房间失败缓存 60 秒，跨房间连续失败 3 次后全局熔断 60 秒，冷却到期允许重试，成功清零。有效成员缓存仍可用；无有效缓存时抛错，由 consumer 回退到 mentions 并计 `room_member_errors`。正、负缓存均有房间数量上限。
+- 静默延后事件重放时，按 event_id 对仍在有界上下文缓冲中的人类消息去重。
+- `processed_at`、`failed_at` 与 `next_attempt_at` 使用 consumer 注入时钟的本批次时间；store 的 `mark_processed(now=...)` 未传时默认墙钟。入站 `received_at` 和独立 speech 去重账本的 `created_at` / `sent_at` 有意使用实际写入墙钟，供接收审计和保留清理，不参与 consumer 的重试调度。

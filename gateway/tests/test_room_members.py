@@ -16,12 +16,14 @@ SRC = os.path.join(GATEWAY_ROOT, "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
-from botville_gateway.room_members import RoomMemberSource
+from botville_gateway.room_members import (RoomMemberSource, NEGATIVE_TTL_SECONDS,
+    BREAKER_FAILURE_THRESHOLD, BREAKER_COOLDOWN_SECONDS)
 from botville_gateway.config import Config
 from botville_gateway.http_server import build_server
 from botville_gateway.matrix import InMemoryMatrixTransport
 from botville_gateway.matrix import DeliveryError
-from botville_gateway.matrix_appservice import AppServiceMatrixTransport
+from botville_gateway.matrix_appservice import (AppServiceMatrixTransport,
+    MEMBER_LOOKUP_TIMEOUT_SECONDS)
 from botville_gateway.engine import ModelClient, ModelConfig
 
 
@@ -35,6 +37,70 @@ def _local_ai(user_id):
 
 
 class TestRoomMemberSource(unittest.TestCase):
+    def setUp(self):
+        self.now = 100.0
+        self.calls = []
+        self.fail = False
+        def fetch(room, personas):
+            self.calls.append(room)
+            if self.fail:
+                raise RuntimeError("down")
+            return (AI_A,)
+        self.source = RoomMemberSource(fetcher=fetch, personas=(AI_A,),
+            is_local_ai=_local_ai, max_rooms=2, monotonic=lambda: self.now)
+
+    def test_negative_cache_and_expiry(self):
+        self.fail = True
+        for _ in range(2):
+            with self.assertRaises(RuntimeError):
+                self.source.members("room")
+        self.assertEqual(self.calls, ["room"])
+        self.now += NEGATIVE_TTL_SECONDS
+        with self.assertRaises(RuntimeError):
+            self.source.members("room")
+        self.assertEqual(self.calls, ["room", "room"])
+
+    def test_global_breaker_cooldown_and_success_reset(self):
+        self.fail = True
+        for index in range(BREAKER_FAILURE_THRESHOLD):
+            with self.assertRaises(RuntimeError):
+                self.source.members(str(index))
+        with self.assertRaises(RuntimeError):
+            self.source.members("new")
+        self.assertEqual(len(self.calls), BREAKER_FAILURE_THRESHOLD)
+        self.now += BREAKER_COOLDOWN_SECONDS
+        self.fail = False
+        self.assertEqual(self.source.members("new"), [AI_A])
+        self.fail = True
+        with self.assertRaises(RuntimeError):
+            self.source.members("failure-after-success")
+        self.fail = False
+        self.assertEqual(self.source.members("another"), [AI_A])
+
+    def test_breaker_preserves_valid_cache(self):
+        self.source.members("cached")
+        self.fail = True
+        for index in range(BREAKER_FAILURE_THRESHOLD):
+            with self.assertRaises(RuntimeError):
+                self.source.members(str(index))
+        self.assertEqual(self.source.members("cached"), [AI_A])
+        self.assertEqual(len(self.calls), 1 + BREAKER_FAILURE_THRESHOLD)
+
+    def test_member_cache_lru_cap(self):
+        for room in ("a", "b", "a", "c", "a", "b"):
+            self.source.members(room)
+        self.assertEqual(self.calls, ["a", "b", "c", "b"])
+        self.assertEqual(len(self.source._items), 2)
+
+    def test_positive_cache_ttl_expiry(self):
+        self.source.members("room")
+        self.now += 29
+        self.source.members("room")
+        self.assertEqual(self.calls, ["room"])
+        self.now += 1
+        self.source.members("room")
+        self.assertEqual(self.calls, ["room", "room"])
+
     def test_member_event_populates_cache_without_fetch(self):
         calls = []
         source = RoomMemberSource(
@@ -139,6 +205,14 @@ class TestProductionWiring(unittest.TestCase):
         self._consume(server)
         self.assertEqual(transport.sent, [])
         self.assertEqual(server.as_consumer.stats.get("room_member_errors"), 1)
+        server.as_txn_store.store_transaction("second", json.dumps({"events": [{
+            "event_id": "$second", "type": "m.room.message", "room_id": "!room:" + SERVER,
+            "sender": "@human:" + SERVER, "content": {"msgtype": "m.text", "body": "hello"},
+        }]}))
+        server.as_consumer.run_once()
+        self.assertEqual(len(transport.member_requests), 1)
+        self.assertEqual(server.as_consumer.stats.get("room_member_errors"), 2)
+        self.assertEqual(transport.sent, [])
 
     def test_consumed_member_event_warms_production_cache_without_fetch(self):
         transport = _FakeHomeserverTransport(joined=(AI_A,))
@@ -157,7 +231,7 @@ class TestProductionWiring(unittest.TestCase):
 
 
 class _JoinedMembersHS:
-    def __init__(self):
+    def __init__(self, status=200):
         self.requests = []
         outer = self
 
@@ -167,7 +241,9 @@ class _JoinedMembersHS:
 
             def _reply(self, payload):
                 data = json.dumps(payload).encode("utf-8")
-                self.send_response(200)
+                self.send_response(status)
+                if status == 302:
+                    self.send_header("Location", outer.url + "/redirect-target")
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
@@ -175,7 +251,11 @@ class _JoinedMembersHS:
 
             def do_GET(self):
                 outer.requests.append(("GET", self.path))
-                self._reply({"joined": {AI_A: {}, "@human:" + SERVER: {}}})
+                if status != 200:
+                    self._reply({"error": "fake-test-token " + self.path,
+                                 "errcode": "fake-test-token " + self.path})
+                else:
+                    self._reply({"joined": {AI_A: {}, "@human:" + SERVER: {}}})
 
             def do_POST(self):
                 raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
@@ -238,6 +318,36 @@ class TestAppserviceProductionMembership(unittest.TestCase):
 
 
 class TestAppserviceMembershipLookup(unittest.TestCase):
+    def test_redirect_is_refused(self):
+        hs = _JoinedMembersHS(status=302)
+        self.addCleanup(hs.close)
+        transport = AppServiceMatrixTransport(homeserver_url=hs.url,
+            as_token="fake-test-token", server_name=SERVER)
+        with self.assertRaises(DeliveryError):
+            transport.joined_members("!room:" + SERVER, (AI_A,))
+        self.assertEqual(len(hs.requests), 1)
+        self.assertNotIn("redirect-target", hs.requests[0][1])
+
+    def test_error_detail_never_contains_token_or_query(self):
+        hs = _JoinedMembersHS(status=500)
+        self.addCleanup(hs.close)
+        transport = AppServiceMatrixTransport(homeserver_url=hs.url,
+            as_token="fake-test-token", server_name=SERVER)
+        with self.assertRaises(DeliveryError) as caught:
+            transport.joined_members("!room:" + SERVER, (AI_A,))
+        for secret in ("fake-test-token", "?", "user_id", AI_A):
+            self.assertNotIn(secret, str(caught.exception))
+        self.assertEqual(len(hs.requests), 1)
+
+    def test_member_lookup_passes_short_timeout(self):
+        transport = AppServiceMatrixTransport(homeserver_url="http://127.0.0.1:9",
+            as_token="fake-test-token", server_name=SERVER)
+        from unittest.mock import patch
+        with patch.object(transport, "_request", return_value={"joined": {}}) as request:
+            transport.joined_members("!room:" + SERVER, (AI_A,))
+        self.assertEqual(request.call_args.kwargs["timeout"], MEMBER_LOOKUP_TIMEOUT_SECONDS)
+        self.assertEqual(MEMBER_LOOKUP_TIMEOUT_SECONDS, 5.0)
+
     def test_retries_personas_until_one_can_read_joined_members(self):
         transport = AppServiceMatrixTransport(
             homeserver_url="http://127.0.0.1:9", as_token="fake-test-token",

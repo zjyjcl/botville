@@ -20,6 +20,7 @@ from typing import Mapping, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .as_txn_store import AS_TXN_PURGE_INTERVAL_MIN_SECONDS
+from .memory.store import MEMORY_PURGE_INTERVAL_MIN_SECONDS
 
 GATEWAY_VERSION = "0.1.0"
 CONTRACT_VERSION = "0.1.0"
@@ -138,6 +139,11 @@ DEFAULT_AS_TXN_PURGE_INTERVAL_SECONDS = 86_400
 # **唯一定义处**：`engine/model_client.py` 从这里 import 之后再用（不在两处各
 # 写一份避免漂移；本模块不 import engine，无循环依赖）。
 DEFAULT_MODEL_TIMEOUT_SECONDS = 30
+
+# B2.6 PR3a local memory.  An empty database path intentionally preserves the
+# PR2 in-process ring-buffer behaviour.
+DEFAULT_MEMORY_RETENTION_DAYS = 90
+DEFAULT_MEMORY_PURGE_INTERVAL_SECONDS = 86_400
 
 # 部署路径前缀（GATEWAY_HTTP_PATH_PREFIX）的禁用片段：这些要么改变路径语义
 # （`//`、`..`），要么在拼 URL / 反代重写时会被提前截断或解码（`?` `#` `%`），
@@ -506,6 +512,11 @@ class Config:
     model_name: Optional[str] = None
     model_api_key: Optional[str] = field(default=None, repr=False)
     model_timeout_seconds: float = 30.0
+    # B2.6 PR3a: persistent conversation memory is opt-in.  Paths are never
+    # emitted by request logs or health output.
+    memory_db_path: Optional[str] = None
+    memory_retention_days: int = DEFAULT_MEMORY_RETENTION_DAYS
+    memory_purge_interval_seconds: int = DEFAULT_MEMORY_PURGE_INTERVAL_SECONDS
 
     def __post_init__(self) -> None:
         # 构造时校验，避免明显错误的配置拖到第一次请求才炸。
@@ -644,6 +655,19 @@ class Config:
             raise ConfigError(
                 "as_txn_purge_interval_seconds must be 0 (disabled) or >= "
                 f"{AS_TXN_PURGE_INTERVAL_MIN_SECONDS}, got {as_purge_interval}"
+            )
+        _check_retention_days(self.memory_retention_days, "memory_retention_days")
+        memory_purge_interval = self.memory_purge_interval_seconds
+        if not isinstance(memory_purge_interval, int) or isinstance(memory_purge_interval, bool):
+            raise ConfigError(
+                "memory_purge_interval_seconds must be an integer, got "
+                f"{memory_purge_interval!r}"
+            )
+        if (memory_purge_interval != 0
+                and memory_purge_interval < MEMORY_PURGE_INTERVAL_MIN_SECONDS):
+            raise ConfigError(
+                "memory_purge_interval_seconds must be 0 (disabled) or >= "
+                f"{MEMORY_PURGE_INTERVAL_MIN_SECONDS}, got {memory_purge_interval}"
             )
         # AS 回调：hs_token 强度校验（与 as_token 同规则；None/空串 = 未配置，合法）。
         # 未配置时网关照常启动，但 /_matrix/app/v1/* 一律 403。空串归一为 None，
@@ -1231,5 +1255,14 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         # 超时：非数字由 _env_float 抛 ConfigError；非正数由 Config 校验拒绝。
         model_timeout_seconds=_env_float(
             source, "GATEWAY_MODEL_TIMEOUT_SECONDS", float(DEFAULT_MODEL_TIMEOUT_SECONDS)
+        ),
+        memory_db_path=(_env_str(source, "GATEWAY_MEMORY_DB_PATH", "") or None),
+        memory_retention_days=_env_int(
+            source, "GATEWAY_MEMORY_RETENTION_DAYS", DEFAULT_MEMORY_RETENTION_DAYS,
+            minimum=1,
+        ),
+        memory_purge_interval_seconds=_env_int(
+            source, "GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS",
+            DEFAULT_MEMORY_PURGE_INTERVAL_SECONDS, minimum=0,
         ),
     )

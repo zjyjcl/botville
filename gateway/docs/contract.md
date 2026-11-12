@@ -41,7 +41,7 @@
 外部运行时**；两者都必须经过网关的限额、审核与隔离层。简单接入的**执行顺序固定**为
 `限额/审核（GatewayService.evaluate_policy）→ 引擎调模型 → 投递（GatewayService.send_ai_message）`：限额被拒时**不调模型**、
 不产生投递；引擎发言永远与 HTTP 发送路径共用同一套裁决。事件消费与引擎的执行主体见
-§1.7.8（0.1.0 已实现消费骨架与内置引擎；记忆在 PR3）。
+§1.7.8（0.1.0 已实现消费骨架、内置引擎及 PR3a 可选持久化记忆）。
 
 ### 会话加密与 AI 参与
 
@@ -707,6 +707,15 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 
 #### 1.7.8 消费语义（B 线 PR1，见 §5.5 Changelog 0.1.0 2026-11-12 条目）
 
+**#203 复审补充（运行与时钟）**
+
+- 生产必须通过 `GATEWAY_HMAC_SECRET` 配置跨重启保持稳定的部署 HMAC 密钥（至少 64 个十六进制字符，拒绝全零）；`service._txn_id_for` 据此推导 Matrix txnId。dev 未配置时使用每进程随机密钥，重启后 txnId 会改变，不能保证跨重启去重。
+- 已知限制：在“消息已发送，但 speech key 尚未写入”的窄窗口崩溃并重启，可能多调一次模型、产生双次模型用量计费；进程内 usage ledger 也无法跨重启保留去重记账。稳定 HMAC 密钥确保重放使用相同 txnId，由 homeserver 去重，不会重复发送消息。
+- 成员查询单次超时 5 秒；房间失败缓存 60 秒，跨房间连续失败 3 次后全局熔断 60 秒，冷却到期允许重试，成功清零。有效成员缓存仍可用；无有效缓存时抛错，由 consumer 回退到 mentions 并计 `room_member_errors`。正、负缓存均有房间数量上限。
+- 静默延后事件重放时，按 event_id 对仍在有界上下文缓冲中的人类消息去重。
+- `processed_at`、`failed_at` 与 `next_attempt_at` 使用 consumer 注入时钟的本批次时间；store 的 `mark_processed(now=...)` 未传时默认墙钟。入站 `received_at` 和独立 speech 去重账本的 `created_at` / `sent_at` 有意使用实际写入墙钟，供接收审计和保留清理，不参与 consumer 的重试调度。
+
+
 本节定义网关进程内消费者如何消费 AS 事务库。**PR1 只搭骨架：不调模型、不发言**，
 事件只做分类、trust 判定、防循环与计数，并通过钩子交给后续 PR。涉及 §1.7.6 / §1.7.7 /
 §6.3 / §7.1 / §7.2 的交叉引用见各条。
@@ -749,6 +758,7 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
   | `personality` | 否 | 追加的性格描述（同属指令区） |
   | `model` | 否 | 模型名覆盖；缺省用 `GATEWAY_MODEL_NAME` |
   | `credential_ref` | 否 | **只能**是 `env:NAME`；调用时读 `os.environ[NAME]` 覆盖全局密钥。任何其他值一律拒绝启动 |
+  | `owner_user_id` | 否 | 本服非 ai_ 用户；未设置则无主人 API 权限，见⑩ R4 |
   | `max_reply_chars` | 否 | 单条回复上限（正整数，不超过 `MAX_MESSAGE_CHARS`）；缺省 2000 |
 
 - **启动期校验**（`engine.personas.load_personas`）：文件读不到 / JSON 非法 / 顶层或条目
@@ -883,14 +893,84 @@ ephemeral 不在 AS 注册里开启，忽略。
 跟随重定向。任何成员缓存或查询失败均 fail-closed，只按结构化/正文 mentions 判定并计
 `room_member_errors`，不会把群聊误判为单聊。
 
-**⑩ 四层记忆（PR3，仅规划）**
+**⑩ 四层记忆（B2.6：PR3a 已实现；PR3b / PR3c 待实现）**
 
-① **最近对话**：每个会话保留最近几十条原文；② **滚动摘要**：超长后压缩旧内容，按对象
-分别存；③ **长期档案**：名字、喜好、生日、亲密度等结构化事实；④ **向量检索**：全部历史
-向量化按语义召回（sqlite-vec 或 pgvector）。每条记忆标注**来源与可见范围**；主人可查看、
-删除、钉住；整理在空闲时批量做以省 token；记忆是**可选模块**；向量检索分轻量版 / 完整版。
-存储：独立 `memory.db`、带 trust 标记、**单聊与群分开**（群里不召回单聊内容，B12）；
-redaction 删除记忆；保留期可配，默认 90 天；**备份属敏感数据**。
+四层为①最近对话、②滚动摘要、③长期档案、④向量检索。以下为完整批准规则；
+标为 PR3b / PR3c 的能力当前不启用。
+
+- **R1 Embedding（PR3b）**：OpenAI 兼容 `{BASE}/embeddings`；计划配置
+  `GATEWAY_EMBEDDING_BASE_URL`（空 = 复用 `GATEWAY_MODEL_BASE_URL`）、
+  `GATEWAY_EMBEDDING_MODEL`（空 = ④关闭）、`GATEWAY_EMBEDDING_API_KEY`
+  （可选，空 = 复用模型密钥；不进日志、/health 或错误）、`GATEWAY_EMBEDDING_DIM`。
+  无 embedding 模型时降级为① + ② + ③ + pinned，/health 不 degraded。
+  模型或维度改变后，旧向量标记待重建，由空闲批处理重建。
+  **当 embedding 复用模型端点和密钥时，DM 原文会发送给同一个模型提供方。**
+- **R2 滚动摘要（PR3b）**：某会话未摘要原文超过 N 条（默认 40）或 M tokens 时排队，
+  仅空闲批处理执行；空闲 = 消费者 X 秒没有新事务（默认 120 秒），每批最多 K 个会话。
+  M、K 具体值留 PR3b 确定。计划配置 `GATEWAY_MEMORY_SUMMARY_MODEL`
+  （空 = `GATEWAY_MODEL_NAME`）。摘要与抽取调用先 evaluate（内部 kind=memory），
+  计入该 persona 的 token 预算；blocked、静默或预算不足时延后：真人回复优先，整理延后。
+  摘要按对象分别存：DM 为 (persona, counterpart)，群为 (persona, room)。
+- **R3 档案事实（PR3a）**：支持主人显式写入及模型抽取结果应用；模型永不覆盖主人写入
+  或 pinned 事实，其余同 key 后写覆盖。白名单常量限定 name、nickname、birthday、
+  likes、dislikes、location、occupation、language、pronouns、notes。
+  **无 intimacy / 亲密度字段**（留 B2.8 关系模块）。仅可信本服人类内容可抽取为事实；
+  外服 / untrusted 永不进入档案。AI 自己的回复进①，但永不抽取。
+  PR3a 提供 Extractor 接口和结果应用规则，**回复热路径不调用抽取模型**；
+  自动模型抽取与调度留 PR3b 空闲 worker。
+- **R4 主人 API（PR3a / PR3c）**：PR3a 仅内部 Python API + 管理员 CLI，
+  支持条目及事实的 list/view/delete/pin/unpin、set fact；所有操作要求 caller 等于
+  persona.owner_user_id，否则抛专用权限异常。人设可选 owner_user_id 必须是本服用户
+  （domain 与 GATEWAY_MATRIX_SERVER_NAME 大小写不敏感相等），localpart 不得以 ai_
+  开头；非法拒绝加载 / 启动，不回显秘密或文件内容。未设 owner 的角色无主人权限
+  （无人能经主人 API 查看、删除、钉住），仅可接收模型抽取结果。
+  v1 只有主人可查看、删除、钉住；非主人删除请求经主人处理。
+  HTTP `/v1/memories*` 属 PR3c minor additive，开工前先将端点草案交总管；
+  修改 gateway.v1.yaml 必须获得总管批准。
+- **R5 lite/full（PR3b）**：lite 仅 stdlib，float32 BLOB 存 memory.db，纯 Python cosine；
+  sqlite-vec 可选加速，仅当 sqlite3 enable_load_extension 可用且扩展可加载时自动启用，
+  否则回退 Python。pgvector 仅定义 VectorStore 接口，full 实现不在本轮。
+  计划配置 `GATEWAY_MEMORY_VECTOR_BACKEND=none|python|sqlite-vec`，默认 python，
+  仅配置 embedding 模型时生效。
+- **R6 存储与开关（PR3a）**：`GATEWAY_MEMORY_DB_PATH` 默认空 = 模块关闭，
+  引擎继续 PR2 进程内 ring buffer。启用后独立 SQLite memory.db，WAL，版本化增量
+  幂等迁移；新库以 0600 创建。`GATEWAY_MEMORY_RETENTION_DAYS` 默认 90，必须 ≥1；
+  pinned 永不过期。`GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS` 默认 86400，0 = 关闭清理，
+  非零必须 ≥60；非法配置即使模块关闭也拒绝启动。启用时启动先清一次，随后 daemon
+  按间隔清理；失败仅记录异常类型。**备份属于敏感数据**。Compose 透传后续由 A 线完成。
+- **R7 召回预算（PR3a）**：代码常量约 2000 tokens，使用引擎 estimate_tokens，按
+  pinned > profile > summary > vector > recent 优先级截断。所有记忆（含主人事实和 AI
+  回复）经 isolation.build_untrusted_segment 包裹，每条最多 8000 Unicode 码点，注记
+  layer / time / trust，全部进入不可信数据区，永不进入 system。日志不含记忆正文、
+  消息正文、原始 txn ID、token 或密钥。PR3a SummaryProvider / VectorRecall 可插拔接口
+  默认返回空，不建摘要 / 向量数据。当前真人输入另外隔离追加，不计入历史召回预算，
+  但完整提示词和预留回复均参与既有 token 预算预检。记忆失败不回退房间 ring buffer。
+- **R8 范围与可见性（PR3a）**：DM 依本轮已确认房间恰好一个本服 AI 判定，按
+  (persona, counterpart) 隔离，只在该 DM 对象上下文召回；否则按群 (persona, room)
+  隔离，只在该群召回。事实 visibility=dm_only|shared，默认 dm_only。群里仅召回
+  该群记忆及当前 sender / 被提及对象的 shared 事实；不召回 dm_only 事实，
+  **DM 原文绝不进入群上下文（B12）**。
+- **R9 Redaction（PR3a；②④处理 PR3b）**：硬删除该事件的①及④向量；含该事件的②
+  标 dirty 待重算；③仅有该事件为来源的事实删除，多来源保留其他来源。撤回 event_id
+  写 tombstone，重放不得重新插入；墓碑也按保留期清理。pinned 只豁免到期清理，
+  不豁免撤回。PR3a 实现①、③、墓碑；PR3b 补② dirty 重算和④删除。
+- **R10 Trust（PR3a；④ PR3b）**：任何入站文本都可进①（及未来④）并携带 trust，
+  召回始终放数据区；③只来自 trusted 本服发送者。引擎成功发送后立即标记发言去重键，
+  再尽力将自身回复记录到①；写入失败仅增加 `memory_write_errors` 并记录异常类型名，
+  不抛出异常或触发重发。回执缺少 `matrix_event_id` 时使用稳定的 `spk:` + 发言幂等键，
+  按 event_id 去重并尊重墓碑，不抽取为事实。人类消息仍在模型调用前写入，失败可重试。
+- **R11 空闲 worker（PR3b）**：独立 daemon 线程，与消费者共享空闲信号，遵守 §1.7.4
+  单进程假设；模型 / embedding 瞬态失败退避，每轮有最大批量。
+- **R12 拆分顺序**：PR3a 为本 PR（存储、档案规则、隔离召回、主人内部 API/CLI、接线及
+  保留清理）；PR3b 为摘要、向量、空闲批处理；PR3c 为需批准 YAML 的主人 HTTP 端点。
+  每个 PR 在前一个合并后再开。
+- **R13 来源与输出（PR3a；摘要/抽取调用 PR3b）**：每条记忆携带 source
+  （event_id / owner / extraction）和 visibility，主人可查看、删除、钉住。
+  摘要和抽取输入中的外服内容放不可信数据区；从不可信内容产生的摘要本身仍为不可信
+  输出，永不替代或进入 system。外服内容可供摘要，但不得成为③档案抽取来源。
+
+PR3a 仅解析 R6 的三个新环境变量；R1、R2、R5 的环境变量均为 PR3b 计划，当前设置
+不启用摘要、embedding 或向量检索。不增加 HTTP 端点、/v1 字段、状态码、错误码或 OpenAPI。
 
 **⑪ 主动发言（不入本 PR）**
 
@@ -1524,6 +1604,8 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.1.0 | 2026-11-13 | [B 线 PR3a memory，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] B2.6 可选 SQLite 记忆基础：①持久化对话、③档案规则、scope 隔离与预算召回、主人内部 Python API / CLI、owner_user_id 校验、撤回墓碑及保留清理；三个 memory 配置默认关闭并保持 PR2 ring buffer。⑩写明完整批准规则及 PR3b 摘要/向量/空闲整理、PR3c HTTP 边界；无热路径模型抽取，不改 compose。 |
+| 0.1.0 | 2026-11-13 | [B 线 #203 复审 nits，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 成员查询增加有界负缓存、全局熔断与 5 秒超时；独立验证 LRU、TTL、拒绝重定向和错误脱敏；静默重放上下文按 event_id 去重；处理时间使用注入时钟；公开只读 persona_ids；补充稳定 HMAC 密钥及重启窗口内模型重复调用和计费限制。 |
 | 0.1.0 | 2026-11-13 | [B 线 PR2 engine-reply 审查修复] 静默时段 `defer` 在预检时不调模型；发送边界竞态时不投递；两者都不消耗发言去重键、不计 attempts/failed。消费者把事务定时到静默窗口结束后重试，深夜人类消息于早晨继续回复。发言去重只在 `sent`/`delivered` 后写入，移除会在崩溃时吞回复的 `claim` 占位；`credential_ref` 的规则明确为只接受 `env:NAME`，不再作密钥字形猜测。 |
 | 0.1.0 | 2026-11-12 | [B 线 PR2 engine-reply（B2.4），**进程内引擎，不改 /v1 端点/字段/状态码/错误码/OpenAPI**] §0 执行主体表从「PR2 落地」改为「已实现」；§1.7.8 ② 更新为已实现：新增只读人设文件 `GATEWAY_PERSONAS_FILE`（启动期校验 schema / 本服 `@ai_*` / credential_ref 形状 / max_reply_chars 范围，错误消息不回显文件内容；仓库只放示例 `gateway/examples/personas.example.json`；真实人设不进仓库）；§1.7.8 ⑨ `should_reply` 补充「被 AI 回复」路径：`m.relates_to.m.in_reply_to.event_id` 指向的事件 sender 是本服 AI 也触发回复；进程内有界 LRU `EventSenderCache` + 可选 AS 传输 `GET .../event/{eventId}` 回填，回填失败按「不是回复」fail-closed；多个 AI 同时被 @ 时按提及顺序全部回复（`target_user_ids` 保序）；§1.7.8 ⑫ 更新模型配置（`GATEWAY_MODEL_BASE_URL` / `GATEWAY_MODEL_NAME` / `GATEWAY_MODEL_API_KEY` / `GATEWAY_MODEL_TIMEOUT_SECONDS`，PR2 已生效）、人设文件（`GATEWAY_PERSONAS_FILE`）、引擎激活三件套条件（消费开启 + 非空 personas + 模型已配；任一缺失只记录/计数，`/health` 不 degraded）；发言去重账本 `as_speech_dedupe`（SQLite，对 §1.7.8 ④ 的「持久化幂等键」落地；随 `run_purge_safely` 按同一保留期清理）。**新增子包 `engine/`**（`personas.py` / `model_client.py` / `engine.py`）：`ModelClient`（urllib 零依赖 OpenAI 兼容 chat completions，5xx/429/408/超时 → `TransientUnavailable`，其余 4xx/结构错误 → `ModelError`，密钥不进 repr/日志/错误体，重定向不跟随）；`EngineHooks`（`ConsumerHooks` 实现，服务 evaluate 限额前置（拦截零模型调用并计数）→ 隔离上下文拼装 → model → 服务 send_ai_message（再次裁决、预留及提交 SENT/token/防刷屏/互聊计数）→ AS masquerade 投递；幂等键经 _txn_id_for 推导 txnId；发送竞态 blocked 写去重，Matrix 不可达/暂不可用为 TransientUnavailable），per-room 最近消息环形缓冲（每轮至多 20 条、每条 8000 码点；所有聊天文本含 AI 回复均经 isolation.build_untrusted_segment 包裹，人设仅进 system；trust 按 §7.1，正文不进日志，持久化记忆留 PR3）。`config.py` 新增 `model_base_url` / `model_name` / `model_api_key`（`repr=False`）/ `model_timeout_seconds` / `personas_file`，校验在 `Config.__post_init__`（非法拒绝启动）；新增辅助函数 `_env_float` / `DEFAULT_MODEL_TIMEOUT_SECONDS`（唯一定义处）。引擎直接复用 `GatewayService`，移除裸策略引擎访问属性；多角色按结构化提及/正文出现顺序串行回复，单角色持久化去重与消费完成去重分离。`http_server.py` `GatewayServer.__init__` 在绑定端口后、消费者启动前装配 `EngineHooks`（三件套缺一 → 记 info 不起引擎）；`engine_hooks` 字段供 `__main__.py` 打印状态。**#200 审查项一并修复**：`_room_ai_ids` fail-closed 过滤（非本服 AI 不计入，回调错误只用 mentions）；`_loop` 唤醒竞态修复（`wake.clear()` 移到 `run_once()` 之前）；`event_id` 类型检查（非字符串/缺失只跳过该事件，计 `invalid_event_ids`）；`reply_to_event_id()` 辅助函数（读 `m.relates_to.m.in_reply_to.event_id`，非字符串/空串返回 None）；`EventSenderCache`（有界 LRU，`max_entries` 可配，默认 2048）；`AsTransactionConsumer` 新增 `sender_cache` / `sender_fetcher` 参数；`AppServiceMatrixTransport.event_sender()` 方法；测试 78 个新增（`test_as_consumer.py` 新增 TestRoomAiIdsFiltering / TestShouldReplyInReplyTo / TestInvalidEventIdSkipped / TestWakeDuringProcessing / TestConsumerStartupOrdering；`test_engine_reply.py` 新增，共 51 个）；`contract.md` changelog 中的 U+FFFD 修复为「；」。 **#202 nits**：修复引号/尖括号 txnId 尾串泄露与异常对象日志；覆盖通用 send、sendToDevice、redact 路径；短标记改用随机进程盐，仅本次运行可关联；清理未用导入、纠正文档和注释，补 health 与真实投递失败日志回归。 |
 | 0.1.0 | 2026-11-12 | [B 线 access-log-txnid，**仅日志，不改 /v1 与 AS 回调的字段/状态码/错误码，不改 OpenAPI**] 落实契约决定 #15（日志不得含原始 AS `txnId` / 事件正文 / token）。**①访问日志**：新增 `log_redact.py` 作为脱敏唯一定义处；`GatewayHandler` 的 `log_message` / `log_error` / `log_request` 全部经过它，`/_matrix/app/v1/transactions/<txnId>` 的 txnId 段（可带 `GATEWAY_HTTP_PATH_PREFIX`、查询串、百分号编码）替换为 `<redacted>`，出站发送路径 `.../send/m.room.message/<txnId>` 同理；`access_token=[REDACTED]` 行为保留。此前基线日志行 `"PUT /_matrix/app/v1/transactions/<txnId>" 200 -` 会打印原始 txnId。**②错误日志**：`AS transaction persist failed for txn %s` 经 stdlib `log_error` 直接写 stderr（不经过 `logging`）；它与 `matrix.resolve_txn_id` 的错误详情改用 `redact_txn_id()` → `txn#xxxxxxxx`（现为随机进程盐 HMAC-SHA256 前 8 位，仅同一次进程运行内可关联，见 #202 nits）。**③测试**：新增 `gateway/tests/test_access_log_txnid.py`（24 例：辅助函数单元测试；真实网关 + stderr 捕获，覆盖纯/百分号编码 txnId、`?access_token=`、路径前缀、非法 txnId 400、持久化失败 500、坏请求行 `send_error`→`log_error`、关闭访问日志；`assertLogs` 验证清理日志与标记行）。§1.7.2 同步。 |
@@ -1946,7 +2028,7 @@ B2.2 起 peer 层限额按 `(persona, peer_id)` 计数，即对每个对端角�
 `isolation.build_untrusted_segment` 包裹后进入不可信数据区，保留 user/assistant 的对话
 角色不代表授予指令权限。trust 仍按 §7.1 判定，不因提示词包裹而提升或重新声明。
 每条聊天文本按 Unicode 码点截断至 **8000**，每轮从进程内房间环形缓冲取至多 **20** 条
-上下文消息（含本轮消息）；真正的持久化记忆在 PR3。日志不得含消息正文、原始事务 ID、
+上下文消息（含本轮消息）；PR3a 配置记忆库后改用⑩的隔离召回和预算。日志不得含消息正文、原始事务 ID、
 token 或 API key。
 
 **执行主体：AI 运行时（简单接入 = 网关内置 `engine/`；完整接入 = 外部运行时）。** 按 §0 与
