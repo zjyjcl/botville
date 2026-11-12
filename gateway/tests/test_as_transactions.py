@@ -858,6 +858,192 @@ class TestAsBodyEncoding(_Base):
         self.assertIn("M_NOT_JSON", body_text)
 
 
+def _raw_request(server, raw: bytes) -> bytes:
+    """发一段手拼的原始 HTTP 请求，返回完整响应字节（直到对端关闭）。"""
+    import socket
+
+    host, port = server.server_address[:2]
+    sock = socket.create_connection((host, port), timeout=5)
+    try:
+        sock.sendall(raw)
+        sock.shutdown(socket.SHUT_WR)
+        chunks = []
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    except OSError:
+        pass
+    finally:
+        sock.close()
+    return b"".join(chunks)
+
+
+def _status_and_body(resp_bytes: bytes):
+    status_line = resp_bytes.split(b"\r\n")[0].decode()
+    body = resp_bytes.split(b"\r\n\r\n", 1)[-1].decode("utf-8", errors="replace")
+    return status_line, body
+
+
+class TestAsFramingConsistency(_Base):
+    """§1.7.3 / §1.7.5：framing 与空体都归 `M_NOT_JSON`（不是 `M_BAD_JSON`）。
+
+    `M_BAD_JSON` 只用于「JSON 合法但结构不对」。transactions 的缺失
+    `Content-Length` 与空体都读不出 JSON，因此一律 `400 M_NOT_JSON`；
+    ping 的正文可选，缺失/空体仍是 `200 {}`。
+    """
+
+    def test_transactions_missing_content_length_400_m_not_json(self):
+        with _ServerFixture(_cfg(hs_token=HS_TOKEN, as_txn_db_path=self.db_path)) as s:
+            resp = _raw_request(
+                s.server,
+                (
+                    "PUT /_matrix/app/v1/transactions/nocl HTTP/1.0\r\n"
+                    f"Authorization: Bearer {HS_TOKEN}\r\n"
+                    "Content-Type: application/json\r\n"
+                    "\r\n"
+                ).encode("ascii"),
+            )
+        status_line, body = _status_and_body(resp)
+        self.assertIn("400", status_line)
+        self.assertIn("M_NOT_JSON", body)
+        self.assertNotIn("M_BAD_JSON", body)
+
+    def test_transactions_content_length_zero_400_m_not_json(self):
+        with _ServerFixture(_cfg(hs_token=HS_TOKEN, as_txn_db_path=self.db_path)) as s:
+            resp = _raw_request(
+                s.server,
+                (
+                    "PUT /_matrix/app/v1/transactions/empty0 HTTP/1.0\r\n"
+                    f"Authorization: Bearer {HS_TOKEN}\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: 0\r\n"
+                    "\r\n"
+                ).encode("ascii"),
+            )
+        status_line, body = _status_and_body(resp)
+        self.assertIn("400", status_line)
+        self.assertIn("M_NOT_JSON", body)
+        self.assertNotIn("M_BAD_JSON", body)
+        # 空体不得落库。
+        store = build_as_txn_store(self.db_path)
+        self.assertEqual(store.get_unprocessed_transactions(), [])
+
+    def test_transactions_whitespace_body_400_m_not_json(self):
+        with _ServerFixture(_cfg(hs_token=HS_TOKEN, as_txn_db_path=self.db_path)) as s:
+            resp = _raw_request(
+                s.server,
+                (
+                    "PUT /_matrix/app/v1/transactions/ws1 HTTP/1.0\r\n"
+                    f"Authorization: Bearer {HS_TOKEN}\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: 3\r\n"
+                    "\r\n"
+                    " \r\n"
+                ).encode("ascii"),
+            )
+        status_line, body = _status_and_body(resp)
+        self.assertIn("400", status_line)
+        self.assertIn("M_NOT_JSON", body)
+
+    def test_transactions_invalid_content_length_400_m_not_json(self):
+        with _ServerFixture(_cfg(hs_token=HS_TOKEN, as_txn_db_path=self.db_path)) as s:
+            resp = _raw_request(
+                s.server,
+                (
+                    "PUT /_matrix/app/v1/transactions/badcl HTTP/1.0\r\n"
+                    f"Authorization: Bearer {HS_TOKEN}\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: not-a-number\r\n"
+                    "\r\n"
+                ).encode("ascii"),
+            )
+        status_line, body = _status_and_body(resp)
+        self.assertIn("400", status_line)
+        self.assertIn("M_NOT_JSON", body)
+
+    def test_transactions_chunked_400_m_not_json(self):
+        with _ServerFixture(_cfg(hs_token=HS_TOKEN, as_txn_db_path=self.db_path)) as s:
+            resp = _raw_request(
+                s.server,
+                (
+                    "PUT /_matrix/app/v1/transactions/chunk1 HTTP/1.0\r\n"
+                    f"Authorization: Bearer {HS_TOKEN}\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Transfer-Encoding: chunked\r\n"
+                    "\r\n"
+                    "2\r\n{}\r\n0\r\n\r\n"
+                ).encode("ascii"),
+            )
+        status_line, body = _status_and_body(resp)
+        self.assertIn("400", status_line)
+        self.assertIn("M_NOT_JSON", body)
+
+    def test_ping_without_body_or_content_length_200(self):
+        # ping 的正文可选：缺失 Content-Length 也是 200 {}（不是 M_NOT_JSON）。
+        with _ServerFixture(_cfg(hs_token=HS_TOKEN, as_txn_db_path=self.db_path)) as s:
+            resp = _raw_request(
+                s.server,
+                (
+                    "POST /_matrix/app/v1/ping HTTP/1.0\r\n"
+                    f"Authorization: Bearer {HS_TOKEN}\r\n"
+                    "\r\n"
+                ).encode("ascii"),
+            )
+        status_line, body = _status_and_body(resp)
+        self.assertIn("200", status_line)
+        self.assertIn("{}", body)
+        self.assertNotIn("M_NOT_JSON", body)
+
+    def test_ping_content_length_zero_200(self):
+        with _ServerFixture(_cfg(hs_token=HS_TOKEN, as_txn_db_path=self.db_path)) as s:
+            resp = _raw_request(
+                s.server,
+                (
+                    "POST /_matrix/app/v1/ping HTTP/1.0\r\n"
+                    f"Authorization: Bearer {HS_TOKEN}\r\n"
+                    "Content-Length: 0\r\n"
+                    "\r\n"
+                ).encode("ascii"),
+            )
+        status_line, body = _status_and_body(resp)
+        self.assertIn("200", status_line)
+        self.assertIn("{}", body)
+
+    def test_ping_invalid_content_length_still_m_not_json(self):
+        # 坏 Content-Length 是 framing 错误：ping 也不放行。
+        with _ServerFixture(_cfg(hs_token=HS_TOKEN, as_txn_db_path=self.db_path)) as s:
+            resp = _raw_request(
+                s.server,
+                (
+                    "POST /_matrix/app/v1/ping HTTP/1.0\r\n"
+                    f"Authorization: Bearer {HS_TOKEN}\r\n"
+                    "Content-Length: abc\r\n"
+                    "\r\n"
+                ).encode("ascii"),
+            )
+        status_line, body = _status_and_body(resp)
+        self.assertIn("400", status_line)
+        self.assertIn("M_NOT_JSON", body)
+
+    def test_ping_chunked_still_m_not_json(self):
+        with _ServerFixture(_cfg(hs_token=HS_TOKEN, as_txn_db_path=self.db_path)) as s:
+            resp = _raw_request(
+                s.server,
+                (
+                    "POST /_matrix/app/v1/ping HTTP/1.0\r\n"
+                    f"Authorization: Bearer {HS_TOKEN}\r\n"
+                    "Transfer-Encoding: chunked\r\n"
+                    "\r\n"
+                    "0\r\n\r\n"
+                ).encode("ascii"),
+            )
+        status_line, body = _status_and_body(resp)
+        self.assertIn("400", status_line)
+        self.assertIn("M_NOT_JSON", body)
+
+
 # ---------------------------------------------------------------------------
 # 10. HTTP 层：真实 sqlite 失败 → 500；并发幂等
 # ---------------------------------------------------------------------------

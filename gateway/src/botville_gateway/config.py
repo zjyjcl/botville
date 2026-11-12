@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from typing import Mapping, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .as_txn_store import AS_TXN_PURGE_INTERVAL_MIN_SECONDS
+
 GATEWAY_VERSION = "0.1.0"
 CONTRACT_VERSION = "0.1.0"
 
@@ -128,8 +130,9 @@ AS_MAX_BODY_BYTES_UPPER = 268_435_456    # 256 MiB
 # 因此重放语义不变、库仍会继续增长（墓碑永不删除）。
 DEFAULT_AS_TXN_RETENTION_DAYS = 90
 # 清理任务间隔（秒）：0 = 关闭；非 0 时至少 60 秒。
+# 最小间隔的**唯一定义**在 as_txn_store（见那里的说明）；这里 import 复用，
+# 不在两处各写一份避免漂移。as_txn_store 只依赖 timeutil，无循环导入。
 DEFAULT_AS_TXN_PURGE_INTERVAL_SECONDS = 86_400
-AS_TXN_PURGE_INTERVAL_MIN_SECONDS = 60
 
 # 部署路径前缀（GATEWAY_HTTP_PATH_PREFIX）的禁用片段：这些要么改变路径语义
 # （`//`、`..`），要么在拼 URL / 反代重写时会被提前截断或解码（`?` `#` `%`），
