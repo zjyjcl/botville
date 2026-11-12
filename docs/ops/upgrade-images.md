@@ -177,11 +177,15 @@ docker run --rm --entrypoint tar \
 **校验备份可读**（不校验的备份不算备份）：
 
 ```bash
-tar tzf "${BACKUP_ROOT}/synapse-data-${STAMP}.tar.gz" | head
-tar tzf "${BACKUP_ROOT}/tuwunel-data-${STAMP}.tar.gz" | head
+tar tzf "${BACKUP_ROOT}/synapse-data-${STAMP}.tar.gz" >/dev/null && echo "synapse-data OK"
+tar tzf "${BACKUP_ROOT}/tuwunel-data-${STAMP}.tar.gz" >/dev/null && echo "tuwunel-data OK"
 docker run --rm --entrypoint pg_restore -v "${BACKUP_ROOT}":/backup:ro \
-  "${PG_IMAGE}" -l "/backup/synapse-db-${STAMP}.dump" | head
+  "${PG_IMAGE}" -l "/backup/synapse-db-${STAMP}.dump" >/dev/null && echo "synapse-db OK"
 ```
+
+（故意读完整个包、不把输出交给 `head`：它只看前几行就退出，既校验不到包尾的损坏，
+在 `set -o pipefail` / 忽略 SIGPIPE 的环境里还会让 tar 报 `stdout: write error`。
+想看内容就先写进文件：`tar tzf … > "${BACKUP_ROOT}/list.txt"` 再打开它。）
 
 说明：Linux 上容器内打包/校验产生的文件属主可能是 root，属正常；`BACKUP_ROOT`
 已 `chmod 700`，目录本身不可被其他用户进入。macOS（Docker Desktop）无此问题。

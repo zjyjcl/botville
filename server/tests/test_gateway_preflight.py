@@ -58,6 +58,43 @@ class GatewayPreflightTest(unittest.TestCase):
             proc = run(text)
             self.assertNotIn("WARNING", proc.stderr)
 
+    def test_env_file_parsed_like_compose(self):
+        """Quotes, inline comments, `export`, blanks around `=` and CRLF are
+        read the way compose's dotenv parser reads them (checked against
+        `docker compose config`)."""
+        with tempfile.TemporaryDirectory() as d:
+            for text in (
+                'BOTVILLE_GATEWAY_PERSONAS_DIR="{}"\n',
+                "BOTVILLE_GATEWAY_PERSONAS_DIR='{}'\n",
+                "BOTVILLE_GATEWAY_PERSONAS_DIR={} # my personas\n",
+                'BOTVILLE_GATEWAY_PERSONAS_DIR="{}"   # quoted + comment\n',
+                "export BOTVILLE_GATEWAY_PERSONAS_DIR={}\n",
+                "  export   BOTVILLE_GATEWAY_PERSONAS_DIR = {}  \n",
+                "BOTVILLE_GATEWAY_PERSONAS_DIR={}\r\n",
+                "BOTVILLE_GATEWAY_PERSONAS_DIR=/nonexistent/a\nexport BOTVILLE_GATEWAY_PERSONAS_DIR='{}'\n",
+            ):
+                with self.subTest(text=text):
+                    proc = run(text.format(d))
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(proc.stdout.strip(),
+                                     "gateway-preflight: OK (personas dir {})".format(d))
+            # A quoted missing path fails with the unquoted path in the message.
+            proc = run('export BOTVILLE_GATEWAY_PERSONAS_DIR="/nonexistent/q" # c\n')
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("BOTVILLE_GATEWAY_PERSONAS_DIR=/nonexistent/q is not", proc.stderr)
+            # Not the key: a longer key with the same prefix, or a commented line.
+            proc = run("BOTVILLE_GATEWAY_PERSONAS_DIR_X=/nonexistent/z\n"
+                       "# BOTVILLE_GATEWAY_PERSONAS_DIR=/nonexistent/y\n")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_personas_file_parsed_like_compose(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "personas.json").write_text("{}", encoding="utf-8")
+            proc = run(("BOTVILLE_GATEWAY_PERSONAS_DIR={}\n"
+                        'export GATEWAY_PERSONAS_FILE="/etc/botville-gateway/personas.json" # real\n').format(d))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertNotIn("WARNING", proc.stderr)
+
     def test_never_prints_other_env_values(self):
         sentinel = "sentinel-model-key-must-not-print-0123456789"
         proc = run("GATEWAY_MODEL_API_KEY={}\nBOTVILLE_GATEWAY_PERSONAS_DIR=/nonexistent/x\n".format(sentinel))
@@ -83,6 +120,25 @@ class MakefileWiresPreflightTest(unittest.TestCase):
         out = self.dry("config")
         self.assertLess(out.index("gateway-preflight.sh"), out.index("config --quiet"))
         self.assertIn("--profile gateway config --quiet", out)
+
+    def test_config_writes_nothing(self):
+        """`make config` only validates: no init.sh (which may append to .env
+        or render generated/)."""
+        lines = self.dry("config").splitlines()
+        self.assertFalse([l for l in lines if "init.sh" in l and not l.startswith("test -f ")],
+                         "make config must not run init.sh")
+        self.assertNotIn("init.sh", self.dry("config").split("exit 1; }", 1)[1])
+
+    def test_config_without_env_file_fails_without_creating_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "no.env"
+            proc = subprocess.run(["make", "-s", "-C", str(REPO_ROOT), "config",
+                                   "ENV_FILE={}".format(missing), "PROJECT=botville-dryrun"],
+                                  stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("not found", proc.stderr)
+            self.assertFalse(missing.exists())
+            self.assertEqual(list(Path(tmp).iterdir()), [])
 
 
 if __name__ == "__main__":

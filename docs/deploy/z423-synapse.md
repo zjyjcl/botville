@@ -346,7 +346,10 @@ curl -s http://127.0.0.1:8020/health   # 端口 = .env 的 BOTVILLE_GATEWAY_PORT
 
 角色引擎（B 线 PR2）：`GATEWAY_MODEL_BASE_URL` / `GATEWAY_MODEL_NAME` /
 `GATEWAY_MODEL_API_KEY` / `GATEWAY_MODEL_TIMEOUT_SECONDS` / `GATEWAY_PERSONAS_FILE` /
-`GATEWAY_CONSUMER_ENABLED` 从 `.env` 透传给网关（init.sh 不生成，开关默认关）；
+`GATEWAY_CONSUMER_ENABLED` 和记忆变量 `GATEWAY_MEMORY_DB_PATH`（空 = 关闭；启用写
+`/var/lib/botville-gateway/memory.db`，0600，在 gateway-data 卷里随备份走）/
+`GATEWAY_MEMORY_RETENTION_DAYS` / `GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS` 从 `.env`
+透传给网关（init.sh 不生成，开关默认关）；
 人设目录 `server/compose/gateway-personas/` 只读挂到 `/etc/botville-gateway`（真实人设
 gitignore）。只有开关打开、配了模型并且配了人设，AI 才会开口。API key 只放本地
 `.env`，不要贴 `docker compose config` 的输出（用 `--quiet`）。详见

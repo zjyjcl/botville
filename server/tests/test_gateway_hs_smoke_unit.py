@@ -2,9 +2,11 @@
 """Unit checks for server/tests/gateway_hs_smoke.py against a fake HTTP server.
 
 - hs_ping fails at once on 401/403, keeps retrying 429/5xx.
-- fixtures (human user, device, room) are reused instead of piling up.
+- fixtures (human user, device, room) are reused instead of piling up; a
+  random user is created only on a confirmed password mismatch, never when
+  whoami/login merely fail.
 - nothing secret is printed: AS/HS tokens, the registration token, the
-  fixture password/token, nor GATEWAY_MODEL_API_KEY from the env file.
+  fixture password/token (stored or derived), nor GATEWAY_MODEL_API_KEY.
 """
 
 import contextlib
@@ -83,6 +85,9 @@ class SmokeUnitTest(unittest.TestCase):
         self.addCleanup(self.srv.close)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        orig = smoke.AUTH_RETRY_SLEEP
+        smoke.AUTH_RETRY_SLEEP = 0
+        self.addCleanup(setattr, smoke, "AUTH_RETRY_SLEEP", orig)
 
     def test_ping_fails_fast_on_client_errors(self):
         for status in (400, 401, 403, 404):
@@ -160,6 +165,77 @@ class SmokeUnitTest(unittest.TestCase):
         self.assertTrue(user_id.startswith("@gwsmoke_"))
         self.assertEqual(names[0], "gwsmoke")
         self.assertEqual(len(names), 2)
+
+    LOGIN = "/_matrix/client/v3/login"
+    WHOAMI = "/_matrix/client/v3/account/whoami"
+    REGISTER = "/_matrix/client/v3/register"
+
+    def assert_fails_without_new_user(self, fixture, reg="unused"):
+        with self.assertRaises(SystemExit) as ctx:
+            smoke.ensure_human(self.srv.url, reg, fixture)
+        self.assertEqual(self.srv.count("POST", self.REGISTER), 0)
+        return str(ctx.exception)
+
+    def test_whoami_failing_after_login_fails_not_random_user(self):
+        """Login worked, whoami did not: a homeserver problem, not a password
+        mismatch -- fail (bounded retries), never register a random user."""
+        reg = SECRETS["BOTVILLE_REGISTRATION_TOKEN"]
+        self.srv.routes[("POST", self.LOGIN)] = (200, {"access_token": "sentinel-t-0123456789"})
+        for answer in ((503, {}), (429, {"errcode": "M_LIMIT_EXCEEDED"}),
+                       (401, {"errcode": "M_UNKNOWN_TOKEN"}), (200, {})):
+            with self.subTest(answer=answer):
+                self.srv.calls.clear()
+                self.srv.routes[("GET", self.WHOAMI)] = answer
+                # Lost fixture -> derived @gwsmoke login path.
+                msg = self.assert_fails_without_new_user({}, reg)
+                self.assertIn("whoami", msg)
+                self.assertLessEqual(self.srv.count("GET", self.WHOAMI), smoke.AUTH_RETRIES)
+                # Stored-password path.
+                self.srv.calls.clear()
+                self.assert_fails_without_new_user(
+                    {"user_id": "@gwsmoke:localhost", "password": PASSWORD}, reg)
+
+    def test_whoami_after_login_must_match_the_user(self):
+        self.srv.routes[("POST", self.LOGIN)] = (200, {"access_token": "sentinel-t-0123456789"})
+        self.srv.routes[("GET", self.WHOAMI)] = (200, {"user_id": "@someone_else:localhost"})
+        self.assert_fails_without_new_user({"user_id": "@gwsmoke:localhost", "password": PASSWORD})
+
+    def test_transient_login_errors_retry_then_fail(self):
+        answers = [(503, {}), (429, {}), (200, {"access_token": "sentinel-t-0123456789"})]
+        self.srv.routes[("POST", self.LOGIN)] = lambda h: answers.pop(0)
+        self.srv.routes[("GET", self.WHOAMI)] = (200, {"user_id": "@gwsmoke:localhost"})
+        user_id, _ = smoke.ensure_human(self.srv.url, "unused", {})
+        self.assertEqual(user_id, "@gwsmoke:localhost")
+        self.assertEqual(self.srv.count("POST", self.LOGIN), 3)
+        self.srv.calls.clear()
+        self.srv.routes[("POST", self.LOGIN)] = (502, {})
+        self.assert_fails_without_new_user({})
+        self.assertEqual(self.srv.count("POST", self.LOGIN), smoke.AUTH_RETRIES)
+
+    def test_unexpected_login_status_fails_fast(self):
+        for status in (400, 401, 404):
+            with self.subTest(status=status):
+                self.srv.calls.clear()
+                self.srv.routes[("POST", self.LOGIN)] = (status, {"errcode": "M_UNKNOWN"})
+                msg = self.assert_fails_without_new_user({})
+                self.assertIn("HTTP {}".format(status), msg)
+                self.assertEqual(self.srv.count("POST", self.LOGIN), 1)
+
+    def test_stored_token_whoami_transient_fails(self):
+        self.srv.routes[("GET", self.WHOAMI)] = (503, {})
+        self.assert_fails_without_new_user(
+            {"user_id": "@gwsmoke:localhost", "access_token": USER_TOKEN, "password": PASSWORD})
+        self.assertEqual(self.srv.count("POST", self.LOGIN), 0)
+
+    def test_fixture_dir_created_0700(self):
+        old = os.umask(0)
+        try:
+            path = os.path.join(self.tmp.name, "a", "generated", "gateway-hs-smoke.json")
+            smoke.save_fixtures(path, {"x": 1})
+        finally:
+            os.umask(old)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
 
     def test_fixture_user_is_reused(self):
         self.srv.routes[("GET", "/_matrix/client/v3/account/whoami")] = (
@@ -246,6 +322,8 @@ class SmokeUnitTest(unittest.TestCase):
                 fh.write("{}={}\n".format(key, value))
         r = self.srv.routes
         r[("GET", "/health")] = (200, {"status": "ok", "checks": [{"name": "matrix", "status": "ok"}]})
+        # Fresh HS: the derived-password login is rejected, @gwsmoke registers.
+        r[("POST", "/_matrix/client/v3/login")] = (403, {"errcode": "M_FORBIDDEN"})
         r[("POST", "/_matrix/client/v3/register")] = (
             200, {"user_id": "@gwsmoke_x:localhost", "access_token": USER_TOKEN})
         r[("POST", "/_matrix/client/v3/user/%40gwsmoke_x%3Alocalhost/openid/request_token")] = (
@@ -262,12 +340,20 @@ class SmokeUnitTest(unittest.TestCase):
                 ])
         text = out.getvalue() + err.getvalue() + str(ctx.exception)
         self.assertIn("HTTP 403", text)
-        for value in list(SECRETS.values()) + [USER_TOKEN, "sentinel-openid-token-0123456789"]:
+        derived = smoke.fixture_password(SECRETS["BOTVILLE_REGISTRATION_TOKEN"])
+        leaks = list(SECRETS.values()) + [USER_TOKEN, "sentinel-openid-token-0123456789", derived]
+        for value in leaks:
             self.assertNotIn(value, text)
+        # The derived password really was used (sent to the HS, kept in the
+        # 0600 fixture), so the assertion above is meaningful.
+        sent = [json.loads(c[3]).get("password") for c in self.srv.calls
+                if c[1] == "/_matrix/client/v3/register" and c[3]]
+        self.assertIn(derived, sent)
         # The fixture landed next to the env file (generated/, 0600) for reuse.
         fixture_path = os.path.join(self.tmp.name, "generated", "gateway-hs-smoke.json")
         self.assertEqual(stat.S_IMODE(os.stat(fixture_path).st_mode), 0o600)
         self.assertIn(self.srv.url, smoke.load_fixtures(fixture_path))
+        self.assertEqual(smoke.load_fixtures(fixture_path)[self.srv.url]["password"], derived)
 
 
 if __name__ == "__main__":

@@ -309,6 +309,8 @@ services:
     #     records and stays silent. GATEWAY_MODEL_API_KEY is a secret: never
     #     paste `docker compose config` output (it interpolates values); use
     #     `config --quiet`. See docs/deploy/appservice.md.
+    #   - Memory (B line PR3a): GATEWAY_MEMORY_* pass through the same way;
+    #     the db path defaults to empty (memory off).
     #   - Personas: ./gateway-personas (BOTVILLE_GATEWAY_PERSONAS_DIR) is
     #     always bind-mounted read-only at /etc/botville-gateway. The repo
     #     ships that directory with only README + personas.example.json (real
@@ -356,6 +358,14 @@ services:
       # (read-only bind mount below) once that file exists.
       GATEWAY_PERSONAS_FILE: ${GATEWAY_PERSONAS_FILE:-}
       GATEWAY_CONSUMER_ENABLED: ${GATEWAY_CONSUMER_ENABLED:-false}
+      # Four-layer memory (B line PR3a). Empty path = memory off (PR2 ring
+      # buffer). To enable, keep it at the TOP LEVEL of the gateway-data
+      # volume, e.g. /var/lib/botville-gateway/memory.db: backups checkpoint
+      # top-level *.db and archive the whole volume. The gateway creates it
+      # 0600 (it holds chat text: treat backups as sensitive).
+      GATEWAY_MEMORY_DB_PATH: ${GATEWAY_MEMORY_DB_PATH:-}
+      GATEWAY_MEMORY_RETENTION_DAYS: ${GATEWAY_MEMORY_RETENTION_DAYS:-90}
+      GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS: ${GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS:-86400}
     ports:
       - "127.0.0.1:${BOTVILLE_GATEWAY_PORT:-8020}:8080"
     volumes:

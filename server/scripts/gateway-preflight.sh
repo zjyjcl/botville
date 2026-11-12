@@ -13,17 +13,50 @@
 #     it; the AI stays silent without personas).
 #
 # Value precedence matches docker compose: the shell environment wins over the
-# env file, and the last assignment in the env file wins. Prints paths only,
-# never any other .env value.
+# env file, and the last assignment in the env file wins. The env file is read
+# the way compose's dotenv parser reads it: an optional `export ` prefix,
+# optional blanks around `=`, "double" or 'single' quotes stripped, and for an
+# unquoted value an inline ` # comment` (a space right before #) and trailing
+# blanks dropped -- checked against `docker compose config`. Writes nothing; prints paths only, never any other .env value.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 compose_dir="$(cd "${script_dir}/../compose" && pwd)"
 env_file="${1:-${BOTVILLE_ENV_FILE:-${compose_dir}/.env}}"
 
+dotenv_unquote() { # dotenv_unquote RAW -> value as compose reads it
+    local raw="$1" v
+    v="${raw#"${raw%%[![:space:]]*}"}"             # leading blanks
+    case "${v}" in
+        \"*)
+            v="${v#\"}"
+            printf '%s' "${v%%\"*}" ;;
+        \'*)
+            v="${v#\'}"
+            printf '%s' "${v%%\'*}" ;;
+        *)
+            # Like compose: cut at the FIRST " #" (space + #) after the
+            # leading blanks; `KEY=#x`, `KEY= #x`, `a#b`, tab+# stay literal.
+            v="${v%% #*}"
+            printf '%s' "${v%"${v##*[![:space:]]}"}" ;;  # trailing blanks
+    esac
+}
+
 env_file_value() { # env_file_value KEY -> last assignment in the env file
     [[ -f "${env_file}" ]] || return 0
-    sed -n "s/^$1=//p" "${env_file}" | tail -n 1
+    local line raw found="" value=""
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ "${line}" == export[[:space:]]* ]] && line="${line#export}" \
+            && line="${line#"${line%%[![:space:]]*}"}"
+        if [[ "${line}" =~ ^$1[[:space:]]*=(.*)$ ]]; then
+            raw="${BASH_REMATCH[1]}"
+            found=1
+        fi
+    done < "${env_file}"
+    [[ -n "${found}" ]] && value="$(dotenv_unquote "${raw}")"
+    printf '%s' "${value}"
 }
 
 value_of() { # value_of KEY DEFAULT

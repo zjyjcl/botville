@@ -181,11 +181,16 @@ endif
 gateway-preflight:
 	bash server/scripts/gateway-preflight.sh $(ENV_FILE)
 
-# Validate the whole configuration without starting anything: init (renders
-# .env/generated), gateway preflight, then `compose config --quiet` for the
-# active HS with the push and gateway profiles (like down/ps/logs). --quiet on
-# purpose: plain `config` prints interpolated values (secrets included).
-config: init gateway-preflight
+# Validate the configuration without starting anything and WITHOUT writing
+# any file: no init.sh (which may append to .env or render generated/), only
+# the gateway preflight (read-only) and `compose config --quiet` for the active
+# HS with the push and gateway profiles (like down/ps/logs). A missing .env is
+# an error (run `make up` / init.sh first, or point ENV_FILE at a file, e.g.
+# ENV_FILE=server/compose/.env.example). --quiet on purpose: plain `config`
+# prints interpolated values (secrets included).
+config:
+	@test -f $(ENV_FILE) || { echo "make config: $(ENV_FILE) not found; run 'make up' (or bash server/scripts/init.sh) first, or pass ENV_FILE=..." >&2; exit 1; }
+	bash server/scripts/gateway-preflight.sh $(ENV_FILE)
 	$(GATEWAY_HS_ENV) $(COMPOSE) --profile $(HS) --profile push --profile gateway config --quiet
 	@echo "compose config OK ($(HS) + push + gateway)"
 

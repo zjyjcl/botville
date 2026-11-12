@@ -208,7 +208,48 @@ MODEL_KEYS = (
     "GATEWAY_MODEL_TIMEOUT_SECONDS",
     "GATEWAY_PERSONAS_FILE",
     "GATEWAY_CONSUMER_ENABLED",
+    "GATEWAY_MEMORY_DB_PATH",
+    "GATEWAY_MEMORY_RETENTION_DAYS",
+    "GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS",
 )
+
+
+class GatewayMemoryEnvStaticTest(unittest.TestCase):
+    """B line PR3a memory vars: compose defaults, .env.example and the names
+    gateway/src actually reads stay in sync (no docker needed)."""
+
+    EXPECTED = {
+        "GATEWAY_MEMORY_DB_PATH": "",
+        "GATEWAY_MEMORY_RETENTION_DAYS": "90",
+        "GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS": "86400",
+    }
+
+    def test_compose_passes_through_with_defaults(self):
+        text = COMPOSE.read_text(encoding="utf-8")
+        for key, default in self.EXPECTED.items():
+            self.assertIn("      {0}: ${{{0}:-{1}}}\n".format(key, default), text, key)
+
+    def test_env_example_mirrors_defaults(self):
+        lines = (REPO_ROOT / "server" / "compose" / ".env.example").read_text(
+            encoding="utf-8").splitlines()
+        for key, default in self.EXPECTED.items():
+            self.assertIn("{}={}".format(key, default), lines, key)
+
+    def test_names_and_defaults_match_gateway_src(self):
+        src = (REPO_ROOT / "gateway" / "src" / "botville_gateway" / "config.py").read_text(
+            encoding="utf-8")
+        for key in self.EXPECTED:
+            self.assertIn('"{}"'.format(key), src, key + " is not read by gateway/src")
+        self.assertRegex(src, r"DEFAULT_MEMORY_RETENTION_DAYS\s*=\s*90\b")
+        self.assertRegex(src, r"DEFAULT_MEMORY_PURGE_INTERVAL_SECONDS\s*=\s*86_?400\b")
+
+    def test_suggested_path_is_top_level_of_gateway_data(self):
+        """Backups checkpoint only TOP-LEVEL *.db of the volume."""
+        text = COMPOSE.read_text(encoding="utf-8")
+        self.assertIn("gateway-data:/var/lib/botville-gateway", text)
+        lib = (REPO_ROOT / "server" / "scripts" / "lib.sh").read_text(encoding="utf-8")
+        self.assertIn("for db in /gateway-data/*.db; do", lib)
+        self.assertIn("tar -czf /backup/gateway-data.tar.gz -C /gateway-data .", lib)
 
 
 class GatewayPersonasDirTest(unittest.TestCase):
@@ -279,6 +320,11 @@ class ComposeGatewayModelEnvTest(unittest.TestCase):
         self.assertEqual(env["GATEWAY_MODEL_TIMEOUT_SECONDS"], "30")
         self.assertEqual(env["GATEWAY_PERSONAS_FILE"] or "", "")
         self.assertEqual(env["GATEWAY_CONSUMER_ENABLED"], "false")
+        # Memory (B line PR3a): empty path = off; retention/purge defaults
+        # mirror gateway/src config.py.
+        self.assertEqual(env["GATEWAY_MEMORY_DB_PATH"] or "", "")
+        self.assertEqual(env["GATEWAY_MEMORY_RETENTION_DAYS"], "90")
+        self.assertEqual(env["GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS"], "86400")
         binds = [v for v in svc["volumes"] if v["type"] == "bind"]
         self.assertEqual(len(binds), 1)
         self.assertEqual(binds[0]["target"], "/etc/botville-gateway")
@@ -293,6 +339,9 @@ class ComposeGatewayModelEnvTest(unittest.TestCase):
             "GATEWAY_MODEL_TIMEOUT_SECONDS=12\n"
             "GATEWAY_PERSONAS_FILE=/etc/botville-gateway/personas.json\n"
             "GATEWAY_CONSUMER_ENABLED=true\n"
+            "GATEWAY_MEMORY_DB_PATH=/var/lib/botville-gateway/memory.db\n"
+            "GATEWAY_MEMORY_RETENTION_DAYS=30\n"
+            "GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS=3600\n"
         ).format(self.SENTINEL))["environment"]
         self.assertEqual(env["GATEWAY_MODEL_BASE_URL"], "http://model.invalid/v1")
         self.assertEqual(env["GATEWAY_MODEL_NAME"], "test-model")
@@ -300,6 +349,9 @@ class ComposeGatewayModelEnvTest(unittest.TestCase):
         self.assertEqual(env["GATEWAY_MODEL_TIMEOUT_SECONDS"], "12")
         self.assertEqual(env["GATEWAY_PERSONAS_FILE"], "/etc/botville-gateway/personas.json")
         self.assertEqual(env["GATEWAY_CONSUMER_ENABLED"], "true")
+        self.assertEqual(env["GATEWAY_MEMORY_DB_PATH"], "/var/lib/botville-gateway/memory.db")
+        self.assertEqual(env["GATEWAY_MEMORY_RETENTION_DAYS"], "30")
+        self.assertEqual(env["GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS"], "3600")
 
     def test_personas_dir_override(self):
         with tempfile.TemporaryDirectory() as other:

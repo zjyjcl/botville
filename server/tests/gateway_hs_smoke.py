@@ -310,7 +310,12 @@ def save_fixtures(path, data):
     """Write atomically with mode 0600 (holds a password and a token)."""
     if not path:
         return
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    parent = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(parent):
+        # Created 0700 explicitly (makedirs' mode is masked by the umask and
+        # only applies to the leaf); init.sh keeps generated/ 0700 as well.
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+        os.chmod(parent, 0o700)
     tmp = "{}.tmp.{}".format(path, os.getpid())
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -319,30 +324,74 @@ def save_fixtures(path, data):
     os.replace(tmp, path)
 
 
-def whoami(hs_url, access_token):
+# Login/whoami answers that may heal by waiting: rate limit, HS errors,
+# unreachable (status 0). Anything else is definitive.
+AUTH_RETRIES = 5
+AUTH_RETRY_SLEEP = 2
+
+
+def _transient(status):
+    return status == 0 or status == 429 or status >= 500
+
+
+def whoami_status(hs_url, access_token):
+    """(status, user_id or None); bounded retries on transient answers."""
     url = path_of(hs_url, "/_matrix/client/v3/account/whoami")
-    status, resp = request_json("GET", url, headers={"Authorization": "Bearer " + access_token})
-    if status == 200 and isinstance(resp, dict):
-        return resp.get("user_id")
-    return None
+    status = 0
+    for attempt in range(AUTH_RETRIES):
+        status, resp = request_json("GET", url, headers={"Authorization": "Bearer " + access_token})
+        if status == 200 and isinstance(resp, dict) and resp.get("user_id"):
+            return status, resp["user_id"]
+        if not _transient(status):
+            return status, None
+        if attempt + 1 < AUTH_RETRIES:
+            time.sleep(AUTH_RETRY_SLEEP)
+    return status, None
+
+
+def whoami_after_login(hs_url, access_token, expected=None):
+    """whoami right after a successful login: must work. A failure here is a
+    homeserver problem, not a password mismatch, so it never falls through to
+    creating a random user -- it fails (after bounded retries)."""
+    url = path_of(hs_url, "/_matrix/client/v3/account/whoami")
+    status, user_id = whoami_status(hs_url, access_token)
+    if not user_id:
+        http_fail("GET", url, status, "whoami failed right after a successful login")
+    if expected and user_id != expected:
+        fail("whoami after login returned another user than the one logged in")
+    return user_id
 
 
 def password_login(hs_url, user_id, password):
-    """Log in on the fixed device (reused, so no new devices pile up)."""
+    """Log in on the fixed device (reused, so no new devices pile up).
+
+    Returns the access token, or None only when the homeserver definitively
+    rejects the credentials (403, e.g. M_FORBIDDEN: wrong password or no such
+    user). Transient answers are retried a bounded number of times, then fail;
+    any other status fails at once.
+    """
     url = path_of(hs_url, "/_matrix/client/v3/login")
-    status, resp = request_json(
-        "POST",
-        url,
-        body={
-            "type": "m.login.password",
-            "identifier": {"type": "m.id.user", "user": user_id},
-            "password": password,
-            "device_id": DEVICE_ID,
-        },
-    )
-    if status == 200 and isinstance(resp, dict) and resp.get("access_token"):
-        return resp["access_token"]
-    return None
+    status = 0
+    for attempt in range(AUTH_RETRIES):
+        status, resp = request_json(
+            "POST",
+            url,
+            body={
+                "type": "m.login.password",
+                "identifier": {"type": "m.id.user", "user": user_id},
+                "password": password,
+                "device_id": DEVICE_ID,
+            },
+        )
+        if status == 200 and isinstance(resp, dict) and resp.get("access_token"):
+            return resp["access_token"]
+        if status == 403:
+            return None
+        if not _transient(status):
+            http_fail("POST", url, status, "password login")
+        if attempt + 1 < AUTH_RETRIES:
+            time.sleep(AUTH_RETRY_SLEEP)
+    http_fail("POST", url, status, "password login: still failing after retries")
 
 
 def fixture_password(registration_token):
@@ -363,28 +412,40 @@ def ensure_human(hs_url, registration_token, fixture):
 
     Order: the stored token (whoami) -> the stored password (login on the
     fixed device) -> the fixed @gwsmoke user with its derived password (login,
-    else register). Only if @gwsmoke exists with another password (e.g. the
-    registration token was rotated) is a random gwsmoke_<hex> user created,
-    once, and then reused through the fixture file.
+    else register). Only when the password mismatch is CONFIRMED -- login
+    rejected with 403 and registering @gwsmoke says M_USER_IN_USE (e.g. the
+    registration token was rotated) -- is a random gwsmoke_<hex> user created,
+    once, and then reused through the fixture file. A login that succeeds but
+    whose whoami then fails, or a homeserver that keeps answering 429/5xx,
+    fails the smoke instead (bounded retries).
 
     Returns (user_id, access_token); updates `fixture` in place.
     """
     user_id = fixture.get("user_id")
     token = fixture.get("access_token")
-    if user_id and token and whoami(hs_url, token) == user_id:
-        return user_id, token
+    if user_id and token:
+        status, current = whoami_status(hs_url, token)
+        if current == user_id:
+            return user_id, token
+        if _transient(status):
+            http_fail("GET", path_of(hs_url, "/_matrix/client/v3/account/whoami"), status,
+                      "whoami with the stored token")
+        # 401 (token expired/logged out) or another user: log in again below.
     password = fixture.get("password")
     if user_id and password:
         token = password_login(hs_url, user_id, password)
-        if token and whoami(hs_url, token) == user_id:
+        if token:
+            whoami_after_login(hs_url, token, expected=user_id)
             fixture["access_token"] = token
             return user_id, token
     password = fixture_password(registration_token)
     token = password_login(hs_url, HUMAN_FIXTURE_LOCALPART, password)
-    user_id = whoami(hs_url, token) if token else None
-    if not user_id:
+    if token:
+        user_id = whoami_after_login(hs_url, token)
+    else:
         created = register_user(hs_url, registration_token, HUMAN_FIXTURE_LOCALPART, password)
         if created is None:
+            # Confirmed: @gwsmoke exists but the derived password is rejected.
             created = register_user(hs_url, registration_token)
         user_id, token, password = created
     fixture.clear()

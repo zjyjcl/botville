@@ -23,7 +23,7 @@ make up GATEWAY=1    # 叠加 botville 网关（gateway profile，A2.2；本机�
 make gateway-hs-smoke # 对真实 HS 冒烟：whoami + OpenID userinfo + AS 事务 ping/落库/重启幂等
                      # （需 GATEWAY=1 的 synapse/tuwunel 栈；网关只能跑一个，只用 make up 重建；
                      # 测试用户/房间跨次复用，记在 generated/gateway-hs-smoke.json）
-make config          # 只校验：init + 网关预检 + compose config --quiet（不打印插值后的值）
+make config          # 只校验、不写任何文件：网关预检 + compose config --quiet（不跑 init，不打印插值后的值；没有 .env 时报错）
 make smoke           # 标准库冒烟测试：注册→登录→建房(v10)→发消息→回读→sync
 make backup          # 备份到 ./backups/<UTC时间戳>/（目录 700、文件 600，A1.1）
 make restore RESTORE_DIR=backups/<时间戳>   # 破坏性恢复（自动 --yes）
@@ -46,6 +46,12 @@ make down            # 停止（不传 -v，不删任何卷）。清卷：docker
 （只读挂载，真实文件不进仓库；自定义目录用 `BOTVILLE_GATEWAY_PERSONAS_DIR`，不存在时
 `make up GATEWAY=1` / `make config` 预检就报错）。详见
 [docs/deploy/appservice.md](../docs/deploy/appservice.md#角色引擎模型与人设)。
+
+记忆（B 线 PR3a）：`GATEWAY_MEMORY_DB_PATH` 默认空 = 关闭；启用时写
+`/var/lib/botville-gateway/memory.db`（gateway-data 卷顶层，`make backup` /
+`make restore` 自动覆盖）。网关以 0600 创建这个文件，里面有聊天内容，备份同样要私密。
+`GATEWAY_MEMORY_RETENTION_DAYS`（默认 90）、`GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS`
+（默认 86400）同样透传。
 
 
 continuwuity 默认关闭上游 announcements 检查（避免 SIGTERM 卡到 SIGKILL）：见 [docs/ops/continuwuity-announcements.md](../docs/ops/continuwuity-announcements.md)。
