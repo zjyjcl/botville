@@ -196,7 +196,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE as_transactions ADD COLUMN next_attempt_at TEXT")
     # 索引必须在补列之后建（旧库上引用 purged_at）。
     conn.execute(_PURGE_INDEX_DDL)
-    # 消費取批查询（`processed_at IS NULL AND purged_at IS NULL AND failed_at IS NULL`）
+    # 消费取批查询（`processed_at IS NULL AND purged_at IS NULL AND failed_at IS NULL`）
     # 的部分索引：只覆盖「待消费」的行，规模随积压而不是随墓碑总数增长。
     conn.execute(_CONSUMABLE_INDEX_DDL)
     # B 线 PR2 发言去重账本（幂等，不影响既有行）。
@@ -558,20 +558,15 @@ class AsTransactionStore:
 
     # ------------------------------------------------- speech dedupe ledger
     def speech_dedupe_seen(self, key: str) -> bool:
-        """该发言幂等键是否已在账本里（已成功发言 / 已 claim）。"""
+        """该发言幂等键是否已在账本里（只在成功发言后写入）。"""
         with self._lock:
             row = self._conn.execute(
                 "SELECT 1 FROM as_speech_dedupe WHERE key = ?", (key,)
             ).fetchone()
             return row is not None
 
-    def speech_dedupe_mark(self, key: str, *, sent: bool = True) -> None:
-        """写入/更新发言幂等键。
-
-        `sent=True`（成功发言后）写 `sent_at`；`sent=False` 只写 `created_at`
-        （「已 claim、尚未发出」，防止同进程内重复调模型）。重复写入是幂等的：
-        已存在的键只在 `sent=True` 时补 `sent_at`（不覆盖首次 `created_at`）。
-        """
+    def speech_dedupe_mark(self, key: str) -> None:
+        """成功发言后写入幂等键；重复写入保持幂等。"""
         now_str = iso_utc(utcnow())
         with self._lock:
             with self._conn:
@@ -579,8 +574,8 @@ class AsTransactionStore:
                     "INSERT INTO as_speech_dedupe(key, created_at, sent_at)"
                     " VALUES (?, ?, ?)"
                     " ON CONFLICT(key) DO UPDATE SET"
-                    " sent_at = COALESCE(excluded.sent_at, as_speech_dedupe.sent_at)",
-                    (key, now_str, now_str if sent else None),
+                    " sent_at = excluded.sent_at",
+                    (key, now_str, now_str),
                 )
 
     def purge_speech_dedupe(self, retention_days: int, now: Optional[datetime] = None) -> int:
@@ -638,9 +633,7 @@ class PersistentSpeechDedupe:
     落在 AS 事务库里：**进程重启 / 换一个 store 实例打开同一个文件**都不会
     重新发言（at-least-once 消费 + 持久化幂等键 = 实际效果至多一次发言）。
 
-    `claim()` 是可选的两阶段写：模型调用**前**先写一行（`sent_at` 为空），
-    避免同进程内两个消费轮次同时走到模型；调用成功后再 `mark()` 补 `sent_at`。
-    `seen()` 对两种状态都返回 True —— 「已 claim」就足够阻止重复发言。
+    只在成功投递后写入：模型调用前占位会在进程崩溃时吞掉未送达的回复。
     """
 
     def __init__(self, store: AsTransactionStore) -> None:
@@ -650,11 +643,7 @@ class PersistentSpeechDedupe:
         return self._store.speech_dedupe_seen(key)
 
     def mark(self, key: str) -> None:
-        self._store.speech_dedupe_mark(key, sent=True)
-
-    def claim(self, key: str) -> None:
-        """模型调用前占位（`sent_at` 仍为空，表示「说过但还没发出」）。"""
-        self._store.speech_dedupe_mark(key, sent=False)
+        self._store.speech_dedupe_mark(key)
 
     def __len__(self) -> int:
         return self._store.speech_dedupe_count()

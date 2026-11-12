@@ -32,7 +32,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import re
 import threading
 import time
 from collections import OrderedDict
@@ -72,10 +71,6 @@ AI_LOCALPART_PREFIX = "ai_"
 # server/compose/appservice/botville-gateway.yaml.tmpl）。它发言同样不触发回复。
 DEFAULT_AS_SENDER_LOCALPART = "botville-gateway"
 
-# 正文里出现的完整 Matrix user ID（用于识别「被 @」）。只用于识别 AI 目标，
-# 不做任何正文存储；匹配结果不写日志。
-_USER_ID_IN_TEXT_RE = re.compile(r"@[A-Za-z0-9._=\-]+:[A-Za-z0-9.\-]+(?::[0-9]+)?")
-
 # 事件分类（contract §1.7.8 第 7 条）。
 EVENT_MESSAGE_TEXT = "message_text"
 EVENT_INVITE_TO_AI = "invite_to_ai"
@@ -95,6 +90,14 @@ class TransientUnavailable(Exception):
     钩子抛本异常时**不计入** attempts，只按短退避重试（contract §1.7.8）。
     运行时应只在本轮确实无法完成、但稍后可重试时抛出。
     """
+
+
+class DeferredUntil(TransientUnavailable):
+    """策略暂不可用；在指定窗口结束时重试，不消耗 attempts。"""
+
+    def __init__(self, retry_at: datetime) -> None:
+        super().__init__("policy deferred until window end")
+        self.retry_at = retry_at
 
 
 def backoff_seconds(attempt: int) -> float:
@@ -389,6 +392,7 @@ class AsTransactionConsumer:
         as_sender_localpart: str = DEFAULT_AS_SENDER_LOCALPART,
         dedupe: Optional[SpeechDedupe] = None,
         room_members: Optional[Callable[[str], Sequence[str]]] = None,
+        room_member_observer: Optional[Callable[[Any], None]] = None,
         conversation_resolver: Optional[Callable[[str], Optional[str]]] = None,
         sender_cache: Optional[EventSenderCache] = None,
         sender_fetcher: Optional[Callable[[str, str], Optional[str]]] = None,
@@ -409,6 +413,7 @@ class AsTransactionConsumer:
         self._dedupe = dedupe if dedupe is not None else InMemorySpeechDedupe()
         # 房间成员解析（PR1 没有成员同步，默认不提供 → 群聊只按 @ 判定）。
         self._room_members = room_members
+        self._room_member_observer = room_member_observer
         # 房间 → 会话键；默认直接用 room_id（appservice 的 `!`-前缀 room_id 在
         # 传输层同时就是合法 conversation_id）。查不到时跳过 record 并计数。
         self._conversation_resolver = conversation_resolver
@@ -565,6 +570,10 @@ class AsTransactionConsumer:
         now: datetime,
         attempts: int,
     ) -> None:
+        if isinstance(exc, DeferredUntil):
+            self._store.record_transient(txn_id, exc.retry_at)
+            self._stats.inc("deferred")
+            return
         if isinstance(exc, TransientUnavailable):
             delay = min(TRANSIENT_BACKOFF_SECONDS, MAX_BACKOFF_SECONDS)
             self._store.record_transient(txn_id, now + timedelta(seconds=delay))
@@ -625,6 +634,11 @@ class AsTransactionConsumer:
             self._stats.inc("invalid_event_ids")
             return
         self._stats.inc(f"event.{category}")
+        if event.get("type") == "m.room.member" and self._room_member_observer is not None:
+            try:
+                self._room_member_observer(event)
+            except Exception:
+                self._stats.inc("room_member_errors")
 
         sender = fields.get("sender")
         room_id = fields.get("room_id")
@@ -674,6 +688,10 @@ class AsTransactionConsumer:
             # 外服消息若也重置，等于让任何联邦用户清空本房间的熔断计数。
             if trust == _TRUSTED:
                 self._record_human_message(room_id)
+            # 引擎按每个 persona 的成功回执去重，不能以首个目标跳过整条事件。
+            if getattr(self._hooks, "manages_speech_dedupe", False):
+                self._hooks.on_human_text(ctx)
+                return
             # 去重：同一 (persona, event_id) 的发言键只执行一次钩子。
             if ctx.idempotency_key and not self._pass_dedupe(ctx.idempotency_key):
                 return
@@ -915,29 +933,6 @@ class AsTransactionConsumer:
         self._stats.inc("reply_target_fetched")
         self._sender_cache.remember(reply_event_id, sender)
         return sender
-
-    def _pick_persona_user_id(
-        self, room_id: Optional[str], text: str, mentions: Iterable[str]
-    ) -> Optional[str]:
-        """本条消息最相关的**本服** AI（保留的兼容接口，PR2 起用 `_reply_targets`）。
-
-        被 @ 的第一个本服 AI > 正文里第一个本服 AI 完整 ID > 单聊房间里的唯一本服 AI > None。
-        外服 `@ai_*` 不作为 persona 目标（contract §1.7.8 ⑦）。
-        """
-        for uid in mentions:
-            if isinstance(uid, str) and self._is_local_ai(uid):
-                return uid
-        for match in _USER_ID_IN_TEXT_RE.findall(text):
-            if self._is_local_ai(match):
-                return match
-        if room_id and self._room_members is not None:
-            try:
-                ids = [uid for uid in self._room_members(room_id) or () if self._is_local_ai(uid)]
-            except Exception:  # noqa: BLE001
-                ids = []
-            if len(ids) == 1:
-                return ids[0]
-        return None
 
     def _record_human_message(self, room_id: Optional[str]) -> None:
         """调用 `GatewayService.record_human_message`（重置防刷屏 / 互聊熔断）。"""

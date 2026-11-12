@@ -717,9 +717,12 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
   套角色引擎」的运行时。网关的限额与审核层**先于**引擎执行；引擎发言一律走内部
   `evaluate → send`，不绕过 `POST /policy/evaluate` 与 `POST /conversations/{id}/messages`
   的任何裁决。具体顺序为 `GatewayService.evaluate_policy → model.complete →
-  GatewayService.send_ai_message`：预检无副作用，拦截时零模型调用并计数；发送前再次裁决、
-  预留额度，成功后提交 SENT 用量、token 预算、防刷屏与 AI 互聊计数。发送时发生限额竞态
-  则跳过、计数并写发言去重账本，重放不再重试；Matrix 不可达/暂不可用映射为
+  GatewayService.send_ai_message`：预检无副作用，任何非 `allow` 裁决都不调模型；发送前再次裁决、
+  预留额度，成功后提交 SENT 用量、token 预算、防刷屏与 AI 互聊计数。引擎统一按字符数
+  `estimate_tokens(text) = max(1, len(text) // 4 + 1)` 粗略估算 token：预检累加系统提示词、
+  每条上下文消息及 `max_reply_chars` 长度回复的估算；发送时仅估算截断后的实际回复。
+  此估算不是模型 tokenizer 的精确计数。发送时发生限额竞态
+  则跳过、计数且不写发言去重账本；Matrix 不可达/暂不可用映射为
   `TransientUnavailable`，其余错误按普通失败处理。
 - 发送的 `conversation_id` 直接使用 Matrix `room_id`（见 ⑦），复用服务上的 AS 传输以
   persona 的 `@ai_*` 身份 masquerade；`Idempotency-Key` 为
@@ -745,7 +748,7 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
   | `system_prompt` | 是 | 人设指令正文，进 **system/instructions 区**（不是数据区） |
   | `personality` | 否 | 追加的性格描述（同属指令区） |
   | `model` | 否 | 模型名覆盖；缺省用 `GATEWAY_MODEL_NAME` |
-  | `credential_ref` | 否 | **只能**是 `env:NAME`；调用时读 `os.environ[NAME]` 覆盖全局密钥。文件里出现明文密钥字形 → 拒绝启动 |
+  | `credential_ref` | 否 | **只能**是 `env:NAME`；调用时读 `os.environ[NAME]` 覆盖全局密钥。任何其他值一律拒绝启动 |
   | `max_reply_chars` | 否 | 单条回复上限（正整数，不超过 `MAX_MESSAGE_CHARS`）；缺省 2000 |
 
 - **启动期校验**（`engine.personas.load_personas`）：文件读不到 / JSON 非法 / 顶层或条目
@@ -794,6 +797,12 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 - **连续 5 次失败** → 写 `failed_at`，该行**不再被取出**（不删行、不清体）。
 - **瞬态不可用**（`TransientUnavailable`：模型 / homeserver 暂时不可用）**不计 attempts**，
   只设 30 秒短退避（封顶 1 小时），计 transient 计数，下次轮询/到期后重试。
+- **静默时段 defer** 是可预期的暂不可用：预检得到 `decision=defer` 时不调模型；发送时复核
+  因 `silent_hours.active` 得到 `blocked` / `deferred`（窗口边界竞态）时不投递。两者都不写
+  单角色发言去重键、不标 processed、不计
+  attempts/failed；事务的 `next_attempt_at` 设为该静默窗口结束时刻并计 `deferred`。因此深夜的
+  人类消息会在早晨静默结束后继续处理并回复；多角色事件中已经成功发送的角色保持去重，重试
+  只发送剩余角色。
 - 损坏的事务体（不是合法 JSON / 顶层不是对象 / 缺 `events` 数组）属**永久错误**：直接标
   failed 并计 `malformed`，**不阻塞后续事务**。单个事件格式不对（非 dict / 缺 `type` 等）
   只跳过该事件并计数，不影响事务内其他事件。
@@ -866,6 +875,13 @@ ephemeral 不在 AS 注册里开启，忽略。
 
 多个 AI 同时被 @ 时，**每个都回复**，按**提及顺序**串行执行（`target_user_ids` 保序；
 单线程消费者内逐个 `evaluate → model → send`，不并发）。
+
+生产消费者维护一个最多 **1000** 个房间、TTL **30 秒**的本服 AI 成员缓存：收到本服
+`@ai_*` 的 `m.room.member` 时，`join` 加入，`leave` / `ban` 移除，`invite` 不视为已加入。
+缓存未命中时，传输层以已配置 persona 依次 masquerade 请求
+`GET /_matrix/client/v3/rooms/{roomId}/joined_members`，首个成功响应写入缓存；请求有超时且不
+跟随重定向。任何成员缓存或查询失败均 fail-closed，只按结构化/正文 mentions 判定并计
+`room_member_errors`，不会把群聊误判为单聊。
 
 **⑩ 四层记忆（PR3，仅规划）**
 
@@ -1508,6 +1524,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.1.0 | 2026-11-13 | [B 线 PR2 engine-reply 审查修复] 静默时段 `defer` 在预检时不调模型；发送边界竞态时不投递；两者都不消耗发言去重键、不计 attempts/failed。消费者把事务定时到静默窗口结束后重试，深夜人类消息于早晨继续回复。发言去重只在 `sent`/`delivered` 后写入，移除会在崩溃时吞回复的 `claim` 占位；`credential_ref` 的规则明确为只接受 `env:NAME`，不再作密钥字形猜测。 |
 | 0.1.0 | 2026-11-12 | [B 线 PR2 engine-reply（B2.4），**进程内引擎，不改 /v1 端点/字段/状态码/错误码/OpenAPI**] §0 执行主体表从「PR2 落地」改为「已实现」；§1.7.8 ② 更新为已实现：新增只读人设文件 `GATEWAY_PERSONAS_FILE`（启动期校验 schema / 本服 `@ai_*` / credential_ref 形状 / max_reply_chars 范围，错误消息不回显文件内容；仓库只放示例 `gateway/examples/personas.example.json`；真实人设不进仓库）；§1.7.8 ⑨ `should_reply` 补充「被 AI 回复」路径：`m.relates_to.m.in_reply_to.event_id` 指向的事件 sender 是本服 AI 也触发回复；进程内有界 LRU `EventSenderCache` + 可选 AS 传输 `GET .../event/{eventId}` 回填，回填失败按「不是回复」fail-closed；多个 AI 同时被 @ 时按提及顺序全部回复（`target_user_ids` 保序）；§1.7.8 ⑫ 更新模型配置（`GATEWAY_MODEL_BASE_URL` / `GATEWAY_MODEL_NAME` / `GATEWAY_MODEL_API_KEY` / `GATEWAY_MODEL_TIMEOUT_SECONDS`，PR2 已生效）、人设文件（`GATEWAY_PERSONAS_FILE`）、引擎激活三件套条件（消费开启 + 非空 personas + 模型已配；任一缺失只记录/计数，`/health` 不 degraded）；发言去重账本 `as_speech_dedupe`（SQLite，对 §1.7.8 ④ 的「持久化幂等键」落地；随 `run_purge_safely` 按同一保留期清理）。**新增子包 `engine/`**（`personas.py` / `model_client.py` / `engine.py`）：`ModelClient`（urllib 零依赖 OpenAI 兼容 chat completions，5xx/429/408/超时 → `TransientUnavailable`，其余 4xx/结构错误 → `ModelError`，密钥不进 repr/日志/错误体，重定向不跟随）；`EngineHooks`（`ConsumerHooks` 实现，服务 evaluate 限额前置（拦截零模型调用并计数）→ 隔离上下文拼装 → model → 服务 send_ai_message（再次裁决、预留及提交 SENT/token/防刷屏/互聊计数）→ AS masquerade 投递；幂等键经 _txn_id_for 推导 txnId；发送竞态 blocked 写去重，Matrix 不可达/暂不可用为 TransientUnavailable），per-room 最近消息环形缓冲（每轮至多 20 条、每条 8000 码点；所有聊天文本含 AI 回复均经 isolation.build_untrusted_segment 包裹，人设仅进 system；trust 按 §7.1，正文不进日志，持久化记忆留 PR3）。`config.py` 新增 `model_base_url` / `model_name` / `model_api_key`（`repr=False`）/ `model_timeout_seconds` / `personas_file`，校验在 `Config.__post_init__`（非法拒绝启动）；新增辅助函数 `_env_float` / `DEFAULT_MODEL_TIMEOUT_SECONDS`（唯一定义处）。引擎直接复用 `GatewayService`，移除裸策略引擎访问属性；多角色按结构化提及/正文出现顺序串行回复，单角色持久化去重与消费完成去重分离。`http_server.py` `GatewayServer.__init__` 在绑定端口后、消费者启动前装配 `EngineHooks`（三件套缺一 → 记 info 不起引擎）；`engine_hooks` 字段供 `__main__.py` 打印状态。**#200 审查项一并修复**：`_room_ai_ids` fail-closed 过滤（非本服 AI 不计入，回调错误只用 mentions）；`_loop` 唤醒竞态修复（`wake.clear()` 移到 `run_once()` 之前）；`event_id` 类型检查（非字符串/缺失只跳过该事件，计 `invalid_event_ids`）；`reply_to_event_id()` 辅助函数（读 `m.relates_to.m.in_reply_to.event_id`，非字符串/空串返回 None）；`EventSenderCache`（有界 LRU，`max_entries` 可配，默认 2048）；`AsTransactionConsumer` 新增 `sender_cache` / `sender_fetcher` 参数；`AppServiceMatrixTransport.event_sender()` 方法；测试 78 个新增（`test_as_consumer.py` 新增 TestRoomAiIdsFiltering / TestShouldReplyInReplyTo / TestInvalidEventIdSkipped / TestWakeDuringProcessing / TestConsumerStartupOrdering；`test_engine_reply.py` 新增，共 51 个）；`contract.md` changelog 中的 U+FFFD 修复为「；」。 **#202 nits**：修复引号/尖括号 txnId 尾串泄露与异常对象日志；覆盖通用 send、sendToDevice、redact 路径；短标记改用随机进程盐，仅本次运行可关联；清理未用导入、纠正文档和注释，补 health 与真实投递失败日志回归。 |
 | 0.1.0 | 2026-11-12 | [B 线 access-log-txnid，**仅日志，不改 /v1 与 AS 回调的字段/状态码/错误码，不改 OpenAPI**] 落实契约决定 #15（日志不得含原始 AS `txnId` / 事件正文 / token）。**①访问日志**：新增 `log_redact.py` 作为脱敏唯一定义处；`GatewayHandler` 的 `log_message` / `log_error` / `log_request` 全部经过它，`/_matrix/app/v1/transactions/<txnId>` 的 txnId 段（可带 `GATEWAY_HTTP_PATH_PREFIX`、查询串、百分号编码）替换为 `<redacted>`，出站发送路径 `.../send/m.room.message/<txnId>` 同理；`access_token=[REDACTED]` 行为保留。此前基线日志行 `"PUT /_matrix/app/v1/transactions/<txnId>" 200 -` 会打印原始 txnId。**②错误日志**：`AS transaction persist failed for txn %s` 经 stdlib `log_error` 直接写 stderr（不经过 `logging`）；它与 `matrix.resolve_txn_id` 的错误详情改用 `redact_txn_id()` → `txn#xxxxxxxx`（现为随机进程盐 HMAC-SHA256 前 8 位，仅同一次进程运行内可关联，见 #202 nits）。**③测试**：新增 `gateway/tests/test_access_log_txnid.py`（24 例：辅助函数单元测试；真实网关 + stderr 捕获，覆盖纯/百分号编码 txnId、`?access_token=`、路径前缀、非法 txnId 400、持久化失败 500、坏请求行 `send_error`→`log_error`、关闭访问日志；`assertLogs` 验证清理日志与标记行）。§1.7.2 同步。 |
 | 0.1.0 | 2026-11-12 | [B 线 as-consumer，**消费骨架 + 纯文档改 /v1 措辞，不改 OpenAPI、不改任何端点/字段/状态码/错误码**] 新增 **§1.7.8 消费语义**：网关进程内后台线程消费 AS 事务库（`GATEWAY_CONSUMER_ENABLED`，默认 **false**；关闭时行为完全不变），事务落库后立即唤醒 + 5 秒兜底轮询；按 rowid 顺序单批 ≤100、单线程串行；at-least-once（副作用完成后才 `mark_processed`）；发言幂等键 `spk_+sha256(persona, event_id)` 稳定推导 + `SpeechDedupe` 钩子（PR1 内存实现）。失败：事务表增量迁移补 `attempts` / `last_error_type`（只存类型名）/ `failed_at` / `next_attempt_at` 四列（对 #192/#194 旧库幂等）；普通失败指数退避 `min(5×2^(n−1), 3600)`、连续 5 次标 failed 不再取出；`TransientUnavailable` 不计 attempts。事件分类：`message_text` / `invite_to_ai` / `redaction` / `reaction` / `edit` / `other_state` / `other`；AI（本服 `@ai_*` 与网关 AS sender）发言不触发回复、只计 AI 事件；本服 trusted 人类消息调用 `record_human_message` 重置熔断计数；外服 sender 一律 `untrusted`；按 Unicode 码点截断至 8000。钩子默认 no-op（PR2 回复 / PR3 记忆）。新增纯函数 `should_reply()`（单聊必回、群聊仅被 @ 或被回复）与 `ConsumerStats` 快照（**不进 /health**、不改 OpenAPI）。积压 >24h 记 warning（限频 1 小时，只记时长）。**文档修订**：§0 与 §7.2 区分「简单接入内置 `engine/`」与「完整接入外部运行时」；§6.3 人类入站入口已存在（消费者默认关闭时行为不变）；§1.7.6 改为消费已由本 PR 实现。模型环境变量（`GATEWAY_MODEL_BASE_URL` / `GATEWAY_MODEL_NAME` / `GATEWAY_MODEL_API_KEY`）**PR2 引入，本 PR 不读取**；PR1 不调模型、不发言。 **顺带 #199 审查 nits**：①`_precreate_private_file` 注释与实现对齐（去掉对不存在返回值的引用）；②`get_unprocessed_transactions` 模块注释更新为「按 rowid 升序、limit 默认 100、<1 抛 ValueError」；③`_migrate` docstring 与 §1.7.7 运维第 5 点补「首次在大库上建两个部分索引可能拉长那一次启动时间」；④§1.7.5 / §1.7.3 明确 ping 的纯空白体等价空体（`200 {}`），新增回归测试；⑤§1.7.8 ⑦ 明确外服 `@ai_*` sender 按 AI 处理（不触发回复、trust=untrusted、不调 record_human_message），且「目标 AI」只认本服 `@ai_*`（未配置 server_name 时 fail-closed，邀请归 other_state）。 |

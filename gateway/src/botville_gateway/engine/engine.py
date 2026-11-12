@@ -10,7 +10,7 @@
 1. **去重**：`PersistentSpeechDedupe`（`as_speech_dedupe` 表）；
 2. **限额前置**（contract §1.7.8 ①）：对每个目标 persona 分别调用内部
    `service.evaluate_policy`（同 `POST /policy/evaluate` 的三层限额 + 防刷屏 + 熔断
-   + 静默）；`blocked` → 跳过，零模型调用；
+   + 静默）；非 allow → 停止，零模型调用；
 3. **上下文拼装**：system = persona 指令区；用户消息环形缓冲（最近
    `MAX_CONTEXT_MESSAGES` 条）；所有聊天文本经 §7.2 数据区隔离包裹；
 4. **模型调用**：`ModelClient.complete`；
@@ -22,11 +22,13 @@
 from __future__ import annotations
 
 import threading
-from collections import deque
-from typing import Dict, Deque, List, Optional, Tuple
+from collections import OrderedDict, deque
+from datetime import datetime, timedelta
+from typing import Any, Dict, Deque, List, Optional, Tuple
 
 from ..as_consumer import (
     ConsumerContext,
+    DeferredUntil,
     ConsumerHooks,
     ConsumerStats,
     SpeechDedupe,
@@ -36,15 +38,21 @@ from ..as_consumer import (
 )
 from ..isolation import SYSTEM_ZONE_DECLARATION, build_untrusted_segment
 from ..errors import GatewayDeliveryError
-from ..policy import DECISION_BLOCK
+from ..policy import DECISION_ALLOW, DECISION_DEFER, CODE_SILENT_HOURS
 from ..service import GatewayService
 from .model_client import ModelClient
 from .personas import Persona
 
 # 每个房间保留的最近消息条数上限（进程内缓冲；PR3 换持久化记忆）。
 MAX_CONTEXT_MESSAGES = 20
+MAX_ROOM_BUFFERS = 1000
 # 进 ring buffer 的单条消息正文上限（已截断的；与 as_consumer 的截断同量级）。
 _RING_TEXT_LIMIT = 8000
+
+
+def estimate_tokens(text: str) -> int:
+    """Estimate tokens by character count, with a minimum of one."""
+    return max(1, len(text) // 4 + 1)
 
 
 class _RoomBuffer:
@@ -79,6 +87,8 @@ class EngineHooks(ConsumerHooks):
     `stats` 属性提供内部计数，不含标识或正文。
     """
 
+    manages_speech_dedupe = True
+
     def __init__(
         self,
         *,
@@ -92,13 +102,16 @@ class EngineHooks(ConsumerHooks):
         self._service = service
         self._dedupe = dedupe
         self.stats = ConsumerStats()
-        self._buffers: Dict[str, _RoomBuffer] = {}
+        self._buffers: OrderedDict[str, _RoomBuffer] = OrderedDict()
         self._buf_lock = threading.Lock()
 
     def _get_buffer(self, room_id: str) -> _RoomBuffer:
         with self._buf_lock:
             if room_id not in self._buffers:
                 self._buffers[room_id] = _RoomBuffer()
+            self._buffers.move_to_end(room_id)
+            while len(self._buffers) > MAX_ROOM_BUFFERS:
+                self._buffers.popitem(last=False)
             return self._buffers[room_id]
 
     def on_human_text(self, ctx: ConsumerContext) -> None:
@@ -138,25 +151,26 @@ class EngineHooks(ConsumerHooks):
         if self._dedupe is not None and self._dedupe.seen(idem_key):
             return
 
-        # 1. 限额前置：与 POST /policy/evaluate 相同的三层判定（blocked → 零模型调用）。
-        decision = self._service.evaluate_policy({
-            "persona_id": persona.user_id,
-            "conversation_id": room_id,
-            "content": text,
-            "token_estimate": max(1, len(text) // 4 + 1),
-            "kind": "message",
-        })
-        if decision["decision"] == DECISION_BLOCK:
-            self.stats.inc("precheck_blocked")
-            if self._dedupe is not None:
-                self._dedupe.mark(idem_key)
-            return
-
-        # 2. 上下文拼装（§7.2 四区隔离：人设进 system 区，对话进数据区）。
+        # 先拼装完整提示词，再估算提示词及最大回复的预算。
         system_text = SYSTEM_ZONE_DECLARATION + "\n" + persona.instruction_text()
         buf = self._get_buffer(room_id) if room_id else None
         history = buf.snapshot() if buf else []
         messages = _build_messages(history, text)
+        token_estimate = (estimate_tokens(system_text)
+                          + sum(estimate_tokens(m["content"]) for m in messages)
+                          + estimate_tokens("x" * persona.max_reply_chars))
+        decision = self._service.evaluate_policy({
+            "persona_id": persona.user_id,
+            "conversation_id": room_id,
+            "content": text,
+            "token_estimate": token_estimate,
+            "kind": "message",
+        })
+        if decision["decision"] != DECISION_ALLOW:
+            if decision["decision"] == DECISION_DEFER:
+                raise self._deferred_until(decision, persona, room_id)
+            self.stats.inc("precheck_blocked")
+            return
 
         # 3. 模型调用。TransientUnavailable / ModelError 原样上抛给消费侧：
         #    transient 不计 attempts 只短退避；ModelError 属普通失败。
@@ -175,7 +189,7 @@ class EngineHooks(ConsumerHooks):
                 payload={
                     "sender_persona_id": persona.user_id,
                     "content": {"type": "text", "text": reply_text},
-                    "token_estimate": max(1, len(reply_text) // 4 + 1),
+                    "token_estimate": estimate_tokens(reply_text),
                     "allow_deferred": False,
                 },
                 idempotency_key=idem_key,
@@ -188,14 +202,41 @@ class EngineHooks(ConsumerHooks):
                 ) from exc
             raise
 
-        # 5. 终态写去重账本；仅成功投递的 AI 回复进入 ring buffer。
-        if self._dedupe is not None:
-            self._dedupe.mark(idem_key)
-        if receipt["outcome"] == "blocked":
+        # 只有发送成功才消耗 speech key；静默边界竞争延后到窗口结束。
+        if receipt["outcome"] not in ("sent", "delivered"):
+            decision = receipt.get("decision", {})
+            if decision.get("decision") == DECISION_DEFER or any(
+                    r.get("code") == CODE_SILENT_HOURS
+                    for r in decision.get("reasons", [])):
+                raise self._deferred_until(decision, persona, room_id, receipt)
             self.stats.inc("send_blocked")
             return
+        if self._dedupe is not None:
+            self._dedupe.mark(idem_key)
         if buf is not None:
             buf.append("assistant", truncate_text(reply_text, _RING_TEXT_LIMIT))
+
+    def _deferred_until(
+        self, decision: Dict[str, Any], persona: Persona, room_id: str,
+        receipt: Optional[Dict[str, Any]] = None,
+    ) -> DeferredUntil:
+        candidates = [decision.get("defer_until"), decision.get("retry_at"),
+                      decision.get("may_clear_at"),
+                      (receipt or {}).get("may_clear_at")]
+        candidates.extend(c.get("reset_at") for c in decision.get("checks", [])
+                          if c.get("key") == "silent_hours" and not c.get("allowed"))
+        for value in candidates:
+            if value:
+                return DeferredUntil(datetime.fromisoformat(value.replace("Z", "+00:00")))
+        delay = decision.get("retry_after_seconds")
+        if delay is not None:
+            at = decision.get("evaluated_at")
+            now = datetime.fromisoformat(at.replace("Z", "+00:00")) if at else self._service.now
+            return DeferredUntil(now + timedelta(seconds=delay))
+        retry_at = self._service.silent_hours_end(persona.user_id, room_id)
+        if retry_at is None:
+            raise TransientUnavailable("deferred policy has no active window")
+        return DeferredUntil(retry_at)
 
 
 def _build_messages(
@@ -235,9 +276,6 @@ class InMemorySpeechDedupeForEngine:
     def mark(self, key: str) -> None:
         with self._lock:
             self._keys.add(key)
-
-    def claim(self, key: str) -> None:
-        self.mark(key)
 
     def __len__(self) -> int:
         with self._lock:

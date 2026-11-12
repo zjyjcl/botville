@@ -40,7 +40,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Sequence, Set, Tuple
 
 from .matrix import DeliveryError, SentEvent, resolve_txn_id
 
@@ -404,6 +404,39 @@ class AppServiceMatrixTransport:
         if not isinstance(sender, str) or not sender:
             return None
         return sender
+
+    def joined_members(self, room_id: str, personas: Sequence[str]) -> Tuple[str, ...]:
+        """Return joined member IDs while masquerading as a local persona.
+
+        The CS API may require a room member's identity.  Try configured local
+        personas in order and accept the first successful response.  A caller
+        receives ``DeliveryError`` when none can read membership, allowing the
+        consumer to fail closed to mention-only routing.
+        """
+        if not isinstance(room_id, str) or not room_id.startswith("!"):
+            raise DeliveryError("conversation.invalid", "room_id must be a Matrix room id")
+        last_error: Optional[DeliveryError] = None
+        path = "/_matrix/client/v3/rooms/{}/joined_members".format(
+            urllib.parse.quote(room_id, safe="")
+        )
+        for persona in personas:
+            if not isinstance(persona, str):
+                continue
+            self._check_sender(persona)
+            try:
+                response = self._request(
+                    "GET", path, query={"user_id": persona}, timeout=self._timeout
+                )
+            except DeliveryError as exc:
+                last_error = exc
+                continue
+            joined = response.get("joined")
+            if not isinstance(joined, dict):
+                raise DeliveryError("appservice.response", "joined_members response has no joined object")
+            return tuple(uid for uid in joined if isinstance(uid, str))
+        if last_error is not None:
+            raise last_error
+        raise DeliveryError("appservice.namespace", "no local persona available for membership lookup")
 
     def healthy(self) -> bool:
         """带 AS 身份的健康检查：whoami 校验可达性 **和** token 有效性。

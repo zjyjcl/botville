@@ -73,6 +73,7 @@ from .limits import LimitStore
 from .log_redact import redact_args as _redact_args
 from .log_redact import redact_txn_id
 from .matrix import InMemoryMatrixTransport, MatrixTransport
+from .room_members import RoomMemberSource
 from .moments.http_api import handle as _handle_moments_dispatch
 from .moments.service import build_moments_service
 from .service import GatewayService
@@ -1290,6 +1291,7 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         # GATEWAY_CONSUMER_ENABLED=false（默认）时不起线程、不唤醒，行为与现在完全一致。
         # 开启但 as_txn_db_path 未配置时打 warning 且不起线程（不拒绝启动）。
         self.as_consumer: Optional[AsTransactionConsumer] = None
+        self.room_member_source: Optional[RoomMemberSource] = None
         # B 线 PR2：内置角色引擎（contract §0 / §1.7.8 ②）。只在三个条件**同时**
         # 成立时装配：消费开启 + 人设有内容 + 模型已配置。否则保持「只记录/计数、
         # 不发言」，/health 不 degraded。
@@ -1303,12 +1305,34 @@ class GatewayServer(http.server.ThreadingHTTPServer):
             else:
                 hooks = self._build_engine_hooks(config, service)
                 self.engine_hooks = hooks
+                # Production membership source for DM routing.  State events
+                # keep a bounded local cache warm; AppService transport fills a
+                # cold cache through joined_members while masquerading as one
+                # configured persona.  Other transports remain mention-only.
+                personas = tuple(hooks._personas) if hooks is not None else ()
+                server_name = (config.matrix_server_name or "").lower()
+
+                def is_local_ai(user_id: str) -> bool:
+                    if not isinstance(user_id, str) or not user_id.startswith("@ai_"):
+                        return False
+                    _localpart, separator, domain = user_id[1:].partition(":")
+                    return bool(separator and domain.lower() == server_name)
+
+                joined_members = getattr(transport, "joined_members", None)
+                fetcher = joined_members if callable(joined_members) else None
+                self.room_member_source = RoomMemberSource(
+                    fetcher=fetcher,
+                    personas=personas,
+                    is_local_ai=is_local_ai,
+                )
                 consumer = AsTransactionConsumer(
                     self.as_txn_store,
                     hooks=hooks,
                     service=service,
                     server_name=config.matrix_server_name,
                     sender_fetcher=getattr(transport, "event_sender", None),
+                    room_members=self.room_member_source.members,
+                    room_member_observer=self.room_member_source.observe_member_event,
                     # Engine persists each persona separately; consumer completion
                     # must not share the first persona key on partial failures.
                     dedupe=None if hooks else PersistentSpeechDedupe(self.as_txn_store),

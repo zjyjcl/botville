@@ -57,7 +57,6 @@ from botville_gateway.engine import (  # noqa: E402
     PersonaConfigError,
     load_personas,
 )
-from botville_gateway.engine.model_client import looks_like_plaintext_key  # noqa: E402
 from botville_gateway.http_server import build_server  # noqa: E402
 from botville_gateway.service import GatewayService
 from botville_gateway.matrix import InMemoryMatrixTransport  # noqa: E402
@@ -557,7 +556,29 @@ class TestEngineServicePath(unittest.TestCase):
         self._assert_cap({"rate_limit_messages": 1, "rate_limit_window_seconds": 86400}, "messages.window.exceeded")
 
     def test_token_budget(self):
-        self._assert_cap({"platform_token_budget": 2}, "tokens.window.exceeded")
+        hooks, service, client, transport = self._setup_service(platform_token_budget=100)
+        hooks.on_human_text(self._make_ctx())
+        client._post.assert_not_called()
+        self.assertEqual(transport.sent, [])
+        self.assertFalse(hooks._dedupe.seen(speech_idempotency_key(AI_A, "$e1")))
+
+    def test_character_token_budget_allows_prompt_and_max_reply(self):
+        from botville_gateway.engine.engine import estimate_tokens
+
+        for text, expected in [("", 1), ("abc", 1), ("abcd", 2), ("你好世界", 2), ("😀" * 8, 3)]:
+            with self.subTest(text=text):
+                self.assertEqual(estimate_tokens(text), expected)
+
+        hooks, service, client, transport = self._setup_service(platform_token_budget=1000)
+        service.evaluate_policy = mock.Mock(wraps=service.evaluate_policy)
+        hooks.on_human_text(self._make_ctx(text="你好😀"))
+        client._post.assert_called_once()
+        self.assertEqual(len(transport.sent), 1)
+        messages = client._post.call_args.args[0]["messages"]
+        expected = sum(len(m["content"]) // 4 + 1 for m in messages)
+        expected += _make_persona().max_reply_chars // 4 + 1
+        self.assertEqual(service.evaluate_policy.call_args.args[0]["token_estimate"], expected)
+        self.assertEqual(service.get_usage(persona_id=AI_A)["totals"]["tokens_total"], 2)
 
     def test_anti_spam(self):
         self._assert_cap({"platform_max_consecutive_ai_messages": 1}, "anti_spam.consecutive")
@@ -720,10 +741,6 @@ class TestPersistentSpeechDedupe(_TmpDb):
         self.dedupe.mark("spk_xyz")
         self.assertEqual(self.store.speech_dedupe_count(), 1)
 
-    def test_claim_seen_before_mark(self):
-        self.dedupe.claim("spk_claim")
-        self.assertTrue(self.dedupe.seen("spk_claim"))
-
     def test_purge_removes_old_keys(self):
         from datetime import datetime, timedelta, timezone
         self.dedupe.mark("spk_old")
@@ -838,12 +855,6 @@ class TestEngineServerIntegration(unittest.TestCase):
 # 7. 密钥安全检查
 # ---------------------------------------------------------------------------
 class TestKeySafety(unittest.TestCase):
-    def test_looks_like_plaintext_key(self):
-        self.assertTrue(looks_like_plaintext_key("sk-abc123"))
-        self.assertTrue(looks_like_plaintext_key("sk_abc123"))
-        self.assertFalse(looks_like_plaintext_key("env:MY_KEY"))
-        self.assertFalse(looks_like_plaintext_key(""))
-
     def test_config_model_api_key_not_in_repr(self):
         from botville_gateway.config import Config
         cfg = Config(dev_mode=True, model_api_key="totally-secret-key-do-not-log")

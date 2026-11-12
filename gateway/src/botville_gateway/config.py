@@ -125,7 +125,8 @@ AI_LOOP_ON_BREAK_VALUES = frozenset({"stop", "notify"})
 DEFAULT_AS_MAX_BODY_BYTES = 16_777_216   # 16 MiB
 AS_MAX_BODY_BYTES_UPPER = 268_435_456    # 256 MiB
 
-# AS 事务库保留期与清理（contract §1.7.7）：与动态模块的保留期清理同一套约定。# 超过保留期的事务只清空原始请求体、保留墓碑（txn_id / 时间 / processed_at），
+# AS 事务库保留期与清理（contract §1.7.7）：与动态模块的保留期清理同一套约定。
+# 超过保留期的事务只清空原始请求体、保留墓碑（txn_id / 时间 / processed_at），
 # 因此重放语义不变、库仍会继续增长（墓碑永不删除）。
 DEFAULT_AS_TXN_RETENTION_DAYS = 90
 # 清理任务间隔（秒）：0 = 关闭；非 0 时至少 60 秒。

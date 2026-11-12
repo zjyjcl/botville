@@ -32,7 +32,7 @@
 | `system_prompt` | 是 | 人设指令正文（进入 **system/instructions 区**，不是数据区） |
 | `personality` | 否 | 追加的性格描述（同样属指令区） |
 | `model` | 否 | 该人设的模型名覆盖；缺省用 `GATEWAY_MODEL_NAME` |
-| `credential_ref` | 否 | 只接受 `env:NAME` 形式，调用时读 `os.environ[NAME]`；覆盖全局 `GATEWAY_MODEL_API_KEY`。**明文密钥/疑似密钥的字面量一律拒绝** |
+| `credential_ref` | 否 | 只接受 `env:NAME` 形式，调用时读 `os.environ[NAME]`；覆盖全局 `GATEWAY_MODEL_API_KEY`。任何其他值一律拒绝 |
 | `max_reply_chars` | 否 | 该人设单条回复上限（正整数，且不超过平台 `MAX_MESSAGE_CHARS`） |
 
 校验在**启动期**完成（`load_personas`）：文件读不到、JSON 非法、结构不对、

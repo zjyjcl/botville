@@ -42,8 +42,6 @@ DEFAULT_MODEL_TIMEOUT_SECONDS = 30
 
 # 瞬时失败的状态码：服务端错误 + 限流 + 请求超时。
 _TRANSIENT_STATUS = frozenset({408, 429})
-# 疑似明文密钥的字面量前缀（`sk-...` 等）——只用于**拒绝**这类配置，不用于日志。
-_KEY_LOOKING_PREFIXES = ("sk-", "sk_", "Bearer ")
 
 
 class ModelConfigError(ValueError):
@@ -274,14 +272,3 @@ def _drain(exc: urllib.error.HTTPError) -> None:
         exc.read()
     except Exception:  # noqa: BLE001 - 读错误体失败无关紧要
         pass
-
-
-def looks_like_plaintext_key(value: str) -> bool:
-    """值是否「看起来就是明文密钥」（用于配置/人设的拒绝规则）。
-
-    只做形状判断，不记录、不回显值。
-    """
-    if not isinstance(value, str):
-        return False
-    stripped = value.strip()
-    return any(stripped.startswith(prefix) for prefix in _KEY_LOOKING_PREFIXES)
