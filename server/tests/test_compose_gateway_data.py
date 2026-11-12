@@ -211,6 +211,12 @@ MODEL_KEYS = (
     "GATEWAY_MEMORY_DB_PATH",
     "GATEWAY_MEMORY_RETENTION_DAYS",
     "GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS",
+    "GATEWAY_MEMORY_SUMMARY_MODEL",
+    "GATEWAY_EMBEDDING_BASE_URL",
+    "GATEWAY_EMBEDDING_MODEL",
+    "GATEWAY_EMBEDDING_API_KEY",
+    "GATEWAY_EMBEDDING_DIM",
+    "GATEWAY_MEMORY_VECTOR_BACKEND",
 )
 
 
@@ -222,6 +228,13 @@ class GatewayMemoryEnvStaticTest(unittest.TestCase):
         "GATEWAY_MEMORY_DB_PATH": "",
         "GATEWAY_MEMORY_RETENTION_DAYS": "90",
         "GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS": "86400",
+        # B line PR3b (defaults as in config.py load_config).
+        "GATEWAY_MEMORY_SUMMARY_MODEL": "",
+        "GATEWAY_EMBEDDING_BASE_URL": "",
+        "GATEWAY_EMBEDDING_MODEL": "",
+        "GATEWAY_EMBEDDING_API_KEY": "",
+        "GATEWAY_EMBEDDING_DIM": "0",
+        "GATEWAY_MEMORY_VECTOR_BACKEND": "python",
     }
 
     def test_compose_passes_through_with_defaults(self):
@@ -242,13 +255,35 @@ class GatewayMemoryEnvStaticTest(unittest.TestCase):
             self.assertIn('"{}"'.format(key), src, key + " is not read by gateway/src")
         self.assertRegex(src, r"DEFAULT_MEMORY_RETENTION_DAYS\s*=\s*90\b")
         self.assertRegex(src, r"DEFAULT_MEMORY_PURGE_INTERVAL_SECONDS\s*=\s*86_?400\b")
+        # PR3b defaults, read straight from load_config's _env_* calls.
+        for key in ("GATEWAY_MEMORY_SUMMARY_MODEL", "GATEWAY_EMBEDDING_BASE_URL",
+                    "GATEWAY_EMBEDDING_MODEL", "GATEWAY_EMBEDDING_API_KEY"):
+            self.assertRegex(src, r'_env_str\(\s*source,\s*"{}",\s*""\s*\)'.format(key), key)
+        self.assertRegex(src, r'_env_int\(\s*source,\s*"GATEWAY_EMBEDDING_DIM",\s*0\b')
+        self.assertRegex(src, r'"GATEWAY_MEMORY_VECTOR_BACKEND",\s*"python"')
+        self.assertIn('MEMORY_VECTOR_BACKENDS = frozenset({"none", "python", "sqlite-vec"})', src)
+        # Empty summary model / embedding URL / key fall back to the chat model's.
+        self.assertRegex(src, r'"GATEWAY_MEMORY_SUMMARY_MODEL", ""\)\s*or _env_str\(source, "GATEWAY_MODEL_NAME"')
+        self.assertRegex(src, r'"GATEWAY_EMBEDDING_BASE_URL", ""\)\s*or _env_str\(source, "GATEWAY_MODEL_BASE_URL"')
+        self.assertRegex(src, r'"GATEWAY_EMBEDDING_API_KEY", ""\)\s*or _env_str\(source, "GATEWAY_MODEL_API_KEY"')
+
+    def test_ci_allowlist_and_docs_cover_all_names(self):
+        ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        doc = (REPO_ROOT / "docs" / "deploy" / "appservice.md").read_text(encoding="utf-8")
+        for key, default in self.EXPECTED.items():
+            self.assertIn('"{}": "{}",'.format(key, default), ci, key)
+            self.assertIn("`${{{0}:-{1}}}`".format(key, default), doc, key)
+        # The privacy warning is in the fallback table and the memory section.
+        self.assertGreaterEqual(doc.count("私聊正文会发给"), 1)
+        self.assertIn("隐私：配置了 `GATEWAY_EMBEDDING_MODEL` 之后", doc)
 
     def test_suggested_path_is_top_level_of_gateway_data(self):
-        """Backups checkpoint only TOP-LEVEL *.db of the volume."""
+        """The suggested path sits in the gateway-data volume, whose *.db files
+        (any depth) are checkpointed before the whole-volume tar."""
         text = COMPOSE.read_text(encoding="utf-8")
         self.assertIn("gateway-data:/var/lib/botville-gateway", text)
         lib = (REPO_ROOT / "server" / "scripts" / "lib.sh").read_text(encoding="utf-8")
-        self.assertIn("for db in /gateway-data/*.db; do", lib)
+        self.assertIn('find /gateway-data -type f -name "*.db"', lib)
         self.assertIn("tar -czf /backup/gateway-data.tar.gz -C /gateway-data .", lib)
 
 
@@ -291,6 +326,7 @@ class ComposeGatewayModelEnvTest(unittest.TestCase):
     interpolated from the env file only and never printed by `config --quiet`."""
 
     SENTINEL = "sentinel-model-key-must-not-print-0123456789"
+    EMB_SENTINEL = "sentinel-embedding-key-must-not-print-0123456789"
 
     def run_compose(self, *args, extra_env=""):
         with tempfile.TemporaryDirectory() as tmp:
@@ -325,6 +361,12 @@ class ComposeGatewayModelEnvTest(unittest.TestCase):
         self.assertEqual(env["GATEWAY_MEMORY_DB_PATH"] or "", "")
         self.assertEqual(env["GATEWAY_MEMORY_RETENTION_DAYS"], "90")
         self.assertEqual(env["GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS"], "86400")
+        # PR3b: empty = inherit / off; dim 0 = auto; backend python.
+        for key in ("GATEWAY_MEMORY_SUMMARY_MODEL", "GATEWAY_EMBEDDING_BASE_URL",
+                    "GATEWAY_EMBEDDING_MODEL", "GATEWAY_EMBEDDING_API_KEY"):
+            self.assertEqual(env[key] or "", "", key)
+        self.assertEqual(env["GATEWAY_EMBEDDING_DIM"], "0")
+        self.assertEqual(env["GATEWAY_MEMORY_VECTOR_BACKEND"], "python")
         binds = [v for v in svc["volumes"] if v["type"] == "bind"]
         self.assertEqual(len(binds), 1)
         self.assertEqual(binds[0]["target"], "/etc/botville-gateway")
@@ -335,14 +377,26 @@ class ComposeGatewayModelEnvTest(unittest.TestCase):
         env = self.gateway(extra_env=(
             "GATEWAY_MODEL_BASE_URL=http://model.invalid/v1\n"
             "GATEWAY_MODEL_NAME=test-model\n"
-            "GATEWAY_MODEL_API_KEY={}\n"
+            "GATEWAY_MODEL_API_KEY={0}\n"
             "GATEWAY_MODEL_TIMEOUT_SECONDS=12\n"
             "GATEWAY_PERSONAS_FILE=/etc/botville-gateway/personas.json\n"
             "GATEWAY_CONSUMER_ENABLED=true\n"
             "GATEWAY_MEMORY_DB_PATH=/var/lib/botville-gateway/memory.db\n"
             "GATEWAY_MEMORY_RETENTION_DAYS=30\n"
             "GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS=3600\n"
-        ).format(self.SENTINEL))["environment"]
+            "GATEWAY_MEMORY_SUMMARY_MODEL=summary-model\n"
+            "GATEWAY_EMBEDDING_BASE_URL=http://embed.invalid/v1\n"
+            "GATEWAY_EMBEDDING_MODEL=embed-model\n"
+            "GATEWAY_EMBEDDING_API_KEY={1}\n"
+            "GATEWAY_EMBEDDING_DIM=384\n"
+            "GATEWAY_MEMORY_VECTOR_BACKEND=sqlite-vec\n"
+        ).format(self.SENTINEL, self.EMB_SENTINEL))["environment"]
+        self.assertEqual(env["GATEWAY_MEMORY_SUMMARY_MODEL"], "summary-model")
+        self.assertEqual(env["GATEWAY_EMBEDDING_BASE_URL"], "http://embed.invalid/v1")
+        self.assertEqual(env["GATEWAY_EMBEDDING_MODEL"], "embed-model")
+        self.assertEqual(env["GATEWAY_EMBEDDING_API_KEY"], self.EMB_SENTINEL)
+        self.assertEqual(env["GATEWAY_EMBEDDING_DIM"], "384")
+        self.assertEqual(env["GATEWAY_MEMORY_VECTOR_BACKEND"], "sqlite-vec")
         self.assertEqual(env["GATEWAY_MODEL_BASE_URL"], "http://model.invalid/v1")
         self.assertEqual(env["GATEWAY_MODEL_NAME"], "test-model")
         self.assertEqual(env["GATEWAY_MODEL_API_KEY"], self.SENTINEL)
@@ -362,7 +416,8 @@ class ComposeGatewayModelEnvTest(unittest.TestCase):
     def test_quiet_config_never_prints_the_key(self):
         """CI and the docs only ever run `config --quiet` (non-quiet config
         interpolates values; documented as never-paste)."""
-        extra = "GATEWAY_MODEL_API_KEY={}\n".format(self.SENTINEL)
+        extra = "GATEWAY_MODEL_API_KEY={}\nGATEWAY_EMBEDDING_API_KEY={}\n".format(
+            self.SENTINEL, self.EMB_SENTINEL)
         for hs in ("synapse", "tuwunel", "continuwuity"):
             for profiles in ((), ("--profile", "push"), ("--profile", "gateway"),
                              ("--profile", "push", "--profile", "gateway")):
@@ -371,17 +426,20 @@ class ComposeGatewayModelEnvTest(unittest.TestCase):
                                             extra_env=extra)
                     self.assertEqual(proc.returncode, 0, "compose config --quiet failed")
                     self.assertNotIn(self.SENTINEL, proc.stdout + proc.stderr)
+                    self.assertNotIn(self.EMB_SENTINEL, proc.stdout + proc.stderr)
 
     def test_key_is_not_in_other_services(self):
         proc = self.run_compose("--profile", "synapse", "--profile", "push",
                                 "--profile", "gateway", "config", "--format", "json",
-                                extra_env="GATEWAY_MODEL_API_KEY={}\n".format(self.SENTINEL))
+                                extra_env="GATEWAY_MODEL_API_KEY={}\nGATEWAY_EMBEDDING_API_KEY={}\n".format(
+                                    self.SENTINEL, self.EMB_SENTINEL))
         self.assertEqual(proc.returncode, 0)
         services = json.loads(proc.stdout)["services"]
         for name, svc in services.items():
             if name == "gateway":
                 continue
             self.assertNotIn(self.SENTINEL, json.dumps(svc), name)
+            self.assertNotIn(self.EMB_SENTINEL, json.dumps(svc), name)
 
 
 class AppserviceRegistrationTemplateTest(unittest.TestCase):

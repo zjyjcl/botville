@@ -163,6 +163,7 @@ class MakefileModelKeyNotPrintedTest(unittest.TestCase):
     neither the echoed recipes nor `make -n` can print it."""
 
     SENTINEL = "sentinel-model-key-must-not-print-0123456789"
+    EMB_SENTINEL = "sentinel-embedding-key-must-not-print-0123456789"
 
     def test_dry_runs_never_contain_the_key(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -170,7 +171,9 @@ class MakefileModelKeyNotPrintedTest(unittest.TestCase):
             with open(env_file, "w", encoding="utf-8") as fh:
                 fh.write("COMPOSE_PROJECT_NAME=botville-dryrun\n")
                 fh.write("GATEWAY_MODEL_API_KEY={}\n".format(self.SENTINEL))
-            for target in ("up", "down", "ps", "logs", "gateway-hs-smoke"):
+                fh.write("GATEWAY_EMBEDDING_API_KEY={}\n".format(self.EMB_SENTINEL))
+            for target in ("up", "down", "ps", "logs", "gateway-hs-smoke", "config",
+                           "gateway-preflight"):
                 with self.subTest(target=target):
                     proc = subprocess.run(
                         ["make", "-n", "-C", str(REPO_ROOT), target, "GATEWAY=1",
@@ -179,7 +182,10 @@ class MakefileModelKeyNotPrintedTest(unittest.TestCase):
                     )
                     self.assertEqual(proc.returncode, 0, proc.stderr)
                     self.assertNotIn(self.SENTINEL, proc.stdout + proc.stderr)
-        self.assertNotIn("GATEWAY_MODEL_API_KEY", MAKEFILE.read_text(encoding="utf-8"))
+                    self.assertNotIn(self.EMB_SENTINEL, proc.stdout + proc.stderr)
+        makefile = MAKEFILE.read_text(encoding="utf-8")
+        self.assertNotIn("GATEWAY_MODEL_API_KEY", makefile)
+        self.assertNotIn("GATEWAY_EMBEDDING_API_KEY", makefile)
 
 
 if __name__ == "__main__":

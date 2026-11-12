@@ -8,11 +8,14 @@ EPIPE -- e.g. `tar: stdout: write error`, exit 2 -- depending on timing and
 entry order. That broke backup-restore (synapse) (#204). Write the producer's
 output to a file or variable and grep that instead (or read the whole stream).
 
-Early-exit consumers caught (any path prefix, e.g. /usr/bin/head):
-  - head (always);
-  - grep / egrep / fgrep / rg with -q / -m N / -mN / -l in any short-flag
-    cluster (`-E -q`, `-Eq`, `-qxF`, `-m1`, `-m 1`) or --quiet / --silent /
-    --max-count / --files-with-matches.
+Early-exit consumers caught (any path prefix, e.g. /usr/bin/head, and
+behind a multi-call wrapper: `busybox grep`, `toybox head` are checked as
+the applet that follows):
+  - head / ghead (always);
+  - grep / egrep / fgrep / rg and the GNU-prefixed ggrep / gegrep / gfgrep
+    with -q / -m N / -mN / -l in any short-flag cluster (`-E -q`, `-Eq`,
+    `-qxF`, `-m1`, `-m 1`) or --quiet / --silent / --max-count /
+    --files-with-matches.
 A consumer is the command right after a single `|` (not `||`), including the
 first command of a line whose previous line ends in `|`.
 
@@ -41,7 +44,10 @@ DOCS = sorted((REPO_ROOT / "docs").rglob("*.md")) + [REPO_ROOT / "server" / "REA
 ALLOWED = {}
 
 PIPE_SPLIT = re.compile(r"(?<!\|)\|(?!\|)")
-GREP_LIKE = {"grep", "egrep", "fgrep", "rg"}
+GREP_LIKE = {"grep", "egrep", "fgrep", "rg", "ggrep", "gegrep", "gfgrep"}
+HEAD_LIKE = {"head", "ghead"}
+# Multi-call binaries: the applet name follows.
+WRAPPERS = {"busybox", "toybox"}
 LONG_EARLY = ("--quiet", "--silent", "--max-count", "--files-with-matches")
 SEGMENT_END = re.compile(r"[;&)`]|\|\|")
 
@@ -54,7 +60,10 @@ def _consumer_is_early_exit(segment):
     if not tokens:
         return False
     name = tokens[0].strip("\"'").rsplit("/", 1)[-1]
-    if name == "head":
+    while name in WRAPPERS and len(tokens) > 1:
+        tokens.pop(0)
+        name = tokens[0].strip("\"'").rsplit("/", 1)[-1]
+    if name in HEAD_LIKE:
         return True
     if name not in GREP_LIKE:
         return False
@@ -132,6 +141,18 @@ class NoEarlyExitPipesTest(unittest.TestCase):
             "a | LC_ALL=C grep -q foo",
             "a | sort | head -n 3",
             "x=$(a | grep -q y)",
+            "tar -tzf x | busybox grep -q foo",
+            "tar -tzf x | /bin/busybox grep -qx foo",
+            "tar -tzf x | busybox grep -E -q foo",
+            "tar -tzf x | busybox grep -m1 foo",
+            "tar -tzf x | busybox head -n 1",
+            "tar -tzf x | toybox head -1",
+            "tar -tzf x | ggrep -q foo",
+            "tar -tzf x | ggrep -Eq foo",
+            "tar -tzf x | /opt/homebrew/bin/ggrep --quiet foo",
+            "tar -tzf x | gegrep -q foo",
+            "tar -tzf x | gfgrep -m 1 foo",
+            "tar -tzf x | ghead -n1",
         )
         for line in bad:
             with self.subTest(line=line):
@@ -150,6 +171,10 @@ class NoEarlyExitPipesTest(unittest.TestCase):
             "a | sort -u",
             "a | grep -v foo | grep -c bar",
             "printf x | sha256sum",
+            "a | busybox grep -i proxy",
+            "a | ggrep -v foo",
+            "a | busybox tail -n 1",
+            "a | busybox wc -l",
         )
         for line in good:
             with self.subTest(line=line):

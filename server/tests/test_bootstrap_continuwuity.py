@@ -467,6 +467,12 @@ class InitScriptTest(unittest.TestCase):
         "GATEWAY_MEMORY_DB_PATH=\n"
         "GATEWAY_MEMORY_RETENTION_DAYS=90\n"
         "GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS=86400\n"
+        "GATEWAY_MEMORY_SUMMARY_MODEL=\n"
+        "GATEWAY_EMBEDDING_BASE_URL=\n"
+        "GATEWAY_EMBEDDING_MODEL=\n"
+        "GATEWAY_EMBEDDING_API_KEY=\n"
+        "GATEWAY_EMBEDDING_DIM=0\n"
+        "GATEWAY_MEMORY_VECTOR_BACKEND=python\n"
     )
 
     def test_model_env_is_passed_through_never_generated_or_printed(self):
@@ -486,16 +492,26 @@ class InitScriptTest(unittest.TestCase):
         self.assertEqual(self.env_value("GATEWAY_MEMORY_DB_PATH"), "")
         self.assertEqual(self.env_value("GATEWAY_MEMORY_RETENTION_DAYS"), "90")
         self.assertEqual(self.env_value("GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS"), "86400")
+        for key in ("GATEWAY_MEMORY_SUMMARY_MODEL", "GATEWAY_EMBEDDING_BASE_URL",
+                    "GATEWAY_EMBEDDING_MODEL", "GATEWAY_EMBEDDING_API_KEY"):
+            self.assertEqual(self.env_value(key), "", key)
+        self.assertEqual(self.env_value("GATEWAY_EMBEDDING_DIM"), "0")
+        self.assertEqual(self.env_value("GATEWAY_MEMORY_VECTOR_BACKEND"), "python")
 
         sentinel = "sentinel-model-key-must-not-print-0123456789"
+        emb_sentinel = "sentinel-embedding-key-must-not-print-0123456789"
         content = self.env_file.read_text(encoding="utf-8")
         content = content.replace("GATEWAY_MODEL_API_KEY=\n",
                                   "GATEWAY_MODEL_API_KEY={}\n".format(sentinel))
+        content = content.replace("GATEWAY_EMBEDDING_API_KEY=\n",
+                                  "GATEWAY_EMBEDDING_API_KEY={}\n".format(emb_sentinel))
         self.env_file.write_text(content, encoding="utf-8")
         proc = self.run_init()
         self.assertEqual(proc.returncode, 0, "init.sh failed")
         self.assertNotIn(sentinel, proc.stdout + proc.stderr)
+        self.assertNotIn(emb_sentinel, proc.stdout + proc.stderr)
         self.assertEqual(self.env_value("GATEWAY_MODEL_API_KEY"), sentinel)
+        self.assertEqual(self.env_value("GATEWAY_EMBEDDING_API_KEY"), emb_sentinel)
 
         # An existing .env without the block gets the keys appended (names
         # only in the message) and the key stays empty.
@@ -508,6 +524,8 @@ class InitScriptTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, "init.sh failed")
         self.assertIn("GATEWAY_MODEL_API_KEY", proc.stdout)
         self.assertEqual(self.env_value("GATEWAY_MODEL_API_KEY"), "")
+        self.assertIn("GATEWAY_EMBEDDING_API_KEY", proc.stdout)
+        self.assertEqual(self.env_value("GATEWAY_EMBEDDING_API_KEY"), "")
 
     def test_generated_dir_is_private(self):
         proc = self.run_init()

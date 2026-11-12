@@ -97,8 +97,12 @@ class GatewayPreflightTest(unittest.TestCase):
 
     def test_never_prints_other_env_values(self):
         sentinel = "sentinel-model-key-must-not-print-0123456789"
-        proc = run("GATEWAY_MODEL_API_KEY={}\nBOTVILLE_GATEWAY_PERSONAS_DIR=/nonexistent/x\n".format(sentinel))
-        self.assertNotIn(sentinel, proc.stdout + proc.stderr)
+        emb = "sentinel-embedding-key-must-not-print-0123456789"
+        for tail in ("BOTVILLE_GATEWAY_PERSONAS_DIR=/nonexistent/x\n", ""):
+            proc = run("GATEWAY_MODEL_API_KEY={}\nGATEWAY_EMBEDDING_API_KEY={}\n{}".format(
+                sentinel, emb, tail))
+            self.assertNotIn(sentinel, proc.stdout + proc.stderr)
+            self.assertNotIn(emb, proc.stdout + proc.stderr)
 
 
 class MakefileWiresPreflightTest(unittest.TestCase):
@@ -140,6 +144,82 @@ class MakefileWiresPreflightTest(unittest.TestCase):
             self.assertFalse(missing.exists())
             self.assertEqual(list(Path(tmp).iterdir()), [])
 
+
+
+def compose_available():
+    try:
+        proc = subprocess.run(["docker", "compose", "version"], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", "node_modules", ".build", "DerivedData"}
+
+
+def snapshot(*roots):
+    """{path: (size, mtime_ns, mode)} of every file/dir under roots (VCS and
+    bytecode caches excluded), plus each root itself."""
+    state = {}
+    for root in roots:
+        root = Path(root)
+        st = root.stat()
+        state[str(root)] = (None, st.st_mtime_ns, st.st_mode)
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            for name in dirnames + filenames:
+                full = os.path.join(dirpath, name)
+                try:
+                    st = os.lstat(full)
+                except FileNotFoundError:
+                    continue
+                state[full] = (st.st_size if not os.path.isdir(full) else None,
+                               st.st_mtime_ns, st.st_mode)
+    return state
+
+
+@unittest.skipUnless(compose_available(), "docker compose v2 not available")
+class ConfigAndPreflightWriteNothingE2ETest(unittest.TestCase):
+    """#206 nit: with the real docker compose, `make config` and
+    gateway-preflight.sh leave the working tree (and the env file's directory)
+    byte-for-byte unchanged: no init.sh, no .env append, no generated/."""
+
+    def diff(self, before, after):
+        added = sorted(set(after) - set(before))
+        removed = sorted(set(before) - set(after))
+        changed = sorted(k for k in set(before) & set(after) if before[k] != after[k])
+        return added, removed, changed
+
+    def test_make_config_and_preflight_write_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / "env"
+            example = REPO_ROOT / "server" / "compose" / ".env.example"
+            env_file.write_text(example.read_text(encoding="utf-8")
+                                + "COMPOSE_PROJECT_NAME=botville-nowrite\n", encoding="utf-8")
+            os.chmod(env_file, 0o600)
+            before = snapshot(REPO_ROOT, tmp)
+            for cmd in (
+                ["make", "-s", "-C", str(REPO_ROOT), "config", "ENV_FILE={}".format(env_file),
+                 "PROJECT=botville-nowrite"],
+                ["make", "-s", "-C", str(REPO_ROOT), "gateway-preflight",
+                 "ENV_FILE={}".format(env_file)],
+                ["bash", str(SCRIPT), str(env_file)],
+            ):
+                with self.subTest(cmd=cmd[3] if cmd[0] == "make" else "preflight"):
+                    proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True,
+                                          text=True, timeout=180)
+                    self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+            after = snapshot(REPO_ROOT, tmp)
+            added, removed, changed = self.diff(before, after)
+            self.assertEqual((added, removed, changed), ([], [], []),
+                             "make config / preflight touched the disk")
+            # Nothing was created in docker either.
+            vols = subprocess.run(
+                ["docker", "volume", "ls", "-q", "--filter",
+                 "label=com.docker.compose.project=botville-nowrite"],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+            self.assertEqual(vols.stdout.strip(), "")
 
 if __name__ == "__main__":
     unittest.main()

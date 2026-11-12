@@ -652,20 +652,22 @@ jobs:
             -f server/compose/federation/docker-compose.federation.yml \
             --env-file server/compose/federation/generated/federation.env config --quiet
 
-      - name: Gateway model API key is never printed by compose config --quiet
+      - name: Gateway model / embedding API keys are never printed by compose config --quiet
         run: |
           set -euo pipefail
-          # A sentinel (not a real key) stands in for GATEWAY_MODEL_API_KEY;
-          # none of the config --quiet runs (every HS x profile combination)
-          # may print it. Non-quiet `config` interpolates values and is never
-          # used in CI or the docs.
+          # Sentinels (not real keys) stand in for GATEWAY_MODEL_API_KEY and
+          # GATEWAY_EMBEDDING_API_KEY; none of the config --quiet runs (every
+          # HS x profile combination) may print either. Non-quiet `config`
+          # interpolates values and is never used in CI or the docs.
           sentinel="ci-model-key-sentinel-not-a-secret"
+          emb_sentinel="ci-embedding-key-sentinel-not-a-secret"
           env_copy="$(mktemp)"
           log="$(mktemp)"
           # Remove both temp files on every exit path (failure included).
           trap 'rm -f "${env_copy}" "${log}"' EXIT
           cp server/compose/.env "${env_copy}"
           echo "GATEWAY_MODEL_API_KEY=${sentinel}" >> "${env_copy}"
+          echo "GATEWAY_EMBEDDING_API_KEY=${emb_sentinel}" >> "${env_copy}"
           for hs in synapse tuwunel continuwuity; do
             for extra in "" "--profile push" "--profile gateway" "--profile push --profile gateway"; do
               # shellcheck disable=SC2086
@@ -677,7 +679,11 @@ jobs:
             echo "::error::compose config --quiet printed GATEWAY_MODEL_API_KEY"
             exit 1
           fi
-          echo "GATEWAY_MODEL_API_KEY not printed (12 combinations)"
+          if grep -qF "${emb_sentinel}" "${log}"; then
+            echo "::error::compose config --quiet printed GATEWAY_EMBEDDING_API_KEY"
+            exit 1
+          fi
+          echo "GATEWAY_MODEL_API_KEY / GATEWAY_EMBEDDING_API_KEY not printed (12 combinations)"
 
       - name: .env.example contains placeholders only
         run: |
@@ -758,6 +764,14 @@ jobs:
               "GATEWAY_MEMORY_DB_PATH": "",
               "GATEWAY_MEMORY_RETENTION_DAYS": "90",
               "GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS": "86400",
+              # Idle memory upkeep (B line PR3b); the embedding key is a
+              # deployer-supplied secret and must never ship a value.
+              "GATEWAY_MEMORY_SUMMARY_MODEL": "",
+              "GATEWAY_EMBEDDING_BASE_URL": "",
+              "GATEWAY_EMBEDDING_MODEL": "",
+              "GATEWAY_EMBEDDING_API_KEY": "",
+              "GATEWAY_EMBEDDING_DIM": "0",
+              "GATEWAY_MEMORY_VECTOR_BACKEND": "python",
               "POSTGRES_IMAGE": "docker.io/library/postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab",
               "SYNAPSE_IMAGE": "docker.io/matrixdotorg/synapse:v1.164.1@sha256:fa4aa980f279bcf26d4e7ecc2a2c9a701c73f2ebe8841da9bdcf3b2fdf693d75",
               "TUWUNEL_IMAGE": "ghcr.io/matrix-construct/tuwunel:v1.9.4@sha256:0e86c6164d6c9f5b60291938eb61ad8395021c37fe58d47a963ea7edddbedaec",

@@ -309,8 +309,10 @@ services:
     #     records and stays silent. GATEWAY_MODEL_API_KEY is a secret: never
     #     paste `docker compose config` output (it interpolates values); use
     #     `config --quiet`. See docs/deploy/appservice.md.
-    #   - Memory (B line PR3a): GATEWAY_MEMORY_* pass through the same way;
-    #     the db path defaults to empty (memory off).
+    #   - Memory (B line PR3a/PR3b): GATEWAY_MEMORY_* / GATEWAY_EMBEDDING_*
+    #     pass through the same way; the db path defaults to empty (memory
+    #     off), the embedding model to empty (vector recall off).
+    #     GATEWAY_EMBEDDING_API_KEY is a secret (same rules as the model key).
     #   - Personas: ./gateway-personas (BOTVILLE_GATEWAY_PERSONAS_DIR) is
     #     always bind-mounted read-only at /etc/botville-gateway. The repo
     #     ships that directory with only README + personas.example.json (real
@@ -361,11 +363,26 @@ services:
       # Four-layer memory (B line PR3a). Empty path = memory off (PR2 ring
       # buffer). To enable, keep it at the TOP LEVEL of the gateway-data
       # volume, e.g. /var/lib/botville-gateway/memory.db: backups checkpoint
-      # top-level *.db and archive the whole volume. The gateway creates it
-      # 0600 (it holds chat text: treat backups as sensitive).
+      # every *.db in the volume and archive all of it; restore forces SQLite
+      # files back to 0600. The gateway creates it 0600 (it holds chat text:
+      # treat backups as sensitive).
       GATEWAY_MEMORY_DB_PATH: ${GATEWAY_MEMORY_DB_PATH:-}
       GATEWAY_MEMORY_RETENTION_DAYS: ${GATEWAY_MEMORY_RETENTION_DAYS:-90}
       GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS: ${GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS:-86400}
+      # Idle memory upkeep (B line PR3b). Defaults mirror gateway/src
+      # config.py: empty summary model = GATEWAY_MODEL_NAME; empty embedding
+      # base URL / key = the chat model's; empty embedding model = layer 4
+      # (vector recall) off; dim 0 = auto-detect; backend python
+      # (none|python|sqlite-vec). PRIVACY: with an embedding model set, chat
+      # text (private chats included) goes to the embedding provider -- the
+      # same provider as the chat model when the base URL is inherited.
+      # GATEWAY_EMBEDDING_API_KEY is a secret like GATEWAY_MODEL_API_KEY.
+      GATEWAY_MEMORY_SUMMARY_MODEL: ${GATEWAY_MEMORY_SUMMARY_MODEL:-}
+      GATEWAY_EMBEDDING_BASE_URL: ${GATEWAY_EMBEDDING_BASE_URL:-}
+      GATEWAY_EMBEDDING_MODEL: ${GATEWAY_EMBEDDING_MODEL:-}
+      GATEWAY_EMBEDDING_API_KEY: ${GATEWAY_EMBEDDING_API_KEY:-}
+      GATEWAY_EMBEDDING_DIM: ${GATEWAY_EMBEDDING_DIM:-0}
+      GATEWAY_MEMORY_VECTOR_BACKEND: ${GATEWAY_MEMORY_VECTOR_BACKEND:-python}
     ports:
       - "127.0.0.1:${BOTVILLE_GATEWAY_PORT:-8020}:8080"
     volumes:

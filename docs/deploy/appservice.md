@@ -158,8 +158,8 @@ sender → **400 `request.invalid`**；房间别名不存在 → **404
   - 收到的事务（原始 JSON，按 txnId 幂等）存进
     `GATEWAY_AS_TXN_DB_PATH=/var/lib/botville-gateway/as_transactions.db`，
     在 `gateway-data` 卷顶层，和 `moments.db` 一样随 `make backup`（synapse）/
-    `make backup-gateway`（tuwunel、continuwuity）整卷备份，备份前对顶层
-    `*.db` 做 WAL checkpoint；恢复同理。`GATEWAY_AS_MAX_BODY_BYTES` 用默认 16 MiB。
+    `make backup-gateway`（tuwunel、continuwuity）整卷备份，备份前对卷内
+    所有 `*.db` 做 WAL checkpoint；恢复同理（SQLite 文件恢复为 0600）。`GATEWAY_AS_MAX_BODY_BYTES` 用默认 16 MiB。
     **HS 与 gateway-data 要成对恢复**：txnId 是 HS 按自己的库分配的，HS 被清空重建
     后会从头编号；这时只恢复 gateway-data，新事务的 txnId 会撞上库里的旧 txnId，
     网关按幂等直接回 200 而不落库（数据不会坏，但新事件被当成已收到）。生产上
@@ -197,7 +197,7 @@ sender → **400 `request.invalid`**；房间别名不存在 → **404
     | `GATEWAY_AS_TOKEN` | `${APPSERVICE_AS_TOKEN:-}` | 空（appservice 模式会拒绝启动） |
     | `GATEWAY_HS_TOKEN` | `${APPSERVICE_HS_TOKEN:-}` | 空（AS 回调一律 403） |
     | `GATEWAY_AS_TXN_DB_PATH` | 固定 | `/var/lib/botville-gateway/as_transactions.db` |
-    | `GATEWAY_MODEL_*` / `GATEWAY_PERSONAS_FILE` / `GATEWAY_CONSUMER_ENABLED` / `GATEWAY_MEMORY_*` | 透传 | 见[角色引擎](#角色引擎模型与人设)的回退值表 |
+    | `GATEWAY_MODEL_*` / `GATEWAY_PERSONAS_FILE` / `GATEWAY_CONSUMER_ENABLED` / `GATEWAY_MEMORY_*` / `GATEWAY_EMBEDDING_*` | 透传 | 见[角色引擎](#角色引擎模型与人设)的回退值表 |
 
   - **只通过 `make up` 重建网关**：`BOTVILLE_HOMESERVER` / `GATEWAY_MATRIX_TRANSPORT`
     只在 `make up` 里导出（`HS=` 可能与 `.env` 不同），注册 url 也只在
@@ -248,18 +248,34 @@ B 线 PR2（角色引擎回复）读的变量，compose 原样透传给 `gateway
 | `GATEWAY_MEMORY_DB_PATH` | `${GATEWAY_MEMORY_DB_PATH:-}` | 空 | 记忆库（B 线 PR3a）；空 = 关闭记忆，只用进程内最近对话。启用写 `/var/lib/botville-gateway/memory.db` |
 | `GATEWAY_MEMORY_RETENTION_DAYS` | `${GATEWAY_MEMORY_RETENTION_DAYS:-90}` | `90` | 记忆保留天数，≥1；置顶不过期 |
 | `GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS` | `${GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS:-86400}` | `86400` | 过期清理间隔（秒）；0 = 不清理，非 0 必须 ≥60 |
+| `GATEWAY_MEMORY_SUMMARY_MODEL` | `${GATEWAY_MEMORY_SUMMARY_MODEL:-}` | 空 → 用 `GATEWAY_MODEL_NAME` | 空闲滚动摘要 / 事实抽取用的模型名（B 线 PR3b）；只在模型已配置时启用 |
+| `GATEWAY_EMBEDDING_BASE_URL` | `${GATEWAY_EMBEDDING_BASE_URL:-}` | 空 → 用 `GATEWAY_MODEL_BASE_URL` | embeddings 接口地址。⚠️ **配置 embedding 后，私聊正文会发给这家 embedding 服务商；留空沿用模型端点时，就是发给聊天模型的同一家** |
+| `GATEWAY_EMBEDDING_MODEL` | `${GATEWAY_EMBEDDING_MODEL:-}` | 空 = 关闭第④层（向量召回） | embedding 模型名；设了它，聊天正文（含私聊）才会送去做 embedding |
+| `GATEWAY_EMBEDDING_API_KEY` | `${GATEWAY_EMBEDDING_API_KEY:-}` | 空 → 用 `GATEWAY_MODEL_API_KEY` | **密钥**，规则同 `GATEWAY_MODEL_API_KEY`：只写在部署方自己的 `server/compose/.env` |
+| `GATEWAY_EMBEDDING_DIM` | `${GATEWAY_EMBEDDING_DIM:-0}` | `0` = 自动探测 | 正整数要求响应维度一致；负数拒绝启动 |
+| `GATEWAY_MEMORY_VECTOR_BACKEND` | `${GATEWAY_MEMORY_VECTOR_BACKEND:-python}` | `python` | `none` / `python` / `sqlite-vec`（扩展加载不了时回退 python）；其他值拒绝启动 |
 | `BOTVILLE_GATEWAY_PERSONAS_DIR` | 挂载源 `${BOTVILLE_GATEWAY_PERSONAS_DIR:-./gateway-personas}` | `server/compose/gateway-personas` | 只读挂到容器 `/etc/botville-gateway` |
 
-**记忆库（B 线 PR3a）**
+**记忆库（B 线 PR3a / PR3b）**
+
+> ⚠️ **隐私：配置了 `GATEWAY_EMBEDDING_MODEL` 之后，聊天正文（包括私聊）会发给
+> embedding 服务商。** `GATEWAY_EMBEDDING_BASE_URL` 留空时沿用 `GATEWAY_MODEL_BASE_URL`，
+> 也就是发给聊天模型的**同一家**；单独填写则发给那一家。空闲整理（滚动摘要、事实抽取，
+> `GATEWAY_MEMORY_SUMMARY_MODEL`，空则用 `GATEWAY_MODEL_NAME`）同样把聊天内容发给模型
+> 服务商。不想让正文出本机，就保持 `GATEWAY_EMBEDDING_MODEL` 为空（第④层关闭）。
 
 - `GATEWAY_MEMORY_DB_PATH` 默认空 = 记忆关闭（引擎只用进程内最近对话）。启用时写
   `/var/lib/botville-gateway/memory.db`：放在 gateway-data 卷**顶层**，和
-  `moments.db` / `as_transactions.db` 一样，`make backup` 先对顶层 `*.db` 做 WAL
-  checkpoint 再打包整个卷，`make restore` 整卷恢复。放进子目录也会被打包，但不会先
-  checkpoint（WAL 里的内容仍随 `-wal` 文件一起进包），所以建议顶层。
+  `moments.db` / `as_transactions.db` 一样。`make backup` 先对卷内所有 `*.db`（子目录
+  也算）做 WAL checkpoint 再打包整个卷，`make restore` 整卷恢复；建议仍放顶层，路径简单。
 - 网关以 **0600** 创建这个文件；里面是聊天内容和长期档案，备份包同样只能本人可读
-  （备份脚本已 chmod 600）。
+  （备份脚本已 chmod 600）。恢复时卷内所有 SQLite 文件（`*.db` 和 `-wal`/`-shm`，
+  任意深度）都会显式 `chmod 600`，旧备份里权限宽松的文件也不例外。
 - 保留期与清理间隔不合法（保留天数 <1、清理间隔非 0 且 <60）时网关拒绝启动。
+- PR3b 变量：`GATEWAY_EMBEDDING_API_KEY` 是密钥，和模型 key 一样只放本地 `.env`，
+  不要贴 `docker compose config` 的输出（CI 用哨兵值验证 `config --quiet` 不会打印它）；
+  `GATEWAY_EMBEDDING_DIM` 负数、`GATEWAY_MEMORY_VECTOR_BACKEND` 不在
+  `none|python|sqlite-vec` 内、设了 embedding 模型却没有可用的 http(s) 地址时，网关拒绝启动。
 
 **人设文件（只读挂载）**
 

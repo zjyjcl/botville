@@ -172,21 +172,24 @@ gateway_running_containers() {
 }
 
 # Shell run inside the one-off container by archive_gateway_data. Before tar,
-# best-effort WAL checkpoint of TOP-LEVEL /gateway-data/*.db only (not
-# recursive; the agreed path is /var/lib/botville-gateway/moments.db at the
-# volume root) with the sqlite3 CLI if present, else python3's sqlite3
-# module (the gateway and synapse images both ship python3). Any -wal/-shm
-# left behind is chowned back to the db's owner so the non-root gateway can
-# reopen it. Then a full-volume tar (everything under the root, not only
+# best-effort WAL checkpoint of EVERY *.db in the volume, subdirectories
+# included (the gateway's SQLite files -- moments.db, as_transactions.db,
+# memory.db -- sit at the volume root, but a deployer may point a path at a
+# subdirectory; the gateway container is stopped meanwhile, so nothing else
+# holds them open). Uses the sqlite3 CLI if present, else python3's sqlite3
+# module (the gateway and synapse images both ship python3). `find | while
+# read` reads the whole list (no early-exit consumer). Any -wal/-shm left
+# behind is chowned back to the db's owner so the non-root gateway can reopen
+# it. Then a full-volume tar (everything under the root, not only
 # .db/-wal/-shm), chowned to the invoking user and chmod 600 inside the
 # container (it runs as root; a host-side chmod would fail).
 # shellcheck disable=SC2016  # expands inside the container shell
-GATEWAY_ARCHIVE_SH='for db in /gateway-data/*.db; do
+GATEWAY_ARCHIVE_SH='find /gateway-data -type f -name "*.db" | while IFS= read -r db; do
     [ -f "$db" ] || continue
     if command -v sqlite3 >/dev/null 2>&1; then
-        sqlite3 "$db" "PRAGMA wal_checkpoint(TRUNCATE);" || true
+        sqlite3 "$db" "PRAGMA wal_checkpoint(TRUNCATE);" </dev/null || true
     elif command -v python3 >/dev/null 2>&1; then
-        python3 -c "import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute(\"PRAGMA wal_checkpoint(TRUNCATE)\"); c.close()" "$db" || true
+        python3 -c "import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute(\"PRAGMA wal_checkpoint(TRUNCATE)\"); c.close()" "$db" </dev/null || true
     fi
     for side in "$db-wal" "$db-shm"; do
         [ -e "$side" ] && chown "$(stat -c %u:%g "$db")" "$side" || true
@@ -197,9 +200,13 @@ chown "$HOST_UID:$HOST_GID" /backup/gateway-data.tar.gz
 chmod 600 /backup/gateway-data.tar.gz'
 
 # Shell run inside the one-off container by restore_gateway_data: empty the
-# volume root, extract, then hand everything to the gateway's uid.
+# volume root, extract, hand everything to the gateway's uid, then force every
+# SQLite file (*.db and its -wal/-shm, any depth: memory.db, moments.db,
+# as_transactions.db, ...) to 0600 -- they hold chat text, profiles and
+# transactions, and the gateway is their only reader. Explicit, so a backup
+# taken from an older/looser volume cannot restore world-readable files.
 # shellcheck disable=SC2016  # expands inside the container shell
-GATEWAY_RESTORE_SH='cd /gateway-data && find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + && tar -xzf /backup/gateway-data.tar.gz && chown -R "$GATEWAY_UID:$GATEWAY_UID" /gateway-data'
+GATEWAY_RESTORE_SH='cd /gateway-data && find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + && tar -xzf /backup/gateway-data.tar.gz && chown -R "$GATEWAY_UID:$GATEWAY_UID" /gateway-data && find /gateway-data -type f \( -name "*.db" -o -name "*.db-wal" -o -name "*.db-shm" \) -exec chmod 600 {} +'
 
 # archive_gateway_data <backup_dir> <runner_service>
 # Writes <backup_dir>/gateway-data.tar.gz from the existing gateway-data
