@@ -461,11 +461,12 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         认证失败也要调用：先完成认证再解析/消费 body，但 body 仍须被读出，
         否则同一连接上的后续字节会被当成新请求行。
         """
-        length = self._as_content_length()
-        if length is None:
+        length, framing_error = self._as_content_length()
+        if framing_error:
             self.close_connection = True
             return
-        if length <= 0:
+        if length is None or length <= 0:
+            # 头部缺失：没有可读的正文；0 同理。
             return
         if length > self.server.config.as_max_body_bytes:  # type: ignore[attr-defined]
             # 不读超大 body；直接关闭连接（HTTP/1.0 下本就逐请求关闭）。
@@ -476,19 +477,33 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             self.close_connection = True
 
-    def _as_content_length(self) -> Optional[int]:
-        """解析 Content-Length；非法/不支持 chunked → None。"""
+    def _as_content_length(self) -> Tuple[Optional[int], bool]:
+        """解析 Content-Length。返回 `(length, framing_error)`。
+
+        - 头部**缺失** → `(None, False)`：这里不判定对错，由各端点决定
+          （ping 的空体合法；transactions 的空体不是可解析 JSON → 调用方报
+          `M_NOT_JSON`）。
+        - 非法 framing（chunked 等非 identity 的 Transfer-Encoding、非整数、
+          负数）→ `(None, True)`，调用方统一按 `400 M_NOT_JSON` 处理。
+        - 合法 → `(length, False)`，`length` 可能是 0（空体）。
+        """
         transfer_encoding = (self.headers.get("Transfer-Encoding") or "").strip().lower()
         if transfer_encoding and transfer_encoding != "identity":
-            return None
-        raw = (self.headers.get("Content-Length") or "0").strip() or "0"
+            return None, True
+        raw = self.headers.get("Content-Length")
+        if raw is None:
+            return None, False
+        raw = raw.strip()
+        if not raw:
+            # 头部存在但为空：不是合法的 Content-Length。
+            return None, True
         try:
             length = int(raw)
         except ValueError:
-            return None
+            return None, True
         if length < 0:
-            return None
-        return length
+            return None, True
+        return length, False
 
     def _as_auth_ok(self) -> bool:
         """校验 `Authorization: Bearer <hs_token>`（只认表头，不认查询参数）。
@@ -518,7 +533,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             return False
         return True
 
-    def _read_as_body(self) -> Tuple[Optional[bytes], Optional[Tuple[int, str, str]]]:
+    def _read_as_body(
+        self, *, allow_empty: bool = False
+    ) -> Tuple[Optional[bytes], Optional[Tuple[int, str, str]]]:
         """读取 AS 回调请求体。返回 (raw, error)；error 为 (status, errcode, error)。
 
         Body 上限用 `GATEWAY_AS_MAX_BODY_BYTES`（与 /v1 的 1 MiB 独立）。
@@ -527,10 +544,24 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         返回 400 `M_NOT_JSON`：按 Matrix 规范，`M_NOT_JSON` 表示「请求体不是
         合法 JSON / 无法解析」，而 `M_BAD_JSON` 只用于「JSON 合法但结构不对」。
         读不出来的体自然属于前者。
+
+        `allow_empty=False`（transactions）：**缺失 `Content-Length` 或空体**
+        （`Content-Length: 0` / 纯空白）都不是可解析的 JSON → 400 `M_NOT_JSON`。
+        `allow_empty=True`（ping）：空体合法，返回 `b""` 交给调用方按可选体处理。
         """
-        length = self._as_content_length()
-        if length is None:
+        length, framing_error = self._as_content_length()
+        if framing_error:
             return None, (400, "M_NOT_JSON", "unreadable request body framing")
+        if length is None:
+            # 头部缺失：没有声明正文。transactions 必须带 JSON 体 → framing 错误；
+            # ping 的正文可选 → 视为空体。
+            if allow_empty:
+                return b"", None
+            return None, (
+                400,
+                "M_NOT_JSON",
+                "missing Content-Length: transaction body must be JSON",
+            )
         limit = self.server.config.as_max_body_bytes  # type: ignore[attr-defined]
         if length > limit:
             self.close_connection = True
@@ -540,10 +571,16 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 f"request body exceeds {limit} bytes",
             )
         if length == 0:
-            return b"", None
+            # transactions：空体不是可解析 JSON（不是「结构不对」）→ M_NOT_JSON。
+            if allow_empty:
+                return b"", None
+            return None, (400, "M_NOT_JSON", "request body is empty")
         raw = self.rfile.read(length)
         if len(raw) != length:
             return None, (400, "M_NOT_JSON", "incomplete request body")
+        if not allow_empty and not raw.strip():
+            # 纯空白体同样不是可解析 JSON（与 Content-Length: 0 同码）。
+            return None, (400, "M_NOT_JSON", "request body is empty")
         return raw, None
 
     @staticmethod
@@ -661,7 +698,8 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         """`POST /_matrix/app/v1/ping`：认证 → 可选 transaction_id → 200 {}。"""
         if not self._as_auth_ok():
             return
-        raw, err = self._read_as_body()
+        # ping 的正文可选：缺失 Content-Length / 空体都按 200 处理（见 §1.7.5）。
+        raw, err = self._read_as_body(allow_empty=True)
         if err is not None:
             self._send_matrix_error(*err)
             return

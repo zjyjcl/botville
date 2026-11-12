@@ -44,6 +44,8 @@ from .timeutil import iso_utc, utcnow
 _log = logging.getLogger(__name__)
 
 # 清理任务的最小间隔（秒）：与 moments 保留期清理一致（0 = 关闭）。
+# **唯一定义处**：`config.py` 从这里 import 后再做环境变量校验，避免两处各写
+# 一份常量而漂移（本模块不 import config，无循环依赖）。
 AS_TXN_PURGE_INTERVAL_MIN_SECONDS = 60
 
 # DDL：txn_id 主键保证幂等；body 保存原始 JSON 文本（清理后为空串）；
@@ -58,6 +60,15 @@ CREATE TABLE IF NOT EXISTS as_transactions (
 );
 """
 
+# 清理查询（`WHERE received_at < ? AND purged_at IS NULL`）的**部分索引**：
+# 只索引尚未清理的行，规模随保留窗口而不是随库总行数增长（墓碑不参与）。
+# `CREATE INDEX IF NOT EXISTS` 是幂等的加法迁移：新库与 #192/#194 时期的旧库
+# 走同一条 `_migrate` 路径都能补上。SQLite 3.8+ 支持 partial index。
+_PURGE_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_as_transactions_purge
+    ON as_transactions(received_at) WHERE purged_at IS NULL;
+"""
+
 # 内存库 / URI 形式不是真实文件，跳过 0600 预建。
 _NON_FILE_DB_PREFIXES = (":memory:", "file:")
 
@@ -67,22 +78,60 @@ def _precreate_private_file(path: Path) -> None:
 
     只作用于**新文件**：已存在的库保持部署侧设定的权限，不悄悄改动机器上
     既有的文件模式。`:memory:` / `file:` URI 不是文件，直接跳过。
+
+    返回 None，但 `connect()` 用 `_create_private_file` 的返回值区分「我们新建
+    了它」与「沿用既有文件」，见该函数。
     """
+    _create_private_file(path)
+
+
+def _create_private_file(path: Path) -> bool:
+    """尝试以 `0600` 独占创建；成功（我们新建了它）返回 True，已存在返回 False。"""
     try:
         os.close(os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600))
     except FileExistsError:
-        pass
+        return False
+    return True
+
+
+def _lock_down_wal_sidecars(path: Path) -> None:
+    """把 SQLite WAL 的 `-wal` / `-shm` 旁文件收紧到 `0600`（尽力而为）。
+
+    WAL 模式下 `-wal` 里是**尚未 checkpoint 的原始事务体**，与主库同级敏感；
+    SQLite 按主库的模式创建这两个旁文件，但主库若是**我们新建**的 0600、
+    旁文件仍可能带上 umask 的宽松位（部分版本 / 先建旁文件的路径）。因此
+    主库是 0600 时，对已存在的旁文件补一次 `chmod 0600`。
+
+    只处理 `0600` 的主库：部署侧刻意放宽过的主库（例如共享只读副本）不被
+    这里反向收紧；失败（不存在 / 权限不足 / 平台不支持）一律忽略——收不紧
+    旁文件不应该阻止网关启动。
+    """
+    try:
+        if (os.stat(str(path)).st_mode & 0o777) != 0o600:
+            return
+    except OSError:
+        return
+    for suffix in ("-wal", "-shm"):
+        sidecar = str(path) + suffix
+        try:
+            if os.path.exists(sidecar):
+                os.chmod(sidecar, 0o600)
+        except OSError:  # noqa: PERF203 - 尽力而为，逐个旁文件独立失败
+            continue
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """就地迁移 #192 建出的旧库：补 `purged_at` 列（幂等）。
+    """就地迁移 #192 建出的旧库：补 `purged_at` 列与清理用的部分索引（幂等）。
 
     旧库的 `body` 是 `NOT NULL`，清理时写空串而不是 NULL，因此无需重建表；
-    ALTER 只加列、不动既有行，旧库升级后行为与新建库一致。
+    ALTER 只加列、不动既有行，旧库升级后行为与新建库一致。索引用
+    `CREATE INDEX IF NOT EXISTS`，对新库与旧库都是加法、可重复执行。
     """
     columns = {row[1] for row in conn.execute("PRAGMA table_info(as_transactions)")}
     if "purged_at" not in columns:
         conn.execute("ALTER TABLE as_transactions ADD COLUMN purged_at TEXT")
+    # 索引必须在补列之后建（旧库上引用 purged_at）。
+    conn.execute(_PURGE_INDEX_DDL)
 
 
 def connect(db_path: str) -> sqlite3.Connection:
@@ -94,7 +143,8 @@ def connect(db_path: str) -> sqlite3.Connection:
     path = Path(db_path)
     if path.parent and not path.parent.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
-    if not db_path.startswith(_NON_FILE_DB_PREFIXES):
+    is_file = not db_path.startswith(_NON_FILE_DB_PREFIXES)
+    if is_file:
         _precreate_private_file(path)
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -103,6 +153,9 @@ def connect(db_path: str) -> sqlite3.Connection:
     with conn:
         conn.execute(_DDL)
         _migrate(conn)
+    if is_file:
+        # WAL 旁文件在 PRAGMA journal_mode=WAL 之后才可能出现，因此放在这里。
+        _lock_down_wal_sidecars(path)
     return conn
 
 
@@ -113,6 +166,8 @@ class AsTransactionStore:
         self,
         conn: sqlite3.Connection,
         purge_retention_days: Optional[int] = None,
+        *,
+        _wait_fn=None,
     ) -> None:
         self._conn = conn
         self._lock = threading.Lock()
@@ -120,6 +175,9 @@ class AsTransactionStore:
         self._purge_retention_days = purge_retention_days
         self._purge_stop: Optional[threading.Event] = None
         self._purge_thread: Optional[threading.Thread] = None
+        # 调度等待函数：`event.wait(timeout)` 的替代注入点，供测试跑快速时钟。
+        # 生产路径保持 None → 使用 Event.wait（真实 sleep）。
+        self._wait_fn = _wait_fn
 
     def store_transaction(self, txn_id: str, body_text: str) -> bool:
         """持久化一条 AS 事务（锁内判重 + 插入，单事务提交）。
@@ -144,22 +202,39 @@ class AsTransactionStore:
                 )
             return True
 
-    def get_unprocessed_transactions(self) -> List[Tuple[str, str, str]]:
-        """返回尚未处理（processed_at IS NULL）的事务列表。
+    # 消费侧单次拉取的默认条数上限：消费侧按批处理，避免把整个积压一次读进内存。
+    DEFAULT_UNPROCESSED_LIMIT = 100
 
-        每条为 (txn_id, body, received_at)，按 received_at 升序排列。
-        **不含墓碑**（purged_at IS NOT NULL）：过期未处理的事务在清理时被丢弃，
-        不再交给消费侧。
+    def get_unprocessed_transactions(
+        self, limit: int = DEFAULT_UNPROCESSED_LIMIT
+    ) -> List[Tuple[str, str, str]]:
+        """按**插入顺序**返回一批尚未处理（`processed_at IS NULL`）的事务。
+
+        每条为 (txn_id, body, received_at)。`received_at` 只有秒精度，
+        同一秒内收到的事务用时间排序是并列的、顺序不确定；因此按 `rowid`
+        （SQLite 的插入顺序，单调递增）升序，保证同一秒内的事务也按到达
+        顺序返回，消费侧能稳定地「先到先处理」。
+
+        `limit` 限制单批条数（默认 100，必须 >= 1）：消费侧循环调用直到返回
+        空列表，避免一次把整个积压读进内存。**不含墓碑**
+        （purged_at IS NOT NULL）：过期未处理的事务在清理时被丢弃，不再交给
+        消费侧。
 
         TODO（后续 PR）：实现消费者调用本接口并触发角色引擎 / 记忆 /
         主动发言逻辑，处理后调用 mark_processed(txn_id)。
         """
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise ValueError(f"limit must be an integer, got {limit!r}")
+        if limit < 1:
+            raise ValueError(f"limit must be >= 1, got {limit}")
         with self._lock:
             rows = self._conn.execute(
                 "SELECT txn_id, body, received_at"
                 " FROM as_transactions"
                 " WHERE processed_at IS NULL AND purged_at IS NULL"
-                " ORDER BY received_at ASC"
+                " ORDER BY rowid ASC"
+                " LIMIT ?",
+                (limit,),
             ).fetchall()
             return [(r["txn_id"], r["body"], r["received_at"]) for r in rows]
 
@@ -239,15 +314,27 @@ class AsTransactionStore:
 
         首次在等待一个间隔后执行（启动时那次由 `build_as_txn_store` 同步执行）。
         `stop_purge_scheduler()` 可让线程尽快退出。
+
+        内部 `_wait_fn(stop_event, timeout)` 是可注入的等待函数（仅测试用；
+        默认 `Event.wait`）。注入时语义须与之一致：**返回 True 表示收到停止
+        信号**、False 表示超时该跑下一轮。
         """
         if interval_seconds <= 0:
             raise ValueError("interval_seconds must be > 0")
         self.stop_purge_scheduler()
         stop = threading.Event()
         self._purge_stop = stop
+        wait_fn = self._wait_fn
 
         def _loop() -> None:
-            while not stop.wait(interval_seconds):
+            while True:
+                stopped = (
+                    wait_fn(stop, interval_seconds)
+                    if wait_fn is not None
+                    else stop.wait(interval_seconds)
+                )
+                if stopped:
+                    return
                 self.run_purge_safely()
 
         thread = threading.Thread(target=_loop, name="as-txn-purge", daemon=True)

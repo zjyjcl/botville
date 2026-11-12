@@ -36,16 +36,22 @@
 gateway/src/botville_gateway/
 ├── __init__.py          导出 Config / LimitStore / PolicyEngine / GatewayService 等
 ├── __main__.py          python -m botville_gateway 本地启动（含启动健康校验）
+├── as_txn_store.py      AS 事务存储：持久化、幂等、保留期清理（SQLite WAL，B 线）
+├── caller_identity.py   调用方身份（caller token / legacy token，#124 §1.2.2）
 ├── config.py            环境变量 → 不可变 Config（构造时校验）
 ├── errors.py            异常类（ValidationError / LimitError / IdempotencyConflict）
+├── isolation.py         §7.2 上下文四区隔离（nonce 包裹，B2.3）
 ├── limits.py            三层限额存储、规则校验、逐项取最严（EffectiveLimits）
 ├── matrix.py            MatrixTransport Protocol + InMemoryMatrixTransport
 ├── matrix_appservice.py AppServiceMatrixTransport（AS token masquerade，A1.3）
 ├── policy.py            三层限速（消息/token/间隔）+ 按日预算 + 静默 → PolicyDecision
 ├── service.py           send_ai_message() 编排、幂等、/limits 与 /usage 查询
 ├── store.py             内存 UsageEvent 日志（append-only、容量有界、不存正文）
-├── http_server.py       stdlib HTTP + build_transport 工厂（/health、/policy、/messages、/limits、/usage）
-└── timeutil.py          UTC `Z` 结尾的 RFC 3339 格式化
+├── http_server.py       stdlib HTTP + build_transport 工厂（/health、/policy、/messages、/limits、/usage、/_matrix/app/v1/*）
+├── moments/             动态模块（存储 / 可见性 / HTTP / 迁移，A2.2）
+├── timeutil.py          UTC `Z` 结尾的 RFC 3339 格式化
+├── trust.py             §7.1 trust 判定规则（B2.3）
+└── user_identity.py     终端用户身份校验（MatrixOpenID / Matrix Bearer，#124 §1.2.3）
 ```
 
 **包位置**：`gateway/src/botville_gateway/`（src-layout）。测试通过 `sys.path` 注入
@@ -100,9 +106,15 @@ continuwuity 仍用 `memory`（尚无文件注册）。运维注意见
 | PUT | `/v1/limits` | `putLimits` | 写入 owner / peer 层（平台层只读） |
 | GET | `/v1/usage` | `getUsage` | 用量汇总、预算与分桶 |
 | GET | `/v1/usage/events` | `listUsageEvents` | 用量账单明细分页（不含正文） |
+| PUT | `/_matrix/app/v1/transactions/{txnId}` | *（不在 OpenAPI）* | Matrix AS 事务接收（幂等落库）。**根路径**，不带 `GATEWAY_HTTP_PATH_PREFIX`；鉴权只用 `Authorization: Bearer <GATEWAY_HS_TOKEN>` 请求头（不认 `?access_token=`）；错误体为 Matrix `{"errcode","error"}`。见 [contract.md](docs/contract.md) §1.7 |
+| POST | `/_matrix/app/v1/ping` | *（不在 OpenAPI）* | Matrix AS 连通性探测，返回 `{}`。同样**根路径**、`Authorization: Bearer <GATEWAY_HS_TOKEN>`、Matrix 错误格式。见 [contract.md](docs/contract.md) §1.7 |
 
 错误统一 `application/problem+json`（RFC 9457）。**策略拦截不是 HTTP 错误**：
 `blocked` 返回 **200**，不是 429/403（契约 `docs/contract.md` §1.4）。
+
+上表最后两行是 **homeserver → 网关**的 Matrix AS 回调，不是面向 App 的 `/v1` API，
+因此**不写入** `gateway/openapi/gateway.v1.yaml`、错误体也不用 problem+json。它们的
+鉴权凭据是 `GATEWAY_HS_TOKEN`（文档只写变量名、不写任何值，见配置表）。
 
 **请求体上限 1 MiB**：超限返回 `400 request.invalid`，`errors[].code` 为 `too_large`
 （契约 §1.1.1，不新增 413）。
@@ -288,8 +300,8 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_HS_TOKEN` | *(空)* | Matrix AS 回调（B 线 as-transactions）的共享密钥：必须与注册文件里的 `hs_token`（= `server/compose/.env` 的 `APPSERVICE_HS_TOKEN`）同值。只从 `Authorization: Bearer` 请求头校验（不认 `?access_token=`），恒定时间比较，不入日志。**留空 = 网关照常启动但 `/_matrix/app/v1/transactions/*` 与 `/ping` 一律 403 `M_FORBIDDEN`**（compose 从 `APPSERVICE_HS_TOKEN` 注入）。设置后要求非占位符、**≥32 字符**、无空白，且**不能等于 `GATEWAY_AS_TOKEN`**，否则拒绝启动。见 [docs/contract.md](docs/contract.md) §1.7 |
 | `GATEWAY_AS_TXN_DB_PATH` | *(空)* | AS 事务 SQLite 路径（WAL + `synchronous=FULL`，返回 200 前提交；新建文件以 **0600** 创建）。**留空 = 关闭接收**（transactions 返回 `500 M_UNKNOWN`，HS 重试），与 `GATEWAY_MOMENTS_DB_PATH` 的「空 = 关闭」约定一致。`make up GATEWAY=1` 时 compose 设为 `/var/lib/botville-gateway/as_transactions.db`（与 `moments.db` 共用 `gateway-data` 卷，#193）。**库含原始事件请求体**，备份按敏感数据处理。见 [docs/contract.md](docs/contract.md) §1.7 / §1.7.7 |
 | `GATEWAY_AS_MAX_BODY_BYTES` | `16777216` | AS 回调请求体上限（字节，**16 MiB**；正整数，最大 256 MiB）。与 `/v1` 的 1 MiB 上限**相互独立**；超限 → `413 M_TOO_LARGE` |
-| `GATEWAY_AS_TXN_RETENTION_DAYS` | `90` | AS 事务库保留天数（正整数，`<1` 拒绝启动）。超过保留期的事务**不删行**：只清空原始请求体并写 `purged_at`（墓碑保留 `txn_id` / 接收时间 / `processed_at`），重放仍 `200 {}` 且不重落库；过期未消费事务按丢弃处理。只在配置了 `GATEWAY_AS_TXN_DB_PATH` 且清理间隔非 0 时生效。见 [docs/contract.md](docs/contract.md) §1.7.7 |
-| `GATEWAY_AS_TXN_PURGE_INTERVAL_SECONDS` | `86400` | AS 事务保留期清理间隔（秒）：启动先跑一次，之后后台按间隔跑，失败只记日志（不记 token / 事件体）。`0` = 关闭（库会持续增长）；非 0 时 **≥60**，否则拒绝启动 |
+| `GATEWAY_AS_TXN_RETENTION_DAYS` | `90` | AS 事务库保留天数（正整数，`<1` 拒绝启动）。超过保留期的事务**不删行**：只清空原始请求体并写 `purged_at`（墓碑保留 `txn_id` / 接收时间 / `processed_at`），重放仍 `200 {}` 且不重落库；过期未消费事务按丢弃处理。**校验与 `GATEWAY_AS_TXN_DB_PATH` 是否配置无关**——非法值在任何情况下都拒绝启动。清理只在同时配置了库路径且间隔非 0 时运行。见 [docs/contract.md](docs/contract.md) §1.7.7 |
+| `GATEWAY_AS_TXN_PURGE_INTERVAL_SECONDS` | `86400` | AS 事务保留期清理间隔（秒）：启动先跑一次，之后后台按间隔跑，失败只记日志（不记 token / 事件体）。`0` = 关闭（启动不跑、不起线程，库会持续增长）；非 0 时 **≥60**，否则拒绝启动。**校验与 `GATEWAY_AS_TXN_DB_PATH` 是否配置无关**。见 [docs/contract.md](docs/contract.md) §1.7.7 |
 
 非法配置（端口非数字、时区不存在、`HH:MM` 格式错）在 `Config` 构造时抛 `ConfigError`，
 进程以退出码 `2` 结束。
