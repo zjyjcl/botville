@@ -7,8 +7,8 @@
 1. **访问日志**（stdlib `BaseHTTPRequestHandler.log_message` / `log_error` /
    `log_request`，直接写 stderr）把路径里的 txnId 段替换成 `<redacted>`；
    `access_token=` 查询参数保持既有 `[REDACTED]` 掩码。
-2. **带 txnId 的 logger 行**只用短哈希标记 `txn#xxxxxxxx`（SHA-256 前 8 位，
-   仅用于相关性、不可逆）。
+2. **带 txnId 的错误日志**只用短标记 `txn#xxxxxxxx`（加盐 HMAC-SHA256 前 8 位，
+   仅在同一次进程运行内可关联）。
 
 用例形态：
 - 纯 txnId、百分号编码 txnId、带 `?access_token=`、带 `GATEWAY_HTTP_PATH_PREFIX`；
@@ -29,6 +29,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -42,6 +43,7 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from botville_gateway.as_txn_store import AsTransactionStore, build_as_txn_store  # noqa: E402
+from botville_gateway.matrix import DeliveryError, InMemoryMatrixTransport, resolve_txn_id  # noqa: E402
 from botville_gateway.config import Config  # noqa: E402
 from botville_gateway.http_server import build_server  # noqa: E402
 from botville_gateway.log_redact import (  # noqa: E402
@@ -75,8 +77,8 @@ def _cfg(**overrides):
 
 
 class _ServerFixture:
-    def __init__(self, config: Config):
-        self.server = build_server(config)
+    def __init__(self, config: Config, transport=None):
+        self.server = build_server(config, transport=transport)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     def __enter__(self):
@@ -203,9 +205,31 @@ class TestRedactHelper(unittest.TestCase):
         self.assertNotIn("abc123", out)
         self.assertIn("/send/m.room.message/<redacted>", out)
 
+    def test_all_client_transaction_paths(self):
+        for version in ("v1", "v3", "v12"):
+            for route in ("rooms/!r:hs/send/m.reaction", "rooms/!r:hs/send/custom.event",
+                          "sendToDevice/m.room.encrypted", "rooms/!r:hs/redact/$event:hs"):
+                for txn in ("abc123", "HEAD\"'<>TAIL", "<redacted>TAIL"):
+                    with self.subTest(version=version, route=route, txn=txn):
+                        base = f"/_matrix/client/{version}/{route}/"
+                        out = redact_text(base + txn + "?access_token=fake-token")
+                        self.assertEqual(out, base + "<redacted>?access_token=[REDACTED]")
+                        self.assertEqual(redact_text(out), out)
+
     def test_idempotent(self):
         once = redact_text("PUT /_matrix/app/v1/transactions/abc123 HTTP/1.0")
         self.assertEqual(redact_text(once), once)
+
+    def test_quotes_and_angles_redact_entire_segment(self):
+        for chars in ('"', "'", "<", ">", "\"'<>", '<redacted>'):
+            for base in ("/_matrix/app/v1/transactions/",
+                         "/_matrix/client/v3/rooms/!r:hs/send/m.room.message/"):
+                for boundary in ("/next", "?query=1", "#fragment", " HTTP/1.1"):
+                    with self.subTest(chars=chars, base=base, boundary=boundary):
+                        raw = base + "HEAD" + chars + "TAIL" + boundary
+                        out = redact_text(raw)
+                        self.assertEqual(out, base + "<redacted>" + boundary)
+                        self.assertEqual(redact_text(out), out)
 
     def test_other_paths_untouched(self):
         line = "GET /_matrix/app/v1/ping HTTP/1.0"
@@ -217,16 +241,25 @@ class TestRedactHelper(unittest.TestCase):
             ("x %s", 200, None, "/_matrix/app/v1/transactions/<redacted>"),
         )
 
-    def test_redact_txn_id_is_short_sha256_prefix(self):
+    def test_redact_txn_id_is_salted_short_marker(self):
         raw = "some-txn-id"
         marker = redact_txn_id(raw)
-        self.assertEqual(marker, "txn#" + hashlib.sha256(raw.encode()).hexdigest()[:8])
+        self.assertNotEqual(marker, "txn#" + hashlib.sha256(raw.encode()).hexdigest()[:8])
         self.assertRegex(marker, r"^txn#[0-9a-f]{8}$")
         self.assertNotIn(raw, marker)
 
     def test_redact_txn_id_deterministic_and_distinct(self):
         self.assertEqual(redact_txn_id("a"), redact_txn_id("a"))
         self.assertNotEqual(redact_txn_id("a"), redact_txn_id("b"))
+
+    def test_markers_change_in_fresh_process(self):
+        code = (
+            "from botville_gateway.log_redact import redact_txn_id; "
+            "print(redact_txn_id('a'), redact_txn_id('b'))"
+        )
+        env = dict(os.environ, PYTHONPATH=_SRC)
+        other = subprocess.check_output([sys.executable, "-c", code], env=env, text=True).strip()
+        self.assertNotEqual(other, redact_txn_id("a") + " " + redact_txn_id("b"))
 
     def test_redact_txn_id_missing_values(self):
         self.assertEqual(redact_txn_id(None), "txn#unknown")
@@ -259,6 +292,26 @@ class TestAccessLogTxnId(_Base):
         self.assertEqual(status, 200)
         self._assert_clean(joined, TXN)
         self.assertIn("PUT /_matrix/app/v1/transactions/<redacted>", joined)  # 确有日志
+
+    def test_quotes_and_angles_access_log_has_no_tail(self):
+        cfg = _cfg(hs_token=HS_TOKEN, as_txn_db_path=self.db_path)
+
+        def send(s):
+            statuses = []
+            for chars in ('"', "'", "<", ">", "\"'<>", '<redacted>'):
+                raw_txn = "HEAD" + chars + "TAIL"
+                status = _http(
+                    "PUT", f"{s.base}/_matrix/app/v1/transactions/{raw_txn}",
+                    _TXN_BODY, headers=_auth(),
+                )[0]
+                statuses.append(status)
+            return statuses
+
+        statuses, joined = self._capture(cfg, send)
+        self.assertEqual(statuses, [200] * 6)
+        self.assertEqual(joined.count("/transactions/<redacted>"), 6)
+        self.assertNotIn("HEAD", joined)
+        self.assertNotIn("TAIL", joined)
 
     def test_percent_encoded_txn_id_never_logged(self):
         cfg = _cfg(hs_token=HS_TOKEN, as_txn_db_path=self.db_path)
@@ -352,15 +405,69 @@ class TestAccessLogTxnId(_Base):
         self.assertNotIn(TXN, joined)
         self.assertIn("/_matrix/app/v1/transactions/<redacted>", joined)
 
+    def test_internal_error_logs_only_exception_type(self):
+        cfg = _cfg(hs_token=HS_TOKEN, as_txn_db_path=self.db_path)
+
+        def send(s):
+            def boom():
+                raise RuntimeError(
+                    f"private body /_matrix/app/v1/transactions/{TXN} "
+                    f"access_token={HS_TOKEN}"
+                )
+            s.server.transport.healthy = boom
+            return _http("GET", f"{s.base}/health")[0]
+
+        status, joined = self._capture(cfg, send)
+        self.assertEqual(status, 500)
+        self.assertIn("unhandled error: RuntimeError", joined)
+        for secret in (TXN, HS_TOKEN, "private body"):
+            self.assertNotIn(secret, joined)
+
     def test_non_txn_paths_still_logged_verbatim(self):
         # 脱敏不得误伤：ping / health 路径原样出现在日志里。
         cfg = _cfg(hs_token=HS_TOKEN, as_txn_db_path=self.db_path)
-        status, joined = self._capture(
+        statuses, joined = self._capture(
             cfg,
-            lambda s: _http("POST", f"{s.base}/_matrix/app/v1/ping", {}, headers=_auth())[0],
+            lambda s: (
+                _http("POST", f"{s.base}/_matrix/app/v1/ping", {}, headers=_auth())[0],
+                _http("GET", f"{s.base}/health")[0],
+            ),
         )
-        self.assertEqual(status, 200)
-        self.assertIn("/_matrix/app/v1/ping", joined)
+        self.assertEqual(statuses, (200, 200))
+        self.assertIn("POST /_matrix/app/v1/ping HTTP/1.1", joined)
+        self.assertIn("GET /health HTTP/1.1", joined)
+
+    def test_delivery_failure_log_redacts_txn_and_token(self):
+        class FailingTransport(InMemoryMatrixTransport):
+            attempted_txn = None
+
+            def send_text(self, **kwargs):
+                self.attempted_txn = resolve_txn_id(kwargs["txn_id"])
+                raise DeliveryError(
+                    "matrix.unreachable",
+                    "PUT /_matrix/client/v3/rooms/!r:hs/send/m.room.message/"
+                    f"{self.attempted_txn}?access_token={HS_TOKEN}: timed out",
+                )
+
+        transport = FailingTransport()
+        buf = io.StringIO()
+        cfg = _cfg(as_txn_db_path=self.db_path)
+        with contextlib.redirect_stderr(buf), _ServerFixture(cfg, transport) as s:
+            status, body, _ = _http(
+                "POST", f"{s.base}/v1/conversations/c/messages",
+                {"sender_persona_id": "p", "content": {"type": "text", "text": "hi"}},
+                headers={"Idempotency-Key": "delivery-log-test"},
+            )
+        self.assertEqual(status, 500)
+        self.assertEqual(body["code"], "internal.error")
+        self.assertTrue(transport.attempted_txn)
+        joined = buf.getvalue()
+        lines = [line for line in joined.splitlines() if "delivery failed:" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("/send/m.room.message/<redacted>", lines[0])
+        self.assertIn("access_token=[REDACTED]", lines[0])
+        self.assertNotIn(transport.attempted_txn, joined)
+        self.assertNotIn(HS_TOKEN, joined)
 
     def test_access_log_disabled_writes_nothing(self):
         cfg = _cfg(hs_token=HS_TOKEN, as_txn_db_path=self.db_path, access_log=False)

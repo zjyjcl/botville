@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -762,19 +763,20 @@ class TestPersistentSpeechDedupe(_TmpDb):
 # ---------------------------------------------------------------------------
 class TestEngineServerIntegration(unittest.TestCase):
     def _server(self, personas_data=None, model_url=None, model_name="gpt-t", **overrides):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = os.path.join(tmpdir, "as.db")
-            kw = dict(consumer_enabled=True, as_txn_db_path=db, port=0)
-            if model_url:
-                kw["model_base_url"] = model_url
-                kw["model_name"] = model_name
-            if personas_data is not None:
-                p = os.path.join(tmpdir, "p.json")
-                with open(p, "w") as f:
-                    json.dump({"personas": personas_data}, f)
-                kw["personas_file"] = p
-            kw.update(overrides)
-            return build_server(_cfg(**kw)), tmpdir
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        db = os.path.join(tmpdir, "as.db")
+        kw = dict(consumer_enabled=True, as_txn_db_path=db, port=0)
+        if model_url:
+            kw["model_base_url"] = model_url
+            kw["model_name"] = model_name
+        if personas_data is not None:
+            p = os.path.join(tmpdir, "p.json")
+            with open(p, "w") as f:
+                json.dump({"personas": personas_data}, f)
+            kw["personas_file"] = p
+        kw.update(overrides)
+        return build_server(_cfg(**kw)), tmpdir
 
     def test_no_personas_no_model_engine_inactive(self):
         server, _ = self._server()

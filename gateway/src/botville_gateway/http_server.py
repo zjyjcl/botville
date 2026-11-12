@@ -71,7 +71,6 @@ from .errors import (
 )
 from .limits import LimitStore
 from .log_redact import redact_args as _redact_args
-from .log_redact import redact_text as _redact_text
 from .log_redact import redact_txn_id
 from .matrix import InMemoryMatrixTransport, MatrixTransport
 from .moments.http_api import handle as _handle_moments_dispatch
@@ -170,10 +169,8 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             super().log_message(fmt, *_redact_args(args))
 
     def log_error(self, fmt: str, *args: Any) -> None:
-        # stdlib 的 log_error 默认转调 log_message，但子类若直接 super().log_error
-        # 会绕开本类的 log_message（BaseHTTPRequestHandler.log_error 显式调用
-        # self.log_message，所以本可省略）；这里显式重写并走脱敏，确保 send_error
-        # 产生的 "code %d, message %s" 与坏请求行日志也经过脱敏，不依赖继承链。
+        # stdlib log_error 调用 self.log_message，仍会经过本类的脱敏。
+        # 此处显式脱敏也安全：重复替换是幂等的，输出直接写 stderr。
         if self.server.config.access_log:  # type: ignore[attr-defined]
             super().log_error(fmt, *_redact_args(args))
 
@@ -918,7 +915,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
 
     def _internal_error(self, exc: BaseException) -> None:
         if self.server.config.access_log:  # type: ignore[attr-defined]
-            self.log_error("unhandled error: %r", exc)
+            self.log_error("unhandled error: %s", type(exc).__name__)
         try:
             self._send_problem(
                 500, "internal.error", "Internal Server Error"
