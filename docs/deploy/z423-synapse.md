@@ -344,6 +344,14 @@ curl -s http://127.0.0.1:8020/health   # 端口 = .env 的 BOTVILLE_GATEWAY_PORT
 - 明文 `http://` 时，网关只允许 loopback 或单标签服务名（`http://synapse:8008` /
   `http://tuwunel:8008` 可以；不要开 `GATEWAY_ALLOW_INSECURE_HS`）。
 
+角色引擎（B 线 PR2）：`GATEWAY_MODEL_BASE_URL` / `GATEWAY_MODEL_NAME` /
+`GATEWAY_MODEL_API_KEY` / `GATEWAY_MODEL_TIMEOUT_SECONDS` / `GATEWAY_PERSONAS_FILE` /
+`GATEWAY_CONSUMER_ENABLED` 从 `.env` 透传给网关（init.sh 不生成，开关默认关）；
+人设目录 `server/compose/gateway-personas/` 只读挂到 `/etc/botville-gateway`（真实人设
+gitignore）。只有开关打开、配了模型并且配了人设，AI 才会开口。API key 只放本地
+`.env`，不要贴 `docker compose config` 的输出（用 `--quiet`）。详见
+[appservice.md](appservice.md#角色引擎模型与人设)。
+
 本地或 CI 冒烟：`make gateway-hs-smoke`——检查容器里的传输与 HS 一致；`/health` 的
 matrix 检查 = 启动 whoami；用 OpenID token 打 `GET /v1/moments` 校验内网 userinfo；
 HS→网关 ping；`@ai_*` 所在房间的消息被推送并落进 `as_transactions.db`；重启网关后

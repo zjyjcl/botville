@@ -21,11 +21,12 @@ masquerade）；运行时不使用 `/_synapse/admin`，也不使用 admin room �
 1. [命名空间约定](#命名空间约定)
 2. [persona / conversation 的 ID 语义（appservice 模式）](#persona--conversation-的-id-语义appservice-模式)
 3. [注册文件与渲染](#注册文件与渲染)
-4. [注册方式差异（三家 homeserver）](#注册方式差异)
-5. [网关配置](#网关配置)
-6. [token 轮换](#token-轮换)
-7. [安全须知](#安全须知)
-8. [验收与排障](#验收与排障)
+4. [角色引擎（模型与人设）](#角色引擎模型与人设)
+5. [注册方式差异（三家 homeserver）](#注册方式差异)
+6. [网关配置](#网关配置)
+7. [token 轮换](#token-轮换)
+8. [安全须知](#安全须知)
+9. [验收与排障](#验收与排障)
 
 ---
 
@@ -196,6 +197,7 @@ sender → **400 `request.invalid`**；房间别名不存在 → **404
     | `GATEWAY_AS_TOKEN` | `${APPSERVICE_AS_TOKEN:-}` | 空（appservice 模式会拒绝启动） |
     | `GATEWAY_HS_TOKEN` | `${APPSERVICE_HS_TOKEN:-}` | 空（AS 回调一律 403） |
     | `GATEWAY_AS_TXN_DB_PATH` | 固定 | `/var/lib/botville-gateway/as_transactions.db` |
+    | `GATEWAY_MODEL_*` / `GATEWAY_PERSONAS_FILE` / `GATEWAY_CONSUMER_ENABLED` | 透传 | 见[角色引擎](#角色引擎模型与人设)的回退值表 |
 
   - **只通过 `make up` 重建网关**：`BOTVILLE_HOMESERVER` / `GATEWAY_MATRIX_TRANSPORT`
     只在 `make up` 里导出（`HS=` 可能与 `.env` 不同），注册 url 也只在
@@ -213,7 +215,55 @@ sender → **400 `request.invalid`**；房间别名不存在 → **404
     或单标签服务名。
   - 验收：`make gateway-hs-smoke`——whoami、OpenID userinfo，以及 AS 事务：HS→
     网关 ping，`@ai_*` 所在房间的消息被推送并落库，网关重启后重放同一 txnId 只存
-    一份，错误 hs_token 得 403。不打印 token；失败只报 HTTP 状态和完整 URL。
+    一份，错误 hs_token 得 403。不打印 token；失败只报 HTTP 状态和完整 URL；
+    ping 遇 401/403（token 不对、未注册）立即失败，429 / 5xx 才重试。
+    夹具不会越积越多：人类测试用户（固定 device）、`@ai_gwsmoke` 和测试房间跨次复用，
+    状态记在 `server/compose/generated/gateway-hs-smoke.json`（gitignore，0600，
+    按 HS 地址分开）；HS 不认识它们时（如 `down -v` 之后）才重建，被替换的房间会
+    先退出并忘记。
+
+## 角色引擎（模型与人设）
+
+B 线 PR2（角色引擎回复）读的变量，compose 原样透传给 `gateway` 服务；init.sh
+**一个都不生成**（`.env.example` 里是空值或默认值，`make up` 时追加进 `.env`，
+已有值不动）。改完后 `make up GATEWAY=1` 重建网关才生效。
+
+**只有三件事同时满足，AI 才会开口**：`GATEWAY_CONSUMER_ENABLED=true`；配了模型
+（`GATEWAY_MODEL_BASE_URL` 与 `GATEWAY_MODEL_NAME`）；配了人设
+（`GATEWAY_PERSONAS_FILE` 指向存在的文件）。缺任何一项都只记录、不发言。
+
+| 变量 | compose 写法 | 回退值 | 说明 |
+| --- | --- | --- | --- |
+| `GATEWAY_CONSUMER_ENABLED` | `${GATEWAY_CONSUMER_ENABLED:-false}` | `false` | 事务消费者总开关，默认关 |
+| `GATEWAY_MODEL_BASE_URL` | `${GATEWAY_MODEL_BASE_URL:-}` | 空 | OpenAI 兼容接口地址；空 = 未配模型，只记录不发言 |
+| `GATEWAY_MODEL_NAME` | `${GATEWAY_MODEL_NAME:-}` | 空 | 模型名 |
+| `GATEWAY_MODEL_API_KEY` | `${GATEWAY_MODEL_API_KEY:-}` | 空 | 密钥，只写在部署方自己的 `server/compose/.env` |
+| `GATEWAY_MODEL_TIMEOUT_SECONDS` | `${GATEWAY_MODEL_TIMEOUT_SECONDS:-30}` | `30` | 单次模型调用超时（秒） |
+| `GATEWAY_PERSONAS_FILE` | `${GATEWAY_PERSONAS_FILE:-}` | 空 | 空 = 不加载人设；建议 `/etc/botville-gateway/personas.json` |
+| `BOTVILLE_GATEWAY_PERSONAS_DIR` | 挂载源 `${BOTVILLE_GATEWAY_PERSONAS_DIR:-./gateway-personas}` | `server/compose/gateway-personas` | 只读挂到容器 `/etc/botville-gateway` |
+
+**人设文件（只读挂载）**
+
+- compose **总是**把 `server/compose/gateway-personas/` 只读挂到
+  `/etc/botville-gateway`。这个目录随仓库提供，里面只有 `README.md` 和虚构的
+  `personas.example.json`，所以没配人设时挂载、`compose config` 和网关启动都不会
+  报错（选这种做法而不是可选 override 文件，是为了不让 `make up` 多一套参数）。
+- 真实人设放同目录的 `personas.json`（`.gitignore` 排除了该目录下示例和 README
+  以外的所有文件），再在 `.env` 里设
+  `GATEWAY_PERSONAS_FILE=/etc/botville-gateway/personas.json`。也可以用
+  `BOTVILLE_GATEWAY_PERSONAS_DIR` 换成仓库外的宿主机目录（绝对路径）。
+- 网关以 uid 10001 运行：Linux 宿主机上文件需对其他用户可读（`0644`）或属主为
+  10001。人设文件里不要放 token / API key。文件格式以 B 线 PR2 契约为准。
+
+**`GATEWAY_MODEL_API_KEY` 不外泄**
+
+- 只经 compose 从 `--env-file` 插值进容器；Makefile 不引用它，`make` 的命令回显
+  和 `make -n` 都不会出现它；init.sh 不生成、不打印（追加缺失键时只打印键名）；
+  冒烟脚本不读它，也不打印任何 token。
+- **不要贴 `docker compose config` 的输出**：不带 `--quiet` 时它会把插值后的值
+  原样打印出来。CI 与文档一律用 `config --quiet`；CI 另有一步用哨兵值验证
+  12 种 HS × profile 组合都不会打印它，`server/tests` 里也有对应断言。
+- 轮换：改 `.env` 后 `make up GATEWAY=1`。
 
 ## 注册方式差异
 
