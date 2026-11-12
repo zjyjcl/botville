@@ -125,14 +125,18 @@ AI_LOOP_ON_BREAK_VALUES = frozenset({"stop", "notify"})
 DEFAULT_AS_MAX_BODY_BYTES = 16_777_216   # 16 MiB
 AS_MAX_BODY_BYTES_UPPER = 268_435_456    # 256 MiB
 
-# AS 事务库保留期与清理（contract §1.7.7）：与动态模块的保留期清理同一套约定。
-# 超过保留期的事务只清空原始请求体、保留墓碑（txn_id / 时间 / processed_at），
+# AS 事务库保留期与清理（contract §1.7.7）：与动态模块的保留期清理同一套约定。# 超过保留期的事务只清空原始请求体、保留墓碑（txn_id / 时间 / processed_at），
 # 因此重放语义不变、库仍会继续增长（墓碑永不删除）。
 DEFAULT_AS_TXN_RETENTION_DAYS = 90
 # 清理任务间隔（秒）：0 = 关闭；非 0 时至少 60 秒。
 # 最小间隔的**唯一定义**在 as_txn_store（见那里的说明）；这里 import 复用，
 # 不在两处各写一份避免漂移。as_txn_store 只依赖 timeutil，无循环导入。
 DEFAULT_AS_TXN_PURGE_INTERVAL_SECONDS = 86_400
+
+# 内置角色引擎的模型调用超时（秒，B 线 PR2，contract §1.7.8 ⑫）。
+# **唯一定义处**：`engine/model_client.py` 从这里 import 之后再用（不在两处各
+# 写一份避免漂移；本模块不 import engine，无循环依赖）。
+DEFAULT_MODEL_TIMEOUT_SECONDS = 30
 
 # 部署路径前缀（GATEWAY_HTTP_PATH_PREFIX）的禁用片段：这些要么改变路径语义
 # （`//`、`..`），要么在拼 URL / 反代重写时会被提前截断或解码（`?` `#` `%`），
@@ -196,6 +200,17 @@ def _env_str(env: Mapping[str, str], name: str, default: str) -> str:
     if raw is None:
         return default
     return raw.strip()
+
+
+def _env_float(env: Mapping[str, str], name: str, default: float) -> float:
+    """读浮点环境变量；空/缺省用默认值，非数字抛 ConfigError（拒绝启动）。"""
+    raw = env.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be a number, got {raw!r}") from exc
 
 
 _DNS_LABEL_RE = re.compile(r"^[0-9a-z]([0-9a-z-]*[0-9a-z])?$")
@@ -477,9 +492,19 @@ class Config:
     # 消费者总开关（默认 false）：关闭时与现在完全一致（不起消费线程、不唤醒）。
     # 开启但未配置 GATEWAY_AS_TXN_DB_PATH → 启动 warning 并不起线程（不拒绝启动）。
     # 开启但未配置模型 → 只记录和计数，不发言（/health 不 degraded）。
-    # 模型环境变量（GATEWAY_MODEL_BASE_URL / GATEWAY_MODEL_NAME /
-    # GATEWAY_MODEL_API_KEY）在 PR2 引入，本 PR 不读取。
     consumer_enabled: bool = False
+    # ---------- 内置角色引擎（B 线 PR2，contract §0 / §1.7.8 ②⑫）----------
+    # 只读人设 JSON 文件（空 = 没有人设 → 引擎永不发言，消费者仍记录/计数）。
+    # 启动期校验：读不到 / JSON 坏 / schema 错 / user_id 非本服 @ai_* / 重复 /
+    # credential_ref 不是 env:NAME → 拒绝启动（错误信息不回显文件内容）。
+    personas_file: Optional[str] = None
+    # OpenAI 兼容模型配置。BASE_URL 空 = 未配置模型（不发言、/health 不 degraded）。
+    # 配置了 BASE_URL 就必须给 MODEL_NAME（否则拒绝启动）；TIMEOUT 必须为正数。
+    # API KEY 单独用 `field(repr=False)` 保存，不进 repr / 日志 / 错误体。
+    model_base_url: Optional[str] = None
+    model_name: Optional[str] = None
+    model_api_key: Optional[str] = field(default=None, repr=False)
+    model_timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         # 构造时校验，避免明显错误的配置拖到第一次请求才炸。
@@ -664,6 +689,9 @@ class Config:
         # #124 调用方身份（契约 §1.2.2）。校验放在这里（而非只在 load_config），
         # 保证直接构造 Config 的调用方（测试/嵌入）也走同一套规则。
         self._validate_caller_tokens()
+        # B2.4 内置引擎（contract §0 / §1.7.8 ②⑫）：模型配置校验。直接构造
+        # Config 也走同一套规则（fail-fast，不带病启动）。
+        self._validate_engine_config()
         # 路径前缀：直接构造 Config 时同样归一化 + 校验（fail closed）。
         # frozen dataclass → object.__setattr__；归一是幂等的，重复构造安全。
         object.__setattr__(
@@ -845,6 +873,44 @@ class Config:
                         "loopback or compose-internal host, or set "
                         "GATEWAY_ALLOW_INSECURE_HS=true to accept the risk"
                     )
+
+    def _validate_engine_config(self) -> None:
+        """B2.4 内置引擎的模型配置校验（contract §0 / §1.7.8 ②⑫）。
+
+        规则：
+          - `GATEWAY_MODEL_BASE_URL` 为空 → **未配置模型**（合法）：引擎不发言，
+            只记录/计数，`/health` 不 degraded；
+          - 配了 BASE_URL → 必须是 http:// 或 https:// URL，且 `MODEL_NAME` 必填；
+          - `GATEWAY_MODEL_TIMEOUT_SECONDS` 必须是正数（非数字 / ≤0 / NaN 拒绝启动）；
+          - `GATEWAY_MODEL_API_KEY` 只存放在 `repr=False` 字段里，**不写入任何
+            错误消息**（错误只点名变量名与规则）。
+
+        人设文件（`GATEWAY_PERSONAS_FILE`）的内容校验在 `engine.load_personas`
+        里做（需要 server_name，且要读文件），这里只检查路径形状/存在性。
+        """
+        base_url = (self.model_base_url or "").strip()
+        model_name = (self.model_name or "").strip()
+        if base_url:
+            if not base_url.startswith(("http://", "https://")):
+                raise ConfigError(
+                    "GATEWAY_MODEL_BASE_URL must be an http:// or https:// URL "
+                    "(e.g. https://api.example.com/v1)"
+                )
+            if not model_name:
+                raise ConfigError(
+                    "GATEWAY_MODEL_BASE_URL is set but GATEWAY_MODEL_NAME is not; "
+                    "the model name is required when a base URL is configured"
+                )
+        timeout = self.model_timeout_seconds
+        if (
+            not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or not (timeout > 0)
+            or timeout != timeout  # NaN
+        ):
+            raise ConfigError(
+                "GATEWAY_MODEL_TIMEOUT_SECONDS must be a positive number of seconds"
+            )
 
     def _validate_caller_tokens(self) -> None:
         """#124 / 契约 §1.2.2：caller token 表的结构与强度校验。
@@ -1145,4 +1211,24 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         # 消费开关（contract §1.7.8）：默认关闭 = 现在行为完全不变。
         # 非法值（非布尔）由 _env_bool 抛 ConfigError，拒绝启动。
         consumer_enabled=_env_bool(source, "GATEWAY_CONSUMER_ENABLED", False),
+        # ---------- 内置角色引擎（B 线 PR2，contract §0 / §1.7.8 ②⑫）----------
+        # 人设文件：空 = 没有人设 → 引擎不发言（消费者仍记录/计数）。
+        # 文件内容（schema / @ai_* / credential_ref）由 engine.load_personas
+        # 在启动时校验，非法则拒绝启动。
+        personas_file=(
+            _env_str(source, "GATEWAY_PERSONAS_FILE", "") or None
+        ),
+        # 模型配置：BASE_URL 空 = 未配置模型（不发言、/health 不 degraded）。
+        model_base_url=(
+            _env_str(source, "GATEWAY_MODEL_BASE_URL", "") or None
+        ),
+        model_name=(_env_str(source, "GATEWAY_MODEL_NAME", "") or None),
+        # 密钥只进 repr=False 字段；空串归一为 None（不参与任何日志/错误体）。
+        model_api_key=(
+            _env_str(source, "GATEWAY_MODEL_API_KEY", "") or None
+        ),
+        # 超时：非数字由 _env_float 抛 ConfigError；非正数由 Config 校验拒绝。
+        model_timeout_seconds=_env_float(
+            source, "GATEWAY_MODEL_TIMEOUT_SECONDS", float(DEFAULT_MODEL_TIMEOUT_SECONDS)
+        ),
     )

@@ -41,7 +41,17 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .as_consumer import AsTransactionConsumer
 from .config import Config, load_config
-from .as_txn_store import AsTransactionStore, build_as_txn_store
+from .as_txn_store import (
+    AsTransactionStore,
+    PersistentSpeechDedupe,
+    build_as_txn_store,
+)
+from .engine import (
+    EngineHooks,
+    ModelClient,
+    ModelConfig,
+    load_personas,
+)
 from .caller_identity import (
     AUTH_INVALID,
     AUTH_MISSING,
@@ -1274,6 +1284,10 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         # GATEWAY_CONSUMER_ENABLED=false（默认）时不起线程、不唤醒，行为与现在完全一致。
         # 开启但 as_txn_db_path 未配置时打 warning 且不起线程（不拒绝启动）。
         self.as_consumer: Optional[AsTransactionConsumer] = None
+        # B 线 PR2：内置角色引擎（contract §0 / §1.7.8 ②）。只在三个条件**同时**
+        # 成立时装配：消费开启 + 人设有内容 + 模型已配置。否则保持「只记录/计数、
+        # 不发言」，/health 不 degraded。
+        self.engine_hooks: Optional[EngineHooks] = None
         if config.consumer_enabled:
             if self.as_txn_store is None:
                 logging.getLogger(__name__).warning(
@@ -1281,10 +1295,15 @@ class GatewayServer(http.server.ThreadingHTTPServer):
                     "set — consumer thread will NOT start"
                 )
             else:
+                hooks = self._build_engine_hooks(config, service, transport)
+                self.engine_hooks = hooks
                 consumer = AsTransactionConsumer(
                     self.as_txn_store,
+                    hooks=hooks,
                     service=service,
                     server_name=config.matrix_server_name,
+                    sender_fetcher=getattr(transport, "event_sender", None),
+                    dedupe=PersistentSpeechDedupe(self.as_txn_store),
                 )
                 # 注册唤醒钩子：事务落库成功后立即唤醒消费线程。
                 self.as_txn_store.set_on_new_transaction(consumer.wake)
@@ -1294,6 +1313,51 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         # 监听端口绑定成功后才起消费线程：绑定失败（OSError）时不留下孤儿线程。
         if self.as_consumer is not None:
             self.as_consumer.start()
+
+    def _build_engine_hooks(
+        self, config: Config, service: GatewayService, transport: MatrixTransport
+    ) -> Optional[EngineHooks]:
+        """按配置装配内置角色引擎；不满足条件时返回 None（消费者保持 no-op 钩子）。
+
+        激活条件（三者同时成立）：
+          1. `GATEWAY_CONSUMER_ENABLED=true`（调用方已保证）；
+          2. `GATEWAY_PERSONAS_FILE` 读出的 `personas` **非空**；
+          3. `GATEWAY_MODEL_BASE_URL` + `GATEWAY_MODEL_NAME` 均已配置。
+
+        人设文件非法 → `PersonaConfigError` 向上抛（**拒绝启动**，不回显文件内容）。
+        未激活时打一条 info（只说明缺哪一项，不含任何配置值）。
+        """
+        personas = load_personas(
+            config.personas_file,
+            server_name=config.matrix_server_name,
+            max_message_chars=config.max_message_chars,
+        )
+        model_config = ModelConfig(
+            base_url=(config.model_base_url or "").rstrip("/"),
+            model=(config.model_name or ""),
+            timeout_seconds=config.model_timeout_seconds,
+            _api_key=config.model_api_key,
+        )
+        missing = []
+        if not personas:
+            missing.append("GATEWAY_PERSONAS_FILE has no personas")
+        if not model_config.configured:
+            missing.append("GATEWAY_MODEL_BASE_URL / GATEWAY_MODEL_NAME not configured")
+        if missing:
+            logging.getLogger(__name__).info(
+                "AS consumer engine is inactive (record/count only): %s",
+                "; ".join(missing),
+            )
+            return None
+        logging.getLogger(__name__).info(
+            "AS consumer engine is active for %d persona(s)", len(personas)
+        )
+        return EngineHooks(
+            personas=personas,
+            client=ModelClient(model_config),
+            transport=transport,
+            policy_engine=service.policy_engine,
+        )
 
     def server_close(self) -> None:
         """关闭监听前先停消费者，再停清理线程（未启用时为 no-op）。"""

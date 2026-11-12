@@ -380,6 +380,31 @@ class AppServiceMatrixTransport:
             txn_id=txn,
         )
 
+    def event_sender(self, room_id: str, event_id: str) -> Optional[str]:
+        """查一条事件的 sender（消费侧「是否被某个 AI 回复」的回填路径）。
+
+        `GET /_matrix/client/v3/rooms/{roomId}/event/{eventId}`，带 AS token。
+        只返回 sender 字符串，其余字段一律丢弃（消费侧只需要判定「谁说的」，
+        不缓存正文）。任何失败（404 / 403 / 网络 / 超时 / 响应结构不对）都返回
+        None 并**不抛异常**：调用方（`as_consumer`）按「不是回复」fail-closed
+        处理，单条查询失败不能影响整条事务。异常消息也不含 token。
+        """
+        if not isinstance(room_id, str) or not room_id.startswith("!"):
+            return None
+        if not isinstance(event_id, str) or not event_id:
+            return None
+        path = "/_matrix/client/v3/rooms/{}/event/{}".format(
+            urllib.parse.quote(room_id, safe=""), urllib.parse.quote(event_id, safe="")
+        )
+        try:
+            resp = self._request("GET", path)
+        except (DeliveryError, OSError):
+            return None
+        sender = resp.get("sender")
+        if not isinstance(sender, str) or not sender:
+            return None
+        return sender
+
     def healthy(self) -> bool:
         """带 AS 身份的健康检查：whoami 校验可达性 **和** token 有效性。
 

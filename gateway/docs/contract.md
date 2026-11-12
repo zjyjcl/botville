@@ -34,12 +34,14 @@
 
 | 接入方式 | 运行时 | 模型调用 |
 |---|---|---|
-| **简单接入** | 网关进程内的子包 `engine/`（填 API + 人设，平台套角色引擎） | 由 `engine/` 调用，**网关的限额与审核层先于引擎执行**；引擎发言一律走内部 `evaluate → send` |
+| **简单接入** | 网关进程内的子包 `engine/`（填 API + 人设，平台套角色引擎）——**0.1.0 已实现**（B2.4，见 §1.7.8 ②⑫） | 由 `engine/` 调用，**网关的限额与审核层先于引擎执行**；引擎发言一律走内部 `evaluate → send` |
 | **完整接入**（如大肥鱼） | 服务方自带运行时，经 SDK 接入网关 | 由外部运行时自行调用；网关只裁决 `POST /policy/evaluate` / `POST /conversations/{id}/messages`，语义不变 |
 
 因此不再笼统地说「网关不调模型」：**简单接入调模型的是网关内置引擎，完整接入调模型的是
-外部运行时**；两者都必须经过网关的限额、审核与隔离层。事件消费与引擎的执行主体见 §1.7.8
-（PR1 只搭消费骨架，**不调模型**）。
+外部运行时**；两者都必须经过网关的限额、审核与隔离层。简单接入的**执行顺序固定**为
+`限额/审核（policy evaluate）→ 引擎调模型 → 投递（send）`：限额被拒时**不调模型**、
+不产生投递；引擎发言永远与 HTTP 发送路径共用同一套裁决。事件消费与引擎的执行主体见
+§1.7.8（0.1.0 已实现消费骨架与内置引擎；记忆在 PR3）。
 
 ### 会话加密与 AI 参与
 
@@ -705,14 +707,34 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
   `evaluate → send`，不绕过 `POST /policy/evaluate` 与 `POST /conversations/{id}/messages`
   的任何裁决。
 - **完整接入**（如大肥鱼）：服务方自带运行时经 SDK 接入，调用网关既有端点，语义不变。
-- 因此「网关不调模型」只对完整接入成立；简单接入由内置 `engine/` 调模型。**PR1 不引入
-  任何模型调用**。
+- 因此「网关不调模型」只对完整接入成立；简单接入由内置 `engine/` 调模型。**PR1 只搭
+  消费骨架、不调模型；B2.4（0.1.0）起内置 `engine/` 调模型。**
 
-**② 人设（计划，PR2 实现）**
+**② 人设（B2.4 已实现）**
 
-- 只读 JSON 文件 `GATEWAY_PERSONAS_FILE`（PR2 引入；**本 PR 不读取**）。
-- 仓库只放**示例**人设；真实人设不进仓库，用户自有人设不开源。
-- 房间归属由房间内 `@ai_*` 成员的成员关系推出；`/v1/personas` 端点以后再做（不在 v1 PR1–PR3B 范围）。
+- 只读 JSON 文件 `GATEWAY_PERSONAS_FILE`（空 = 没有人设 → 引擎**永不发言**，消费者
+  仍记录/计数）。仓库只放**示例**：`gateway/examples/personas.example.json`；
+  **真实人设不进仓库**，用户自有人设不开源。
+- 结构：`{"personas": [...]}`，每项字段：
+
+  | 字段 | 必填 | 含义 |
+  |---|---|---|
+  | `user_id` | 是 | **本服** `@ai_*`（domain 等于 `GATEWAY_MATRIX_SERVER_NAME`，大小写不敏感） |
+  | `display_name` | 否 | 展示名（拼进系统提示） |
+  | `system_prompt` | 是 | 人设指令正文，进 **system/instructions 区**（不是数据区） |
+  | `personality` | 否 | 追加的性格描述（同属指令区） |
+  | `model` | 否 | 模型名覆盖；缺省用 `GATEWAY_MODEL_NAME` |
+  | `credential_ref` | 否 | **只能**是 `env:NAME`；调用时读 `os.environ[NAME]` 覆盖全局密钥。文件里出现明文密钥字形 → 拒绝启动 |
+  | `max_reply_chars` | 否 | 单条回复上限（正整数，不超过 `MAX_MESSAGE_CHARS`）；缺省 2000 |
+
+- **启动期校验**（`engine.personas.load_personas`）：文件读不到 / JSON 非法 / 顶层或条目
+  有未知字段 / `user_id` 缺失或不是本服 `@ai_*` / `user_id` 重复 / `system_prompt` 缺失 /
+  `credential_ref` 不是 `env:NAME` / `max_reply_chars` 越界 / 未配置
+  `GATEWAY_MATRIX_SERVER_NAME` → **拒绝启动**（exit 2）。错误消息只报**位置与字段名**，
+  **不回显文件内容或任何字段原值**（人设文件可能含部署侧写的密钥）。
+- 房间归属由房间内 `@ai_*` 成员的成员关系推出（`room_members` 回调的返回值会被过滤，
+  只保留本服 `@ai_*`；回调缺失/出错时 fail-closed）；`/v1/personas` 端点以后再做
+  （不在 v1 PR1–PR3B 范围）。
 
 **③ 消费者形态**
 
@@ -813,10 +835,16 @@ ephemeral 不在 AS 注册里开启，忽略。
 1. sender 自己是 AI → **否**（防循环）；
 2. 房间里**恰好一个** AI → **是**（单聊必回）；
 3. 群聊：被 **@**（`m.mentions.user_ids` 含该 AI，或正文含其**完整** user ID）或被该 AI
-   回复 → **是**；
+   **回复**（`content["m.relates_to"]["m.in_reply_to"]["event_id"]` 指向的事件 sender 是它）
+   → **是**；
 4. 其余 → **否**。
 
-多个 AI 同时被 @ 时，按提及顺序经 B3 内部调度处理（不在本函数职责内）。
+「被回复对象的 sender」由消费者解析：进程内有界 LRU（`EventSenderCache`，每条消费成功的
+事件写入 `event_id → sender`）+ 可选回填（AS 传输 `GET /_matrix/client/v3/rooms/{roomId}/event/{eventId}`）。
+回填失败 / 超时 / 查不到 → **按「不是回复」处理**（fail-closed），不影响事务继续处理。
+
+多个 AI 同时被 @ 时，**每个都回复**，按**提及顺序**串行执行（`target_user_ids` 保序；
+单线程消费者内逐个 `evaluate → model → send`，不并发）。
 
 **⑩ 四层记忆（PR3，仅规划）**
 
@@ -836,17 +864,22 @@ redaction 删除记忆；保留期可配，默认 90 天；**备份属敏感数�
 - `GATEWAY_CONSUMER_ENABLED`（bool，**默认 false**，非法值拒绝启动）。关闭时与现在**完全
   一致**：不起线程、不唤醒。
 - 开启但未配置 `GATEWAY_AS_TXN_DB_PATH` → 启动**警告**并不起线程（**不拒绝启动**）。
-- 开启但未配置模型 → 只记录和计数，**不发言**，`/health` **不 degraded**。
-- 模型配置**计划名**（**PR2 引入，本 PR 不读取**）：`GATEWAY_MODEL_BASE_URL` /
-  `GATEWAY_MODEL_NAME` / `GATEWAY_MODEL_API_KEY`。密钥**不写日志、不进 `/health`、不进
-  任何错误体**。
+- **内置引擎的激活条件**（三者同时成立才发言，否则只记录/计数，`/health` 不 degraded）：
+  1. `GATEWAY_CONSUMER_ENABLED=true`；
+  2. `GATEWAY_PERSONAS_FILE` 读出**非空** personas；
+  3. `GATEWAY_MODEL_BASE_URL` + `GATEWAY_MODEL_NAME` 均已配置。
+- 模型配置（**B2.4 已生效**）：`GATEWAY_MODEL_BASE_URL`（http/https，空 = 未配置模型）/
+  `GATEWAY_MODEL_NAME`（配了 BASE_URL 就必填）/ `GATEWAY_MODEL_API_KEY`（可选；`Authorization:
+  Bearer`）/ `GATEWAY_MODEL_TIMEOUT_SECONDS`（默认 30，必须为正数）。密钥**不写日志、不进
+  `/health`、不进任何错误体**；人设可用 `credential_ref: "env:NAME"` 按人设覆盖密钥。
+- `GATEWAY_PERSONAS_FILE`：只读 JSON 路径（空 = 无 personas → 引擎不发言）。启动期校验
+  schema / 本服 `@ai_*` / `credential_ref` 形状 / `max_reply_chars` 范围，非法**拒绝启动**。
 - 统计：线程安全的 `ConsumerStats` 快照（dict of counters），只供内部 / 测试读取；
   **不新增** `/health` 字段（不改 OpenAPI）。
 
 **⑬ 契约范围**
 
-本节只描述网关内部消费行为，**不改任何 `/v1` 端点、不改 OpenAPI**；C 线不受影响。A 线
-以后注入模型环境变量（不在本 PR）。
+本节只描述网关内部消费与引擎行为，**不改任何 `/v1` 端点、不改 OpenAPI**；C 线不受影响。
 
 ---
 
@@ -1454,7 +1487,8 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
-| 0.1.0 | 2026-11-12 | [B 线 as-consumer，**消费骨架 + 纯文档改 /v1 措辞，不改 OpenAPI、不改任何端点/字段/状态码/错误码**] 新增 **§1.7.8 消费语义**：网关进程内后台线程消费 AS 事务库（`GATEWAY_CONSUMER_ENABLED`，默认 **false**；关闭时行为完全不变），事务落库后立即唤醒 + 5 秒兜底轮询；按 rowid 顺序单批 ≤100、单线程串行；at-least-once（副作用完成后才 `mark_processed`）；发言幂等键 `spk_+sha256(persona, event_id)` 稳定推导 + `SpeechDedupe` 钩子（PR1 内存实现）。失败：事务表增量迁移补 `attempts` / `last_error_type`（只存类型名）/ `failed_at` / `next_attempt_at` 四列（对 #192/#194 旧库幂等）���普通失败指数退避 `min(5×2^(n−1), 3600)`、连续 5 次标 failed 不再取出；`TransientUnavailable` 不计 attempts。事件分类：`message_text` / `invite_to_ai` / `redaction` / `reaction` / `edit` / `other_state` / `other`；AI（本服 `@ai_*` 与网关 AS sender）发言不触发回复、只计 AI 事件；本服 trusted 人类消息调用 `record_human_message` 重置熔断计数；外服 sender 一律 `untrusted`；按 Unicode 码点截断至 8000。钩子默认 no-op（PR2 回复 / PR3 记忆）。新增纯函数 `should_reply()`（单聊必回、群聊仅被 @ 或被回复）与 `ConsumerStats` 快照（**不进 /health**、不改 OpenAPI）。积压 >24h 记 warning（限频 1 小时，只记时长）。**文档修订**：§0 与 §7.2 区分「简单接入内置 `engine/`」与「完整接入外部运行时」；§6.3 人类入站入口已存在（消费者默认关闭时行为不变）；§1.7.6 改为消费已由本 PR 实现。模型环境变量（`GATEWAY_MODEL_BASE_URL` / `GATEWAY_MODEL_NAME` / `GATEWAY_MODEL_API_KEY`）**PR2 引入，本 PR 不读取**；PR1 不调模型、不发言。 **顺带 #199 审查 nits**：①`_precreate_private_file` 注释与实现对齐（去掉对不存在返回值的引用）；②`get_unprocessed_transactions` 模块注释更新为「按 rowid 升序、limit 默认 100、<1 抛 ValueError」；③`_migrate` docstring 与 §1.7.7 运维第 5 点补「首次在大库上建两个部分索引可能拉长那一次启动时间」；④§1.7.5 / §1.7.3 明确 ping 的纯空白体等价空体（`200 {}`），新增回归测试；⑤§1.7.8 ⑦ 明确外服 `@ai_*` sender 按 AI 处理（不触发回复、trust=untrusted、不调 record_human_message），且「目标 AI」只认本服 `@ai_*`（未配置 server_name 时 fail-closed，邀请归 other_state）。 |
+| 0.1.0 | 2026-11-12 | [B2.4 engine-reply，**进程内引擎，不改 /v1 端点/字段/状态码/错误码/OpenAPI**] §0 执行主体表从「PR2 落地」改为「已实现」；§1.7.8 ② 更新为已实现：新增只读人设文件 `GATEWAY_PERSONAS_FILE`（启动期校验 schema / 本服 `@ai_*` / credential_ref 形状 / max_reply_chars 范围，错误消息不回显文件内容；仓库只放示例 `gateway/examples/personas.example.json`；真实人设不进仓库）；§1.7.8 ⑨ `should_reply` 补充「被 AI 回复」路径：`m.relates_to.m.in_reply_to.event_id` 指向的事件 sender 是本服 AI 也触发回复；进程内有界 LRU `EventSenderCache` + 可选 AS 传输 `GET .../event/{eventId}` 回填，回填失败按「不是回复」fail-closed；多个 AI 同时被 @ 时按提及顺序全部回复（`target_user_ids` 保序）；§1.7.8 ⑫ 更新模型配置（`GATEWAY_MODEL_BASE_URL` / `GATEWAY_MODEL_NAME` / `GATEWAY_MODEL_API_KEY` / `GATEWAY_MODEL_TIMEOUT_SECONDS`，PR2 已生效）、人设文件（`GATEWAY_PERSONAS_FILE`）、引擎激活三件套条件（消费开启 + 非空 personas + 模型已配；任一缺失只记录/计数，`/health` 不 degraded）；发言去重账本 `as_speech_dedupe`（SQLite，对 §1.7.8 ④ 的「持久化幂等键」落地；随 `run_purge_safely` 按同一保留期清理）。**新增子包 `engine/`**（`personas.py` / `model_client.py` / `engine.py`）：`ModelClient`（urllib 零依赖 OpenAI 兼容 chat completions，5xx/429/408/超时 → `TransientUnavailable`，其余 4xx/结构错误 → `ModelError`，密钥不进 repr/日志/错误体，重定向不跟随）；`EngineHooks`（`ConsumerHooks` 实现，限额前置 → 四区隔离上下文拼装 → model → AS masquerade 投递，幂等 txnId = idem_key），per-room 最近消息环形缓冲（20 条，`user`/`assistant`，不存正文以外字段）。`config.py` 新增 `model_base_url` / `model_name` / `model_api_key`（`repr=False`）/ `model_timeout_seconds` / `personas_file`，校验在 `Config.__post_init__`（非法拒绝启动）；新增辅助函数 `_env_float` / `DEFAULT_MODEL_TIMEOUT_SECONDS`（唯一定义处）。`service.py` 新增 `policy_engine` 属性（引擎复用同一实例）。`http_server.py` `GatewayServer.__init__` 在绑定端口后、消费者启动前装配 `EngineHooks`（三件套缺一 → 记 info 不起引擎）；`engine_hooks` 字段供 `__main__.py` 打印状态。**#200 审查项一并修复**：`_room_ai_ids` fail-closed 过滤（非本服 AI 不计入，回调错误只用 mentions）；`_loop` 唤醒竞态修复（`wake.clear()` 移到 `run_once()` 之前）；`event_id` 类型检查（非字符串/缺失只跳过该事件，计 `invalid_event_ids`）；`reply_to_event_id()` 辅助函数（读 `m.relates_to.m.in_reply_to.event_id`，非字符串/空串返回 None）；`EventSenderCache`（有界 LRU，`max_entries` 可配，默认 2048）；`AsTransactionConsumer` 新增 `sender_cache` / `sender_fetcher` 参数；`AppServiceMatrixTransport.event_sender()` 方法；测试 78 个新增（`test_as_consumer.py` 新增 TestRoomAiIdsFiltering / TestShouldReplyInReplyTo / TestInvalidEventIdSkipped / TestWakeDuringProcessing / TestConsumerStartupOrdering；`test_engine_reply.py` 新增，共 51 个）；`contract.md` changelog 中的 U+FFFD 修复为「；」。 |
+| 0.1.0 | 2026-11-12 | [B 线 as-consumer，**消费骨架 + 纯文档改 /v1 措辞，不改 OpenAPI、不改任何端点/字段/状态码/错误码**] 新增 **§1.7.8 消费语义**：网关进程内后台线程消费 AS 事务库（`GATEWAY_CONSUMER_ENABLED`，默认 **false**；关闭时行为完全不变），事务落库后立即唤醒 + 5 秒兜底轮询；按 rowid 顺序单批 ≤100、单线程串行；at-least-once（副作用完成后才 `mark_processed`）；发言幂等键 `spk_+sha256(persona, event_id)` 稳定推导 + `SpeechDedupe` 钩子（PR1 内存实现）。失败：事务表增量迁移补 `attempts` / `last_error_type`（只存类型名）/ `failed_at` / `next_attempt_at` 四列（对 #192/#194 旧库幂等）；普通失败指数退避 `min(5×2^(n−1), 3600)`、连续 5 次标 failed 不再取出；`TransientUnavailable` 不计 attempts。事件分类：`message_text` / `invite_to_ai` / `redaction` / `reaction` / `edit` / `other_state` / `other`；AI（本服 `@ai_*` 与网关 AS sender）发言不触发回复、只计 AI 事件；本服 trusted 人类消息调用 `record_human_message` 重置熔断计数；外服 sender 一律 `untrusted`；按 Unicode 码点截断至 8000。钩子默认 no-op（PR2 回复 / PR3 记忆）。新增纯函数 `should_reply()`（单聊必回、群聊仅被 @ 或被回复）与 `ConsumerStats` 快照（**不进 /health**、不改 OpenAPI）。积压 >24h 记 warning（限频 1 小时，只记时长）。**文档修订**：§0 与 §7.2 区分「简单接入内置 `engine/`」与「完整接入外部运行时」；§6.3 人类入站入口已存在（消费者默认关闭时行为不变）；§1.7.6 改为消费已由本 PR 实现。模型环境变量（`GATEWAY_MODEL_BASE_URL` / `GATEWAY_MODEL_NAME` / `GATEWAY_MODEL_API_KEY`）**PR2 引入，本 PR 不读取**；PR1 不调模型、不发言。 **顺带 #199 审查 nits**：①`_precreate_private_file` 注释与实现对齐（去掉对不存在返回值的引用）；②`get_unprocessed_transactions` 模块注释更新为「按 rowid 升序、limit 默认 100、<1 抛 ValueError」；③`_migrate` docstring 与 §1.7.7 运维第 5 点补「首次在大库上建两个部分索引可能拉长那一次启动时间」；④§1.7.5 / §1.7.3 明确 ping 的纯空白体等价空体（`200 {}`），新增回归测试；⑤§1.7.8 ⑦ 明确外服 `@ai_*` sender 按 AI 处理（不触发回复、trust=untrusted、不调 record_human_message），且「目标 AI」只认本服 `@ai_*`（未配置 server_name 时 fail-closed，邀请归 other_state）。 |
 | 0.1.0 | 2026-11-12 | [B 线 as-txn-nits，**协议层 + 文档，不改 /v1，不改 OpenAPI**] **①Content-Length 一致性**：transactions 的缺失/`0`/纯空白正文统一 `400 M_NOT_JSON`（之前误作 `M_BAD_JSON`）；ping 的缺失/空体保持 `200 {}`；坏 Content-Length / chunked 两者都是 `M_NOT_JSON`。§1.7.3 错误码表与 §1.7.5 分界说明同步。**②常量唯一定义**：`AS_TXN_PURGE_INTERVAL_MIN_SECONDS` 单一定义在 `as_txn_store.py`，`config.py` import 复用，不再重复定义。**③回归测试**（新文件 `test_as_txn_store_ops.py`）：新建库 `0600`；既有库权限不变；WAL 旁文件与主库同级收紧；旧库（#192 时期）就地补索引且 `EXPLAIN QUERY PLAN` 命中；调度器注入快速等待函数、3 轮内完成验证；间隔 0 经 `build_server` 路径验证不跑清理不起线程；配置校验与库路径无关各 3 个测试。**④运维**：清理查询加**部分索引** `idx_as_transactions_purge ON as_transactions(received_at) WHERE purged_at IS NULL`（幂等迁移，新旧库统一）；WAL 旁文件 `-wal`/`-shm` 在主库 `0600` 时 `chmod 0600`（尽力而为，OSError 忽略）；§1.7.7 ops notes 更新：补配置校验无关库路径说明、补旁文件与目录权限说明（目录建议 `0700`，见 `docs/deploy/appservice.md`）。**⑤配置校验**：`GATEWAY_AS_TXN_RETENTION_DAYS`/`GATEWAY_AS_TXN_PURGE_INTERVAL_SECONDS` 非法时无论是否配置库路径均拒绝启动；测试覆盖。**⑥README**：补 `PUT /_matrix/app/v1/transactions/{txnId}` / `POST /_matrix/app/v1/ping` 两行；包结构树补 `as_txn_store.py` 等缺失模块；配置表补 `GATEWAY_HS_TOKEN`/`GATEWAY_AS_MAX_BODY_BYTES`/`GATEWAY_AS_TXN_DB_PATH`/`GATEWAY_AS_TXN_RETENTION_DAYS`/`GATEWAY_AS_TXN_PURGE_INTERVAL_SECONDS`；修正过时的「尚未接线」等旧 AS 表述。**⑦`get_unprocessed_transactions` 语义升级**：由 `ORDER BY received_at` 改为 `ORDER BY rowid`（插入顺序，同一秒内不再并列无序），加 `limit` 批量上限参数（默认 100，`< 1` 抛 ValueError）；测试覆盖同一秒内插入顺序、limit 生效、默认 100 条。§1.7.4 / §1.7.6 同步。 |
 | 0.1.0 | 2026-11-12 | [B 线 as-txn-cleanup，**协议层 + 部署文档，不改 /v1 字段/状态码/错误码，不改 OpenAPI**] **保留与清理**：新增 §1.7.7。`as_transactions` 超过保留期**不删行**，只清空 `body` 并写 `purged_at`（墓碑保留 `txn_id`/`received_at`/`processed_at`；就地迁移给 #192 旧库补列，幂等）；清理后重放同一 `txnId` 仍 `200 {}`、不重落库、不重标未处理；过期未消费事务按丢弃处理，`get_unprocessed_transactions()` 不再返回。新增配置 `GATEWAY_AS_TXN_RETENTION_DAYS`（默认 90，≥1）、`GATEWAY_AS_TXN_PURGE_INTERVAL_SECONDS`（默认 86400；0 = 关闭；非 0 ≥ 60）；启动跑一次 + 后台守护线程，失败只记日志（不记 token/事件体）；新库文件以 0600 创建。文档写明库会持续增长、备份含事件体属敏感数据、恢复须与 HS 数据成对。**#192 审查 nits**：legacy 根路径 `/transactions`、`/users`、`/rooms`、`/thirdparty` 现在**任何方法**都返回 `404 M_UNRECOGNIZED`（Matrix JSON、不鉴权），与 §1.7.3 一致；`Config(hs_token="")` 归一为未配置；非 UTF-8 体与 framing 错误统一 `400 M_NOT_JSON`（原 framing 为 `M_BAD_JSON`），§1.7.3/§1.7.5 同步；§1.7.4 注明幂等锁为**进程内**、同一事务库只允许单进程接收；补真实 sqlite 失败与并发幂等测试。**#193 对齐**：§1.7.6 改为注册 `url` 已由 #193 在 `make up GATEWAY=1`（synapse/tuwunel）时设为 `http://gateway:8080`，compose 注入 `GATEWAY_HS_TOKEN` / `GATEWAY_AS_TXN_DB_PATH`，事件消费仍在后续 PR。见 §1.7.6 / §1.7.7。 |
 | 0.1.0 | 2026-11-12 | [B 线 as-transactions，**协议层，不改 /v1 字段/状态码/错误码**] 新增 §1.7「Matrix AS 回调」：(1) `PUT /_matrix/app/v1/transactions/{txnId}` 幂等接收事务，校验 `hs_token`（`Authorization: Bearer`，不认 `?access_token=`），按 `txnId` 判重（单锁内判重+插入，无竞态），`PRAGMA synchronous=FULL` 确保 200 前落库，`GATEWAY_AS_TXN_DB_PATH` 未配置时 500 M_UNKNOWN 让 HS 重试；(2) `POST /_matrix/app/v1/ping` 探通；(3) 错误体为 Matrix 标准 `{"errcode","error"}`，`Content-Type: application/json`，不用 problem+json；(4) 路径挂域名根，不带 `GATEWAY_HTTP_PATH_PREFIX`；(5) 新增配置 `GATEWAY_HS_TOKEN`（可选，非占位符、≥32、无空白、不等于 `GATEWAY_AS_TOKEN`；未配置时端点一律 403）、`GATEWAY_AS_TXN_DB_PATH`（空/未设 = 关闭，同 `GATEWAY_MOMENTS_DB_PATH` 约定）、`GATEWAY_AS_MAX_BODY_BYTES`（默认 16 MiB，与 /v1 的 1 MiB 独立）；(6) 访问日志脱敏：带 `access_token=` 的查询串替换为 `[REDACTED]`；(7) 存储层留 `get_unprocessed_transactions()` / `mark_processed()` 钩子，**事件消费留给后续 PR**，本 PR 只做协议层；(8) 注册 `url` 在本 PR 合入时仍为 `null`，compose 接线由 A 线后续 PR 完成（后由 #193 接线：见 §1.7.6）。 |
