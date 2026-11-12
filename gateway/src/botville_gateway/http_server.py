@@ -33,11 +33,13 @@ from __future__ import annotations
 import hmac
 import http.server
 import json
+import logging
 import re
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
+from .as_consumer import AsTransactionConsumer
 from .config import Config, load_config
 from .as_txn_store import AsTransactionStore, build_as_txn_store
 from .caller_identity import (
@@ -689,9 +691,10 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 500, "M_UNKNOWN", "failed to persist transaction; retry later"
             )
             return
-        # TODO（后续 PR）：事件消费（角色引擎 / 记忆 / 主动发言）从
-        # `store.get_unprocessed_transactions()` 拉取并 mark_processed；
-        # #192/#193 只做协议层接收与持久化；事件消费留给后续 PR。
+        # 事件消费（B 线 PR1，contract §1.7.8）：进程内消费者已由
+        # `GatewayServer` 在开启 GATEWAY_CONSUMER_ENABLED 时启动，事务落库后经
+        # `store.set_on_new_transaction()` 立即唤醒（另有 5 秒兜底轮询）。
+        # 本端点只负责协议层接收与持久化，**不**在当前请求里处理事件。
         self._send_json(200, {})
 
     def _handle_as_ping(self) -> None:
@@ -1267,11 +1270,35 @@ class GatewayServer(http.server.ThreadingHTTPServer):
             ),
             purge_interval_seconds=config.as_txn_purge_interval_seconds,
         )
+        # B 线 PR1（contract §1.7.8）：进程内 AS 事务消费者。
+        # GATEWAY_CONSUMER_ENABLED=false（默认）时不起线程、不唤醒，行为与现在完全一致。
+        # 开启但 as_txn_db_path 未配置时打 warning 且不起线程（不拒绝启动）。
+        self.as_consumer: Optional[AsTransactionConsumer] = None
+        if config.consumer_enabled:
+            if self.as_txn_store is None:
+                logging.getLogger(__name__).warning(
+                    "GATEWAY_CONSUMER_ENABLED=true but GATEWAY_AS_TXN_DB_PATH is not "
+                    "set — consumer thread will NOT start"
+                )
+            else:
+                consumer = AsTransactionConsumer(
+                    self.as_txn_store,
+                    service=service,
+                    server_name=config.matrix_server_name,
+                )
+                # 注册唤醒钩子：事务落库成功后立即唤醒消费线程。
+                self.as_txn_store.set_on_new_transaction(consumer.wake)
+                self.as_consumer = consumer
+                consumer.start()
         log_startup_warnings(config)
         super().__init__((config.host, config.port), GatewayHandler)
 
     def server_close(self) -> None:
-        """关闭监听前先停后台清理线程（未启用时为 no-op）。"""
+        """关闭监听前先停消费者，再停清理线程（未启用时为 no-op）。"""
+        # 消费者先于清理线程停（避免清理线程 purge 后消费者还在处理已清理行）。
+        consumer = getattr(self, "as_consumer", None)
+        if consumer is not None:
+            consumer.stop(timeout=5.0)
         moments = getattr(self, "moments_service", None)
         if moments is not None:
             moments.stop_purge_scheduler()

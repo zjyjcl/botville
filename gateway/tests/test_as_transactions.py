@@ -1011,6 +1011,30 @@ class TestAsFramingConsistency(_Base):
         self.assertIn("200", status_line)
         self.assertIn("{}", body)
 
+    def test_ping_whitespace_only_body_200(self):
+        """ping 的纯空白体等价空体 → 200 {}（contract §1.7.5）。
+
+        回归：`_read_as_body(allow_empty=True)` 只在 `allow_empty=False` 时把纯
+        空白体判为 `M_NOT_JSON`；ping 走 allow_empty，纯空白应视作空体，由
+        `_handle_as_ping` 的 `raw.strip()` 分支直接返回 `{}`。
+        """
+        with _ServerFixture(_cfg(hs_token=HS_TOKEN, as_txn_db_path=self.db_path)) as s:
+            resp = _raw_request(
+                s.server,
+                (
+                    "POST /_matrix/app/v1/ping HTTP/1.0\r\n"
+                    f"Authorization: Bearer {HS_TOKEN}\r\n"
+                    "Content-Length: 3\r\n"
+                    "\r\n"
+                    "  \n"
+                ).encode("ascii"),
+            )
+        status_line, body = _status_and_body(resp)
+        self.assertIn("200", status_line)
+        self.assertIn("{}", body)
+        self.assertNotIn("M_NOT_JSON", body)
+        self.assertNotIn("M_BAD_JSON", body)
+
     def test_ping_invalid_content_length_still_m_not_json(self):
         # 坏 Content-Length 是 framing 错误：ping 也不放行。
         with _ServerFixture(_cfg(hs_token=HS_TOKEN, as_txn_db_path=self.db_path)) as s:

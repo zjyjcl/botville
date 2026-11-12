@@ -302,6 +302,7 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_AS_MAX_BODY_BYTES` | `16777216` | AS 回调请求体上限（字节，**16 MiB**；正整数，最大 256 MiB）。与 `/v1` 的 1 MiB 上限**相互独立**；超限 → `413 M_TOO_LARGE` |
 | `GATEWAY_AS_TXN_RETENTION_DAYS` | `90` | AS 事务库保留天数（正整数，`<1` 拒绝启动）。超过保留期的事务**不删行**：只清空原始请求体并写 `purged_at`（墓碑保留 `txn_id` / 接收时间 / `processed_at`），重放仍 `200 {}` 且不重落库；过期未消费事务按丢弃处理。**校验与 `GATEWAY_AS_TXN_DB_PATH` 是否配置无关**——非法值在任何情况下都拒绝启动。清理只在同时配置了库路径且间隔非 0 时运行。见 [docs/contract.md](docs/contract.md) §1.7.7 |
 | `GATEWAY_AS_TXN_PURGE_INTERVAL_SECONDS` | `86400` | AS 事务保留期清理间隔（秒）：启动先跑一次，之后后台按间隔跑，失败只记日志（不记 token / 事件体）。`0` = 关闭（启动不跑、不起线程，库会持续增长）；非 0 时 **≥60**，否则拒绝启动。**校验与 `GATEWAY_AS_TXN_DB_PATH` 是否配置无关**。见 [docs/contract.md](docs/contract.md) §1.7.7 |
+| `GATEWAY_CONSUMER_ENABLED` | `false` | 进程内 AS 事务消费者（B 线 PR1，契约 §1.7.8）总开关。**默认 false = 行为与之前完全一致**（不起线程、不唤醒）。开启后：事务落库立即唤醒 + 5 秒兜底轮询，按 rowid 顺序消费，做事件分类 / trust / 防循环 / 计数并调用钩子；**PR1 不调模型、不发言**（引擎在 PR2）。开启但 `GATEWAY_AS_TXN_DB_PATH` 未配置 → 启动 warning 且不起线程（不拒绝启动）；开启但未配置模型 → 只记录计数，`/health` 不 degraded。`GATEWAY_MODEL_BASE_URL` / `GATEWAY_MODEL_NAME` / `GATEWAY_MODEL_API_KEY` 为 PR2 计划变量，本 PR 不读取 |
 
 非法配置（端口非数字、时区不存在、`HH:MM` 格式错）在 `Config` 构造时抛 `ConfigError`，
 进程以退出码 `2` 结束。
