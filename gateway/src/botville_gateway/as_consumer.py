@@ -530,7 +530,7 @@ class AsTransactionConsumer:
         # processed（墓碑无害），不计失败。
         if not body or not body.strip():
             self._stats.inc("skipped_purged")
-            self._store.mark_processed(txn_id)
+            self._store.mark_processed(txn_id, now=now)
             return
         try:
             payload = json.loads(body)
@@ -552,7 +552,7 @@ class AsTransactionConsumer:
                 return
             self._dispatch_event(event)
         # 所有事件副作用完成后才标记（at-least-once）。
-        self._store.mark_processed(txn_id)
+        self._store.mark_processed(txn_id, now=now)
         self._stats.inc("processed")
     def _permanent_failure(self, txn_id: str, now: datetime, error_type: str) -> None:
         """永久错误（损坏的事务体）：直接标 failed，不阻塞后续事务。"""

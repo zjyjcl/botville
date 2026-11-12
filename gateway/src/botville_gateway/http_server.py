@@ -1309,7 +1309,7 @@ class GatewayServer(http.server.ThreadingHTTPServer):
                 # keep a bounded local cache warm; AppService transport fills a
                 # cold cache through joined_members while masquerading as one
                 # configured persona.  Other transports remain mention-only.
-                personas = tuple(hooks._personas) if hooks is not None else ()
+                personas = hooks.persona_ids if hooks is not None else ()
                 server_name = (config.matrix_server_name or "").lower()
 
                 def is_local_ai(user_id: str) -> bool:

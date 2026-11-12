@@ -58,22 +58,23 @@ def estimate_tokens(text: str) -> int:
 class _RoomBuffer:
     """进程内 per-room 最近消息环形缓冲（线程安全）。
 
-    只存 `(role, text)` 对：`role` 是 `"user"` / `"assistant"`，`text` 是
-    已截断的正文。不存 sender / event_id / 时间 / trust：只用来给模型提供上下文，
-    不做任何幂等或计费决策。
+    存 role、已截断正文与可选 event_id；只对仍在缓冲中的事件去重，
+    不做任何发送幂等或计费决策。
     """
 
     def __init__(self, max_entries: int = MAX_CONTEXT_MESSAGES) -> None:
-        self._buf: Deque[Tuple[str, str]] = deque(maxlen=max_entries)
+        self._buf: Deque[Tuple[str, str, Optional[str]]] = deque(maxlen=max_entries)
         self._lock = threading.Lock()
 
-    def append(self, role: str, text: str) -> None:
+    def append(self, role: str, text: str, event_id: Optional[str] = None) -> None:
         with self._lock:
-            self._buf.append((role, text))
+            if event_id and any(entry[2] == event_id for entry in self._buf):
+                return
+            self._buf.append((role, text, event_id))
 
     def snapshot(self) -> List[Tuple[str, str]]:
         with self._lock:
-            return list(self._buf)
+            return [(role, text) for role, text, _ in self._buf]
 
 
 class EngineHooks(ConsumerHooks):
@@ -105,6 +106,11 @@ class EngineHooks(ConsumerHooks):
         self._buffers: OrderedDict[str, _RoomBuffer] = OrderedDict()
         self._buf_lock = threading.Lock()
 
+    @property
+    def persona_ids(self) -> Tuple[str, ...]:
+        """Configured persona IDs as an immutable snapshot."""
+        return tuple(self._personas)
+
     def _get_buffer(self, room_id: str) -> _RoomBuffer:
         with self._buf_lock:
             if room_id not in self._buffers:
@@ -123,7 +129,7 @@ class EngineHooks(ConsumerHooks):
         # 先把人类消息放进 ring buffer（不管是否会回复）。
         if room_id:
             buf = self._get_buffer(room_id)
-            buf.append("user", truncate_text(text, _RING_TEXT_LIMIT))
+            buf.append("user", truncate_text(text, _RING_TEXT_LIMIT), event_id)
 
         targets = list(ctx.target_user_ids) if ctx.target_user_ids else (
             [ctx.persona_user_id] if ctx.persona_user_id else []

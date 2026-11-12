@@ -70,6 +70,27 @@ class QuietHoursTests(unittest.TestCase):
         self.assertEqual(len(self.transport.sent), 1)
         self.assertEqual(self.client.complete.call_count, 1)
 
+    def test_deferred_replay_context_has_one_human_message(self):
+        self.enqueue()
+        self.consumer.run_once()
+        self.clock = self.end
+        self.consumer.run_once()
+        messages = self.client.complete.call_args.kwargs['messages']
+        self.assertEqual(sum(m['role'] == 'user' for m in messages), 1)
+        self.assertEqual(self.hooks._get_buffer(ROOM).snapshot().count(('user', 'hello')), 1)
+
+    def test_processed_at_uses_fake_clock(self):
+        self.clock = self.end
+        self.enqueue()
+        self.consumer.run_once()
+        row = self.conn.execute("SELECT processed_at FROM as_transactions").fetchone()
+        self.assertEqual(row['processed_at'], '2026-11-13T23:30:00Z')
+
+    def test_persona_ids_is_read_only(self):
+        self.assertEqual(self.hooks.persona_ids, (AI, OTHER))
+        with self.assertRaises(AttributeError):
+            self.hooks.persona_ids = ()
+
     def test_send_boundary_race_and_partial_personas(self):
         self.clock = datetime(2026, 11, 13, 14, 59, tzinfo=timezone.utc)
         def reply(**kwargs):

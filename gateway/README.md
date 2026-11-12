@@ -426,3 +426,13 @@ npx --yes @redocly/cli lint gateway/openapi/gateway.v1.yaml
   （见 [`docs/contract.md#14-️-策略结论不是-http-错误`](docs/contract.md#14-️-策略结论不是-http-错误)）。
 - 不写任何真实密钥、token、密码，只用 `<change-me>` 占位（见 `CONTRIBUTING.md`）。
 - 新文件加 Apache-2.0 SPDX 头。
+
+### 引擎配置与运维补充（#203 复审）
+
+**#203 复审补充（运行与时钟）**
+
+- 生产必须通过 `GATEWAY_HMAC_SECRET` 配置跨重启保持稳定的部署 HMAC 密钥（至少 64 个十六进制字符，拒绝全零）；`service._txn_id_for` 据此推导 Matrix txnId。dev 未配置时使用每进程随机密钥，重启后 txnId 会改变，不能保证跨重启去重。
+- 已知限制：在“消息已发送，但 speech key 尚未写入”的窄窗口崩溃并重启，可能多调一次模型、产生双次模型用量计费；进程内 usage ledger 也无法跨重启保留去重记账。稳定 HMAC 密钥确保重放使用相同 txnId，由 homeserver 去重，不会重复发送消息。
+- 成员查询单次超时 5 秒；房间失败缓存 60 秒，跨房间连续失败 3 次后全局熔断 60 秒，冷却到期允许重试，成功清零。有效成员缓存仍可用；无有效缓存时抛错，由 consumer 回退到 mentions 并计 `room_member_errors`。正、负缓存均有房间数量上限。
+- 静默延后事件重放时，按 event_id 对仍在有界上下文缓冲中的人类消息去重。
+- `processed_at`、`failed_at` 与 `next_attempt_at` 使用 consumer 注入时钟的本批次时间；store 的 `mark_processed(now=...)` 未传时默认墙钟。入站 `received_at` 和独立 speech 去重账本的 `created_at` / `sent_at` 有意使用实际写入墙钟，供接收审计和保留清理，不参与 consumer 的重试调度。

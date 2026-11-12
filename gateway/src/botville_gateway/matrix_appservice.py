@@ -64,6 +64,9 @@ _monotonic = time.monotonic
 LOCAL_ID_RE = re.compile(r"^[a-z0-9._=-]{1,64}$")
 
 
+MEMBER_LOOKUP_TIMEOUT_SECONDS = 5.0
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """禁止跟随重定向：AS token 在 Authorization 头里，跟随 3xx 可能把凭据
     转发到跨源地址。重定向在这里永远是配置错误（比如把 URL 指到了反代跳转），
@@ -425,10 +428,11 @@ class AppServiceMatrixTransport:
             self._check_sender(persona)
             try:
                 response = self._request(
-                    "GET", path, query={"user_id": persona}, timeout=self._timeout
+                    "GET", path, query={"user_id": persona}, timeout=MEMBER_LOOKUP_TIMEOUT_SECONDS
                 )
-            except DeliveryError as exc:
-                last_error = exc
+            except DeliveryError:
+                # Never propagate an HS body or URL that may echo credentials.
+                last_error = DeliveryError("appservice.response", "joined_members lookup failed")
                 continue
             joined = response.get("joined")
             if not isinstance(joined, dict):

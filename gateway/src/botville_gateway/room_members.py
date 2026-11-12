@@ -3,7 +3,7 @@
 """Bounded local-AI room membership cache for the AS consumer.
 
 The cache is deliberately a routing aid, not an authority: a failed homeserver
-lookup returns no members so callers retain mention-only behaviour.
+lookup raises so callers retain mention-only behaviour and count errors.
 """
 
 from __future__ import annotations
@@ -16,6 +16,9 @@ from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 DEFAULT_MEMBER_CACHE_TTL_SECONDS = 30.0
 DEFAULT_MEMBER_CACHE_ROOMS = 1000
+NEGATIVE_TTL_SECONDS = 60.0
+BREAKER_FAILURE_THRESHOLD = 3
+BREAKER_COOLDOWN_SECONDS = 60.0
 
 
 class RoomMemberSource:
@@ -48,10 +51,17 @@ class RoomMemberSource:
         self._max_rooms = max_rooms
         self._monotonic = monotonic
         self._items: "OrderedDict[str, Tuple[set[str], float]]" = OrderedDict()
+        self._negative: OrderedDict[str, float] = OrderedDict()
+        self._consecutive_failures = 0
+        self._breaker_until = 0.0
         self._lock = threading.Lock()
 
     def members(self, room_id: str) -> List[str]:
-        """Return cached members, or perform one fail-closed AS lookup."""
+        """Return valid cache or look up members; failures/backoff raise.
+
+        Negative entries are bounded independently of positive entries. During
+        a global cooldown, valid cached membership remains usable.
+        """
         now = self._monotonic()
         with self._lock:
             cached = self._items.get(room_id)
@@ -60,11 +70,30 @@ class RoomMemberSource:
                 return sorted(cached[0])
             if cached is not None:
                 del self._items[room_id]
+            if self._negative.get(room_id, 0.0) > now or self._breaker_until > now:
+                raise RuntimeError("room membership lookup temporarily unavailable")
+            self._negative.pop(room_id, None)
         if self._fetcher is None or not self._personas:
             return []
-        received = self._fetcher(room_id, self._personas)
-        ids = {uid for uid in received if isinstance(uid, str) and self._is_local_ai(uid)}
-        self._put(room_id, ids, now)
+        try:
+            received = self._fetcher(room_id, self._personas)
+            ids = {uid for uid in received if isinstance(uid, str) and self._is_local_ai(uid)}
+        except Exception:
+            with self._lock:
+                failed_at = self._monotonic()
+                self._negative[room_id] = failed_at + NEGATIVE_TTL_SECONDS
+                self._negative.move_to_end(room_id)
+                while len(self._negative) > self._max_rooms:
+                    self._negative.popitem(last=False)
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= BREAKER_FAILURE_THRESHOLD:
+                    self._breaker_until = failed_at + BREAKER_COOLDOWN_SECONDS
+            raise
+        with self._lock:
+            self._negative.pop(room_id, None)
+            self._consecutive_failures = 0
+            self._breaker_until = 0.0
+        self._put(room_id, ids, self._monotonic())
         return sorted(ids)
 
     def observe_member_event(self, event: object) -> None:
