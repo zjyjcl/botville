@@ -473,6 +473,13 @@ class Config:
     # as_txn_db_path 且间隔 > 0 时运行。
     as_txn_retention_days: int = DEFAULT_AS_TXN_RETENTION_DAYS
     as_txn_purge_interval_seconds: int = DEFAULT_AS_TXN_PURGE_INTERVAL_SECONDS
+    # ---------- AS 事务消费（B 线 PR1，contract §1.7.8）----------
+    # 消费者总开关（默认 false）：关闭时与现在完全一致（不起消费线程、不唤醒）。
+    # 开启但未配置 GATEWAY_AS_TXN_DB_PATH → 启动 warning 并不起线程（不拒绝启动）。
+    # 开启但未配置模型 → 只记录和计数，不发言（/health 不 degraded）。
+    # 模型环境变量（GATEWAY_MODEL_BASE_URL / GATEWAY_MODEL_NAME /
+    # GATEWAY_MODEL_API_KEY）在 PR2 引入，本 PR 不读取。
+    consumer_enabled: bool = False
 
     def __post_init__(self) -> None:
         # 构造时校验，避免明显错误的配置拖到第一次请求才炸。
@@ -1135,4 +1142,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
             DEFAULT_AS_TXN_PURGE_INTERVAL_SECONDS,
             minimum=0,
         ),
+        # 消费开关（contract §1.7.8）：默认关闭 = 现在行为完全不变。
+        # 非法值（非布尔）由 _env_bool 抛 ConfigError，拒绝启动。
+        consumer_enabled=_env_bool(source, "GATEWAY_CONSUMER_ENABLED", False),
     )
