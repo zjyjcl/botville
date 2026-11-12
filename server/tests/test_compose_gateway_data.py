@@ -200,6 +200,138 @@ class ComposeGatewayServiceRenderTest(unittest.TestCase):
             self.assertNotIn("APPSERVICE_HS_TOKEN", env)
 
 
+PERSONAS_DIR = REPO_ROOT / "server" / "compose" / "gateway-personas"
+MODEL_KEYS = (
+    "GATEWAY_MODEL_BASE_URL",
+    "GATEWAY_MODEL_NAME",
+    "GATEWAY_MODEL_API_KEY",
+    "GATEWAY_MODEL_TIMEOUT_SECONDS",
+    "GATEWAY_PERSONAS_FILE",
+    "GATEWAY_CONSUMER_ENABLED",
+)
+
+
+class GatewayPersonasDirTest(unittest.TestCase):
+    def test_repo_ships_only_example_and_readme(self):
+        """The bind-mount source always exists (so an unconfigured deployment
+        mounts it without error) and only holds the example + README."""
+        self.assertTrue(PERSONAS_DIR.is_dir())
+        tracked = subprocess.run(
+            ["git", "ls-files", str(PERSONAS_DIR.relative_to(REPO_ROOT))],
+            cwd=REPO_ROOT, capture_output=True, text=True,
+        )
+        if tracked.returncode == 0 and tracked.stdout.strip():
+            names = sorted(Path(line).name for line in tracked.stdout.split())
+            self.assertEqual(names, ["README.md", "personas.example.json"])
+        json.loads((PERSONAS_DIR / "personas.example.json").read_text(encoding="utf-8"))
+
+    def test_real_personas_are_gitignored(self):
+        if not shutil.which("git"):
+            self.skipTest("git not available")
+        for name in ("personas.json", "my-town.json"):
+            proc = subprocess.run(
+                ["git", "check-ignore", "-q",
+                 "server/compose/gateway-personas/" + name],
+                cwd=REPO_ROOT,
+            )
+            self.assertEqual(proc.returncode, 0, name + " must be gitignored")
+        for name in ("personas.example.json", "README.md"):
+            proc = subprocess.run(
+                ["git", "check-ignore", "-q",
+                 "server/compose/gateway-personas/" + name],
+                cwd=REPO_ROOT,
+            )
+            self.assertEqual(proc.returncode, 1, name + " must stay tracked")
+
+
+@unittest.skipUnless(compose_available(), "docker compose v2 not available")
+class ComposeGatewayModelEnvTest(unittest.TestCase):
+    """B line PR2 pass-through: names/defaults as agreed, the API key is
+    interpolated from the env file only and never printed by `config --quiet`."""
+
+    SENTINEL = "sentinel-model-key-must-not-print-0123456789"
+
+    def run_compose(self, *args, extra_env=""):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / "env"
+            env_file.write_text(REQUIRED_ENV + extra_env, encoding="utf-8")
+            return subprocess.run(
+                ["docker", "compose", "-p", "botville-test", "-f", str(COMPOSE),
+                 "--env-file", str(env_file), *args],
+                cwd=REPO_ROOT, capture_output=True, text=True,
+            )
+
+    def gateway(self, extra_env=""):
+        proc = self.run_compose("--profile", "gateway", "config", "--format", "json",
+                                extra_env=extra_env)
+        if proc.returncode != 0:
+            self.fail("compose config failed (exit {})".format(proc.returncode))
+        return json.loads(proc.stdout)["services"]["gateway"]
+
+    def test_defaults_without_any_model_or_personas(self):
+        svc = self.gateway()
+        env = svc["environment"]
+        for key in MODEL_KEYS:
+            self.assertIn(key, env, key)
+        self.assertEqual(env["GATEWAY_MODEL_BASE_URL"] or "", "")
+        self.assertEqual(env["GATEWAY_MODEL_NAME"] or "", "")
+        self.assertEqual(env["GATEWAY_MODEL_API_KEY"] or "", "")
+        self.assertEqual(env["GATEWAY_MODEL_TIMEOUT_SECONDS"], "30")
+        self.assertEqual(env["GATEWAY_PERSONAS_FILE"] or "", "")
+        self.assertEqual(env["GATEWAY_CONSUMER_ENABLED"], "false")
+        binds = [v for v in svc["volumes"] if v["type"] == "bind"]
+        self.assertEqual(len(binds), 1)
+        self.assertEqual(binds[0]["target"], "/etc/botville-gateway")
+        self.assertTrue(binds[0].get("read_only"))
+        self.assertEqual(Path(binds[0]["source"]).resolve(), PERSONAS_DIR.resolve())
+
+    def test_values_pass_through(self):
+        env = self.gateway(extra_env=(
+            "GATEWAY_MODEL_BASE_URL=http://model.invalid/v1\n"
+            "GATEWAY_MODEL_NAME=test-model\n"
+            "GATEWAY_MODEL_API_KEY={}\n"
+            "GATEWAY_MODEL_TIMEOUT_SECONDS=12\n"
+            "GATEWAY_PERSONAS_FILE=/etc/botville-gateway/personas.json\n"
+            "GATEWAY_CONSUMER_ENABLED=true\n"
+        ).format(self.SENTINEL))["environment"]
+        self.assertEqual(env["GATEWAY_MODEL_BASE_URL"], "http://model.invalid/v1")
+        self.assertEqual(env["GATEWAY_MODEL_NAME"], "test-model")
+        self.assertEqual(env["GATEWAY_MODEL_API_KEY"], self.SENTINEL)
+        self.assertEqual(env["GATEWAY_MODEL_TIMEOUT_SECONDS"], "12")
+        self.assertEqual(env["GATEWAY_PERSONAS_FILE"], "/etc/botville-gateway/personas.json")
+        self.assertEqual(env["GATEWAY_CONSUMER_ENABLED"], "true")
+
+    def test_personas_dir_override(self):
+        with tempfile.TemporaryDirectory() as other:
+            svc = self.gateway(extra_env="BOTVILLE_GATEWAY_PERSONAS_DIR={}\n".format(other))
+            binds = [v for v in svc["volumes"] if v["type"] == "bind"]
+            self.assertEqual(Path(binds[0]["source"]).resolve(), Path(other).resolve())
+
+    def test_quiet_config_never_prints_the_key(self):
+        """CI and the docs only ever run `config --quiet` (non-quiet config
+        interpolates values; documented as never-paste)."""
+        extra = "GATEWAY_MODEL_API_KEY={}\n".format(self.SENTINEL)
+        for hs in ("synapse", "tuwunel", "continuwuity"):
+            for profiles in ((), ("--profile", "push"), ("--profile", "gateway"),
+                             ("--profile", "push", "--profile", "gateway")):
+                with self.subTest(hs=hs, profiles=profiles):
+                    proc = self.run_compose("--profile", hs, *profiles, "config", "--quiet",
+                                            extra_env=extra)
+                    self.assertEqual(proc.returncode, 0, "compose config --quiet failed")
+                    self.assertNotIn(self.SENTINEL, proc.stdout + proc.stderr)
+
+    def test_key_is_not_in_other_services(self):
+        proc = self.run_compose("--profile", "synapse", "--profile", "push",
+                                "--profile", "gateway", "config", "--format", "json",
+                                extra_env="GATEWAY_MODEL_API_KEY={}\n".format(self.SENTINEL))
+        self.assertEqual(proc.returncode, 0)
+        services = json.loads(proc.stdout)["services"]
+        for name, svc in services.items():
+            if name == "gateway":
+                continue
+            self.assertNotIn(self.SENTINEL, json.dumps(svc), name)
+
+
 class AppserviceRegistrationTemplateTest(unittest.TestCase):
     def test_registration_url_is_rendered_by_init(self):
         """The url line is a placeholder init.sh fills with exactly `null` or

@@ -386,13 +386,16 @@ jobs:
       - name: Verify gateway-data survived (gateway healthy on it)
         run: |
           set -euo pipefail
-          ${STACK} exec -T gateway grep -qx botville-gateway-data-seed /var/lib/botville-gateway/ci-seed.txt
+          # Wait for /health before any exec: right after restore-gateway the
+          # container may still be (re)starting, and exec into a restarting
+          # container fails.
           for _ in $(seq 1 60); do
             curl -fsS "http://127.0.0.1:${GATEWAY_PORT}/health" && break
             sleep 2
           done
           curl -fsS "http://127.0.0.1:${GATEWAY_PORT}/health" >/dev/null \
             || { echo "::error::gateway /health not OK after restore"; exit 1; }
+          ${STACK} exec -T gateway grep -qx botville-gateway-data-seed /var/lib/botville-gateway/ci-seed.txt
           if [ "${{ matrix.homeserver }}" != continuwuity ]; then
             ${STACK} exec -T gateway python -c "import sqlite3; c = sqlite3.connect('/var/lib/botville-gateway/as_transactions.db'); assert c.execute('select count(*) from as_transactions').fetchone()[0] >= 1"
             # The homeserver was wiped (down -v) but gateway-data restored, so the
@@ -633,6 +636,32 @@ jobs:
             -f server/compose/federation/docker-compose.federation.yml \
             --env-file server/compose/federation/generated/federation.env config --quiet
 
+      - name: Gateway model API key is never printed by compose config --quiet
+        run: |
+          set -euo pipefail
+          # A sentinel (not a real key) stands in for GATEWAY_MODEL_API_KEY;
+          # none of the config --quiet runs (every HS x profile combination)
+          # may print it. Non-quiet `config` interpolates values and is never
+          # used in CI or the docs.
+          sentinel="ci-model-key-sentinel-not-a-secret"
+          env_copy="$(mktemp)"
+          cp server/compose/.env "${env_copy}"
+          echo "GATEWAY_MODEL_API_KEY=${sentinel}" >> "${env_copy}"
+          log="$(mktemp)"
+          for hs in synapse tuwunel continuwuity; do
+            for extra in "" "--profile push" "--profile gateway" "--profile push --profile gateway"; do
+              # shellcheck disable=SC2086
+              docker compose -f server/compose/docker-compose.yml --env-file "${env_copy}" \
+                --profile "${hs}" ${extra} config --quiet >> "${log}" 2>&1
+            done
+          done
+          if grep -qF "${sentinel}" "${log}"; then
+            echo "::error::compose config --quiet printed GATEWAY_MODEL_API_KEY"
+            exit 1
+          fi
+          rm -f "${env_copy}" "${log}"
+          echo "GATEWAY_MODEL_API_KEY not printed (12 combinations)"
+
       - name: .env.example contains placeholders only
         run: |
           python3 - <<'EOF'
@@ -699,6 +728,15 @@ jobs:
               "BOTVILLE_GATEWAY_PORT": "8020",
               "BOTVILLE_GATEWAY_AUTH_TOKEN": "<change-me>",
               "BOTVILLE_GATEWAY_HMAC_SECRET": "<change-me>",
+              # Persona engine pass-through (B line PR2): off / empty by
+              # default; init.sh generates none of them (the API key is
+              # deployer-supplied and must never ship a value).
+              "GATEWAY_CONSUMER_ENABLED": "false",
+              "GATEWAY_MODEL_BASE_URL": "",
+              "GATEWAY_MODEL_NAME": "",
+              "GATEWAY_MODEL_API_KEY": "",
+              "GATEWAY_MODEL_TIMEOUT_SECONDS": "30",
+              "GATEWAY_PERSONAS_FILE": "",
               "POSTGRES_IMAGE": "docker.io/library/postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab",
               "SYNAPSE_IMAGE": "docker.io/matrixdotorg/synapse:v1.164.1@sha256:fa4aa980f279bcf26d4e7ecc2a2c9a701c73f2ebe8841da9bdcf3b2fdf693d75",
               "TUWUNEL_IMAGE": "ghcr.io/matrix-construct/tuwunel:v1.9.4@sha256:0e86c6164d6c9f5b60291938eb61ad8395021c37fe58d47a963ea7edddbedaec",

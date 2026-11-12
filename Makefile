@@ -103,7 +103,9 @@ endif
 # continuwuity without file-based registration). `up` passes it to init.sh as
 # BOTVILLE_APPSERVICE_URL; when the rendered url changed, init.sh leaves
 # $(APPSERVICE_URL_MARKER) and `up` restarts the homeserver (it reads the
-# registration only at startup) before `up -d`. Other targets that run init
+# registration only at startup) before `up -d`. If that restart fails, `up`
+# stops with a non-zero exit and keeps the marker, so the next `make up`
+# retries the restart instead of leaving the HS on the old url. Other targets that run init
 # (smoke, e2e, ...) keep whatever url is already rendered.
 GATEWAY ?=
 GATEWAY_PROFILE := $(if $(filter 1 true yes,$(GATEWAY)),--profile gateway,)
@@ -156,7 +158,10 @@ endif
 		case "$(HS)" in \
 		synapse|tuwunel) \
 			echo "appservice registration url changed: restarting $(HS) (no-op if not created yet)"; \
-			$(COMPOSE) --profile $(HS) restart $(HS) ;; \
+			if ! $(COMPOSE) --profile $(HS) restart $(HS); then \
+				echo "make up: restarting $(HS) failed; keeping $(APPSERVICE_URL_MARKER) so the next 'make up' retries" >&2; \
+				exit 1; \
+			fi ;; \
 		esac; \
 		rm -f $(APPSERVICE_URL_MARKER); \
 	fi

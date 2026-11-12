@@ -457,6 +457,52 @@ class InitScriptTest(unittest.TestCase):
         ]
         return values[-1] if values else None
 
+    MODEL_BLOCK = (
+        "GATEWAY_CONSUMER_ENABLED=false\n"
+        "GATEWAY_MODEL_BASE_URL=\n"
+        "GATEWAY_MODEL_NAME=\n"
+        "GATEWAY_MODEL_API_KEY=\n"
+        "GATEWAY_MODEL_TIMEOUT_SECONDS=30\n"
+        "GATEWAY_PERSONAS_FILE=\n"
+    )
+
+    def test_model_env_is_passed_through_never_generated_or_printed(self):
+        """B line PR2 vars: init.sh appends them with their (empty/default)
+        example values, never generates the API key, keeps a deployer value
+        verbatim and never prints it."""
+        (self.tmp / "compose" / ".env.example").write_text(
+            ENV_EXAMPLE + self.MODEL_BLOCK, encoding="utf-8"
+        )
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.env_value("GATEWAY_MODEL_API_KEY"), "")
+        self.assertEqual(self.env_value("GATEWAY_MODEL_BASE_URL"), "")
+        self.assertEqual(self.env_value("GATEWAY_MODEL_TIMEOUT_SECONDS"), "30")
+        self.assertEqual(self.env_value("GATEWAY_CONSUMER_ENABLED"), "false")
+        self.assertEqual(self.env_value("GATEWAY_PERSONAS_FILE"), "")
+
+        sentinel = "sentinel-model-key-must-not-print-0123456789"
+        content = self.env_file.read_text(encoding="utf-8")
+        content = content.replace("GATEWAY_MODEL_API_KEY=\n",
+                                  "GATEWAY_MODEL_API_KEY={}\n".format(sentinel))
+        self.env_file.write_text(content, encoding="utf-8")
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 0, "init.sh failed")
+        self.assertNotIn(sentinel, proc.stdout + proc.stderr)
+        self.assertEqual(self.env_value("GATEWAY_MODEL_API_KEY"), sentinel)
+
+        # An existing .env without the block gets the keys appended (names
+        # only in the message) and the key stays empty.
+        self.env_file.write_text(
+            "\n".join(l for l in self.env_file.read_text(encoding="utf-8").splitlines()
+                      if not l.startswith("GATEWAY_")) + "\n",
+            encoding="utf-8",
+        )
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 0, "init.sh failed")
+        self.assertIn("GATEWAY_MODEL_API_KEY", proc.stdout)
+        self.assertEqual(self.env_value("GATEWAY_MODEL_API_KEY"), "")
+
     def test_fresh_run_creates_env_with_secrets(self):
         proc = self.run_init()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)

@@ -10,8 +10,8 @@ or tuwunel):
   1. Gateway GET /health is 200, `status=ok`, and the `matrix` check is ok.
      In appservice mode that check is the startup whoami with
      GATEWAY_AS_TOKEN (the process exits if whoami fails).
-  2. OpenID userinfo: register a throwaway user on the homeserver, request
-     an OpenID token, then GET /v1/moments on the gateway with
+  2. OpenID userinfo: reuse (or, the first time, register) the fixture user
+     on the homeserver, request an OpenID token, then GET /v1/moments on the gateway with
      `Authorization: MatrixOpenID ...`. HTTP 200 means the gateway validated
      the token via in-stack userinfo (GATEWAY_HOMESERVER_FEDERATION_URL is
      empty, so it falls back to GATEWAY_HOMESERVER_URL).
@@ -19,13 +19,20 @@ or tuwunel):
      a. HS -> gateway ping: POST /_matrix/client/v1/appservice/<id>/ping
         with the as_token; the homeserver calls the gateway's
         /_matrix/app/v1/ping (registration url http://gateway:8080).
-     b. an @ai_* user joins a room the human user created and the human
-        sends a message; the homeserver pushes a transaction and the gateway
+     b. the fixed @ai_gwsmoke user is in the fixture room of the human user
+        and the human sends a message; the homeserver pushes a transaction and the gateway
         stores it (checked in GATEWAY_AS_TXN_DB_PATH via --gateway-exec).
      c. restart the gateway (--gateway-restart), wait for /health, check the
         row survived, then replay the same txnId with the hs_token: HTTP 200
         and still exactly one stored row (idempotent by txnId). A wrong
         hs_token must get 403.
+
+Fixtures do not pile up: the human user (with one fixed device), the
+@ai_gwsmoke user and the room are reused across runs. Their ids and the
+human's password / access token live in --fixture-file (default
+<env-file dir>/generated/gateway-hs-smoke.json, gitignored, mode 0600), keyed
+by --hs-url. They are re-created only when the homeserver no longer knows
+them (e.g. after `down -v`); a replaced room is left and forgotten.
 
 Tokens, passwords and registration secrets are never printed: failures
 report only the HTTP status and the full URL (scheme://host:port/path, never
@@ -44,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import secrets
 import shlex
 import subprocess
@@ -56,6 +64,8 @@ import urllib.request
 REQUEST_TIMEOUT = 15.0
 SUPPORTED_STAGES = ("m.login.registration_token", "m.login.dummy")
 APPSERVICE_ID = "botville-gateway"
+AI_FIXTURE_LOCALPART = "ai_gwsmoke"
+DEVICE_ID = "GWSMOKE"
 AS_TXN_DB_PATH = "/var/lib/botville-gateway/as_transactions.db"
 
 # Runs inside the gateway container (python:3.12-slim). Prints only counts
@@ -153,8 +163,11 @@ def run_cmd(prefix, extra, what, input_text=None):
     command output is not echoed: compose may print environment details).
     """
     argv = shlex.split(prefix) + list(extra)
+    # Never hand our stdin to `docker compose exec` (it would swallow the
+    # rest of a calling script fed through stdin, e.g. a heredoc).
+    stdin_kw = {"input": input_text} if input_text is not None else {"stdin": subprocess.DEVNULL}
     proc = subprocess.run(
-        argv, input=input_text, capture_output=True, text=True, timeout=180
+        argv, capture_output=True, text=True, timeout=180, **stdin_kw
     )
     if proc.returncode != 0:
         fail("{} failed (exit {})".format(what, proc.returncode))
@@ -201,7 +214,7 @@ def wait_for_health(gateway_url, timeout):
 
 
 def register_user(hs_url, registration_token):
-    """Generic UIA register; returns (user_id, access_token) and never prints either.
+    """Generic UIA register; returns (user_id, access_token, password), never printed.
 
     Retries HTTP 429/503: Synapse's default rc_registration burst is small, so a
     smoke run right after `make e2e` seed can be rate-limited for a few seconds.
@@ -212,7 +225,7 @@ def register_user(hs_url, registration_token):
     while time.monotonic() < deadline:
         username = "gwsmoke_" + secrets.token_hex(4)
         password = secrets.token_hex(16)
-        body = {"username": username, "password": password}
+        body = {"username": username, "password": password, "device_id": DEVICE_ID}
         flow = None
         rate_limited = False
         for _ in range(12):
@@ -223,7 +236,7 @@ def register_user(hs_url, registration_token):
                 access_token = resp.get("access_token")
                 if not user_id or not access_token:
                     http_fail("POST", register_url, status, "missing user_id or access_token")
-                return user_id, access_token
+                return user_id, access_token, password
             if status in (429, 503):
                 rate_limited = True
                 break
@@ -258,6 +271,83 @@ def register_user(hs_url, registration_token):
             http_fail("POST", register_url, last_status)
         time.sleep(5)
     http_fail("POST", register_url, last_status, "still rate-limited after 60s")
+
+
+# --- reusable fixtures -------------------------------------------------------
+
+
+def default_fixture_file(env_file):
+    base = os.path.dirname(os.path.abspath(env_file)) if env_file else os.getcwd()
+    return os.path.join(base, "generated", "gateway-hs-smoke.json")
+
+
+def load_fixtures(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_fixtures(path, data):
+    """Write atomically with mode 0600 (holds a password and a token)."""
+    if not path:
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = "{}.tmp.{}".format(path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def whoami(hs_url, access_token):
+    url = path_of(hs_url, "/_matrix/client/v3/account/whoami")
+    status, resp = request_json("GET", url, headers={"Authorization": "Bearer " + access_token})
+    if status == 200 and isinstance(resp, dict):
+        return resp.get("user_id")
+    return None
+
+
+def password_login(hs_url, user_id, password):
+    """Log in on the fixed device (reused, so no new devices pile up)."""
+    url = path_of(hs_url, "/_matrix/client/v3/login")
+    status, resp = request_json(
+        "POST",
+        url,
+        body={
+            "type": "m.login.password",
+            "identifier": {"type": "m.id.user", "user": user_id},
+            "password": password,
+            "device_id": DEVICE_ID,
+        },
+    )
+    if status == 200 and isinstance(resp, dict) and resp.get("access_token"):
+        return resp["access_token"]
+    return None
+
+
+def ensure_human(hs_url, registration_token, fixture):
+    """Reuse the fixture user when the HS still knows it; else register one.
+
+    Returns (user_id, access_token); updates `fixture` in place.
+    """
+    user_id = fixture.get("user_id")
+    token = fixture.get("access_token")
+    if user_id and token and whoami(hs_url, token) == user_id:
+        return user_id, token
+    password = fixture.get("password")
+    if user_id and password:
+        token = password_login(hs_url, user_id, password)
+        if token and whoami(hs_url, token) == user_id:
+            fixture["access_token"] = token
+            return user_id, token
+    user_id, token, password = register_user(hs_url, registration_token)
+    fixture.clear()
+    fixture.update({"user_id": user_id, "password": password, "access_token": token})
+    return user_id, token
 
 
 def request_openid_token(hs_url, user_id, access_token):
@@ -308,18 +398,24 @@ def hs_ping(hs_url, as_token):
         if status == 200 and isinstance(resp, dict):
             print("PASS: homeserver -> gateway ping (/_matrix/app/v1/ping)")
             return
-        # 502/504: the HS could not reach the AS yet (e.g. just restarted).
+        if status in (401, 403):
+            # Auth problems (wrong/unknown as_token, AS not registered for
+            # this token) never heal by waiting: fail now.
+            http_fail("POST", url, status, "appservice ping: authentication rejected")
+        # 429 / 5xx (502/504: the HS could not reach the AS yet, e.g. just
+        # restarted) / unreachable: transient, retry until the deadline.
         time.sleep(3)
     http_fail("POST", url, status, "appservice ping")
 
 
-def as_register_ai_user(hs_url, as_token):
+def as_register_ai_user(hs_url, as_token, server_name):
+    """Register the fixed @ai_gwsmoke user; already registered is fine."""
     url = path_of(hs_url, "/_matrix/client/v3/register")
     # Synapse applies the per-IP rc_registration limit before the AS branch,
     # so a smoke run right after other registrations can see 429 for a while.
     deadline = time.monotonic() + 90
     while True:
-        localpart = "ai_gwsmoke_" + secrets.token_hex(4)
+        localpart = AI_FIXTURE_LOCALPART
         status, resp = request_json(
             "POST",
             url,
@@ -335,9 +431,64 @@ def as_register_ai_user(hs_url, as_token):
         wait_ms = resp.get("retry_after_ms") if isinstance(resp, dict) else None
         wait = wait_ms / 1000.0 if isinstance(wait_ms, (int, float)) and wait_ms > 0 else 5.0
         time.sleep(min(max(wait, 1.0), 15.0))
+    if status == 400 and isinstance(resp, dict) and resp.get("errcode") == "M_USER_IN_USE":
+        return "@{}:{}".format(AI_FIXTURE_LOCALPART, server_name)
     if status != 200 or not isinstance(resp, dict) or not resp.get("user_id"):
         http_fail("POST", url, status, "m.login.application_service")
     return resp["user_id"]
+
+
+def joined_members(hs_url, access_token, room_id):
+    """Set of joined user ids, or None when the room is not usable."""
+    url = path_of(
+        hs_url,
+        "/_matrix/client/v3/rooms/{}/joined_members".format(urllib.parse.quote(room_id, safe="")),
+    )
+    status, resp = request_json("GET", url, headers={"Authorization": "Bearer " + access_token})
+    if status == 200 and isinstance(resp, dict) and isinstance(resp.get("joined"), dict):
+        return set(resp["joined"])
+    return None
+
+
+def invite(hs_url, access_token, room_id, user_id):
+    url = path_of(
+        hs_url, "/_matrix/client/v3/rooms/{}/invite".format(urllib.parse.quote(room_id, safe=""))
+    )
+    status, _ = request_json(
+        "POST", url, body={"user_id": user_id}, headers={"Authorization": "Bearer " + access_token}
+    )
+    if status != 200:
+        http_fail("POST", url, status, "invite the @ai_* user")
+
+
+def leave_and_forget(hs_url, access_token, room_id):
+    """Best effort: drop a room the fixture no longer uses."""
+    quoted = urllib.parse.quote(room_id, safe="")
+    for action in ("leave", "forget"):
+        request_json(
+            "POST",
+            path_of(hs_url, "/_matrix/client/v3/rooms/{}/{}".format(quoted, action)),
+            body={},
+            headers={"Authorization": "Bearer " + access_token},
+        )
+
+
+def ensure_room(hs_url, access_token, as_token, user_id, ai_user, fixture):
+    """Reuse the fixture room (human joined) or create one; make sure the AI
+    is joined. Updates `fixture` in place and returns the room id."""
+    room_id = fixture.get("room_id")
+    members = joined_members(hs_url, access_token, room_id) if room_id else None
+    if members is None or user_id not in members:
+        if room_id:
+            leave_and_forget(hs_url, access_token, room_id)
+        room_id = create_room_with_ai(hs_url, access_token, ai_user)
+        fixture["room_id"] = room_id
+        members = {user_id}
+    elif ai_user not in members:
+        invite(hs_url, access_token, room_id, ai_user)
+    if ai_user not in members:
+        ai_join(hs_url, as_token, ai_user, room_id)
+    return room_id
 
 
 def create_room_with_ai(hs_url, access_token, ai_user):
@@ -424,12 +575,14 @@ def put_transaction(gateway_url, txn_id, token):
     return url, status
 
 
-def check_as_transactions(args, hs_url, access_token, as_token, hs_token):
+def check_as_transactions(args, hs_url, user_id, access_token, as_token, hs_token,
+                          fixture, save):
     hs_ping(hs_url, as_token)
 
-    ai_user = as_register_ai_user(hs_url, as_token)
-    room_id = create_room_with_ai(hs_url, access_token, ai_user)
-    ai_join(hs_url, as_token, ai_user, room_id)
+    server_name = user_id.split(":", 1)[1]
+    ai_user = as_register_ai_user(hs_url, as_token, server_name)
+    room_id = ensure_room(hs_url, access_token, as_token, user_id, ai_user, fixture)
+    save()
     event_id = send_message(hs_url, access_token, room_id, "gwsmoke " + secrets.token_hex(4))
     stored = wait_for_stored(args.gateway_exec, event_id)
     if len(stored["txn_ids"]) != 1:
@@ -472,6 +625,8 @@ def main(argv=None):
     parser.add_argument("--gateway-exec", default="", help="command prefix that runs a command in the gateway container")
     parser.add_argument("--gateway-restart", default="", help="command that restarts the gateway container")
     parser.add_argument("--skip-as-txn", action="store_true", help="skip the AS transaction checks")
+    parser.add_argument("--fixture-file", default=None,
+                        help="reused fixture state (default <env-file dir>/generated/gateway-hs-smoke.json; never printed)")
     args = parser.parse_args(argv)
 
     token = args.registration_token
@@ -487,7 +642,20 @@ def main(argv=None):
 
     wait_for_health(args.gateway_url, args.timeout)
     print("PASS: gateway /health matrix check is ok (startup whoami)")
-    user_id, access_token = register_user(args.hs_url, token)
+    fixture_file = args.fixture_file
+    if fixture_file is None:
+        fixture_file = default_fixture_file(args.env_file)
+    fixtures = load_fixtures(fixture_file) if fixture_file else {}
+    fixture = fixtures.get(args.hs_url)
+    if not isinstance(fixture, dict):
+        fixture = {}
+    fixtures[args.hs_url] = fixture
+
+    def save():
+        save_fixtures(fixture_file, fixtures)
+
+    user_id, access_token = ensure_human(args.hs_url, token, fixture)
+    save()
     openid_token = request_openid_token(args.hs_url, user_id, access_token)
     check_moments_via_openid(args.gateway_url, openid_token)
 
@@ -498,7 +666,8 @@ def main(argv=None):
         hs_token = env_value(args.env_file, "APPSERVICE_HS_TOKEN")
         if not as_token or not hs_token or "<change-me>" in (as_token, hs_token):
             fail("APPSERVICE_AS_TOKEN / APPSERVICE_HS_TOKEN missing or placeholder in the env file")
-        check_as_transactions(args, args.hs_url, access_token, as_token, hs_token)
+        check_as_transactions(args, args.hs_url, user_id, access_token, as_token, hs_token,
+                              fixture, save)
 
     print("PASS: gateway homeserver smoke")
     return 0

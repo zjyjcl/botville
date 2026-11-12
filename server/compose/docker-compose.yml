@@ -302,6 +302,19 @@ services:
     #     against the same volume or the same registration.
     #   - Plain http is allowed only for loopback or a single-label service
     #     name; http://synapse:8008 / http://tuwunel:8008 qualify.
+    #   - Persona engine (B line PR2): GATEWAY_MODEL_* / GATEWAY_PERSONAS_FILE /
+    #     GATEWAY_CONSUMER_ENABLED are passed through from the deployer's .env
+    #     (init.sh generates none of them). An AI only speaks when the consumer
+    #     is enabled AND a model AND personas are configured; otherwise it
+    #     records and stays silent. GATEWAY_MODEL_API_KEY is a secret: never
+    #     paste `docker compose config` output (it interpolates values); use
+    #     `config --quiet`. See docs/deploy/appservice.md.
+    #   - Personas: ./gateway-personas (BOTVILLE_GATEWAY_PERSONAS_DIR) is
+    #     always bind-mounted read-only at /etc/botville-gateway. The repo
+    #     ships that directory with only README + personas.example.json (real
+    #     personas are gitignored), so the mount never fails when unconfigured;
+    #     set GATEWAY_PERSONAS_FILE=/etc/botville-gateway/personas.json after
+    #     dropping a real file there.
     # Changing BOTVILLE_SERVER_NAME must stay in sync with the registration
     # regex (init.sh) and GATEWAY_MATRIX_SERVER_NAME (below). Rotating
     # APPSERVICE_AS_TOKEN requires re-rendering the registration and
@@ -332,10 +345,24 @@ services:
       # Moments SQLite on the gateway-data volume; migrations ship in the
       # image (/app/gateway/migrations/moments) and run at startup.
       GATEWAY_MOMENTS_DB_PATH: /var/lib/botville-gateway/moments.db
+      # Persona engine (B line PR2). Pass-through only; empty base URL = no
+      # model (record, never speak). The API key comes from the deployer's
+      # .env; init.sh never generates it and nothing prints it.
+      GATEWAY_MODEL_BASE_URL: ${GATEWAY_MODEL_BASE_URL:-}
+      GATEWAY_MODEL_NAME: ${GATEWAY_MODEL_NAME:-}
+      GATEWAY_MODEL_API_KEY: ${GATEWAY_MODEL_API_KEY:-}
+      GATEWAY_MODEL_TIMEOUT_SECONDS: ${GATEWAY_MODEL_TIMEOUT_SECONDS:-30}
+      # Empty = no personas. Point it at /etc/botville-gateway/personas.json
+      # (read-only bind mount below) once that file exists.
+      GATEWAY_PERSONAS_FILE: ${GATEWAY_PERSONAS_FILE:-}
+      GATEWAY_CONSUMER_ENABLED: ${GATEWAY_CONSUMER_ENABLED:-false}
     ports:
       - "127.0.0.1:${BOTVILLE_GATEWAY_PORT:-8020}:8080"
     volumes:
       - gateway-data:/var/lib/botville-gateway
+      # Read-only personas directory; always present in the repo (example
+      # only), so an unconfigured deployment mounts it without error.
+      - ${BOTVILLE_GATEWAY_PERSONAS_DIR:-./gateway-personas}:/etc/botville-gateway:ro
     depends_on:
       synapse:
         condition: service_healthy

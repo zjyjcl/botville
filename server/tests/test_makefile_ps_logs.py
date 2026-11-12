@@ -6,8 +6,10 @@ they are up, `make ps` / `make logs` should show them without repeating the
 flag (same idea as `make down` already always passing both profiles).
 """
 
+import os
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -115,6 +117,69 @@ class MakefileAppserviceUrlTest(unittest.TestCase):
         up = out.index(" up -d")
         self.assertLess(restart, up)
         self.assertIn("rm -f {}".format(marker), out)
+
+    def marker_block(self, hs):
+        """The marker/restart shell block exactly as `make -n up` prints it."""
+        lines = self.dry_run_up(hs, "1").splitlines()
+        start = next(i for i, l in enumerate(lines) if l.startswith("if [ -f "))
+        end = next(i for i in range(start, len(lines)) if lines[i].strip() == "fi")
+        return "\n".join(lines[start:end + 1])
+
+    def run_marker_block(self, restart_exit):
+        """Run that block with a fake `docker` whose restart exits restart_exit."""
+        marker = "server/compose/generated/appservice/.url-changed"
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = os.path.join(tmp, "bin")
+            os.makedirs(bindir)
+            fake = os.path.join(bindir, "docker")
+            with open(fake, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\nexit {}\n".format(restart_exit))
+            os.chmod(fake, 0o755)
+            os.makedirs(os.path.join(tmp, os.path.dirname(marker)))
+            with open(os.path.join(tmp, marker), "w", encoding="utf-8"):
+                pass
+            env = dict(os.environ, PATH=bindir + os.pathsep + os.environ.get("PATH", ""))
+            proc = subprocess.run(
+                ["bash", "-c", self.marker_block("synapse")],
+                cwd=tmp, env=env, capture_output=True, text=True, timeout=30,
+            )
+            return proc, os.path.exists(os.path.join(tmp, marker))
+
+    def test_restart_failure_keeps_marker_and_fails(self):
+        proc, marker_left = self.run_marker_block(restart_exit=1)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertTrue(marker_left, "marker must survive a failed HS restart")
+        self.assertIn("keeping", proc.stderr)
+
+    def test_restart_success_removes_marker(self):
+        proc, marker_left = self.run_marker_block(restart_exit=0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(marker_left)
+
+
+class MakefileModelKeyNotPrintedTest(unittest.TestCase):
+    """GATEWAY_MODEL_API_KEY reaches the gateway only through compose
+    interpolation of the env file; make never puts it on a command line, so
+    neither the echoed recipes nor `make -n` can print it."""
+
+    SENTINEL = "sentinel-model-key-must-not-print-0123456789"
+
+    def test_dry_runs_never_contain_the_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = os.path.join(tmp, "env")
+            with open(env_file, "w", encoding="utf-8") as fh:
+                fh.write("COMPOSE_PROJECT_NAME=botville-dryrun\n")
+                fh.write("GATEWAY_MODEL_API_KEY={}\n".format(self.SENTINEL))
+            for target in ("up", "down", "ps", "logs", "gateway-hs-smoke"):
+                with self.subTest(target=target):
+                    proc = subprocess.run(
+                        ["make", "-n", "-C", str(REPO_ROOT), target, "GATEWAY=1",
+                         "ENV_FILE=" + env_file],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertNotIn(self.SENTINEL, proc.stdout + proc.stderr)
+        self.assertNotIn("GATEWAY_MODEL_API_KEY", MAKEFILE.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
