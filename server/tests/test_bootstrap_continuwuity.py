@@ -464,6 +464,9 @@ class InitScriptTest(unittest.TestCase):
         "GATEWAY_MODEL_API_KEY=\n"
         "GATEWAY_MODEL_TIMEOUT_SECONDS=30\n"
         "GATEWAY_PERSONAS_FILE=\n"
+        "GATEWAY_MEMORY_DB_PATH=\n"
+        "GATEWAY_MEMORY_RETENTION_DAYS=90\n"
+        "GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS=86400\n"
     )
 
     def test_model_env_is_passed_through_never_generated_or_printed(self):
@@ -480,6 +483,9 @@ class InitScriptTest(unittest.TestCase):
         self.assertEqual(self.env_value("GATEWAY_MODEL_TIMEOUT_SECONDS"), "30")
         self.assertEqual(self.env_value("GATEWAY_CONSUMER_ENABLED"), "false")
         self.assertEqual(self.env_value("GATEWAY_PERSONAS_FILE"), "")
+        self.assertEqual(self.env_value("GATEWAY_MEMORY_DB_PATH"), "")
+        self.assertEqual(self.env_value("GATEWAY_MEMORY_RETENTION_DAYS"), "90")
+        self.assertEqual(self.env_value("GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS"), "86400")
 
         sentinel = "sentinel-model-key-must-not-print-0123456789"
         content = self.env_file.read_text(encoding="utf-8")

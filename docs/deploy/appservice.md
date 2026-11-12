@@ -197,7 +197,7 @@ sender → **400 `request.invalid`**；房间别名不存在 → **404
     | `GATEWAY_AS_TOKEN` | `${APPSERVICE_AS_TOKEN:-}` | 空（appservice 模式会拒绝启动） |
     | `GATEWAY_HS_TOKEN` | `${APPSERVICE_HS_TOKEN:-}` | 空（AS 回调一律 403） |
     | `GATEWAY_AS_TXN_DB_PATH` | 固定 | `/var/lib/botville-gateway/as_transactions.db` |
-    | `GATEWAY_MODEL_*` / `GATEWAY_PERSONAS_FILE` / `GATEWAY_CONSUMER_ENABLED` | 透传 | 见[角色引擎](#角色引擎模型与人设)的回退值表 |
+    | `GATEWAY_MODEL_*` / `GATEWAY_PERSONAS_FILE` / `GATEWAY_CONSUMER_ENABLED` / `GATEWAY_MEMORY_*` | 透传 | 见[角色引擎](#角色引擎模型与人设)的回退值表 |
 
   - **只通过 `make up` 重建网关**：`BOTVILLE_HOMESERVER` / `GATEWAY_MATRIX_TRANSPORT`
     只在 `make up` 里导出（`HS=` 可能与 `.env` 不同），注册 url 也只在
@@ -245,7 +245,21 @@ B 线 PR2（角色引擎回复）读的变量，compose 原样透传给 `gateway
 | `GATEWAY_MODEL_API_KEY` | `${GATEWAY_MODEL_API_KEY:-}` | 空 | 密钥，只写在部署方自己的 `server/compose/.env` |
 | `GATEWAY_MODEL_TIMEOUT_SECONDS` | `${GATEWAY_MODEL_TIMEOUT_SECONDS:-30}` | `30` | 单次模型调用超时（秒） |
 | `GATEWAY_PERSONAS_FILE` | `${GATEWAY_PERSONAS_FILE:-}` | 空 | 空 = 不加载人设；建议 `/etc/botville-gateway/personas.json` |
+| `GATEWAY_MEMORY_DB_PATH` | `${GATEWAY_MEMORY_DB_PATH:-}` | 空 | 记忆库（B 线 PR3a）；空 = 关闭记忆，只用进程内最近对话。启用写 `/var/lib/botville-gateway/memory.db` |
+| `GATEWAY_MEMORY_RETENTION_DAYS` | `${GATEWAY_MEMORY_RETENTION_DAYS:-90}` | `90` | 记忆保留天数，≥1；置顶不过期 |
+| `GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS` | `${GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS:-86400}` | `86400` | 过期清理间隔（秒）；0 = 不清理，非 0 必须 ≥60 |
 | `BOTVILLE_GATEWAY_PERSONAS_DIR` | 挂载源 `${BOTVILLE_GATEWAY_PERSONAS_DIR:-./gateway-personas}` | `server/compose/gateway-personas` | 只读挂到容器 `/etc/botville-gateway` |
+
+**记忆库（B 线 PR3a）**
+
+- `GATEWAY_MEMORY_DB_PATH` 默认空 = 记忆关闭（引擎只用进程内最近对话）。启用时写
+  `/var/lib/botville-gateway/memory.db`：放在 gateway-data 卷**顶层**，和
+  `moments.db` / `as_transactions.db` 一样，`make backup` 先对顶层 `*.db` 做 WAL
+  checkpoint 再打包整个卷，`make restore` 整卷恢复。放进子目录也会被打包，但不会先
+  checkpoint（WAL 里的内容仍随 `-wal` 文件一起进包），所以建议顶层。
+- 网关以 **0600** 创建这个文件；里面是聊天内容和长期档案，备份包同样只能本人可读
+  （备份脚本已 chmod 600）。
+- 保留期与清理间隔不合法（保留天数 <1、清理间隔非 0 且 <60）时网关拒绝启动。
 
 **人设文件（只读挂载）**
 
@@ -253,7 +267,9 @@ B 线 PR2（角色引擎回复）读的变量，compose 原样透传给 `gateway
   `server/scripts/gateway-preflight.sh`：`BOTVILLE_GATEWAY_PERSONAS_DIR` 指向的目录
   不存在就直接报错退出（否则 docker 会把缺失的挂载源建成 root 的空目录，网关
   悄悄没有人设）；`GATEWAY_PERSONAS_FILE` 指向的文件不在该目录里只给警告。
-  `make config` 只做校验：init、预检、`compose config --quiet`。
+  `make config` 只做校验、不写任何文件：不跑 init.sh（它可能往 `.env` 追加新变量、
+  渲染 `generated/`），只跑预检和 `compose config --quiet`；`.env` 不存在时直接报错
+  （先 `make up` 或 `bash server/scripts/init.sh`，或用 `ENV_FILE=` 指定文件）。
 - compose **总是**把 `server/compose/gateway-personas/` 只读挂到
   `/etc/botville-gateway`。这个目录随仓库提供，里面只有 `README.md` 和虚构的
   `personas.example.json`，所以没配人设时挂载、`compose config` 和网关启动都不会
