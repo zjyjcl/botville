@@ -72,12 +72,52 @@ final class ForegroundInAppBannerTests: XCTestCase {
         XCTAssertNil(store.current)
     }
 
+    func testTemporarySuppressionDoesNotConsumePresentationKey() {
+        for background in [true, false] {
+            let store = ForegroundInAppBannerStore()
+            let value = candidate()
+            store.updateContext(isForeground: !background, visibleRoomID: nil, isInputActive: false,
+                                mutedRoomIDs: background ? [] : [value.roomID])
+            store.receive(value)
+            XCTAssertNil(store.current)
+            store.updateContext(isForeground: true, visibleRoomID: nil, isInputActive: false)
+            XCTAssertNil(store.current) // Context recovery never actively replays.
+            store.receive(value)
+            XCTAssertEqual(store.current, value)
+            store.dismiss()
+            store.receive(value)
+            XCTAssertNil(store.current) // A presented event remains consumed.
+        }
+    }
+
+    func testInputAndVisibleRoomNeverReplayAfterContextRecovery() {
+        for input in [true, false] {
+            let store = ForegroundInAppBannerStore()
+            let value = candidate()
+            store.updateContext(isForeground: true, visibleRoomID: input ? nil : value.roomID, isInputActive: input)
+            store.receive(value)
+            store.updateContext(isForeground: true, visibleRoomID: nil, isInputActive: false)
+            store.receive(value)
+            XCTAssertNil(store.current)
+        }
+    }
+
+    func testRepeatedSuppressionDoesNotPrematurelyEvictConsumedKey() {
+        let store = ForegroundInAppBannerStore()
+        let value = candidate()
+        store.updateContext(isForeground: true, visibleRoomID: nil, isInputActive: true)
+        for _ in 0..<300 { store.receive(value) }
+        store.updateContext(isForeground: true, visibleRoomID: nil, isInputActive: false)
+        store.receive(value)
+        XCTAssertNil(store.current)
+    }
+
     func testStoreReplacesNewEventAndOldTimerCannotDismissIt() async {
         let clock = TestClock()
         let store = ForegroundInAppBannerStore(displayDuration: .seconds(3), sleep: { duration in await clock.sleep(duration) })
         store.updateContext(isForeground: true, visibleRoomID: nil, isInputActive: false)
         let first = candidate(eventID: "$one")
-        let second = candidate(eventID: "$two", date: date.addingTimeInterval(1))
+        let second = candidate(roomID: "!other:test", eventID: "$two", date: date.addingTimeInterval(1))
         store.receive(first)
         await clock.waitForSleeps(1)
         let firstDurations = await clock.durations()

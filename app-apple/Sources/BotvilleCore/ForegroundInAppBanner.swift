@@ -71,9 +71,22 @@ public final class ForegroundInAppBannerStore: ObservableObject {
 
     public func receive(_ candidate: ForegroundBannerCandidate) {
         let key = candidate.deduplicationKey
-        guard !consumedKeys.contains(key) else { return }
+        // Decide before taking a presentation key. Input/current-room events
+        // are intentionally discarded, not deferred until the user leaves.
+        if shouldSuppress(candidate) {
+#if DEBUG
+            UnreadBannerProbeLog.banner(roomID: candidate.roomID, reason: suppressionReason(candidate))
+#endif
+            if candidate.isOwn || visibleRoomID == candidate.roomID || isInputActive { consume(key) }
+            return
+        }
+        guard !consumedKeys.contains(key) else {
+#if DEBUG
+            UnreadBannerProbeLog.banner(roomID: candidate.roomID, reason: .alreadyHandled)
+#endif
+            return
+        }
         consume(key)
-        guard !shouldSuppress(candidate) else { return }
         current = candidate
         dismissalTask?.cancel()
         let expected = candidate
@@ -117,8 +130,18 @@ public final class ForegroundInAppBannerStore: ObservableObject {
         !isForeground || candidate.isOwn || visibleRoomID == candidate.roomID || isInputActive || mutedRoomIDs.contains(candidate.roomID)
     }
 
+#if DEBUG
+    private func suppressionReason(_ candidate: ForegroundBannerCandidate) -> UnreadBannerProbeLog.BannerReason {
+        if candidate.isOwn { return .ownMessage }
+        if visibleRoomID == candidate.roomID { return .visibleRoom }
+        if isInputActive { return .inputActive }
+        if !isForeground { return .notForeground }
+        return .muted
+    }
+#endif
+
     private func consume(_ key: String) {
-        consumedKeys.insert(key)
+        guard consumedKeys.insert(key).inserted else { return }
         consumedOrder.append(key)
         while consumedOrder.count > 256 {
             consumedKeys.remove(consumedOrder.removeFirst())
@@ -234,3 +257,52 @@ struct ForegroundBannerDetector {
         hasBaseline = false
     }
 }
+
+#if DEBUG
+import os
+
+/// Allowlisted diagnostics only. No message, user, token, or event ID input.
+@MainActor
+enum UnreadBannerProbeLog {
+    enum UnreadSource: String, CaseIterable {
+        case readReceiptLocalZero, sdkUnreadZero, sdkInfoUnavailable, refreshCommitZero
+    }
+    enum RefreshOutcome: String, CaseIterable {
+        case observed, committed, superseded, sessionChanged, inactiveSession, gateRejected
+    }
+    enum BannerReason: String, CaseIterable {
+        case notForeground, ownMessage, visibleRoom, inputActive, muted, alreadyHandled
+        case staleVisibility, deliveredInBackground, roomUnavailable, initialSync, cancelled, staleSession
+    }
+    private static let logger = Logger(subsystem: "com.zjyjcl.botville", category: "UnreadBannerProbeLog")
+    // Test observer receives exactly the same sanitized line as os.Logger.
+    static var observer: ((String) -> Void)?
+
+    static func fingerprint(_ roomID: String) -> String { TimelineTrace.fingerprint(roomID) }
+
+    static func unread(_ source: UnreadSource, roomID: String, before: UInt64?, after: UInt64,
+                       muted: Bool? = nil, refresh: UUID? = nil, online: Bool = false,
+                       outcome: RefreshOutcome = .observed,
+                       now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        emit("unread_banner_probe t=\(now) source=\(source.rawValue) room=\(fingerprint(roomID))"
+             + " before=\(before.map(String.init) ?? "-") after=\(after) muted=\(muted.map(String.init) ?? "-")"
+             + " refresh=\(TimelineTrace.fingerprint(refresh?.uuidString)) online=\(online) outcome=\(outcome.rawValue)")
+    }
+
+    static func refresh(_ refresh: UUID, online: Bool, outcome: RefreshOutcome,
+                        now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        emit("unread_banner_probe t=\(now) refresh=\(TimelineTrace.fingerprint(refresh.uuidString))"
+             + " online=\(online) outcome=\(outcome.rawValue)")
+    }
+
+    static func banner(roomID: String, reason: BannerReason,
+                       now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        emit("unread_banner_probe t=\(now) room=\(fingerprint(roomID)) reason=\(reason.rawValue)")
+    }
+
+    private static func emit(_ line: String) {
+        observer?(line)
+        logger.debug("\(line, privacy: .public)")
+    }
+}
+#endif

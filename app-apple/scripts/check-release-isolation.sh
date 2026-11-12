@@ -228,6 +228,11 @@ for relative in ('Sources/BotvilleCore/PushNotificationUX.swift',
                  'Sources/BotvilleApp/PushDiagnosticsView.swift',
                  'Tests/BotvilleCoreTests/PushNotificationUXTests.swift'):
     guarded(root / relative, 'PushForegroundProbeLog')
+for relative in ('Sources/BotvilleCore/ForegroundInAppBanner.swift',
+                 'Sources/BotvilleCore/ForegroundSyncNotifications.swift',
+                 'Sources/BotvilleCore/MatrixService.swift',
+                 'Tests/BotvilleCoreTests/UnreadBannerProbeTests.swift'):
+    guarded(root / relative, 'UnreadBannerProbeLog')
 if 'PushHTTPPolicy.permitsHTTP(allowHTTP)' not in (core / 'MatrixService.swift').read_text():
     raise SystemExit('MatrixService must delegate push HTTP policy to PushHTTPPolicy')
 

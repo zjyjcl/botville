@@ -42,17 +42,44 @@ final class ForegroundSyncNotificationBridge: SyncNotificationListener, @uncheck
 
     func onNotification(notification: NotificationItem, roomId: String) {
         let context = lock.withLock { (ready, active, epoch) }
+#if DEBUG
+        if case .timeline(let event) = notification.event, event.senderId() == userID {
+            recordSuppression(.ownMessage, roomID: roomId)
+        }
+#endif
         guard let candidate = Self.candidate(notification: notification, roomID: roomId, userID: userID),
               let eventID = candidate.eventID else { return }
         lock.withLock {
             let key = roomId + "|" + eventID
-            guard seen.insert(key).inserted else { return }
+            guard seen.insert(key).inserted else {
+#if DEBUG
+                recordSuppression(.alreadyHandled, roomID: roomId)
+#endif
+                return
+            }
             order.append(key)
             if order.count > 2048 { seen.remove(order.removeFirst()) }
-            guard context.0, context.1, active, context.2 == epoch else { return }
+            guard context.0, context.1, active, context.2 == epoch else {
+#if DEBUG
+                let reason: UnreadBannerProbeLog.BannerReason = !context.0 ? .initialSync
+                    : (!context.1 || !active ? .notForeground : .staleVisibility)
+                recordSuppression(reason, roomID: roomId)
+#endif
+                return
+            }
             continuation.yield(ForegroundSyncEvent(candidate: candidate, visibilityEpoch: epoch))
         }
     }
+
+#if DEBUG
+    private func recordSuppression(_ reason: UnreadBannerProbeLog.BannerReason, roomID: String) {
+        // Capture monotonic time at the SDK callback, before the actor hop.
+        let now = ProcessInfo.processInfo.systemUptime
+        Task { @MainActor in
+            UnreadBannerProbeLog.banner(roomID: roomID, reason: reason, now: now)
+        }
+    }
+#endif
 
     static func candidate(notification: NotificationItem, roomID: String,
                           userID: String) -> ForegroundBannerCandidate? {
