@@ -115,6 +115,15 @@ final class ReleaseIsolationTests: XCTestCase {
         XCTAssertEqual(try expand(overridden["DEVELOPMENT_TEAM"]!, using: overridden), "DIRECT1234")
     }
 
+    func testUnreadBannerProbeIsDebugGuarded() throws {
+        for relative in ["Sources/BotvilleCore/ForegroundInAppBanner.swift",
+                         "Sources/BotvilleCore/ForegroundSyncNotifications.swift",
+                         "Sources/BotvilleCore/MatrixService.swift",
+                         "Tests/BotvilleCoreTests/UnreadBannerProbeTests.swift"] {
+            try guarded("UnreadBannerProbeLog", at: root.appendingPathComponent(relative))
+        }
+    }
+
     func testEntitlementAndDebugViewsAreIsolated() throws {
         let project = try String(contentsOf: root.appendingPathComponent("Botville.xcodeproj/project.pbxproj"), encoding: .utf8)
         XCTAssertTrue(project.contains("CODE_SIGN_ENTITLEMENTS = BotvilleApp/BotvilleApp.entitlements;"))
@@ -287,6 +296,16 @@ final class ReleaseIsolationTests: XCTestCase {
             let call = "." + ns.substring(with: match.range(at: 1)) + "(" + ns.substring(from: NSMaxRange(match.range))
             return !(allowed[source] ?? []).contains { call.hasPrefix($0) }
         }.count
+    }
+
+    func testForegroundProbeImplementationAndReferencesAreDebugGuarded() throws {
+        // Mirror check-release-isolation.sh without changing its shared checks.
+        for relative in ["Sources/BotvilleCore/PushNotificationUX.swift",
+                         "Sources/BotvilleApp/BotvilleApp.swift",
+                         "Sources/BotvilleApp/PushDiagnosticsView.swift",
+                         "Tests/BotvilleCoreTests/PushNotificationUXTests.swift"] {
+            try guarded("PushForegroundProbeLog", at: root.appendingPathComponent(relative))
+        }
     }
 
     func testNSELogScannerCatchesLeadingDotMultilineAndAdditionalArguments() throws {

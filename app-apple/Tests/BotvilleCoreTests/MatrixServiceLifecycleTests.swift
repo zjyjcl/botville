@@ -1176,9 +1176,12 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         await service.restoreSession()
         try await waitUntil { service.connectionStatus == .connected }
         XCTAssertTrue(received.isEmpty, "first sync notification is history")
+        // Re-delivery after the initial-sync boundary must remain consumed.
+        client.emit(notification: syncNotification(eventID: "$history", body: "history", timestamp: 1_700_000_000_000), roomID: "!push:matrix.test")
+        client.emit(notification: syncNotification(eventID: "$live", body: "live", timestamp: 1_700_000_001_000), roomID: "!push:matrix.test")
         client.emit(notification: syncNotification(eventID: "$live", body: "live", timestamp: 1_700_000_001_000), roomID: "!push:matrix.test")
         try await waitUntil { received.count == 1 }
-        withExtendedLifetime(observation) { XCTAssertEqual(received.first?.eventID, "$live") }
+        withExtendedLifetime(observation) { XCTAssertEqual(received.map(\.eventID), ["$live"]) }
         await service.logout()
     }
 
@@ -1324,6 +1327,9 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         XCTAssertTrue(received.isEmpty)
         try await client.notificationSettings.unmuteRoom(roomId: "!push:matrix.test", isEncrypted: false, isOneToOne: false)
         try await waitUntil { !service.roomNotifications.isMuted("!push:matrix.test") }
+        // Store temporary suppression is retryable, but the SDK bridge never
+        // replays a previously seen muted event when the same callback repeats.
+        client.emit(notification: syncNotification(eventID: "$muted", body: "test", timestamp: 1_700_000_001_000), roomID: "!push:matrix.test")
         client.emit(notification: syncNotification(eventID: "$unmuted", body: "test", timestamp: 1_700_000_002_000), roomID: "!push:matrix.test")
         try await waitUntil { received.count == 1 }
         XCTAssertEqual(received.first?.eventID, "$unmuted")

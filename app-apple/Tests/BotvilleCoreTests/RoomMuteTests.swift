@@ -551,6 +551,24 @@ final class RoomMuteTests: XCTestCase {
         } catch { XCTAssertTrue(error is RoomNotificationSettingsError) }
     }
 
+    func testNilEncryptionResolverKeepsUnknownRoomsFailClosed() async throws {
+        let settings = TestNotificationSettings()
+        let provider = SDKRoomNotificationSettings(settings, resolveEncryption: nil)
+        let unknown = room.withSecurity(encryption: .unknown, participants: .unknown)
+        do {
+            _ = try await provider.isMuted(unknown)
+            XCTFail("Unknown encryption must reject reads")
+        } catch { XCTAssertTrue(error is RoomNotificationSettingsError) }
+        do {
+            try await provider.setMuted(false, room: unknown)
+            XCTFail("Unknown encryption must reject unmute")
+        } catch { XCTAssertTrue(error is RoomNotificationSettingsError) }
+        XCTAssertTrue(settings.roomReadEncryption.isEmpty)
+        XCTAssertTrue(settings.unmuteEncryptionArguments.isEmpty)
+        let muted = try await provider.isMuted(room)
+        XCTAssertFalse(muted)
+    }
+
     func testResolvedEncryptionIsPassedToUnmuteAndReadback() async throws {
         for encryption in [RoomEncryptionState.encrypted, .unencrypted] {
             let settings = TestNotificationSettings()
@@ -629,15 +647,16 @@ final class RoomMuteTests: XCTestCase {
         XCTAssertEqual(PushBadge.total(rooms: [MatrixRoom(id: "!large:test", name: "Large", unreadCount: .max)], isMuted: { _ in false }), Int.max)
     }
 
-    func testForegroundMutedEventConsumedAndUnmutingOnlyAllowsNewEvent() {
+    func testForegroundMutedEventDoesNotReserveStoreKeyOrReplayOnContextChange() {
         let store = ForegroundInAppBannerStore()
         let candidate = ForegroundBannerCandidate(roomID: room.id, eventID: "$old", latestActivity: Date(), title: "Test", preview: "Test")
         store.updateContext(isForeground: true, visibleRoomID: nil, isInputActive: false, mutedRoomIDs: [room.id])
         store.receive(candidate)
         XCTAssertNil(store.current)
         store.updateContext(isForeground: true, visibleRoomID: nil, isInputActive: false)
-        store.receive(candidate)
-        XCTAssertNil(store.current)
+        XCTAssertNil(store.current) // Unmuting alone never replays the old event.
+        store.receive(candidate) // Explicit fresh delivery is eligible at the Store boundary.
+        XCTAssertEqual(store.current, candidate)
         store.receive(ForegroundBannerCandidate(roomID: room.id, eventID: "$new", latestActivity: Date(), title: "Test", preview: "Test"))
         XCTAssertNotNil(store.current)
         store.reset()
