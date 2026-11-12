@@ -58,6 +58,9 @@ from .errors import (
     ValidationError,
 )
 from .limits import LimitStore
+from .log_redact import redact_args as _redact_args
+from .log_redact import redact_text as _redact_text
+from .log_redact import redact_txn_id
 from .matrix import InMemoryMatrixTransport, MatrixTransport
 from .moments.http_api import handle as _handle_moments_dispatch
 from .moments.service import build_moments_service
@@ -153,6 +156,20 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         if self.server.config.access_log:  # type: ignore[attr-defined]
             super().log_message(fmt, *_redact_args(args))
+
+    def log_error(self, fmt: str, *args: Any) -> None:
+        # stdlib 的 log_error 默认转调 log_message，但子类若直接 super().log_error
+        # 会绕开本类的 log_message（BaseHTTPRequestHandler.log_error 显式调用
+        # self.log_message，所以本可省略）；这里显式重写并走脱敏，确保 send_error
+        # 产生的 "code %d, message %s" 与坏请求行日志也经过脱敏，不依赖继承链。
+        if self.server.config.access_log:  # type: ignore[attr-defined]
+            super().log_error(fmt, *_redact_args(args))
+
+    def log_request(self, code: Any = "-", size: Any = "-") -> None:
+        # log_request 把 self.requestline 直接拼进消息；requestline 含原始 txnId，
+        # 必须脱敏。走 log_message 路径即可复用 _redact_args。
+        if self.server.config.access_log:  # type: ignore[attr-defined]
+            super().log_request(code, size)
 
     # ------------------------------------------------------------- helpers
     def parse_request(self) -> bool:  # type: ignore[override]
@@ -680,9 +697,11 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             store.store_transaction(txn_id, raw.decode("utf-8"))
         except Exception as exc:  # sqlite3.Error / IO
             if self.server.config.access_log:  # type: ignore[attr-defined]
+                # 契约决定 #15：日志不落原始 txnId，只记可关联的短哈希标记
+                # （`txn#xxxxxxxx`，见 log_redact.redact_txn_id）。
                 self.log_error(
                     "AS transaction persist failed for txn %s: %s",
-                    txn_id,
+                    redact_txn_id(txn_id),
                     type(exc).__name__,
                 )
             self._send_matrix_error(
@@ -1159,16 +1178,6 @@ def _normalize_request_target(method: str, target: str) -> Optional[str]:
     except ValueError:
         return None
     return candidate
-
-
-def _redact_args(args: tuple) -> tuple:
-    """对日志参数做脱敏：字符串里含 `access_token=` 的部分替换为 `[REDACTED]`。"""
-    out = []
-    for arg in args:
-        if isinstance(arg, str) and "access_token=" in arg:
-            arg = re.sub(r"access_token=[^&# ]*", "access_token=[REDACTED]", arg)
-        out.append(arg)
-    return tuple(out)
 
 
 def _is_moments_path(path: str) -> bool:
