@@ -52,6 +52,7 @@ from typing import Dict, List, Mapping, Optional, Tuple
 
 # `env:NAME` 的 NAME 形状（POSIX 环境变量名）。
 _ENV_REF_RE = re.compile(r"^env:[A-Za-z_][A-Za-z0-9_]*$")
+_MATRIX_LOCALPART_RE = re.compile(r"^[A-Za-z0-9._=/-]+$")
 # 人设条目的允许字段（未知字段拒绝：配置拼错不应静默忽略）。
 _PERSONA_FIELDS = frozenset(
     {
@@ -62,6 +63,7 @@ _PERSONA_FIELDS = frozenset(
         "model",
         "credential_ref",
         "max_reply_chars",
+        "owner_user_id",
     }
 )
 # 人设文件允许的顶层字段。
@@ -86,6 +88,8 @@ class Persona:
     # `env:NAME` 形式的引用（**不是**密钥本身）。密钥在调用时从环境读取。
     credential_ref: Optional[str] = field(default=None, repr=False)
     max_reply_chars: int = DEFAULT_MAX_REPLY_CHARS
+    # Optional local human account authorized for the internal memory API.
+    owner_user_id: Optional[str] = None
 
     @property
     def credential_env_name(self) -> Optional[str]:
@@ -114,6 +118,18 @@ def _is_local_ai(user_id: str, server_name: Optional[str]) -> bool:
     if not server_name:
         return False
     return domain.lower() == server_name.strip().lower()
+
+
+def _is_local_owner(user_id: str, server_name: Optional[str]) -> bool:
+    """A memory owner is a local non-AI Matrix account."""
+    if not isinstance(user_id, str) or not user_id.startswith("@") or not server_name:
+        return False
+    localpart, sep, domain = user_id[1:].partition(":")
+    return bool(
+        sep and localpart and domain and _MATRIX_LOCALPART_RE.fullmatch(localpart)
+        and not localpart.lower().startswith("ai_")
+        and domain.lower() == server_name.strip().lower()
+    )
 
 
 def load_personas(
@@ -222,6 +238,15 @@ def load_personas(
                 f"({max_message_chars})"
             )
 
+        owner_user_id = entry.get("owner_user_id")
+        if "owner_user_id" in entry and (
+            not isinstance(owner_user_id, str)
+            or not _is_local_owner(owner_user_id, server_name)
+        ):
+            raise PersonaConfigError(
+                f"{where}.owner_user_id must be a local non-ai Matrix user ID"
+            )
+
         personas[user_id] = Persona(
             user_id=user_id,
             system_prompt=system_prompt,
@@ -230,5 +255,6 @@ def load_personas(
             model=model.strip() if isinstance(model, str) else None,
             credential_ref=credential_ref,
             max_reply_chars=max_reply_chars,
+            owner_user_id=owner_user_id,
         )
     return personas

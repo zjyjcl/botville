@@ -46,6 +46,7 @@ from .as_txn_store import (
     PersistentSpeechDedupe,
     build_as_txn_store,
 )
+from .memory.store import MemoryPurger, MemoryStore
 from .engine import (
     EngineHooks,
     ModelClient,
@@ -1287,6 +1288,17 @@ class GatewayServer(http.server.ThreadingHTTPServer):
             ),
             purge_interval_seconds=config.as_txn_purge_interval_seconds,
         )
+        # B2.6 PR3a: local persistent memory is opt-in.  This is deliberately
+        # independent of the AS transaction database and never affects health.
+        self.memory_store: Optional[MemoryStore] = None
+        self.memory_purger: Optional[MemoryPurger] = None
+        if config.memory_db_path:
+            self.memory_store = MemoryStore(
+                config.memory_db_path, retention_days=config.memory_retention_days
+            )
+            self.memory_purger = MemoryPurger(
+                self.memory_store, config.memory_purge_interval_seconds
+            )
         # B 线 PR1（contract §1.7.8）：进程内 AS 事务消费者。
         # GATEWAY_CONSUMER_ENABLED=false（默认）时不起线程、不唤醒，行为与现在完全一致。
         # 开启但 as_txn_db_path 未配置时打 warning 且不起线程（不拒绝启动）。
@@ -1296,6 +1308,13 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         # 成立时装配：消费开启 + 人设有内容 + 模型已配置。否则保持「只记录/计数、
         # 不发言」，/health 不 degraded。
         self.engine_hooks: Optional[EngineHooks] = None
+        # Persona ownership is a startup-time security boundary, independent
+        # of whether this process currently starts the consumer/model engine.
+        if config.personas_file:
+            load_personas(
+                config.personas_file, server_name=config.matrix_server_name,
+                max_message_chars=config.max_message_chars,
+            )
         if config.consumer_enabled:
             if self.as_txn_store is None:
                 logging.getLogger(__name__).warning(
@@ -1345,6 +1364,8 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         # 监听端口绑定成功后才起消费线程：绑定失败（OSError）时不留下孤儿线程。
         if self.as_consumer is not None:
             self.as_consumer.start()
+        if self.memory_purger is not None:
+            self.memory_purger.start()
 
     def _build_engine_hooks(
         self, config: Config, service: GatewayService
@@ -1375,7 +1396,13 @@ class GatewayServer(http.server.ThreadingHTTPServer):
             missing.append("GATEWAY_PERSONAS_FILE has no personas")
         if not model_config.configured:
             missing.append("GATEWAY_MODEL_BASE_URL / GATEWAY_MODEL_NAME not configured")
-        if missing:
+        if not personas:
+            logging.getLogger(__name__).info(
+                "AS consumer engine is inactive (record/count only): %s",
+                "; ".join(missing),
+            )
+            return None
+        if not model_config.configured and self.memory_store is None:
             logging.getLogger(__name__).info(
                 "AS consumer engine is inactive (record/count only): %s",
                 "; ".join(missing),
@@ -1389,6 +1416,7 @@ class GatewayServer(http.server.ThreadingHTTPServer):
             client=ModelClient(model_config),
             service=service,
             dedupe=PersistentSpeechDedupe(self.as_txn_store),
+            memory_store=self.memory_store,
         )
 
     def server_close(self) -> None:
@@ -1403,6 +1431,12 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         store = getattr(self, "as_txn_store", None)
         if store is not None:
             store.stop_purge_scheduler()
+        memory_purger = getattr(self, "memory_purger", None)
+        if memory_purger is not None:
+            memory_purger.stop()
+        memory_store = getattr(self, "memory_store", None)
+        if memory_store is not None:
+            memory_store.close()
         super().server_close()
 
 

@@ -286,6 +286,17 @@ class ConsumerContext:
     persona_user_id: Optional[str] = None
     target_user_ids: Tuple[str, ...] = ()
     reply_to_event_id: Optional[str] = None
+    # For m.room.redaction only, the event being removed.  It is deliberately
+    # separate from event_id (the redaction event itself).
+    redacts_event_id: Optional[str] = None
+    # Local AI members known when routing this event; used solely to choose
+    # memory DM/group scope.  It contains no message body.
+    room_ai_user_ids: Tuple[str, ...] = ()
+    # True only when membership lookup (not a mention fallback) confirmed the
+    # room's local-AI membership.  Memory must never turn a guessed DM into a
+    # DM scope.
+    room_members_confirmed: bool = False
+    mentioned_user_ids: Tuple[str, ...] = ()
 
 
 class ConsumerHooks:
@@ -653,6 +664,11 @@ class AsTransactionConsumer:
             mentions = fields.get("mentions") or ()
             reply_event_id = fields.get("reply_to_event_id")
             reply_to_sender = self._reply_target_sender(reply_event_id, room_id)
+            room_ai_user_ids, room_members_confirmed = self._confirmed_room_ai_ids(room_id)
+            reply_ai_ids = list(room_ai_user_ids)
+            for mentioned in mentions:
+                if self._is_local_ai(mentioned) and mentioned not in reply_ai_ids:
+                    reply_ai_ids.append(mentioned)
             targets = self._reply_targets(
                 room_id=room_id,
                 text=text,
@@ -660,6 +676,7 @@ class AsTransactionConsumer:
                 sender=sender or "",
                 reply_to_sender=reply_to_sender,
                 is_ai_sender=is_ai,
+                ai_ids=reply_ai_ids,
             )
             target = targets[0] if targets else None
             reply = bool(targets)
@@ -677,6 +694,9 @@ class AsTransactionConsumer:
                 persona_user_id=target,
                 target_user_ids=targets,
                 reply_to_event_id=reply_event_id,
+                room_ai_user_ids=tuple(room_ai_user_ids),
+                room_members_confirmed=room_members_confirmed,
+                mentioned_user_ids=tuple(uid for uid in mentions if isinstance(uid, str)),
             )
             if is_ai:
                 # 防循环：AI（含网关自己的 AS sender）发言不触发回复。
@@ -727,6 +747,7 @@ class AsTransactionConsumer:
                 room_id=room_id,
                 sender=sender,
                 trust=trust,
+                redacts_event_id=fields.get("redacts_event_id"),
             )
             self._stats.inc("redactions")
             self._run_hook(self._hooks.on_redaction, ctx)
@@ -782,6 +803,11 @@ class AsTransactionConsumer:
         if event_type == "m.reaction":
             return EVENT_REACTION, fields
         if event_type == "m.room.redaction":
+            # Matrix v1 permits the old top-level field; newer events carry it
+            # in content.  Accept either without recording either identifier.
+            redacts = content.get("redacts") or event.get("redacts")
+            if isinstance(redacts, str) and redacts:
+                fields["redacts_event_id"] = redacts
             return EVENT_REDACTION, fields
         if event_type == "m.room.member":
             if content.get("membership") == "invite":
@@ -862,6 +888,25 @@ class AsTransactionConsumer:
                 ids.append(uid)
         return ids
 
+    def _confirmed_room_ai_ids(self, room_id: Optional[str]) -> Tuple[Tuple[str, ...], bool]:
+        """Membership-only local AI list for memory scoping.
+
+        Mentions are suitable for deciding who should reply, but are not proof
+        that a room is a DM.  A failed/cold member source therefore returns an
+        unconfirmed result and memory uses group scope fail-closed.
+        """
+        if not room_id or self._room_members is None:
+            return (), False
+        try:
+            ids = []
+            for user_id in self._room_members(room_id) or ():
+                if self._is_local_ai(user_id) and user_id not in ids:
+                    ids.append(user_id)
+            return tuple(ids), True
+        except Exception:
+            self._stats.inc("room_member_errors")
+            return (), False
+
     def _reply_targets(
         self,
         *,
@@ -871,6 +916,7 @@ class AsTransactionConsumer:
         sender: str,
         reply_to_sender: Optional[str],
         is_ai_sender: bool,
+        ai_ids: Optional[Sequence[str]] = None,
     ) -> Tuple[str, ...]:
         """本条消息应回复的**全部**本服 AI，按提及顺序（PR2 逐个发言）。
 
@@ -883,7 +929,7 @@ class AsTransactionConsumer:
         """
         if is_ai_sender:
             return ()
-        ai_ids = self._room_ai_ids(room_id, mentions)
+        ai_ids = list(ai_ids) if ai_ids is not None else self._room_ai_ids(room_id, mentions)
         others = [uid for uid in ai_ids if uid != sender]
         if not others:
             return ()

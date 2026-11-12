@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 import sys
+import sqlite3
 
 from .config import ConfigError, load_config
 from .http_server import build_server, build_transport
+from .engine.personas import PersonaConfigError
 
 
 def main(argv=None) -> int:
@@ -41,8 +43,14 @@ def main(argv=None) -> int:
 
     try:
         server = build_server(config, transport)
-    except OSError as exc:
-        print(f"config error: cannot bind {config.host}:{config.port}: {exc}", file=sys.stderr)
+    except PersonaConfigError:
+        print("config error: persona configuration is invalid", file=sys.stderr)
+        return 2
+    except (sqlite3.Error, RuntimeError):
+        print("config error: memory storage initialization failed", file=sys.stderr)
+        return 2
+    except OSError:
+        print("config error: gateway startup failed", file=sys.stderr)
         return 2
 
     host, port = config.host, config.port
@@ -85,6 +93,11 @@ def main(argv=None) -> int:
             "  (AS consumer: enabled — record/count only; the built-in engine is "
             "inactive because GATEWAY_PERSONAS_FILE has no personas and/or "
             "GATEWAY_MODEL_BASE_URL / GATEWAY_MODEL_NAME are not configured)"
+        )
+    elif not (config.model_base_url and config.model_name):
+        print(
+            "  (AS consumer: enabled — persistent memory records layer-1 events; "
+            "the built-in engine will not speak until a model is configured)"
         )
     else:
         print(

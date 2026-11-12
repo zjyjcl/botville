@@ -97,11 +97,13 @@ class EngineHooks(ConsumerHooks):
         client: ModelClient,
         service: GatewayService,
         dedupe: Optional[SpeechDedupe] = None,
+        memory_store: Optional[object] = None,
     ) -> None:
         self._personas = personas
         self._client = client
         self._service = service
         self._dedupe = dedupe
+        self._memory_store = memory_store
         self.stats = ConsumerStats()
         self._buffers: OrderedDict[str, _RoomBuffer] = OrderedDict()
         self._buf_lock = threading.Lock()
@@ -126,14 +128,24 @@ class EngineHooks(ConsumerHooks):
         text = ctx.text
         event_id = ctx.event_id or ""
 
-        # 先把人类消息放进 ring buffer（不管是否会回复）。
-        if room_id:
+        # Persistent memory replaces the in-process buffer when enabled.
+        if room_id and self._memory_store is None:
             buf = self._get_buffer(room_id)
             buf.append("user", truncate_text(text, _RING_TEXT_LIMIT), event_id)
 
         targets = list(ctx.target_user_ids) if ctx.target_user_ids else (
             [ctx.persona_user_id] if ctx.persona_user_id else []
         )
+        if self._memory_store is not None and event_id and self._memory_store.is_tombstoned(event_id):
+            return
+        if self._memory_store is not None:
+            # In a group, retain human input for every confirmed local persona
+            # even when it was not mentioned and will not answer this turn.
+            record_ids = list(dict.fromkeys((*targets, *ctx.room_ai_user_ids)))
+            for persona_user_id in record_ids:
+                persona = self._personas.get(persona_user_id)
+                if persona is not None:
+                    self._record_memory(persona, ctx, "user", text, event_id)
         if not targets:
             return
 
@@ -141,7 +153,7 @@ class EngineHooks(ConsumerHooks):
             persona = self._personas.get(persona_user_id)
             if persona is None:
                 continue
-            self._reply_as(persona, room_id, text, event_id)
+            self._reply_as(persona, room_id, text, event_id, ctx)
 
     def _reply_as(
         self,
@@ -149,8 +161,13 @@ class EngineHooks(ConsumerHooks):
         room_id: str,
         text: str,
         event_id: str,
+        ctx: Optional[ConsumerContext] = None,
     ) -> None:
         """一个 persona 对一条消息的完整回复流程。"""
+        # PR3a may install the hooks solely to persist layer-1 memory while no
+        # model is configured.  Preserve PR2's record/count-only behaviour.
+        if not self._client.config.configured:
+            return
         idem_key = speech_idempotency_key(persona.user_id, event_id)
 
         # 去重：重放时已 mark 的键直接跳过。
@@ -159,9 +176,27 @@ class EngineHooks(ConsumerHooks):
 
         # 先拼装完整提示词，再估算提示词及最大回复的预算。
         system_text = SYSTEM_ZONE_DECLARATION + "\n" + persona.instruction_text()
-        buf = self._get_buffer(room_id) if room_id else None
-        history = buf.snapshot() if buf else []
-        messages = _build_messages(history, text)
+        buf = self._get_buffer(room_id) if room_id and self._memory_store is None else None
+        if self._memory_store is not None and ctx is not None:
+            scope_kind, scope_key, counterpart = self._memory_scope(persona, ctx)
+            try:
+                from ..memory.recall import assemble_recall
+                messages = assemble_recall(
+                    self._memory_store, persona_id=persona.user_id,
+                    scope_kind=scope_kind, scope_key=scope_key,
+                    counterpart=counterpart,
+                    mentioned_counterparts=ctx.mentioned_user_ids,
+                    budget=2000,
+                )
+                # The current event must be visible even when pinned/profile
+                # memory consumes the recall allowance.  It remains untrusted.
+                messages.extend(_build_messages([], text))
+            except Exception:
+                self.stats.inc("memory_recall_errors")
+                raise TransientUnavailable("memory recall unavailable") from None
+        else:
+            history = buf.snapshot() if buf else []
+            messages = _build_messages(history, text)
         token_estimate = (estimate_tokens(system_text)
                           + sum(estimate_tokens(m["content"]) for m in messages)
                           + estimate_tokens("x" * persona.max_reply_chars))
@@ -217,10 +252,48 @@ class EngineHooks(ConsumerHooks):
                 raise self._deferred_until(decision, persona, room_id, receipt)
             self.stats.inc("send_blocked")
             return
+        if self._memory_store is not None and ctx is not None:
+            self._record_memory(
+                persona, ctx, "assistant", reply_text,
+                str((receipt.get("delivery") or {}).get("matrix_event_id") or ""),
+            )
         if self._dedupe is not None:
             self._dedupe.mark(idem_key)
         if buf is not None:
             buf.append("assistant", truncate_text(reply_text, _RING_TEXT_LIMIT))
+
+    def on_redaction(self, ctx: ConsumerContext) -> None:
+        if self._memory_store is None or not ctx.redacts_event_id:
+            return
+        try:
+            self._memory_store.redact_event(ctx.redacts_event_id, room_id=ctx.room_id or None)
+        except Exception:
+            self.stats.inc("memory_redaction_errors")
+            raise TransientUnavailable("memory redaction unavailable") from None
+
+    @staticmethod
+    def _memory_scope(persona: Persona, ctx: ConsumerContext) -> Tuple[str, str, str]:
+        if ctx.room_members_confirmed and len(ctx.room_ai_user_ids) == 1 and ctx.sender:
+            return "dm", ctx.sender, ctx.sender
+        return "group", ctx.room_id or "", ctx.sender or ""
+
+    def _record_memory(self, persona: Persona, ctx: ConsumerContext, role: str,
+                       text: str, event_id: str) -> None:
+        scope_kind, scope_key, counterpart = self._memory_scope(persona, ctx)
+        if role == "assistant" and not event_id:
+            raise TransientUnavailable("memory delivery receipt unavailable")
+        try:
+            self._memory_store.add_item(
+                persona_id=persona.user_id, scope_kind=scope_kind, scope_key=scope_key,
+                room_id=ctx.room_id or "", counterpart=counterpart,
+                event_id=event_id or None,
+                sender=ctx.sender if role == "user" else persona.user_id,
+                role=role, trust=ctx.trust if role == "user" else "trusted",
+                text=truncate_text(text, _RING_TEXT_LIMIT), source="event",
+            )
+        except Exception:
+            self.stats.inc("memory_write_errors")
+            raise TransientUnavailable("memory write unavailable") from None
 
     def _deferred_until(
         self, decision: Dict[str, Any], persona: Persona, room_id: str,
