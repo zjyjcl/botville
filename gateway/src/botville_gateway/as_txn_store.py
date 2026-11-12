@@ -23,10 +23,23 @@
   即「过期未消费 = 丢弃」），只按条数记日志，不记录 txn_id 或事件内容。
 
 消费侧钩子：
-  `get_unprocessed_transactions()` 返回 txn_id 有序列表，供后续 PR 读取
-  并交给角色引擎 / 记忆 / 主动发言模块处理；处理后应调用
-  `mark_processed(txn_id)` 更新 processed_at，防止重复消费。
+  `get_unprocessed_transactions(limit=100)` 按 `rowid`（插入顺序）升序返回一批
+  尚未处理的事务 `(txn_id, body, received_at)`，供后续 PR 读取并交给角色引擎 /
+  记忆 / 主动发言模块处理；处理后应调用 `mark_processed(txn_id)` 更新
+  processed_at，防止重复消费。
   目前（#192 起）只定义接口，**不**向任何角色引擎分发事件；消费留给后续 PR。
+
+消费骨架（B 线 PR1，contract §1.7.8）：
+  在 #192/#194 的表结构上**增量**补四列（`attempts` / `last_error_type` /
+  `failed_at` / `next_attempt_at`），迁移对旧库幂等。新增：
+  - `get_consumable_batch(now, limit)`：按 rowid 取「未处理、未清理、未 failed、
+    已到 next_attempt_at」的一批事务（含 attempts），供 `as_consumer` 逐条处理；
+  - `record_failure()` / `record_transient()`：写失败次数、异常**类型名**与下次
+    重试时间（不写异常内容、不写正文）；
+  - `oldest_unprocessed_received_at()`：积压告警用的最老未处理接收时间；
+  - `set_on_new_transaction(cb)`：新事务落库成功后在**锁外**通知消费者唤醒
+    （回调异常吞掉；实现不得记录 txn_id）。
+  `store_transaction` 的返回值与幂等语义保持不变。
 """
 
 from __future__ import annotations
@@ -37,7 +50,7 @@ import sqlite3
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .timeutil import iso_utc, utcnow
 
@@ -52,11 +65,15 @@ AS_TXN_PURGE_INTERVAL_MIN_SECONDS = 60
 # processed_at 为 NULL 表示尚未被消费侧处理；purged_at 非空 = 保留期清理过的墓碑。
 _DDL = """
 CREATE TABLE IF NOT EXISTS as_transactions (
-    txn_id       TEXT    PRIMARY KEY,
-    body         TEXT    NOT NULL,
-    received_at  TEXT    NOT NULL,
-    processed_at TEXT,
-    purged_at    TEXT
+    txn_id          TEXT    PRIMARY KEY,
+    body            TEXT    NOT NULL,
+    received_at     TEXT    NOT NULL,
+    processed_at    TEXT,
+    purged_at       TEXT,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    last_error_type TEXT,
+    failed_at       TEXT,
+    next_attempt_at TEXT
 );
 """
 
@@ -69,6 +86,15 @@ CREATE INDEX IF NOT EXISTS idx_as_transactions_purge
     ON as_transactions(received_at) WHERE purged_at IS NULL;
 """
 
+# 消费取批（contract §1.7.8）的部分索引：只索引「待消费」的行
+# （`processed_at` / `purged_at` / `failed_at` 均为 NULL）。与清理索引同样用
+# `CREATE INDEX IF NOT EXISTS`，新库与 #192/#194 旧库走同一条迁移路径都幂等。
+# 取批查询仍按 `rowid` 升序（插入顺序），索引只负责快速排除已处理/墓碑/failed 行。
+_CONSUMABLE_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_as_transactions_consumable
+    ON as_transactions(failed_at) WHERE processed_at IS NULL AND purged_at IS NULL;
+"""
+
 # 内存库 / URI 形式不是真实文件，跳过 0600 预建。
 _NON_FILE_DB_PREFIXES = (":memory:", "file:")
 
@@ -79,8 +105,8 @@ def _precreate_private_file(path: Path) -> None:
     只作用于**新文件**：已存在的库保持部署侧设定的权限，不悄悄改动机器上
     既有的文件模式。`:memory:` / `file:` URI 不是文件，直接跳过。
 
-    返回 None，但 `connect()` 用 `_create_private_file` 的返回值区分「我们新建
-    了它」与「沿用既有文件」，见该函数。
+    内部调用 `_create_private_file`：文件不存在时以 `O_CREAT|O_EXCL|0600`
+    独占创建，文件已存在时静默返回（不改权限、不报错）。
     """
     _create_private_file(path)
 
@@ -121,17 +147,43 @@ def _lock_down_wal_sidecars(path: Path) -> None:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """就地迁移 #192 建出的旧库：补 `purged_at` 列与清理用的部分索引（幂等）。
+    """就地迁移 #192 / #194 建出的旧库：补列与清理用的部分索引（幂等）。
 
     旧库的 `body` 是 `NOT NULL`，清理时写空串而不是 NULL，因此无需重建表；
     ALTER 只加列、不动既有行，旧库升级后行为与新建库一致。索引用
     `CREATE INDEX IF NOT EXISTS`，对新库与旧库都是加法、可重复执行。
+
+    消费骨架（contract §1.7.8）增量补四列：
+      - `attempts`（普通失败次数，transient 不计数）；
+      - `last_error_type`（只存异常类型名，不存内容）；
+      - `failed_at`（达到重试上限后写入；非空 = 永不再取出）；
+      - `next_attempt_at`（指数退避的下次可处理时间；空 = 立即可取）。
+    四列都带默认值 / 可空，旧行升级后 `attempts=0`、其余为 NULL，即「立即可消费」。
+
+    运维注意：首次在大库（#192/#194 时期积累的旧库）上执行本迁移时，两个
+    **部分索引**（`idx_as_transactions_purge` 与 `idx_as_transactions_consumable`）
+    要各扫一遍表来建立。墓碑越多、建得越久，那**一次**启动会明显变慢；
+    之后每次启动都是 `IF NOT EXISTS` 的空操作，开销可忽略。建议在低峰期升级，
+    或先停机 `VACUUM` / 归档旧墓碑再升级（见 contract §1.7.7 运维第 1 点）。
     """
     columns = {row[1] for row in conn.execute("PRAGMA table_info(as_transactions)")}
     if "purged_at" not in columns:
         conn.execute("ALTER TABLE as_transactions ADD COLUMN purged_at TEXT")
+    if "attempts" not in columns:
+        conn.execute(
+            "ALTER TABLE as_transactions ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+        )
+    if "last_error_type" not in columns:
+        conn.execute("ALTER TABLE as_transactions ADD COLUMN last_error_type TEXT")
+    if "failed_at" not in columns:
+        conn.execute("ALTER TABLE as_transactions ADD COLUMN failed_at TEXT")
+    if "next_attempt_at" not in columns:
+        conn.execute("ALTER TABLE as_transactions ADD COLUMN next_attempt_at TEXT")
     # 索引必须在补列之后建（旧库上引用 purged_at）。
     conn.execute(_PURGE_INDEX_DDL)
+    # 消费取批查询（`processed_at IS NULL AND purged_at IS NULL AND failed_at IS NULL`）
+    # 的部分索引：只覆盖「待消费」的行，规模随积压而不是随墓碑总数增长。
+    conn.execute(_CONSUMABLE_INDEX_DDL)
 
 
 def connect(db_path: str) -> sqlite3.Connection:
@@ -178,6 +230,18 @@ class AsTransactionStore:
         # 调度等待函数：`event.wait(timeout)` 的替代注入点，供测试跑快速时钟。
         # 生产路径保持 None → 使用 Event.wait（真实 sleep）。
         self._wait_fn = _wait_fn
+        # 新事务唤醒回调（消费骨架）：store_transaction 写入成功后在**锁外**调用，
+        # 异常吞掉（消费者没起来不能影响接收）。回调不得记录 txn_id。
+        self._on_new_transaction: Optional[Callable[[], None]] = None
+
+    def set_on_new_transaction(self, callback: Optional[Callable[[], None]]) -> None:
+        """注册「新事务落库成功」回调（消费骨架用，见 contract §1.7.8）。
+
+        只在 `store_transaction` 返回 True（**新写入**）时、且**锁已释放**后调用；
+        幂等重放不唤醒。回调抛出的任何异常都被吞掉——唤醒失败只是让消费者等到
+        下一次 5 秒兜底轮询，绝不能让 HS 的 200 变成 500。
+        """
+        self._on_new_transaction = callback
 
     def store_transaction(self, txn_id: str, body_text: str) -> bool:
         """持久化一条 AS 事务（锁内判重 + 插入，单事务提交）。
@@ -186,6 +250,9 @@ class AsTransactionStore:
         **已清理（墓碑）的 txn_id 同样返回 False**：重放不会重新落库，也不会
         把墓碑复活成「未处理」。数据库写入失败会抛出 sqlite3.Error，调用方应
         映射为 500 M_UNKNOWN。本方法**不**进行任何事件分发。
+
+        新写入成功后在**锁外**触发 `on_new_transaction` 回调（若已注册），
+        用于立即唤醒进程内消费者；回调异常吞掉，不影响返回值。
         """
         now_str = iso_utc(utcnow())
         with self._lock:
@@ -200,10 +267,117 @@ class AsTransactionStore:
                     " VALUES (?, ?, ?)",
                     (txn_id, body_text, now_str),
                 )
-            return True
+        # 锁外通知：消费者线程可能立刻开始处理，不能在持锁时唤醒（否则它要等到
+        # 本函数返回才能拿锁，反而放大接收路径的锁等待）。
+        callback = self._on_new_transaction
+        if callback is not None:
+            try:
+                callback()
+            except Exception:  # noqa: BLE001 - 唤醒失败只退化为兜底轮询
+                pass
+        return True
 
+    # ------------------------------------------------------- consumer helpers
     # 消费侧单次拉取的默认条数上限：消费侧按批处理，避免把整个积压一次读进内存。
     DEFAULT_UNPROCESSED_LIMIT = 100
+
+    def get_consumable_batch(
+        self,
+        now: datetime,
+        limit: int = DEFAULT_UNPROCESSED_LIMIT,
+    ) -> List[Tuple[str, str, str, int]]:
+        """按插入顺序取一批「当前可处理」的事务（消费骨架，contract §1.7.8）。
+
+        「可处理」的条件：
+          - `processed_at IS NULL`（尚未成功消费）；
+          - `purged_at IS NULL`（未清理/墓碑）；
+          - `failed_at IS NULL`（未达 5 次失败上限）；
+          - `next_attempt_at` 为 NULL **或** ≤ now（退避到期）。
+
+        返回 (txn_id, body, received_at, attempts) 四元组列表，按 `rowid` 升序
+        （插入顺序），单批最多 `limit` 条。`attempts` 供消费者计算下次退避。
+        """
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise ValueError(f"limit must be an integer, got {limit!r}")
+        if limit < 1:
+            raise ValueError(f"limit must be >= 1, got {limit}")
+        now_str = iso_utc(now)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT txn_id, body, received_at, attempts"
+                " FROM as_transactions"
+                " WHERE processed_at IS NULL AND purged_at IS NULL AND failed_at IS NULL"
+                " AND (next_attempt_at IS NULL OR next_attempt_at <= ?)"
+                " ORDER BY rowid ASC"
+                " LIMIT ?",
+                (now_str, limit),
+            ).fetchall()
+            return [(r["txn_id"], r["body"], r["received_at"], r["attempts"]) for r in rows]
+
+    def record_failure(
+        self,
+        txn_id: str,
+        error_type: str,
+        now: datetime,
+        *,
+        next_attempt_at: Optional[datetime] = None,
+        mark_failed: bool = False,
+    ) -> None:
+        """记录普通失败（attempts+1，存异常**类型名**，设退避时间）。
+
+        `next_attempt_at` 缺省时用 `now`（无退避）。`mark_failed=True` 时额外
+        写入 `failed_at = now`（达到重试上限），该行此后不再出现在
+        `get_consumable_batch()` 结果中。
+
+        安全约束：`error_type` 只存异常类型名（如 `'ValueError'`），不写异常
+        消息正文；`txn_id` 不写日志（调用方同理）。
+        """
+        next_str = iso_utc(next_attempt_at if next_attempt_at is not None else now)
+        failed_str = iso_utc(now) if mark_failed else None
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE as_transactions"
+                    " SET attempts = attempts + 1,"
+                    "     last_error_type = ?,"
+                    "     next_attempt_at = ?,"
+                    "     failed_at = ?"
+                    " WHERE txn_id = ? AND processed_at IS NULL AND failed_at IS NULL",
+                    (error_type, next_str, failed_str, txn_id),
+                )
+
+    def record_transient(
+        self,
+        txn_id: str,
+        next_attempt_at: datetime,
+    ) -> None:
+        """记录瞬态不可用（TransientUnavailable）：只设退避时间，**不计 attempts**。
+
+        瞬态失败（模型/HS 临时不可用）不消耗重试次数；消费者下次到期后仍会
+        取出此事务继续处理。
+        """
+        next_str = iso_utc(next_attempt_at)
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE as_transactions"
+                    " SET next_attempt_at = ?"
+                    " WHERE txn_id = ? AND processed_at IS NULL AND failed_at IS NULL",
+                    (next_str, txn_id),
+                )
+
+    def oldest_unprocessed_received_at(self) -> Optional[str]:
+        """返回最老的「未处理且未清理且未 failed」事务的 `received_at`，供积压告警。
+
+        无未处理事务时返回 None。日志调用方只记时间差（不记 txn_id）。
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT received_at FROM as_transactions"
+                " WHERE processed_at IS NULL AND purged_at IS NULL AND failed_at IS NULL"
+                " ORDER BY rowid ASC LIMIT 1"
+            ).fetchone()
+            return row[0] if row else None
 
     def get_unprocessed_transactions(
         self, limit: int = DEFAULT_UNPROCESSED_LIMIT
@@ -220,8 +394,8 @@ class AsTransactionStore:
         （purged_at IS NOT NULL）：过期未处理的事务在清理时被丢弃，不再交给
         消费侧。
 
-        TODO（后续 PR）：实现消费者调用本接口并触发角色引擎 / 记忆 /
-        主动发言逻辑，处理后调用 mark_processed(txn_id)。
+        本方法保留为兼容接口（现有测试与运维脚本使用）；进程内消费者改用
+        `get_consumable_batch()`，后者额外排除 failed 行并遵守退避时间。
         """
         if not isinstance(limit, int) or isinstance(limit, bool):
             raise ValueError(f"limit must be an integer, got {limit!r}")

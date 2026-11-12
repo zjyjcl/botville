@@ -73,6 +73,18 @@ def main(argv=None) -> int:
         )
     else:
         print("  (AS transactions: retention purge disabled — the transaction DB keeps growing)")
+    # 消费骨架（contract §1.7.8）：只打印状态，不打印任何敏感值。
+    if not config.consumer_enabled:
+        print("  (AS consumer: disabled — GATEWAY_CONSUMER_ENABLED=false)")
+    elif server.as_consumer is None:
+        print(
+            "  (AS consumer: enabled but NOT running — GATEWAY_AS_TXN_DB_PATH is not set)"
+        )
+    else:
+        print(
+            "  (AS consumer: enabled — the engine/model are not wired in this PR; "
+            "events are classified and counted only)"
+        )
     print(f"transport: {type(transport).__name__} (GATEWAY_MATRIX_TRANSPORT={config.matrix_transport})")
     try:
         server.serve_forever()
