@@ -58,6 +58,7 @@ from botville_gateway.engine import (  # noqa: E402
 )
 from botville_gateway.engine.model_client import looks_like_plaintext_key  # noqa: E402
 from botville_gateway.http_server import build_server  # noqa: E402
+from botville_gateway.service import GatewayService
 from botville_gateway.matrix import InMemoryMatrixTransport  # noqa: E402
 
 SERVER_NAME = "example.test"
@@ -405,7 +406,7 @@ class TestEngineHooks(unittest.TestCase):
         transport = InMemoryMatrixTransport()
         personas = {AI_A: _make_persona()}
         return (
-            EngineHooks(personas=personas, client=client, transport=transport),
+            EngineHooks(personas=personas, client=client, service=GatewayService(_cfg(), transport)),
             transport,
         )
 
@@ -422,7 +423,7 @@ class TestEngineHooks(unittest.TestCase):
         hooks, transport = self._hooks("hi")
         ctx = self._make_ctx(event_id="$unique")
         hooks.on_human_text(ctx)
-        self.assertEqual(transport.sent[0].txn_id, speech_idempotency_key(AI_A, "$unique"))
+        self.assertEqual(transport.sent[0].txn_id, hooks._service._txn_id_for(speech_idempotency_key(AI_A, "$unique")))
 
     def test_no_matching_persona_no_send(self):
         hooks, transport = self._hooks()
@@ -449,7 +450,7 @@ class TestEngineHooks(unittest.TestCase):
         hooks = EngineHooks(
             personas={AI_A: _make_persona()},
             client=client,
-            transport=transport,
+            service=GatewayService(_cfg(), transport),
             dedupe=dedupe,
         )
         ctx = self._make_ctx(event_id="$dup")
@@ -458,44 +459,23 @@ class TestEngineHooks(unittest.TestCase):
         self.assertEqual(len(transport.sent), 1)
 
     def test_blocked_by_policy_no_model_call(self):
-        from botville_gateway.policy import DECISION_BLOCK, PolicyDecision
-        from botville_gateway.timeutil import iso_utc, utcnow
-
         client = _mock_client()
-        called = []
-        original_post = client._post
-        def _record(*a, **kw):
-            called.append(True)
-            return original_post(*a, **kw)
-        client._post = _record  # type: ignore
-
-        mock_engine = mock.Mock()
-        mock_engine.evaluate.return_value = PolicyDecision(
-            decision=DECISION_BLOCK,
-            allowed=False,
-            evaluated_at=iso_utc(utcnow()),
-            winner_layer="platform_default",
-            retryable=False,
-            retry_after_seconds=None,
-            estimated_tokens=0,
-        )
+        client._post = mock.Mock(wraps=client._post)
         transport = InMemoryMatrixTransport()
-        hooks = EngineHooks(
-            personas={AI_A: _make_persona()},
-            client=client,
-            transport=transport,
-            policy_engine=mock_engine,
-        )
+        service = GatewayService(_cfg(), transport)
+        service.evaluate_policy = mock.Mock(return_value={"decision": "block"})
+        hooks = EngineHooks(personas={AI_A: _make_persona()}, client=client, service=service)
         hooks.on_human_text(self._make_ctx())
-        self.assertEqual(called, [])
+        client._post.assert_not_called()
         self.assertEqual(transport.sent, [])
+        self.assertEqual(hooks.stats.snapshot()["precheck_blocked"], 1)
 
     def test_multiple_targets_replied_in_order(self):
         """群聊同时 @ 两个 AI → 两个都发言，顺序与 target_user_ids 一致。"""
         client = _mock_client("回复")
         transport = InMemoryMatrixTransport()
         personas = {AI_A: _make_persona(AI_A), AI_B: _make_persona(AI_B)}
-        hooks = EngineHooks(personas=personas, client=client, transport=transport)
+        hooks = EngineHooks(personas=personas, client=client, service=GatewayService(_cfg(), transport))
         ctx = ConsumerContext(
             event_type="message_text",
             event_id="$g1",
@@ -524,7 +504,7 @@ class TestEngineHooks(unittest.TestCase):
 
         client._post = _capture  # type: ignore
         transport = InMemoryMatrixTransport()
-        hooks = EngineHooks(personas={AI_A: _make_persona()}, client=client, transport=transport)
+        hooks = EngineHooks(personas={AI_A: _make_persona()}, client=client, service=GatewayService(_cfg(), transport))
 
         hooks.on_human_text(ConsumerContext(
             event_type="message_text", event_id="$first", room_id="!r:x",
@@ -541,6 +521,182 @@ class TestEngineHooks(unittest.TestCase):
         roles = [m["role"] for m in msgs if m["role"] != "system"]
         self.assertIn("assistant", roles)
         self.assertTrue(roles[-1] == "user")
+
+
+class TestEngineServicePath(unittest.TestCase):
+    _make_ctx = TestEngineHooks._make_ctx
+    def _setup_service(self, **config):
+        transport = InMemoryMatrixTransport()
+        service = GatewayService(_cfg(**config), transport)
+        client = _mock_client("pong")
+        client._post = mock.Mock(wraps=client._post)
+        from botville_gateway.engine.engine import InMemorySpeechDedupeForEngine
+        hooks = EngineHooks(personas={AI_A: _make_persona()}, client=client,
+                            service=service, dedupe=InMemorySpeechDedupeForEngine())
+        return hooks, service, client, transport
+
+    def _assert_cap(self, config, reason):
+        hooks, service, client, transport = self._setup_service(**config)
+        hooks.on_human_text(self._make_ctx(event_id="$first"))
+        totals = service.get_usage(persona_id=AI_A)["totals"]
+        self.assertEqual(totals["messages_sent"], 1)
+        self.assertEqual(totals["tokens_total"], 2)
+        decision = service.evaluate_policy({"persona_id": AI_A,
+            "conversation_id": "!r:example.test", "content": "hello", "token_estimate": 2})
+        self.assertIn(reason, [r["code"] for r in decision["reasons"]])
+        client._post.reset_mock()
+        hooks.on_human_text(self._make_ctx(event_id="$second"))
+        hooks.on_human_text(self._make_ctx(event_id="$third"))
+        client._post.assert_not_called()
+        self.assertEqual(len(transport.sent), 1)
+        self.assertEqual(hooks.stats.snapshot()["precheck_blocked"], 2)
+        self.assertEqual(service.get_usage(persona_id=AI_A)["totals"]["messages_sent"], 1)
+
+    def test_daily_message_cap(self):
+        self._assert_cap({"rate_limit_messages": 1, "rate_limit_window_seconds": 86400}, "messages.window.exceeded")
+
+    def test_token_budget(self):
+        self._assert_cap({"platform_token_budget": 2}, "tokens.window.exceeded")
+
+    def test_anti_spam(self):
+        self._assert_cap({"platform_max_consecutive_ai_messages": 1}, "anti_spam.consecutive")
+
+    def test_ai_loop(self):
+        self._assert_cap({"platform_max_ai_messages_per_hour": 1}, "ai_loop.tripped")
+
+    def test_send_race_block_is_terminal(self):
+        hooks, service, client, transport = self._setup_service(rate_limit_messages=1)
+        original = client._post
+        def race(*args, **kwargs):
+            service.send_ai_message("!r:example.test", {"sender_persona_id": AI_A,
+                "content": {"type": "text", "text": "other"}, "allow_deferred": False})
+            return original(*args, **kwargs)
+        client._post = mock.Mock(side_effect=race)
+        ctx = self._make_ctx()
+        hooks.on_human_text(ctx)
+        hooks.on_human_text(ctx)
+        self.assertEqual(client._post.call_count, 1)
+        self.assertEqual(hooks.stats.snapshot()["send_blocked"], 1)
+        self.assertEqual(len(transport.sent), 1)
+
+    def test_service_idempotency_without_speech_dedupe(self):
+        hooks, service, client, transport = self._setup_service()
+        hooks._dedupe = None
+        ctx = self._make_ctx()
+        hooks.on_human_text(ctx)
+        hooks.on_human_text(ctx)
+        self.assertEqual(len(transport.sent), 1)
+        self.assertEqual(service.get_usage(persona_id=AI_A)["totals"]["messages_sent"], 1)
+
+    def test_delivery_errors(self):
+        from botville_gateway.matrix import DeliveryError
+        from botville_gateway.errors import GatewayDeliveryError
+        from botville_gateway.as_consumer import TransientUnavailable
+        for code in ("matrix.unreachable", "matrix.unavailable", "matrix.forbidden"):
+            with self.subTest(code=code):
+                hooks, service, client, transport = self._setup_service()
+                transport.send_text = mock.Mock(side_effect=DeliveryError(code, "fake failure"))
+                expected = GatewayDeliveryError if code == "matrix.forbidden" else TransientUnavailable
+                with self.assertRaises(expected):
+                    hooks.on_human_text(self._make_ctx())
+                self.assertFalse(hooks._dedupe.seen(speech_idempotency_key(AI_A, "$e1")))
+                self.assertEqual(service.pending_reservations, 0)
+                self.assertEqual(service.get_usage()["totals"]["messages_sent"], 0)
+
+    def test_restart_persistent_speech_dedupe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "speech.db")
+            transport = InMemoryMatrixTransport()
+            for attempt in range(2):
+                conn = connect(path)
+                try:
+                    client = _mock_client("pong")
+                    client._post = mock.Mock(wraps=client._post)
+                    hooks = EngineHooks(personas={AI_A: _make_persona()}, client=client,
+                        service=GatewayService(_cfg(), transport),
+                        dedupe=PersistentSpeechDedupe(AsTransactionStore(conn)))
+                    hooks.on_human_text(self._make_ctx())
+                    self.assertEqual(client._post.call_count, 1 if attempt == 0 else 0)
+                finally:
+                    conn.close()
+            self.assertEqual(len(transport.sent), 1)
+
+    def test_all_chat_is_wrapped_and_bounded(self):
+        from botville_gateway.engine.engine import _build_messages
+        history = [("assistant", "😀" * 9000)] * 25
+        messages = _build_messages(history, "x" * 9000)
+        self.assertEqual(len(messages), 20)
+        for message in messages:
+            self.assertTrue(message["content"].startswith('<untrusted id="'))
+        self.assertEqual(messages[0]["content"].count("😀"), 8000)
+        self.assertIn("x" * 8000 + "</untrusted", messages[-1]["content"])
+
+
+class TestEngineMentionOrder(_TmpDb):
+    def test_mentions_and_body_order_are_serial(self):
+        from botville_gateway.as_consumer import AsTransactionConsumer
+        for structured in (True, False):
+            with self.subTest(structured=structured):
+                trace = []
+                transport = InMemoryMatrixTransport()
+                original_send = transport.send_text
+                def send(**kwargs):
+                    trace.append(("send", kwargs["sender_id"]))
+                    return original_send(**kwargs)
+                transport.send_text = send
+                client = _mock_client()
+                def complete(**kwargs):
+                    trace.append(("model", kwargs["persona"].user_id))
+                    return "pong"
+                client.complete = complete
+                service = GatewayService(_cfg(), transport)
+                hooks = EngineHooks(personas={AI_A: _make_persona(AI_A), AI_B: _make_persona(AI_B)},
+                    client=client, service=service, dedupe=PersistentSpeechDedupe(self.store))
+                consumer = AsTransactionConsumer(self.store, hooks=hooks, service=service,
+                    server_name=SERVER_NAME, room_members=lambda room: [AI_A, AI_B])
+                content = {"msgtype": "m.text", "body": f"{AI_B} {AI_A}"}
+                if structured:
+                    content["m.mentions"] = {"user_ids": [AI_B, AI_A]}
+                    content["body"] = f"{AI_A} {AI_B}"
+                event = {"type": "m.room.message", "event_id": "$order" + str(structured),
+                    "room_id": "!r:example.test", "sender": "@alice:example.test", "content": content}
+                self.store.store_transaction("fake-order-" + str(structured), json.dumps({"events": [event]}))
+                consumer.run_once()
+                self.assertEqual(trace, [("model", AI_B), ("send", AI_B), ("model", AI_A), ("send", AI_A)])
+
+
+    def test_partial_reply_restart_continues_remaining_persona(self):
+        from botville_gateway.as_consumer import AsTransactionConsumer, TransientUnavailable
+        transport = InMemoryMatrixTransport()
+        service = GatewayService(_cfg(), transport)
+        client = _mock_client()
+        calls = []
+        def complete(**kwargs):
+            uid = kwargs["persona"].user_id
+            calls.append(uid)
+            if uid == AI_B and calls.count(AI_B) == 1:
+                raise TransientUnavailable("fake unavailable")
+            return "pong"
+        client.complete = complete
+        event = {"type": "m.room.message", "event_id": "$partial", "room_id": "!r:example.test",
+            "sender": "@alice:example.test", "content": {"msgtype": "m.text", "body": "hi",
+            "m.mentions": {"user_ids": [AI_A, AI_B]}}}
+        self.store.store_transaction("fake-partial", json.dumps({"events": [event]}))
+        for attempt in range(2):
+            # Reopen SQLite and recreate hooks/consumer as on process restart.
+            conn = connect(self.db_path)
+            try:
+                store = AsTransactionStore(conn)
+                hooks = EngineHooks(personas={AI_A: _make_persona(AI_A), AI_B: _make_persona(AI_B)},
+                    client=client, service=service, dedupe=PersistentSpeechDedupe(store))
+                consumer = AsTransactionConsumer(store, hooks=hooks, service=service, server_name=SERVER_NAME)
+                consumer.run_once()
+                conn.execute("UPDATE as_transactions SET next_attempt_at=NULL")
+                conn.commit()
+            finally:
+                conn.close()
+        self.assertEqual(calls, [AI_A, AI_B, AI_B])
+        self.assertEqual([e.sender_id for e in transport.sent], [AI_A, AI_B])
 
 
 # ---------------------------------------------------------------------------
@@ -640,6 +796,26 @@ class TestEngineServerIntegration(unittest.TestCase):
         server, _ = self._server(model_url="http://fake.invalid", personas_data=[])
         try:
             self.assertIsNone(server.engine_hooks)
+        finally:
+            server.server_close()
+
+    def test_engine_uses_service_appservice_transport(self):
+        from botville_gateway.matrix_appservice import AppServiceMatrixTransport
+        server, _ = self._server(personas_data=[_base_persona_dict()],
+            model_url="http://fake.invalid", matrix_transport="appservice",
+            homeserver_url="http://127.0.0.1:9999", as_token="obviously-fake-as-token-for-test-only-12345")
+        try:
+            self.assertIsInstance(server.transport, AppServiceMatrixTransport)
+            self.assertIs(server.engine_hooks._service, server.service)
+            sent = InMemoryMatrixTransport()
+            with mock.patch.object(server.transport, "send_text", side_effect=sent.send_text) as send:
+                server.engine_hooks._client = _mock_client("pong")
+                ctx = TestEngineHooks._make_ctx(self)
+                server.engine_hooks.on_human_text(ctx)
+                self.assertEqual(send.call_args.kwargs["sender_id"], AI_A)
+                self.assertEqual(send.call_args.kwargs["txn_id"],
+                    server.service._txn_id_for(speech_idempotency_key(AI_A, ctx.event_id)))
+                self.assertEqual(server.service.get_usage()["totals"]["messages_sent"], 1)
         finally:
             server.server_close()
 

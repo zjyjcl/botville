@@ -872,12 +872,14 @@ class AsTransactionConsumer:
         if len(others) == 1:
             return (others[0],)
 
-        mention_set = {m for m in mentions if m}
         targets: list = []
-        for uid in others:
-            if uid in mention_set or uid in text:
-                if uid not in targets:
-                    targets.append(uid)
+        for uid in mentions:
+            if uid in others and uid not in targets:
+                targets.append(uid)
+        # 无结构化提及时按正文首次出现顺序；其余正文提及追加在结构化列表后。
+        for uid in sorted((uid for uid in others if uid in text), key=text.index):
+            if uid not in targets:
+                targets.append(uid)
         if reply_to_sender is not None and reply_to_sender in others:
             if reply_to_sender not in targets:
                 targets.append(reply_to_sender)

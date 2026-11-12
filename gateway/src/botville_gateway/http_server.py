@@ -1295,7 +1295,7 @@ class GatewayServer(http.server.ThreadingHTTPServer):
                     "set — consumer thread will NOT start"
                 )
             else:
-                hooks = self._build_engine_hooks(config, service, transport)
+                hooks = self._build_engine_hooks(config, service)
                 self.engine_hooks = hooks
                 consumer = AsTransactionConsumer(
                     self.as_txn_store,
@@ -1303,7 +1303,9 @@ class GatewayServer(http.server.ThreadingHTTPServer):
                     service=service,
                     server_name=config.matrix_server_name,
                     sender_fetcher=getattr(transport, "event_sender", None),
-                    dedupe=PersistentSpeechDedupe(self.as_txn_store),
+                    # Engine persists each persona separately; consumer completion
+                    # must not share the first persona key on partial failures.
+                    dedupe=None if hooks else PersistentSpeechDedupe(self.as_txn_store),
                 )
                 # 注册唤醒钩子：事务落库成功后立即唤醒消费线程。
                 self.as_txn_store.set_on_new_transaction(consumer.wake)
@@ -1315,7 +1317,7 @@ class GatewayServer(http.server.ThreadingHTTPServer):
             self.as_consumer.start()
 
     def _build_engine_hooks(
-        self, config: Config, service: GatewayService, transport: MatrixTransport
+        self, config: Config, service: GatewayService
     ) -> Optional[EngineHooks]:
         """按配置装配内置角色引擎；不满足条件时返回 None（消费者保持 no-op 钩子）。
 
@@ -1355,8 +1357,8 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         return EngineHooks(
             personas=personas,
             client=ModelClient(model_config),
-            transport=transport,
-            policy_engine=service.policy_engine,
+            service=service,
+            dedupe=PersistentSpeechDedupe(self.as_txn_store),
         )
 
     def server_close(self) -> None:

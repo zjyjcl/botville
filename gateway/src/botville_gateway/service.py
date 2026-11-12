@@ -241,15 +241,6 @@ class GatewayService:
         return self._store
 
     @property
-    def policy_engine(self) -> PolicyEngine:
-        """内置引擎用：与 `POST /policy/evaluate` **同一个**策略引擎实例。
-
-        复用同一实例是刻意的：限额、防刷屏冷却与 AI 互聊熔断的进程内状态必须
-        与 HTTP 路径共享，否则引擎发言会绕过（或重复计算）同一份计数。
-        """
-        return self._engine
-
-    @property
     def limits(self) -> LimitStore:
         return self._limits
 
