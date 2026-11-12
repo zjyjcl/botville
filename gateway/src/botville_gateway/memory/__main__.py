@@ -84,7 +84,7 @@ def _resolve_api(args: argparse.Namespace) -> OwnerMemoryAPI:
     # ownerless persona cannot cause a local database side effect.
     if not owners.get(args.persona) or owners[args.persona] != args.as_owner:
         raise MemoryPermissionError("memory owner permission denied")
-    return OwnerMemoryAPI(MemoryStore(args.db), owners)
+    return OwnerMemoryAPI(MemoryStore(args.db), owners, server_name=args.server_name)
 
 
 def _dispatch(api: OwnerMemoryAPI, args: argparse.Namespace) -> Dict[str, Any]:

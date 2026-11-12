@@ -9,6 +9,9 @@ from ..isolation import build_untrusted_segment, generate_nonce
 from .store import MemoryStore
 
 RECALL_TOKEN_BUDGET = 2000
+RECALL_ITEMS_LIMIT = 200
+RECALL_FACTS_LIMIT = 100
+RECALL_PEOPLE_LIMIT = 100
 
 
 class SummaryProvider(Protocol):
@@ -58,31 +61,52 @@ def assemble_recall(
     candidates = []
     people = ((counterpart,) if scope_kind == 'dm' else
               tuple(dict.fromkeys((counterpart, *mentioned_counterparts))))
-    for person in people:
+    for person in people[:RECALL_PEOPLE_LIMIT]:
         if not person:
             continue
-        for fact in store.facts(persona_id, person):
+        for fact in store.facts(persona_id, person, limit=RECALL_FACTS_LIMIT,
+                                visibility='shared' if scope_kind == 'group' else None):
             if scope_kind == 'group' and fact['visibility'] != 'shared':
                 continue
             candidates.append((0 if fact['pinned'] else 1, 'profile',
                                fact['updated_at'], fact['trust'],
                                f"{fact['key']}: {fact['value']}"))
-    for item in store.items(persona_id, scope_kind=scope_kind, scope_key=scope_key):
-        candidates.append((0 if item['pinned'] else 4, 'recent',
-                           item['created_at'], item['trust'], item['text']))
+    recent_entries = {}
+    for item in store.items(persona_id, scope_kind=scope_kind, scope_key=scope_key,
+                            limit=RECALL_ITEMS_LIMIT):
+        entry = (0 if item['pinned'] else 4, 'recent',
+                 item['created_at'], item['trust'], item['text'])
+        recent_entries[item['id']] = entry
+        candidates.append(entry)
+    summary_ids = set()
     for provider, rank, layer in ((summary_provider, 2, 'summary'),
                                   (vector_recall, 3, 'vector')):
         if provider is None:
             continue
-        rows = provider.recall(persona_id=persona_id, scope_kind=scope_kind,
-                               scope_key=scope_key)
+        try:
+            rows = provider.recall(persona_id=persona_id, scope_kind=scope_kind,
+                                   scope_key=scope_key)
+        except Exception:
+            if layer == 'vector':
+                continue
+            raise
         for row in rows:
+            if layer == 'summary' and row.get('id') is not None:
+                summary_ids.add(row['id'])
             if any(row.get(key, value) != value for key, value in (
                     ('persona_id', persona_id), ('scope_kind', scope_kind),
                     ('scope_key', scope_key))):
                 continue
             if scope_kind == 'group' and row.get('visibility') == 'dm_only':
                 continue
+            if layer == 'vector':
+                if row.get('summary_id') in summary_ids:
+                    continue
+                recent = recent_entries.pop(row.get('item_id'), None)
+                if recent is not None:
+                    if recent[0] == 0:  # Preserve the higher pinned priority.
+                        continue
+                    candidates.remove(recent)  # Promote once to vector priority.
             if isinstance(row.get('text'), str):
                 candidates.append((0 if row.get('pinned') else rank, layer,
                                    str(row.get('created_at', '')), 'untrusted', row['text']))

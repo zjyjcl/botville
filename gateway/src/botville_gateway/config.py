@@ -144,6 +144,7 @@ DEFAULT_MODEL_TIMEOUT_SECONDS = 30
 # PR2 in-process ring-buffer behaviour.
 DEFAULT_MEMORY_RETENTION_DAYS = 90
 DEFAULT_MEMORY_PURGE_INTERVAL_SECONDS = 86_400
+MEMORY_VECTOR_BACKENDS = frozenset({"none", "python", "sqlite-vec"})
 
 # 部署路径前缀（GATEWAY_HTTP_PATH_PREFIX）的禁用片段：这些要么改变路径语义
 # （`//`、`..`），要么在拼 URL / 反代重写时会被提前截断或解码（`?` `#` `%`），
@@ -517,6 +518,14 @@ class Config:
     memory_db_path: Optional[str] = None
     memory_retention_days: int = DEFAULT_MEMORY_RETENTION_DAYS
     memory_purge_interval_seconds: int = DEFAULT_MEMORY_PURGE_INTERVAL_SECONDS
+    # PR3b consolidation configuration. Secret values never appear in repr.
+    # A zero dimension pins the first embedding response's dimension.
+    memory_summary_model: Optional[str] = None
+    embedding_base_url: Optional[str] = None
+    embedding_model: Optional[str] = None
+    embedding_api_key: Optional[str] = field(default=None, repr=False)
+    embedding_dim: int = 0
+    memory_vector_backend: str = "python"
 
     def __post_init__(self) -> None:
         # 构造时校验，避免明显错误的配置拖到第一次请求才炸。
@@ -668,6 +677,13 @@ class Config:
             raise ConfigError(
                 "memory_purge_interval_seconds must be 0 (disabled) or >= "
                 f"{MEMORY_PURGE_INTERVAL_MIN_SECONDS}, got {memory_purge_interval}"
+            )
+        if (not isinstance(self.embedding_dim, int)
+                or isinstance(self.embedding_dim, bool) or self.embedding_dim < 0):
+            raise ConfigError("GATEWAY_EMBEDDING_DIM must be a non-negative integer")
+        if self.memory_vector_backend not in MEMORY_VECTOR_BACKENDS:
+            raise ConfigError(
+                "GATEWAY_MEMORY_VECTOR_BACKEND must be one of none, python, sqlite-vec"
             )
         # AS 回调：hs_token 强度校验（与 as_token 同规则；None/空串 = 未配置，合法）。
         # 未配置时网关照常启动，但 /_matrix/app/v1/* 一律 403。空串归一为 None，
@@ -936,6 +952,20 @@ class Config:
             raise ConfigError(
                 "GATEWAY_MODEL_TIMEOUT_SECONDS must be a positive number of seconds"
             )
+        embedding_base = (self.embedding_base_url or self.model_base_url or "").strip()
+        if self.embedding_model:
+            if not embedding_base:
+                raise ConfigError(
+                    "GATEWAY_EMBEDDING_MODEL is set but no embedding or model base URL is configured"
+                )
+            parsed_embedding = urllib.parse.urlsplit(embedding_base)
+            if (parsed_embedding.scheme not in ("http", "https")
+                    or not parsed_embedding.hostname
+                    or parsed_embedding.username is not None
+                    or parsed_embedding.password is not None):
+                raise ConfigError(
+                    "GATEWAY_EMBEDDING_BASE_URL must be an http:// or https:// URL without credentials"
+                )
 
     def _validate_caller_tokens(self) -> None:
         """#124 / 契约 §1.2.2：caller token 表的结构与强度校验。
@@ -1265,4 +1295,21 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
             source, "GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS",
             DEFAULT_MEMORY_PURGE_INTERVAL_SECONDS, minimum=0,
         ),
+        memory_summary_model=(
+            _env_str(source, "GATEWAY_MEMORY_SUMMARY_MODEL", "")
+            or _env_str(source, "GATEWAY_MODEL_NAME", "") or None
+        ),
+        embedding_base_url=(
+            _env_str(source, "GATEWAY_EMBEDDING_BASE_URL", "")
+            or _env_str(source, "GATEWAY_MODEL_BASE_URL", "") or None
+        ),
+        embedding_model=(_env_str(source, "GATEWAY_EMBEDDING_MODEL", "") or None),
+        embedding_api_key=(
+            _env_str(source, "GATEWAY_EMBEDDING_API_KEY", "")
+            or _env_str(source, "GATEWAY_MODEL_API_KEY", "") or None
+        ),
+        embedding_dim=_env_int(source, "GATEWAY_EMBEDDING_DIM", 0, minimum=0),
+        memory_vector_backend=_env_str(
+            source, "GATEWAY_MEMORY_VECTOR_BACKEND", "python"
+        ).lower(),
     )

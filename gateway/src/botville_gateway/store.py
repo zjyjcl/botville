@@ -48,6 +48,7 @@ class EventKind(str, Enum):
     DEFERRED = "deferred"
     PROACTIVE = "proactive"
     TOWN_ACTION = "town_action"
+    MEMORY = "memory"  # Internal accounting only; no public kind added.
     HUMAN = "human"  # B2.2: 人类消息记录，用于 anti_spam / ai_loop 计数重置
 
 
@@ -58,6 +59,7 @@ KIND_TO_CONTRACT: Dict[EventKind, str] = {
     EventKind.DEFERRED: "message_deferred",
     EventKind.PROACTIVE: "proactive_message",
     EventKind.TOWN_ACTION: "town_action",
+    EventKind.MEMORY: "",
     EventKind.HUMAN: "",  # 哨兵：空串；list_usage_events 按此过滤
 }
 

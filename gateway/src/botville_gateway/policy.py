@@ -150,15 +150,15 @@ class PolicyDecision:
 
 
 def estimate_tokens(text: str) -> int:
-    """粗略 token 估算（≈4 字符/token，最少 1）。
-
-    这是**下限**估算，不是精确计数：对中文（常见 1–2 字符/token）会低估，
-    但 B3 起它是客户端 `token_estimate` 的地板，保证 `token_estimate: 0` 无法
-    把非空正文计成 0 token。接真实模型后应改用实际 token 计数。
-    """
+    """CJK scripts/forms cost about one token; other text costs about 1/4."""
     if not text:
         return 0
-    return max(1, len(text) // 4 + 1)
+    ranges = ((0x1100, 0x11FF), (0x2E80, 0xA4CF), (0xA960, 0xA97F),
+              (0xAC00, 0xD7FF), (0xF900, 0xFAFF), (0xFE10, 0xFE1F),
+              (0xFE30, 0xFE4F), (0xFF00, 0xFFEF), (0x1B000, 0x1B16F),
+              (0x20000, 0x2FA1F), (0x30000, 0x3FFFF))
+    cjk = sum(any(start <= ord(char) <= end for start, end in ranges) for char in text)
+    return cjk + (len(text) - cjk) // 4 + 1
 
 
 @dataclass(frozen=True)
@@ -712,12 +712,11 @@ class PolicyEngine:
         since = now - timedelta(seconds=window)
         use_peer_filter = (layer == LAYER_PEER and peer_id is not None)
         events = sorted(
-            self._store.events_in_window(
+            [e for e in self._store.events_in_window(
                 persona_id=persona_id,
-                kind=EventKind.SENT,
                 since=since,
                 peer_id=peer_id if use_peer_filter else None,
-            ),
+            ) if e.kind in (EventKind.SENT, EventKind.MEMORY)],
             key=lambda e: e.recorded_at,
         )
         used = sum(e.tokens_in + e.tokens_out for e in events)

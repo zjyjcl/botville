@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import OrderedDict, deque
 from datetime import datetime, timedelta
 from typing import Any, Dict, Deque, List, Optional, Tuple
@@ -34,12 +35,13 @@ from ..as_consumer import (
     ConsumerStats,
     SpeechDedupe,
     TransientUnavailable,
+    MemoryDBUnavailable,
     speech_idempotency_key,
     truncate_text,
 )
 from ..isolation import SYSTEM_ZONE_DECLARATION, build_untrusted_segment
 from ..errors import GatewayDeliveryError
-from ..policy import DECISION_ALLOW, DECISION_DEFER, CODE_SILENT_HOURS
+from ..policy import DECISION_ALLOW, DECISION_DEFER, CODE_SILENT_HOURS, estimate_tokens
 from ..service import GatewayService
 from .model_client import ModelClient
 from .personas import Persona
@@ -50,11 +52,6 @@ MAX_ROOM_BUFFERS = 1000
 # 进 ring buffer 的单条消息正文上限（已截断的；与 as_consumer 的截断同量级）。
 _RING_TEXT_LIMIT = 8000
 _LOG = logging.getLogger(__name__)
-
-
-def estimate_tokens(text: str) -> int:
-    """Estimate tokens by character count, with a minimum of one."""
-    return max(1, len(text) // 4 + 1)
 
 
 class _RoomBuffer:
@@ -100,13 +97,21 @@ class EngineHooks(ConsumerHooks):
         service: GatewayService,
         dedupe: Optional[SpeechDedupe] = None,
         memory_store: Optional[object] = None,
+        memory_embedding: Optional[object] = None,
+        memory_vectors: Optional[object] = None,
     ) -> None:
         self._personas = personas
         self._client = client
         self._service = service
         self._dedupe = dedupe
         self._memory_store = memory_store
+        self._memory_embedding = memory_embedding
+        self._memory_vectors = memory_vectors
         self.stats = ConsumerStats()
+        self._memory_failures = 0
+        self._memory_warning_at = float('-inf')
+        self.stats.set("memory_db_unavailable_consecutive", 0)
+        self.stats.set("memory_db_alerts", 0)
         self._buffers: OrderedDict[str, _RoomBuffer] = OrderedDict()
         self._buf_lock = threading.Lock()
 
@@ -124,7 +129,33 @@ class EngineHooks(ConsumerHooks):
                 self._buffers.popitem(last=False)
             return self._buffers[room_id]
 
+    def _memory_unavailable(self, exc: Exception) -> MemoryDBUnavailable:
+        self._memory_failures += 1
+        self.stats.set("memory_db_unavailable_consecutive", self._memory_failures)
+        if self._memory_failures == 5:
+            self.stats.inc("memory_db_alerts")
+        now = time.monotonic()
+        if self._memory_failures >= 5 and now - self._memory_warning_at >= 3600:
+            _LOG.warning("%s", type(exc).__name__)
+            self._memory_warning_at = now
+        return MemoryDBUnavailable(min(3600, 30 * 2 ** min(self._memory_failures - 1, 7)))
+
+    def _memory_recovered(self) -> None:
+        self._memory_failures = 0
+        self.stats.set("memory_db_unavailable_consecutive", 0)
+
     def on_human_text(self, ctx: ConsumerContext) -> None:
+        try:
+            self._on_human_text(ctx)
+        except MemoryDBUnavailable:
+            raise
+        except Exception:
+            self._memory_recovered()
+            raise
+        else:
+            self._memory_recovered()
+
+    def _on_human_text(self, ctx: ConsumerContext) -> None:
         """per-event 入口：对 target_user_ids 里每个 persona 执行 evaluate→model→send。"""
         room_id = ctx.room_id or ""
         text = ctx.text
@@ -138,8 +169,13 @@ class EngineHooks(ConsumerHooks):
         targets = list(ctx.target_user_ids) if ctx.target_user_ids else (
             [ctx.persona_user_id] if ctx.persona_user_id else []
         )
-        if self._memory_store is not None and event_id and self._memory_store.is_tombstoned(event_id):
-            return
+        if self._memory_store is not None and event_id:
+            try:
+                if self._memory_store.is_tombstoned(event_id):
+                    return
+            except Exception as exc:
+                self.stats.inc("memory_read_errors")
+                raise self._memory_unavailable(exc) from None
         if self._memory_store is not None:
             # In a group, retain human input for every confirmed local persona
             # even when it was not mentioned and will not answer this turn.
@@ -183,19 +219,35 @@ class EngineHooks(ConsumerHooks):
             scope_kind, scope_key, counterpart = self._memory_scope(persona, ctx)
             try:
                 from ..memory.recall import assemble_recall
+                from ..memory.summary import StoreSummaryProvider
+                vector_recall = None
+                if self._memory_embedding is not None and self._memory_vectors is not None:
+                    from ..memory.worker import budgeted_embed
+                    from ..memory.vector import VectorRecall
+                    try:
+                        query = budgeted_embed(self._memory_embedding, self._service,
+                                               persona.user_id, text)
+                        vector_recall = VectorRecall(self._memory_vectors, query_vec=query,
+                                                     model=self._memory_embedding.config.model,
+                                                     dim=self._memory_embedding.dimension)
+                    except Exception:
+                        # Vector enrichment is optional; never defer a human reply.
+                        self.stats.inc('memory_vector_skipped')
                 messages = assemble_recall(
                     self._memory_store, persona_id=persona.user_id,
                     scope_kind=scope_kind, scope_key=scope_key,
                     counterpart=counterpart,
                     mentioned_counterparts=ctx.mentioned_user_ids,
                     budget=2000,
+                    summary_provider=StoreSummaryProvider(self._memory_store),
+                    vector_recall=vector_recall,
                 )
                 # The current event must be visible even when pinned/profile
                 # memory consumes the recall allowance.  It remains untrusted.
                 messages.extend(_build_messages([], text))
-            except Exception:
+            except Exception as exc:
                 self.stats.inc("memory_recall_errors")
-                raise TransientUnavailable("memory recall unavailable") from None
+                raise self._memory_unavailable(exc) from None
         else:
             history = buf.snapshot() if buf else []
             messages = _build_messages(history, text)
@@ -269,9 +321,10 @@ class EngineHooks(ConsumerHooks):
             return
         try:
             self._memory_store.redact_event(ctx.redacts_event_id, room_id=ctx.room_id or None)
-        except Exception:
+        except Exception as exc:
             self.stats.inc("memory_redaction_errors")
-            raise TransientUnavailable("memory redaction unavailable") from None
+            raise self._memory_unavailable(exc) from None
+        self._memory_recovered()
 
     @staticmethod
     def _memory_scope(persona: Persona, ctx: ConsumerContext) -> Tuple[str, str, str]:
@@ -297,7 +350,7 @@ class EngineHooks(ConsumerHooks):
                 # Delivery already succeeded; memory must not trigger a resend.
                 _LOG.warning("%s", type(exc).__name__)
                 return
-            raise TransientUnavailable("memory write unavailable") from None
+            raise self._memory_unavailable(exc) from None
 
     def _deferred_until(
         self, decision: Dict[str, Any], persona: Persona, room_id: str,

@@ -8,7 +8,10 @@ against the configured persona owner before accessing memory data.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Mapping, Optional
+
+from ..engine.personas import _is_local_owner
 
 from .profile import FACT_KEYS
 from .store import MemoryStore
@@ -22,9 +25,11 @@ class OwnerMemoryAPI:
     """Owner-gated management operations for one or more personas."""
 
     def __init__(self, store: MemoryStore,
-                 owners: Mapping[str, Optional[str]]) -> None:
+                 owners: Mapping[str, Optional[str]], *,
+                 server_name: Optional[str] = None) -> None:
         self._store = store
         self._owners = dict(owners)
+        self._server_name = server_name or os.environ.get("GATEWAY_MATRIX_SERVER_NAME")
 
     def close(self) -> None:
         """Release the locally-owned store used by an administrative process."""
@@ -85,6 +90,8 @@ class OwnerMemoryAPI:
     def set_fact(self, persona_id: str, caller: str, key: str, value: str,
                  counterpart: str, visibility: str = "dm_only") -> bool:
         self._require_owner(persona_id, caller)
+        if not _is_local_owner(counterpart, self._server_name):
+            raise ValueError("counterpart must be a local non-ai Matrix user ID")
         if key not in FACT_KEYS:
             raise ValueError("fact key is not allowed")
         if visibility not in ("dm_only", "shared"):

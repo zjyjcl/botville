@@ -406,7 +406,7 @@ class GatewayService:
                 since=start,
                 until=end,
             )
-            if e.contract_kind  # filter out HUMAN events
+            if e.contract_kind or e.kind == EventKind.MEMORY  # internal token totals
         ]
         counts: Dict[str, int] = {}
         for event in events:
@@ -501,6 +501,38 @@ class GatewayService:
                 secret=self._store.secret,
             )
         )
+
+    def record_memory_usage(self, *, persona_id: str, tokens: int) -> None:
+        """Account internal model work without sending or adding a public kind."""
+        if tokens > 0:
+            self._store.append(UsageEvent.make(
+                EventKind.MEMORY, persona_id=persona_id, at=self._now(),
+                tokens_in=tokens, secret=self._store.secret))
+
+    def memory_budget_available(self, persona_id: str, estimate: int) -> bool:
+        """Leave 20% of the effective rolling token cap available to replies."""
+        with self._lock:
+            budget = self._budget_for(persona_id, None, self._now())
+            return (budget['limit'] is None or
+                    budget['remaining'] - estimate - sum(
+                        r.tokens for r in self._reservations.for_persona(persona_id)
+                    ) >= budget['limit'] * 0.2)
+
+    def authorize_memory_call(self, persona_id: str, estimate: int) -> bool:
+        """Atomically precharge conservative usage; no message or text is stored.
+
+        Failed calls retain the charge since remote consumption is unknown.
+        """
+        with self._lock:
+            decision = self.evaluate_policy({
+                'persona_id': persona_id, 'kind': 'memory',
+                'token_estimate': estimate,
+            }, internal_memory=True)
+            if (decision['decision'] != 'allow' or
+                    not self.memory_budget_available(persona_id, estimate)):
+                return False
+            self.record_memory_usage(persona_id=persona_id, tokens=estimate)
+            return True
 
     # ------------------------------------------------------------- B2.3 context/assemble
     def assemble_context(
@@ -695,7 +727,7 @@ class GatewayService:
         )
 
     # ----------------------------------------------------------- policy only
-    def evaluate_policy(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def evaluate_policy(self, payload: Dict[str, Any], *, internal_memory: bool = False) -> Dict[str, Any]:
         # B5: 拒绝未知字段（additionalProperties: false）
         unknown = set(payload.keys()) - _EVALUATE_FIELDS
         if unknown:
@@ -728,7 +760,7 @@ class GatewayService:
                 "request.invalid", "'token_estimate' must be a non-negative integer", "token_estimate"
             )
         kind = payload.get("kind", "message")
-        if kind not in EVALUATE_KINDS:
+        if kind not in EVALUATE_KINDS and not (internal_memory and kind == "memory"):
             raise ValidationError(
                 "request.invalid",
                 f"'kind' must be one of {sorted(EVALUATE_KINDS)}, got {kind!r}",
