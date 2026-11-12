@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""No `producer | grep -q` / `| head` in CI steps and pipefail scripts.
+"""No `producer | grep -q` / `| head` in CI, the Makefile, scripts or test shell snippets.
 
 GitHub Actions steps inherit SIGPIPE=ignored. Under `set -o pipefail`, a
 consumer that exits early (grep -q / grep -m / head) makes the producer's
@@ -13,8 +13,14 @@ import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CHECKED = [REPO_ROOT / ".github" / "workflows" / "ci.yml"] + sorted(
-    (REPO_ROOT / "server" / "scripts").glob("*.sh")
+CHECKED = (
+    sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml"))
+    + [REPO_ROOT / "Makefile"]
+    + sorted((REPO_ROOT / "server" / "scripts").glob("*.sh"))
+    + sorted((REPO_ROOT / "scripts").glob("*.sh"))
+    # Shell snippets embedded in tests (fake docker/compose scripts).
+    + sorted(p for p in (REPO_ROOT / "server" / "tests").glob("*.py")
+             if p.name != Path(__file__).name)
 )
 EARLY_EXIT = re.compile(r"\|\s*(grep\s+(-[A-Za-z]*[qm][A-Za-z]*\b|--quiet|--max-count)|head\b)")
 

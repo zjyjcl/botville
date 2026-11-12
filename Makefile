@@ -38,7 +38,7 @@
 
 COMPOSE_FILE := server/compose/docker-compose.yml
 ENV_FILE := server/compose/.env
-PROJECT ?= $(shell sed -n 's/^COMPOSE_PROJECT_NAME=//p' $(ENV_FILE) 2>/dev/null | head -n 1)
+PROJECT ?= $(shell sed -n '/^COMPOSE_PROJECT_NAME=/{s///p;q;}' $(ENV_FILE) 2>/dev/null)
 ifeq ($(strip $(PROJECT)),)
 PROJECT := botville
 endif

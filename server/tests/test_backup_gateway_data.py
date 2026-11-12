@@ -38,7 +38,7 @@ if [ "$1" = ps ]; then
     exit 0
 fi
 # default COMPOSE prefix (docker compose ... run ...): same artifact stub.
-if [ "$1" = compose ] && printf '%s' "$*" | grep -q 'tar -czf /backup/gateway-data.tar.gz'; then
+if [ "$1" = compose ] && [[ "$*" == *'tar -czf /backup/gateway-data.tar.gz'* ]]; then
     printf 'fake-gateway-tar\\n' > "${FAKE_BACKUP_DIR:?}/gateway-data.tar.gz"
 fi
 exit 0
@@ -48,7 +48,7 @@ exit 0
 # create it in FAKE_BACKUP_DIR (the real one bind-mounts it at /backup).
 FAKE_COMPOSE = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "${FAKE_COMPOSE_LOG:?}"
-if [ "${1-}" = run ] && printf '%s' "$*" | grep -q 'tar -czf /backup/gateway-data.tar.gz'; then
+if [ "${1-}" = run ] && [[ "$*" == *'tar -czf /backup/gateway-data.tar.gz'* ]]; then
     [ "${FAKE_COMPOSE_FAIL:-0}" = 1 ] && exit 3
     printf 'fake-gateway-tar\\n' > "${FAKE_BACKUP_DIR:?}/gateway-data.tar.gz"
     chmod 600 "${FAKE_BACKUP_DIR}/gateway-data.tar.gz"
