@@ -302,7 +302,12 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_AS_MAX_BODY_BYTES` | `16777216` | AS 回调请求体上限（字节，**16 MiB**；正整数，最大 256 MiB）。与 `/v1` 的 1 MiB 上限**相互独立**；超限 → `413 M_TOO_LARGE` |
 | `GATEWAY_AS_TXN_RETENTION_DAYS` | `90` | AS 事务库保留天数（正整数，`<1` 拒绝启动）。超过保留期的事务**不删行**：只清空原始请求体并写 `purged_at`（墓碑保留 `txn_id` / 接收时间 / `processed_at`），重放仍 `200 {}` 且不重落库；过期未消费事务按丢弃处理。**校验与 `GATEWAY_AS_TXN_DB_PATH` 是否配置无关**——非法值在任何情况下都拒绝启动。清理只在同时配置了库路径且间隔非 0 时运行。见 [docs/contract.md](docs/contract.md) §1.7.7 |
 | `GATEWAY_AS_TXN_PURGE_INTERVAL_SECONDS` | `86400` | AS 事务保留期清理间隔（秒）：启动先跑一次，之后后台按间隔跑，失败只记日志（不记 token / 事件体）。`0` = 关闭（启动不跑、不起线程，库会持续增长）；非 0 时 **≥60**，否则拒绝启动。**校验与 `GATEWAY_AS_TXN_DB_PATH` 是否配置无关**。见 [docs/contract.md](docs/contract.md) §1.7.7 |
-| `GATEWAY_CONSUMER_ENABLED` | `false` | 进程内 AS 事务消费者（B 线 PR1，契约 §1.7.8）总开关。**默认 false = 行为与之前完全一致**（不起线程、不唤醒）。开启后：事务落库立即唤醒 + 5 秒兜底轮询，按 rowid 顺序消费，做事件分类 / trust / 防循环 / 计数并调用钩子；**PR1 不调模型、不发言**（引擎在 PR2）。开启但 `GATEWAY_AS_TXN_DB_PATH` 未配置 → 启动 warning 且不起线程（不拒绝启动）；开启但未配置模型 → 只记录计数，`/health` 不 degraded。`GATEWAY_MODEL_BASE_URL` / `GATEWAY_MODEL_NAME` / `GATEWAY_MODEL_API_KEY` 为 PR2 计划变量，本 PR 不读取 |
+| `GATEWAY_CONSUMER_ENABLED` | `false` | 进程内 AS 事务消费者（B 线 PR1，契约 §1.7.8）总开关。**默认 false = 行为与之前完全一致**（不起线程、不唤醒）。开启后：事务落库立即唤醒 + 5 秒兜底轮询，按 rowid 顺序消费，做事件分类 / trust / 防循环 / 计数并调用钩子。开启但 `GATEWAY_AS_TXN_DB_PATH` 未配置 → 启动 warning 且不起线程（不拒绝启动）；开启但未配置模型/人设 → 只记录计数，`/health` 不 degraded |
+| `GATEWAY_PERSONAS_FILE` | 空 | 只读人设 JSON（B2.4，契约 §1.7.8 ②）。空 = 无人设 → 内置引擎**永不发言**（消费者仍记录/计数）。启动期校验 schema / 本服 `@ai_*` / `credential_ref` 形状 / `max_reply_chars` 范围，非法**拒绝启动**（错误信息不回显文件内容）。示例见 [`examples/personas.example.json`](examples/personas.example.json)；**真实人设不进仓库** |
+| `GATEWAY_MODEL_BASE_URL` | 空 | OpenAI 兼容模型基址（B2.4，契约 §1.7.8 ⑫）。空 = **未配置模型**：引擎不发言、`/health` 不 degraded。非空时必须是 `http://` / `https://` URL。请求形如 `POST {BASE_URL}/chat/completions` |
+| `GATEWAY_MODEL_NAME` | 空 | 模型名。配置了 `GATEWAY_MODEL_BASE_URL` 时**必填**，否则拒绝启动。人设可用 `model` 字段覆盖 |
+| `GATEWAY_MODEL_API_KEY` | 空 | 可选模型密钥（`Authorization: Bearer`）。**不写日志、不进 `/health`、不进任何错误体、不进 `repr`**。人设可用 `credential_ref: "env:NAME"` 覆盖（调用时读环境变量，缺失即永久失败并只点名变量名） |
+| `GATEWAY_MODEL_TIMEOUT_SECONDS` | `30` | 模型调用超时（秒）。必须是正数；非数字 / ≤0 / NaN → 拒绝启动。超时 / 连接错误 / HTTP 5xx / 408 / 429 → 按瞬态处理（不计 attempts，短退避重试）；其余 4xx 与响应结构错误 → 普通失败 |
 
 非法配置（端口非数字、时区不存在、`HH:MM` 格式错）在 `Config` 构造时抛 `ConfigError`，
 进程以退出码 `2` 结束。

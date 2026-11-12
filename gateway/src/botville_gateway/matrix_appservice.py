@@ -40,7 +40,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Sequence, Set, Tuple
 
 from .matrix import DeliveryError, SentEvent, resolve_txn_id
 
@@ -379,6 +379,64 @@ class AppServiceMatrixTransport:
             content_type=content_type,
             txn_id=txn,
         )
+
+    def event_sender(self, room_id: str, event_id: str) -> Optional[str]:
+        """查一条事件的 sender（消费侧「是否被某个 AI 回复」的回填路径）。
+
+        `GET /_matrix/client/v3/rooms/{roomId}/event/{eventId}`，带 AS token。
+        只返回 sender 字符串，其余字段一律丢弃（消费侧只需要判定「谁说的」，
+        不缓存正文）。任何失败（404 / 403 / 网络 / 超时 / 响应结构不对）都返回
+        None 并**不抛异常**：调用方（`as_consumer`）按「不是回复」fail-closed
+        处理，单条查询失败不能影响整条事务。异常消息也不含 token。
+        """
+        if not isinstance(room_id, str) or not room_id.startswith("!"):
+            return None
+        if not isinstance(event_id, str) or not event_id:
+            return None
+        path = "/_matrix/client/v3/rooms/{}/event/{}".format(
+            urllib.parse.quote(room_id, safe=""), urllib.parse.quote(event_id, safe="")
+        )
+        try:
+            resp = self._request("GET", path)
+        except (DeliveryError, OSError):
+            return None
+        sender = resp.get("sender")
+        if not isinstance(sender, str) or not sender:
+            return None
+        return sender
+
+    def joined_members(self, room_id: str, personas: Sequence[str]) -> Tuple[str, ...]:
+        """Return joined member IDs while masquerading as a local persona.
+
+        The CS API may require a room member's identity.  Try configured local
+        personas in order and accept the first successful response.  A caller
+        receives ``DeliveryError`` when none can read membership, allowing the
+        consumer to fail closed to mention-only routing.
+        """
+        if not isinstance(room_id, str) or not room_id.startswith("!"):
+            raise DeliveryError("conversation.invalid", "room_id must be a Matrix room id")
+        last_error: Optional[DeliveryError] = None
+        path = "/_matrix/client/v3/rooms/{}/joined_members".format(
+            urllib.parse.quote(room_id, safe="")
+        )
+        for persona in personas:
+            if not isinstance(persona, str):
+                continue
+            self._check_sender(persona)
+            try:
+                response = self._request(
+                    "GET", path, query={"user_id": persona}, timeout=self._timeout
+                )
+            except DeliveryError as exc:
+                last_error = exc
+                continue
+            joined = response.get("joined")
+            if not isinstance(joined, dict):
+                raise DeliveryError("appservice.response", "joined_members response has no joined object")
+            return tuple(uid for uid in joined if isinstance(uid, str))
+        if last_error is not None:
+            raise last_error
+        raise DeliveryError("appservice.namespace", "no local persona available for membership lookup")
 
     def healthy(self) -> bool:
         """带 AS 身份的健康检查：whoami 校验可达性 **和** token 有效性。

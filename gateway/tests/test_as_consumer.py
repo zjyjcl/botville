@@ -873,8 +873,6 @@ class TestOnNewTransaction(_TmpDb):
         self.assertTrue(result)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 # ---------------------------------------------------------------------------
@@ -1004,3 +1002,492 @@ class TestLocalAiTargeting(_TmpDb):
         self.assertEqual(ctx.persona_user_id, target)
         self.assertEqual(ctx.idempotency_key, speech_idempotency_key(target, "$m2"))
         self.assertTrue(ctx.should_reply)
+
+
+
+
+# ---------------------------------------------------------------------------
+# 19. #200 审查项 1：房间 AI 成员只保留本服 @ai_*（fail-closed）
+# ---------------------------------------------------------------------------
+class TestRoomAiIdsFiltering(_TmpDb):
+    def _ids_for(self, members, mentions=(), server_name=SERVER_NAME):
+        c = self._make_consumer(room_members=lambda room: members, server_name=server_name)
+        return c._room_ai_ids("!r:example.test", mentions)
+
+    def test_filters_non_ai_and_foreign(self):
+        ids = self._ids_for([
+            f"@ai_a:{SERVER_NAME}",
+            f"@alice:{SERVER_NAME}",          # 本服人类
+            "@ai_x:other.server",             # 外服 @ai_*
+            f"@botville-gateway:{SERVER_NAME}",  # AS sender 不是 @ai_*
+            "not-a-user-id",
+            f"@ai_b:{SERVER_NAME.upper()}",   # 大小写不敏感
+        ])
+        self.assertEqual(ids, [f"@ai_a:{SERVER_NAME}", f"@ai_b:{SERVER_NAME.upper()}"])
+
+    def test_no_server_name_fail_closed(self):
+        self.assertEqual(self._ids_for([f"@ai_a:{SERVER_NAME}"], server_name=None), [])
+
+    def test_callback_error_fail_closed_keeps_mentions_only(self):
+        def _boom(_room):
+            raise RuntimeError("member lookup failed")
+
+        target = f"@ai_a:{SERVER_NAME}"
+        c = self._make_consumer(room_members=_boom)
+        ids = c._room_ai_ids("!r:example.test", [target])
+        self.assertEqual(ids, [target])
+        self.assertEqual(c.stats.get("room_member_errors"), 1)
+
+    def test_human_member_does_not_make_room_a_dm(self):
+        """回调里混入人类时，房间不能被当成「只有一个 AI」的单聊。"""
+        target = f"@ai_a:{SERVER_NAME}"
+        members = [target, f"@alice:{SERVER_NAME}"]
+        self.assertEqual(self._ids_for(members), [target])
+        call = self._make_consumer(room_members=lambda room: members)
+
+
+# ---------------------------------------------------------------------------
+# 20. #200 审查项 3：should_reply 尊重 in_reply_to
+# ---------------------------------------------------------------------------
+class TestShouldReplyInReplyTo(_TmpDb):
+    AI_A = f"@ai_a:{SERVER_NAME}"
+    AI_B = f"@ai_b:{SERVER_NAME}"
+
+    def test_pure_function_reply_target_ai(self):
+        self.assertTrue(should_reply(
+            sender=f"@alice:{SERVER_NAME}",
+            room_ai_user_ids=[self.AI_A, self.AI_B],
+            reply_to_sender=self.AI_B,
+        ))
+
+    def test_pure_function_reply_target_human_no_reply(self):
+        self.assertFalse(should_reply(
+            sender=f"@alice:{SERVER_NAME}",
+            room_ai_user_ids=[self.AI_A, self.AI_B],
+            reply_to_sender=f"@bob:{SERVER_NAME}",
+        ))
+
+    def test_pure_function_reply_target_foreign_ai_no_reply(self):
+        self.assertFalse(should_reply(
+            sender=f"@alice:{SERVER_NAME}",
+            room_ai_user_ids=[self.AI_A, self.AI_B],
+            reply_to_sender="@ai_x:other.server",
+        ))
+
+    # ---- 消费者级：缓存命中 ----
+    def test_cache_hit_from_previous_event_in_same_batch(self):
+        calls = []
+
+        class _H(ConsumerHooks):
+            def on_ai_text(self, ctx):
+                pass
+            def on_human_text(self, ctx):
+                calls.append(ctx)
+
+        # 事件 1：本服 AI 发言（写入 sender 缓存）
+        ai_event = {
+            "type": "m.room.message",
+            "event_id": "$ai-speaking",
+            "room_id": "!r:example.test",
+            "sender": self.AI_B,
+            "content": {"msgtype": "m.text", "body": "我先说一句"},
+        }
+        # 事件 2：人类群聊里回复那条 AI 消息（没 @ 任何人）
+        reply_event = {
+            "type": "m.room.message",
+            "event_id": "$human-reply",
+            "room_id": "!r:example.test",
+            "sender": f"@alice:{SERVER_NAME}",
+            "content": {
+                "msgtype": "m.text",
+                "body": "说得好",
+                "m.relates_to": {"m.in_reply_to": {"event_id": "$ai-speaking"}},
+            },
+        }
+        ai_ids = [self.AI_A, self.AI_B]
+        self.store.store_transaction(
+            "t1", json.dumps({"events": [ai_event, reply_event]})
+        )
+        c = self._make_consumer(hooks=_H(), room_members=lambda room: ai_ids)
+        c.run_once()
+        self.assertEqual(len(calls), 1)
+        ctx = calls[0]
+        self.assertTrue(ctx.should_reply)
+        self.assertEqual(ctx.reply_to_event_id, "$ai-speaking")
+        self.assertEqual(ctx.target_user_ids, (self.AI_B,))
+        self.assertEqual(ctx.persona_user_id, self.AI_B)
+        self.assertEqual(c.stats.get("reply_target_cached"), 1)
+
+    def test_reply_to_human_in_group_no_reply(self):
+        calls = []
+
+        class _H(ConsumerHooks):
+            def on_human_text(self, ctx):
+                calls.append(ctx)
+
+        human_event = {
+            "type": "m.room.message",
+            "event_id": "$bob-msg",
+            "room_id": "!r:example.test",
+            "sender": f"@bob:{SERVER_NAME}",
+            "content": {"msgtype": "m.text", "body": "大家好"},
+        }
+        reply_event = {
+            "type": "m.room.message",
+            "event_id": "$alice-reply",
+            "room_id": "!r:example.test",
+            "sender": f"@alice:{SERVER_NAME}",
+            "content": {
+                "msgtype": "m.text",
+                "body": "嗯",
+                "m.relates_to": {"m.in_reply_to": {"event_id": "$bob-msg"}},
+            },
+        }
+        ai_ids = [self.AI_A, self.AI_B]
+        self.store.store_transaction(
+            "t1", json.dumps({"events": [human_event, reply_event]})
+        )
+        c = self._make_consumer(hooks=_H(), room_members=lambda room: ai_ids)
+        c.run_once()
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(not ctx.should_reply for ctx in calls))
+        self.assertEqual(calls[-1].target_user_ids, ())
+
+    # ---- 消费者级：fetcher 回填 ----
+    def test_fetch_fallback_used_when_cache_misses(self):
+        calls = []
+        fetched = []
+
+        class _H(ConsumerHooks):
+            def on_human_text(self, ctx):
+                calls.append(ctx)
+
+        def _fetcher(room_id, event_id):
+            fetched.append((room_id, event_id))
+            return self.AI_A
+
+        event = {
+            "type": "m.room.message",
+            "event_id": "$human-reply",
+            "room_id": "!r:example.test",
+            "sender": f"@alice:{SERVER_NAME}",
+            "content": {
+                "msgtype": "m.text",
+                "body": "继续",
+                "m.relates_to": {"m.in_reply_to": {"event_id": "$older-ai-event"}},
+            },
+        }
+        self.store.store_transaction("t1", json.dumps({"events": [event]}))
+        c = self._make_consumer(
+            hooks=_H(),
+            room_members=lambda room: [self.AI_A, self.AI_B],
+            sender_fetcher=_fetcher,
+        )
+        c.run_once()
+        self.assertEqual(fetched, [("!r:example.test", "$older-ai-event")])
+        self.assertTrue(calls[0].should_reply)
+        self.assertEqual(calls[0].target_user_ids, (self.AI_A,))
+        self.assertEqual(c.stats.get("reply_target_fetched"), 1)
+        # fetcher 结果写回缓存：再消费同一事件不再回填。
+        c2 = self._make_consumer(
+            hooks=_H(),
+            room_members=lambda room: [self.AI_A, self.AI_B],
+            sender_fetcher=_fetcher,
+        )
+        c2._sender_cache.remember("$older-ai-event", self.AI_A)
+        c2.run_once()
+        self.assertEqual(len(fetched), 1)
+
+    def test_fetch_error_is_fail_closed_not_a_reply(self):
+        calls = []
+
+        class _H(ConsumerHooks):
+            def on_human_text(self, ctx):
+                calls.append(ctx)
+
+        def _boom(room_id, event_id):
+            raise OSError("connection refused")
+
+        event = {
+            "type": "m.room.message",
+            "event_id": "$human-reply",
+            "room_id": "!r:example.test",
+            "sender": f"@alice:{SERVER_NAME}",
+            "content": {
+                "msgtype": "m.text",
+                "body": "继续",
+                "m.relates_to": {"m.in_reply_to": {"event_id": "$missing"}},
+            },
+        }
+        self.store.store_transaction("t1", json.dumps({"events": [event]}))
+        c = self._make_consumer(
+            hooks=_H(),
+            room_members=lambda room: [self.AI_A, self.AI_B],
+            sender_fetcher=_boom,
+        )
+        c.run_once()
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0].should_reply)
+        self.assertEqual(calls[0].target_user_ids, ())
+        self.assertEqual(c.stats.get("reply_lookup_errors"), 1)
+        # 事务仍然被标记 processed（回填失败不能把整条事务标 failed）。
+        row = self.conn.execute(
+            "SELECT processed_at, failed_at FROM as_transactions WHERE txn_id='t1'"
+        ).fetchone()
+        self.assertIsNotNone(row[0])
+        self.assertIsNone(row[1])
+
+    def test_fetch_returns_none_treated_as_no_reply(self):
+        calls = []
+
+        class _H(ConsumerHooks):
+            def on_human_text(self, ctx):
+                calls.append(ctx)
+
+        event = {
+            "type": "m.room.message",
+            "event_id": "$human-reply",
+            "room_id": "!r:example.test",
+            "sender": f"@alice:{SERVER_NAME}",
+            "content": {
+                "msgtype": "m.text",
+                "body": "继续",
+                "m.relates_to": {"m.in_reply_to": {"event_id": "$gone"}},
+            },
+        }
+        self.store.store_transaction("t1", json.dumps({"events": [event]}))
+        c = self._make_consumer(
+            hooks=_H(),
+            room_members=lambda room: [self.AI_A, self.AI_B],
+            sender_fetcher=lambda room, ev: None,
+        )
+        c.run_once()
+        self.assertFalse(calls[0].should_reply)
+        self.assertEqual(calls[0].target_user_ids, ())
+
+    def test_non_ai_reply_target_in_group(self):
+        """被回复的是本服人类 → 不是回复，不发言。"""
+        calls = []
+
+        class _H(ConsumerHooks):
+            def on_human_text(self, ctx):
+                calls.append(ctx)
+
+        event = {
+            "type": "m.room.message",
+            "event_id": "$human-reply",
+            "room_id": "!r:example.test",
+            "sender": f"@alice:{SERVER_NAME}",
+            "content": {
+                "msgtype": "m.text",
+                "body": "继续",
+                "m.relates_to": {"m.in_reply_to": {"event_id": "$older"}},
+            },
+        }
+        self.store.store_transaction("t1", json.dumps({"events": [event]}))
+        c = self._make_consumer(
+            hooks=_H(),
+            room_members=lambda room: [self.AI_A, self.AI_B],
+            sender_fetcher=lambda room, ev: f"@bob:{SERVER_NAME}",
+        )
+        c.run_once()
+        self.assertFalse(calls[0].should_reply)
+        self.assertEqual(calls[0].target_user_ids, ())
+
+    def test_reply_event_id_only_accepts_strings(self):
+        from botville_gateway.as_consumer import reply_to_event_id
+
+        self.assertEqual(
+            reply_to_event_id({"m.relates_to": {"m.in_reply_to": {"event_id": "$e"}}}),
+            "$e",
+        )
+        self.assertIsNone(reply_to_event_id({}))
+        self.assertIsNone(reply_to_event_id(None))
+        self.assertIsNone(
+            reply_to_event_id({"m.relates_to": {"m.in_reply_to": {"event_id": 42}}})
+        )
+        self.assertIsNone(
+            reply_to_event_id({"m.relates_to": {"m.in_reply_to": {"event_id": ""}}})
+        )
+        self.assertIsNone(
+            reply_to_event_id({"m.relates_to": {"m.in_reply_to": "not-a-dict"}})
+        )
+
+
+# ---------------------------------------------------------------------------
+# 21. #200 审查项 4：非字符串 event_id 只跳过该事件
+# ---------------------------------------------------------------------------
+class TestInvalidEventIdSkipped(_TmpDb):
+    def test_non_string_event_id_skips_only_that_event(self):
+        calls = []
+
+        class _H(ConsumerHooks):
+            def on_human_text(self, ctx):
+                calls.append(ctx.event_id)
+
+        base = {
+            "type": "m.room.message",
+            "room_id": "!r:example.test",
+            "sender": f"@alice:{SERVER_NAME}",
+            "content": {"msgtype": "m.text", "body": "hi"},
+        }
+        events = [
+            dict(base, event_id=12345),          # 数字
+            dict(base, event_id=None),           # null
+            {k: v for k, v in base.items() if k != "event_id"},  # 缺失
+            dict(base, event_id="$good"),        # 正常
+        ]
+        self.store.store_transaction("t1", json.dumps({"events": events}))
+        c = self._make_consumer(hooks=_H())
+        c.run_once()
+        self.assertEqual(calls, ["$good"])
+        self.assertEqual(c.stats.get("invalid_event_ids"), 3)
+        row = self.conn.execute(
+            "SELECT processed_at, failed_at FROM as_transactions WHERE txn_id='t1'"
+        ).fetchone()
+        self.assertIsNotNone(row[0], "transaction should be marked processed")
+        self.assertIsNone(row[1], "transaction must not be marked failed")
+
+
+# ---------------------------------------------------------------------------
+# 22. #200 审查项 5：处理期间到达的唤醒不能被吞掉（无 ~5s 延迟）
+# ---------------------------------------------------------------------------
+class TestWakeDuringProcessing(_TmpDb):
+    def test_second_transaction_consumed_well_before_poll_interval(self):
+        seen = []
+        first_started = threading.Event()
+        release_first = threading.Event()
+        second_seen = threading.Event()
+
+        class _H(ConsumerHooks):
+            def on_human_text(self, ctx):
+                if ctx.event_id == "$first":
+                    first_started.set()
+                    # 卡住第一轮处理，模拟「慢钩子 / 慢模型」。
+                    release_first.wait(timeout=5.0)
+                elif ctx.event_id == "$second":
+                    second_seen.set()
+                seen.append(ctx.event_id)
+
+        # 轮询间隔 30 秒：只有唤醒机制生效才能远早于它看到第二条事务。
+        c = self._make_consumer(hooks=_H(), poll_interval=30.0)
+        c.start()
+        try:
+            self.store.store_transaction("t1", json.dumps({"events": [{
+                "type": "m.room.message",
+                "event_id": "$first",
+                "room_id": "!r:example.test",
+                "sender": f"@alice:{SERVER_NAME}",
+                "content": {"msgtype": "m.text", "body": "one"},
+            }]}))
+            c.wake()
+            self.assertTrue(first_started.wait(timeout=5.0), "first event never processed")
+
+            # 在第一轮仍在处理时落库第二条并唤醒。
+            self.store.store_transaction("t2", json.dumps({"events": [{
+                "type": "m.room.message",
+                "event_id": "$second",
+                "room_id": "!r:example.test",
+                "sender": f"@alice:{SERVER_NAME}",
+                "content": {"msgtype": "m.text", "body": "two"},
+            }]}))
+            c.wake()
+            release_first.set()
+
+            # 若「处理期间的唤醒被吞掉」，这里要等满 30s 轮询；断言远小于它。
+            self.assertTrue(
+                second_seen.wait(timeout=3.0),
+                "wake that arrived during processing was lost",
+            )
+        finally:
+            release_first.set()
+            c.stop(timeout=5.0)
+        self.assertIn("$second", seen)
+
+
+
+# ---------------------------------------------------------------------------
+# 23. #200 审查项 6：启动顺序回归（无库路径 / 端口绑定失败）
+# ---------------------------------------------------------------------------
+class TestConsumerStartupOrdering(unittest.TestCase):
+    def test_enabled_without_db_path_warns_and_serves_health(self):
+        cfg = _cfg(consumer_enabled=True, as_txn_db_path=None)
+        with self.assertLogs("botville_gateway.http_server", level="WARNING") as cm:
+            with _ServerFixture(cfg) as s:
+                self.assertIsNone(s.server.as_consumer)
+                self.assertFalse(
+                    any(t.name == "as-txn-consumer" for t in threading.enumerate()),
+                    "no consumer thread may be started without a transaction DB",
+                )
+                # 网关照常可用：/health 仍然 200（消费开关不影响 HTTP 端口）。
+                with urllib.request.urlopen(f"{s.base}/health", timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+        combined = " ".join(cm.output)
+        self.assertIn("GATEWAY_CONSUMER_ENABLED", combined)
+        self.assertIn("GATEWAY_AS_TXN_DB_PATH", combined)
+
+    def test_bind_failure_does_not_start_consumer(self):
+        """端口已被占用（bind 失败）时不能起消费线程，也不能启动清理线程。"""
+        import socket as _socket
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = os.path.join(tmpdir, "as.db")
+            # 用裸 socket 占住一个端口：比再起一个网关更干净，不会留下消费线程。
+            holder = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            holder.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+            holder.bind(("127.0.0.1", 0))
+            holder.listen(1)
+            port = holder.getsockname()[1]
+            started = []
+            real_start = AsTransactionConsumer.start
+
+            def _record_start(consumer):  # noqa: ANN001
+                started.append(consumer)
+                return real_start(consumer)
+
+            try:
+                with mock.patch.object(AsTransactionConsumer, "start", _record_start):
+                    with self.assertRaises(OSError):
+                        build_server(
+                            _cfg(consumer_enabled=True, as_txn_db_path=db, port=port)
+                        )
+                self.assertEqual(
+                    started, [], "consumer must not start when the bind failed"
+                )
+                self.assertFalse(
+                    any(t.name == "as-txn-consumer" for t in threading.enumerate())
+                )
+            finally:
+                holder.close()
+
+    def test_consumer_starts_only_after_bind_succeeds(self):
+        import http.server as _http_server
+
+        order = []
+        real_init = _http_server.ThreadingHTTPServer.__init__
+        real_start = AsTransactionConsumer.start
+
+        def _init(srv, *args, **kwargs):  # noqa: ANN001
+            real_init(srv, *args, **kwargs)
+            order.append("bound")
+
+        def _start(consumer):  # noqa: ANN001
+            order.append("consumer-start")
+            return real_start(consumer)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = os.path.join(tmpdir, "as.db")
+            with mock.patch.object(_http_server.ThreadingHTTPServer, "__init__", _init):
+                with mock.patch.object(AsTransactionConsumer, "start", _start):
+                    server = build_server(
+                        _cfg(consumer_enabled=True, as_txn_db_path=db, port=0)
+                    )
+            try:
+                self.assertEqual(order, ["bound", "consumer-start"])
+                self.assertTrue(server.as_consumer.running)
+            finally:
+                server.server_close()
+
+
+if __name__ == "__main__":
+    unittest.main()

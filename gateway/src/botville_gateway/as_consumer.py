@@ -32,9 +32,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import re
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, Optional, Protocol, Sequence, Tuple
@@ -71,10 +71,6 @@ AI_LOCALPART_PREFIX = "ai_"
 # server/compose/appservice/botville-gateway.yaml.tmpl）。它发言同样不触发回复。
 DEFAULT_AS_SENDER_LOCALPART = "botville-gateway"
 
-# 正文里出现的完整 Matrix user ID（用于识别「被 @」）。只用于识别 AI 目标，
-# 不做任何正文存储；匹配结果不写日志。
-_USER_ID_IN_TEXT_RE = re.compile(r"@[A-Za-z0-9._=\-]+:[A-Za-z0-9.\-]+(?::[0-9]+)?")
-
 # 事件分类（contract §1.7.8 第 7 条）。
 EVENT_MESSAGE_TEXT = "message_text"
 EVENT_INVITE_TO_AI = "invite_to_ai"
@@ -94,6 +90,14 @@ class TransientUnavailable(Exception):
     钩子抛本异常时**不计入** attempts，只按短退避重试（contract §1.7.8）。
     运行时应只在本轮确实无法完成、但稍后可重试时抛出。
     """
+
+
+class DeferredUntil(TransientUnavailable):
+    """策略暂不可用；在指定窗口结束时重试，不消耗 attempts。"""
+
+    def __init__(self, retry_at: datetime) -> None:
+        super().__init__("policy deferred until window end")
+        self.retry_at = retry_at
 
 
 def backoff_seconds(attempt: int) -> float:
@@ -144,17 +148,20 @@ def should_reply(
 ) -> bool:
     """纯决策函数：这条消息是否应触发 AI 回复（contract §1.7.8 第 10 条）。
 
-    规则（与 PR2 的发言路径共用，PR1 只做判定、不发言）：
+    规则（与 PR2 的发言路径共用）：
 
     1. `sender` 自己是 AI（`is_ai_sender` 或 sender ∈ `room_ai_user_ids`）→ 否
        （防循环；AI 互聊由 §6.3 熔断处理）。
     2. 房间里**恰好一个** AI（排除 sender）→ 是（单聊必回）。
     3. 群聊：被 **@** 时回——`mentions`（`m.mentions.user_ids`）里有该 AI，或
-       正文出现该 AI 的**完整** user ID；被该 AI 回复（`reply_to_sender` 是它）
-       同样回。
+       正文出现该 AI 的**完整** user ID；或被该 AI **回复**时回。
     4. 其余（无 AI / 多个 AI 但未被 @ / 未被回复）→ 否。
 
-    多个 AI 同时被 @ 时由 B3 内部调度按提及顺序处理（不在本函数职责内）。
+    `reply_to_sender` 是**被回复事件**（`m.in_reply_to.event_id` 指向的事件）的
+    sender，由调用方解析（进程内缓存 + 可选回填 fetcher，见 `EventSenderCache`）；
+    解析不出来时传 None（fail-closed = 不是回复）。
+
+    多个 AI 同时被 @ 时由内部调度按提及顺序逐个处理（不在本函数职责内）。
     """
     ai_ids = [uid for uid in room_ai_user_ids if uid]
     if is_ai_sender or sender in ai_ids:
@@ -172,6 +179,81 @@ def should_reply(
     return reply_target_is_ai
 
 
+def reply_to_event_id(content: Any) -> Optional[str]:
+    """读取 `content["m.relates_to"]["m.in_reply_to"]["event_id"]`。
+
+    只认**非空字符串**：结构不对 / 类型不对 / 空串一律返回 None（fail-closed，
+    调用方据此按「不是回复」处理）。不记录正文、不写日志。
+    """
+    if not isinstance(content, dict):
+        return None
+    relates_to = content.get("m.relates_to")
+    if not isinstance(relates_to, dict):
+        return None
+    in_reply_to = relates_to.get("m.in_reply_to")
+    if not isinstance(in_reply_to, dict):
+        return None
+    event_id = in_reply_to.get("event_id")
+    if not isinstance(event_id, str) or not event_id:
+        return None
+    return event_id
+
+
+# 被回复事件 sender 缓存的默认容量（条）。只存 event_id → sender，不存正文。
+DEFAULT_SENDER_CACHE_ENTRIES = 2048
+
+
+class EventSenderCache:
+    """有界 LRU：`event_id → sender`（进程内，线程安全）。
+
+    判定「是否被某个本服 AI 回复」需要知道**被回复那条事件**的 sender。缓存由
+    消费者在处理**每一条**成功分类的事件时写入（`remember()`）：
+      - 同一事务内先出现的目标事件必然命中；
+      - 更早事务 / 重启后的目标事件不在缓存里 → 调用方可选地走 AS 传输的
+        回填 fetcher（`_reply_target_sender`）；
+      - fetcher 失败 / 超时 / 查不到 → 一律当作「不是回复」（fail-closed）。
+
+    只保存 (event_id, sender) 两个标识：不存正文、房间或时间；不写日志、
+    不进 `/health`。容量满时按 LRU 淘汰最久未使用的一条。
+    """
+
+    def __init__(self, max_entries: int = DEFAULT_SENDER_CACHE_ENTRIES) -> None:
+        if not isinstance(max_entries, int) or isinstance(max_entries, bool):
+            raise ValueError("max_entries must be an integer")
+        if max_entries < 1:
+            raise ValueError("max_entries must be >= 1")
+        self._max = max_entries
+        self._items: "OrderedDict[str, str]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def remember(self, event_id: Any, sender: Any) -> None:
+        """记录一条事件的 sender（非字符串 / 空的标识直接忽略）。"""
+        if not isinstance(event_id, str) or not event_id:
+            return
+        if not isinstance(sender, str) or not sender:
+            return
+        with self._lock:
+            self._items[event_id] = sender
+            self._items.move_to_end(event_id)
+            while len(self._items) > self._max:
+                self._items.popitem(last=False)
+
+    def get(self, event_id: Any) -> Optional[str]:
+        """查 sender；未命中返回 None。命中时刷新 LRU 位置。"""
+        if not isinstance(event_id, str) or not event_id:
+            return None
+        with self._lock:
+            sender = self._items.get(event_id)
+            if sender is not None:
+                self._items.move_to_end(event_id)
+            return sender
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+
+
 # --------------------------------------------------------------------------- #
 # 钩子与上下文
 # --------------------------------------------------------------------------- #
@@ -186,8 +268,11 @@ class ConsumerContext:
       - `trust`：`trusted` / `untrusted`（§7.1；外服 sender 一律 untrusted）；
       - `text`：**已截断**的正文（≤ 8000 码点）；非消息事件为空串；
       - `idempotency_key`：发言幂等键；目标 AI 不明时为 None；
-      - `should_reply`：纯函数判定结果；
-      - `persona_user_id`：本条最相关的本服 AI（被邀请者 / 被 @ 者 / 单聊对象）。
+      - `should_reply`：是否应触发任意一个本服 AI 回复；
+      - `persona_user_id`：本条最相关的本服 AI（首要目标）；
+      - `target_user_ids`：**按提及顺序排列**的全部目标本服 AI（群聊多人 @）；
+        单聊时含唯一 AI、空列表时不回复。PR2 按此列表逐个发言；
+      - `reply_to_event_id`：被回复事件的 event_id（`m.in_reply_to`，仅消息事件）。
     """
 
     event_type: str
@@ -199,6 +284,8 @@ class ConsumerContext:
     idempotency_key: Optional[str] = None
     should_reply: bool = False
     persona_user_id: Optional[str] = None
+    target_user_ids: Tuple[str, ...] = ()
+    reply_to_event_id: Optional[str] = None
 
 
 class ConsumerHooks:
@@ -305,7 +392,10 @@ class AsTransactionConsumer:
         as_sender_localpart: str = DEFAULT_AS_SENDER_LOCALPART,
         dedupe: Optional[SpeechDedupe] = None,
         room_members: Optional[Callable[[str], Sequence[str]]] = None,
+        room_member_observer: Optional[Callable[[Any], None]] = None,
         conversation_resolver: Optional[Callable[[str], Optional[str]]] = None,
+        sender_cache: Optional[EventSenderCache] = None,
+        sender_fetcher: Optional[Callable[[str, str], Optional[str]]] = None,
         now: Callable[[], datetime] = utcnow,
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
         batch_limit: int = DEFAULT_BATCH_LIMIT,
@@ -323,9 +413,18 @@ class AsTransactionConsumer:
         self._dedupe = dedupe if dedupe is not None else InMemorySpeechDedupe()
         # 房间成员解析（PR1 没有成员同步，默认不提供 → 群聊只按 @ 判定）。
         self._room_members = room_members
+        self._room_member_observer = room_member_observer
         # 房间 → 会话键；默认直接用 room_id（appservice 的 `!`-前缀 room_id 在
         # 传输层同时就是合法 conversation_id）。查不到时跳过 record 并计数。
         self._conversation_resolver = conversation_resolver
+        # 被回复事件的 sender 解析：进程内有界 LRU（每条消费过的事件都写入）
+        # + 可选回填 fetcher（`(room_id, event_id) -> sender | None`，通常实现为
+        # AS 传输 `GET /_matrix/client/v3/rooms/{roomId}/event/{eventId}`）。
+        # fetcher 出错 / 超时 / 查不到一律按「不是回复」处理（fail-closed）。
+        self._sender_cache = (
+            sender_cache if sender_cache is not None else EventSenderCache()
+        )
+        self._sender_fetcher = sender_fetcher
         self._now = now
         self._poll_interval = poll_interval
         self._batch_limit = batch_limit
@@ -372,14 +471,16 @@ class AsTransactionConsumer:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
+            # 在开始处理**之前**清唤醒位：处理期间到达的 wake() 会重新置位，
+            # 下面的 wait 立刻返回、再来一轮（否则那一轮唤醒会被吞掉，最坏等满
+            # 一个 poll_interval）。唤醒是「计数器语义」而非「一次性事件」。
+            self._wake.clear()
             try:
                 self.run_once()
             except Exception as exc:  # noqa: BLE001 - 消费线程不能裸抛
                 # 只记异常类型名；不写 txn_id / 正文。
                 self._stats.inc("loop_errors")
                 _log.warning("AS consumer loop error: %s", type(exc).__name__)
-            # 先清唤醒位再等待，避免「处理期间到达的唤醒」被吞掉。
-            self._wake.clear()
             self._wake.wait(self._poll_interval)
 
     # --------------------------------------------------------------- process
@@ -453,7 +554,6 @@ class AsTransactionConsumer:
         # 所有事件副作用完成后才标记（at-least-once）。
         self._store.mark_processed(txn_id)
         self._stats.inc("processed")
-
     def _permanent_failure(self, txn_id: str, now: datetime, error_type: str) -> None:
         """永久错误（损坏的事务体）：直接标 failed，不阻塞后续事务。"""
         self._stats.inc("malformed")
@@ -470,6 +570,10 @@ class AsTransactionConsumer:
         now: datetime,
         attempts: int,
     ) -> None:
+        if isinstance(exc, DeferredUntil):
+            self._store.record_transient(txn_id, exc.retry_at)
+            self._stats.inc("deferred")
+            return
         if isinstance(exc, TransientUnavailable):
             delay = min(TRANSIENT_BACKOFF_SECONDS, MAX_BACKOFF_SECONDS)
             self._store.record_transient(txn_id, now + timedelta(seconds=delay))
@@ -520,25 +624,45 @@ class AsTransactionConsumer:
             self._stats.inc("invalid_events")
             return
         category, fields = routed
+        event_id = fields.get("event_id")
+        # 事件标识必须是**非空字符串**：缺失 / 非字符串（数字、null、对象）
+        # 只跳过**这一条**并计数，不把整条事务标 failed（contract §1.7.8 ⑤：
+        # 单事件格式不对只跳过该事件，不影响事务内其他事件）。没有 event_id
+        # 也无法推导发言幂等键，继续处理会绕过去重。
+        if not isinstance(event_id, str) or not event_id:
+            self._stats.inc("invalid_events")
+            self._stats.inc("invalid_event_ids")
+            return
         self._stats.inc(f"event.{category}")
+        if event.get("type") == "m.room.member" and self._room_member_observer is not None:
+            try:
+                self._room_member_observer(event)
+            except Exception:
+                self._stats.inc("room_member_errors")
 
         sender = fields.get("sender")
-        event_id = fields.get("event_id")
         room_id = fields.get("room_id")
         is_ai, trust = self._classify_sender(sender)
+
+        # 每条被接受的事件都进 sender 缓存：后续事务/同一事务内「回复某人」
+        # 的判定据此找到被回复事件的 sender（不缓存正文）。
+        self._sender_cache.remember(event_id, sender)
 
         if category == EVENT_MESSAGE_TEXT:
             text = truncate_text(fields.get("text") or "", self._max_text_codepoints)
             mentions = fields.get("mentions") or ()
-            target = self._pick_persona_user_id(room_id, text, mentions)
-            ai_ids = self._room_ai_ids(room_id, mentions)
-            reply = should_reply(
-                sender=sender or "",
-                room_ai_user_ids=ai_ids,
+            reply_event_id = fields.get("reply_to_event_id")
+            reply_to_sender = self._reply_target_sender(reply_event_id, room_id)
+            targets = self._reply_targets(
+                room_id=room_id,
                 text=text,
                 mentions=mentions,
+                sender=sender or "",
+                reply_to_sender=reply_to_sender,
                 is_ai_sender=is_ai,
             )
+            target = targets[0] if targets else None
+            reply = bool(targets)
             ctx = ConsumerContext(
                 event_type=category,
                 event_id=event_id,
@@ -547,12 +671,12 @@ class AsTransactionConsumer:
                 trust=trust,
                 text=text,
                 idempotency_key=(
-                    speech_idempotency_key(target, event_id)
-                    if target and event_id
-                    else None
+                    speech_idempotency_key(target, event_id) if target else None
                 ),
                 should_reply=reply,
                 persona_user_id=target,
+                target_user_ids=targets,
+                reply_to_event_id=reply_event_id,
             )
             if is_ai:
                 # 防循环：AI（含网关自己的 AS sender）发言不触发回复。
@@ -564,6 +688,10 @@ class AsTransactionConsumer:
             # 外服消息若也重置，等于让任何联邦用户清空本房间的熔断计数。
             if trust == _TRUSTED:
                 self._record_human_message(room_id)
+            # 引擎按每个 persona 的成功回执去重，不能以首个目标跳过整条事件。
+            if getattr(self._hooks, "manages_speech_dedupe", False):
+                self._hooks.on_human_text(ctx)
+                return
             # 去重：同一 (persona, event_id) 的发言键只执行一次钩子。
             if ctx.idempotency_key and not self._pass_dedupe(ctx.idempotency_key):
                 return
@@ -588,7 +716,7 @@ class AsTransactionConsumer:
                 should_reply=False,
             )
             self._stats.inc("invites")
-            # 关系策略尚未接入：PR1 的 on_invite_to_ai 是 no-op stub。
+            # 关系策略尚未接入：on_invite_to_ai 是 no-op stub（不自动接受邀请）。
             self._run_hook(self._hooks.on_invite_to_ai, ctx)
             return
 
@@ -647,6 +775,8 @@ class AsTransactionConsumer:
             if msgtype in ("m.text", "m.notice"):
                 fields["text"] = content.get("body")
                 fields["mentions"] = _mentions_of(content)
+                # 回复关系：`m.relates_to.m.in_reply_to.event_id`（只认非空字符串）。
+                fields["reply_to_event_id"] = reply_to_event_id(content)
                 return EVENT_MESSAGE_TEXT, fields
             return EVENT_OTHER, fields
         if event_type == "m.reaction":
@@ -709,14 +839,22 @@ class AsTransactionConsumer:
     def _room_ai_ids(
         self, room_id: Optional[str], mentions: Iterable[str]
     ) -> list:
-        """房间里的**本服** AI 用户 ID（成员解析可选；PR1 默认只含被 @ 的本服 AI）。
+        """房间里**本服** `@ai_*` 用户 ID，按「被 @ 的先后 + 成员顺序」去重。
 
-        外服 `@ai_*` 不计入：contract §1.7.8 ⑦ 只认本服 AI 为「目标 AI」。
+        `room_members(room_id)` 的返回值**必须过滤**：成员回调可能把人类、外服
+        用户乃至非 `@ai_*` 的账号一起返回，直接采信会让 `should_reply` 的
+        「单聊必回 / 群聊需 @」判错目标。这里只保留 `_is_local_ai` 为真的
+        （domain == `GATEWAY_MATRIX_SERVER_NAME` 且 localpart 以 `ai_` 开头）。
+
+        fail-closed：未配置 server_name → 没有任何可识别的本服 AI；回调抛异常
+        → 只用 mentions（同样逐个过滤），并计 `room_member_errors`。
         """
         ids: list = []
         if room_id and self._room_members is not None:
             try:
-                ids.extend(uid for uid in self._room_members(room_id) or ())
+                for uid in self._room_members(room_id) or ():
+                    if self._is_local_ai(uid) and uid not in ids:
+                        ids.append(uid)
             except Exception:  # noqa: BLE001 - 成员解析失败不阻塞消费
                 self._stats.inc("room_member_errors")
         for uid in mentions:
@@ -724,27 +862,77 @@ class AsTransactionConsumer:
                 ids.append(uid)
         return ids
 
-    def _pick_persona_user_id(
-        self, room_id: Optional[str], text: str, mentions: Iterable[str]
-    ) -> Optional[str]:
-        """本条消息最相关的**本服** AI：被 @ 的第一个本服 AI > 单聊房间里的唯一本服 AI > None。
+    def _reply_targets(
+        self,
+        *,
+        room_id: Optional[str],
+        text: str,
+        mentions: Iterable[str],
+        sender: str,
+        reply_to_sender: Optional[str],
+        is_ai_sender: bool,
+    ) -> Tuple[str, ...]:
+        """本条消息应回复的**全部**本服 AI，按提及顺序（PR2 逐个发言）。
 
-        外服 `@ai_*` 不作为 persona 目标（contract §1.7.8 ⑦）。
+        - sender 自己是 AI → 空（防循环）；
+        - 单聊（房间里恰好一个本服 AI）→ 该 AI（必回）；
+        - 群聊 → 被 `m.mentions.user_ids` 点名或被正文写出完整 user ID 的本服
+          AI，按 mention 顺序；此外若被某个本服 AI 回复（`reply_to_sender` 是
+          它）→ 也回（追加在末尾，去重）。
+        - 外服 `@ai_*` 永不在结果里（`_is_local_ai` fail-closed）。
         """
+        if is_ai_sender:
+            return ()
+        ai_ids = self._room_ai_ids(room_id, mentions)
+        others = [uid for uid in ai_ids if uid != sender]
+        if not others:
+            return ()
+        if len(others) == 1:
+            return (others[0],)
+
+        targets: list = []
         for uid in mentions:
-            if isinstance(uid, str) and self._is_local_ai(uid):
-                return uid
-        for match in _USER_ID_IN_TEXT_RE.findall(text):
-            if self._is_local_ai(match):
-                return match
-        if room_id and self._room_members is not None:
-            try:
-                ids = [uid for uid in self._room_members(room_id) or () if self._is_local_ai(uid)]
-            except Exception:  # noqa: BLE001
-                ids = []
-            if len(ids) == 1:
-                return ids[0]
-        return None
+            if uid in others and uid not in targets:
+                targets.append(uid)
+        # 无结构化提及时按正文首次出现顺序；其余正文提及追加在结构化列表后。
+        for uid in sorted((uid for uid in others if uid in text), key=text.index):
+            if uid not in targets:
+                targets.append(uid)
+        if reply_to_sender is not None and reply_to_sender in others:
+            if reply_to_sender not in targets:
+                targets.append(reply_to_sender)
+        return tuple(targets)
+
+    def _reply_target_sender(
+        self, reply_event_id: Optional[str], room_id: Optional[str]
+    ) -> Optional[str]:
+        """解析被回复事件的 sender：进程内缓存 → 可选回填 fetcher → None。
+
+        回填 fetcher 通常实现为 AS 传输的
+        `GET /_matrix/client/v3/rooms/{roomId}/event/{eventId}`；任何异常
+        （网络错误、超时、HTTP 错误、响应结构不对）都**吞掉**并返回 None，
+        计 `reply_lookup_errors`，语义上等价于「不是回复」（fail-closed）——
+        查不到被回复对象不能把整条事务标 failed，更不能凭空判定「被 AI 回复」。
+        命中缓存 / fetcher 成功后写回缓存；日志不含 event_id / room_id。
+        """
+        if not reply_event_id:
+            return None
+        cached = self._sender_cache.get(reply_event_id)
+        if cached is not None:
+            self._stats.inc("reply_target_cached")
+            return cached
+        if self._sender_fetcher is None or not room_id:
+            return None
+        try:
+            sender = self._sender_fetcher(room_id, reply_event_id)
+        except Exception:  # noqa: BLE001 - 回填失败按「不是回复」处理
+            self._stats.inc("reply_lookup_errors")
+            return None
+        if not isinstance(sender, str) or not sender:
+            return None
+        self._stats.inc("reply_target_fetched")
+        self._sender_cache.remember(reply_event_id, sender)
+        return sender
 
     def _record_human_message(self, room_id: Optional[str]) -> None:
         """调用 `GatewayService.record_human_message`（重置防刷屏 / 互聊熔断）。"""

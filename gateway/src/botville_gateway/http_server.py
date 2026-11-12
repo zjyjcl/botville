@@ -41,7 +41,17 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .as_consumer import AsTransactionConsumer
 from .config import Config, load_config
-from .as_txn_store import AsTransactionStore, build_as_txn_store
+from .as_txn_store import (
+    AsTransactionStore,
+    PersistentSpeechDedupe,
+    build_as_txn_store,
+)
+from .engine import (
+    EngineHooks,
+    ModelClient,
+    ModelConfig,
+    load_personas,
+)
 from .caller_identity import (
     AUTH_INVALID,
     AUTH_MISSING,
@@ -61,9 +71,9 @@ from .errors import (
 )
 from .limits import LimitStore
 from .log_redact import redact_args as _redact_args
-from .log_redact import redact_text as _redact_text
 from .log_redact import redact_txn_id
 from .matrix import InMemoryMatrixTransport, MatrixTransport
+from .room_members import RoomMemberSource
 from .moments.http_api import handle as _handle_moments_dispatch
 from .moments.service import build_moments_service
 from .service import GatewayService
@@ -160,10 +170,8 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             super().log_message(fmt, *_redact_args(args))
 
     def log_error(self, fmt: str, *args: Any) -> None:
-        # stdlib 的 log_error 默认转调 log_message，但子类若直接 super().log_error
-        # 会绕开本类的 log_message（BaseHTTPRequestHandler.log_error 显式调用
-        # self.log_message，所以本可省略）；这里显式重写并走脱敏，确保 send_error
-        # 产生的 "code %d, message %s" 与坏请求行日志也经过脱敏，不依赖继承链。
+        # stdlib log_error 调用 self.log_message，仍会经过本类的脱敏。
+        # 此处显式脱敏也安全：重复替换是幂等的，输出直接写 stderr。
         if self.server.config.access_log:  # type: ignore[attr-defined]
             super().log_error(fmt, *_redact_args(args))
 
@@ -908,7 +916,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
 
     def _internal_error(self, exc: BaseException) -> None:
         if self.server.config.access_log:  # type: ignore[attr-defined]
-            self.log_error("unhandled error: %r", exc)
+            self.log_error("unhandled error: %s", type(exc).__name__)
         try:
             self._send_problem(
                 500, "internal.error", "Internal Server Error"
@@ -1283,6 +1291,11 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         # GATEWAY_CONSUMER_ENABLED=false（默认）时不起线程、不唤醒，行为与现在完全一致。
         # 开启但 as_txn_db_path 未配置时打 warning 且不起线程（不拒绝启动）。
         self.as_consumer: Optional[AsTransactionConsumer] = None
+        self.room_member_source: Optional[RoomMemberSource] = None
+        # B 线 PR2：内置角色引擎（contract §0 / §1.7.8 ②）。只在三个条件**同时**
+        # 成立时装配：消费开启 + 人设有内容 + 模型已配置。否则保持「只记录/计数、
+        # 不发言」，/health 不 degraded。
+        self.engine_hooks: Optional[EngineHooks] = None
         if config.consumer_enabled:
             if self.as_txn_store is None:
                 logging.getLogger(__name__).warning(
@@ -1290,10 +1303,39 @@ class GatewayServer(http.server.ThreadingHTTPServer):
                     "set — consumer thread will NOT start"
                 )
             else:
+                hooks = self._build_engine_hooks(config, service)
+                self.engine_hooks = hooks
+                # Production membership source for DM routing.  State events
+                # keep a bounded local cache warm; AppService transport fills a
+                # cold cache through joined_members while masquerading as one
+                # configured persona.  Other transports remain mention-only.
+                personas = tuple(hooks._personas) if hooks is not None else ()
+                server_name = (config.matrix_server_name or "").lower()
+
+                def is_local_ai(user_id: str) -> bool:
+                    if not isinstance(user_id, str) or not user_id.startswith("@ai_"):
+                        return False
+                    _localpart, separator, domain = user_id[1:].partition(":")
+                    return bool(separator and domain.lower() == server_name)
+
+                joined_members = getattr(transport, "joined_members", None)
+                fetcher = joined_members if callable(joined_members) else None
+                self.room_member_source = RoomMemberSource(
+                    fetcher=fetcher,
+                    personas=personas,
+                    is_local_ai=is_local_ai,
+                )
                 consumer = AsTransactionConsumer(
                     self.as_txn_store,
+                    hooks=hooks,
                     service=service,
                     server_name=config.matrix_server_name,
+                    sender_fetcher=getattr(transport, "event_sender", None),
+                    room_members=self.room_member_source.members,
+                    room_member_observer=self.room_member_source.observe_member_event,
+                    # Engine persists each persona separately; consumer completion
+                    # must not share the first persona key on partial failures.
+                    dedupe=None if hooks else PersistentSpeechDedupe(self.as_txn_store),
                 )
                 # 注册唤醒钩子：事务落库成功后立即唤醒消费线程。
                 self.as_txn_store.set_on_new_transaction(consumer.wake)
@@ -1303,6 +1345,51 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         # 监听端口绑定成功后才起消费线程：绑定失败（OSError）时不留下孤儿线程。
         if self.as_consumer is not None:
             self.as_consumer.start()
+
+    def _build_engine_hooks(
+        self, config: Config, service: GatewayService
+    ) -> Optional[EngineHooks]:
+        """按配置装配内置角色引擎；不满足条件时返回 None（消费者保持 no-op 钩子）。
+
+        激活条件（三者同时成立）：
+          1. `GATEWAY_CONSUMER_ENABLED=true`（调用方已保证）；
+          2. `GATEWAY_PERSONAS_FILE` 读出的 `personas` **非空**；
+          3. `GATEWAY_MODEL_BASE_URL` + `GATEWAY_MODEL_NAME` 均已配置。
+
+        人设文件非法 → `PersonaConfigError` 向上抛（**拒绝启动**，不回显文件内容）。
+        未激活时打一条 info（只说明缺哪一项，不含任何配置值）。
+        """
+        personas = load_personas(
+            config.personas_file,
+            server_name=config.matrix_server_name,
+            max_message_chars=config.max_message_chars,
+        )
+        model_config = ModelConfig(
+            base_url=(config.model_base_url or "").rstrip("/"),
+            model=(config.model_name or ""),
+            timeout_seconds=config.model_timeout_seconds,
+            _api_key=config.model_api_key,
+        )
+        missing = []
+        if not personas:
+            missing.append("GATEWAY_PERSONAS_FILE has no personas")
+        if not model_config.configured:
+            missing.append("GATEWAY_MODEL_BASE_URL / GATEWAY_MODEL_NAME not configured")
+        if missing:
+            logging.getLogger(__name__).info(
+                "AS consumer engine is inactive (record/count only): %s",
+                "; ".join(missing),
+            )
+            return None
+        logging.getLogger(__name__).info(
+            "AS consumer engine is active for %d persona(s)", len(personas)
+        )
+        return EngineHooks(
+            personas=personas,
+            client=ModelClient(model_config),
+            service=service,
+            dedupe=PersistentSpeechDedupe(self.as_txn_store),
+        )
 
     def server_close(self) -> None:
         """关闭监听前先停消费者，再停清理线程（未启用时为 no-op）。"""

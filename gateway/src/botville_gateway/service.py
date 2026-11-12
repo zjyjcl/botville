@@ -258,6 +258,13 @@ class GatewayService:
         """当前时钟值（供 /health uptime 计算）。"""
         return self._now()
 
+    def silent_hours_end(self, persona_id: str, conversation_id: str) -> Optional[datetime]:
+        """返回当前有效静默窗口结束时刻，复用策略的分层限额及时区规则。"""
+        now = self._now()
+        effective = self._limits.effective(persona_id=persona_id,
+            conversation_id=conversation_id, peer_id=None, now=now)
+        return self._engine._silent_view(now, effective).ends_at
+
     def pending_queue(self) -> List[_QueueItem]:
         with self._lock:
             return list(self._queue.values())
@@ -774,7 +781,12 @@ class GatewayService:
                 if not prepared.needs_delivery:
                     receipt = prepared.receipt
                     assert receipt is not None
-                    if idempotency_key:
+                    # 静默阻塞未发送；必须允许同 key 在窗口结束后重新评估。
+                    quiet_block = receipt.get("outcome") == "blocked" and any(
+                        r.get("code") == "silent_hours.active"
+                        for r in receipt.get("decision", {}).get("reasons", [])
+                    )
+                    if idempotency_key and not quiet_block:
                         self._idempotency_put(idempotency_key, fingerprint, receipt)
                     return json.loads(json.dumps(receipt))
 

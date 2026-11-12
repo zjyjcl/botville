@@ -95,6 +95,18 @@ CREATE INDEX IF NOT EXISTS idx_as_transactions_consumable
     ON as_transactions(failed_at) WHERE processed_at IS NULL AND purged_at IS NULL;
 """
 
+# 发言去重账本（B 线 PR2，contract §1.7.8 ④）：键是
+# `speech_idempotency_key(persona, event_id)`（`spk_<sha256hex>`），只存时间戳。
+# **不含**正文、persona 或 event_id：键本身已不可逆，存其他标识只会扩大泄露面。
+# 幂等：`CREATE TABLE IF NOT EXISTS`，旧库升级直接补表。
+_SPEECH_DEDUPE_DDL = """
+CREATE TABLE IF NOT EXISTS as_speech_dedupe (
+    key        TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    sent_at    TEXT
+);
+"""
+
 # 内存库 / URI 形式不是真实文件，跳过 0600 预建。
 _NON_FILE_DB_PREFIXES = (":memory:", "file:")
 
@@ -165,6 +177,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     要各扫一遍表来建立。墓碑越多、建得越久，那**一次**启动会明显变慢；
     之后每次启动都是 `IF NOT EXISTS` 的空操作，开销可忽略。建议在低峰期升级，
     或先停机 `VACUUM` / 归档旧墓碑再升级（见 contract §1.7.7 运维第 1 点）。
+
+    B 线 PR2（contract §1.7.8 ④）再补一张**发言去重账本** `as_speech_dedupe`：
+    `CREATE TABLE IF NOT EXISTS` 是纯加法，旧库升级即补表、不影响既有行。
     """
     columns = {row[1] for row in conn.execute("PRAGMA table_info(as_transactions)")}
     if "purged_at" not in columns:
@@ -184,6 +199,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # 消费取批查询（`processed_at IS NULL AND purged_at IS NULL AND failed_at IS NULL`）
     # 的部分索引：只覆盖「待消费」的行，规模随积压而不是随墓碑总数增长。
     conn.execute(_CONSUMABLE_INDEX_DDL)
+    # B 线 PR2 发言去重账本（幂等，不影响既有行）。
+    conn.execute(_SPEECH_DEDUPE_DDL)
 
 
 def connect(db_path: str) -> sqlite3.Connection:
@@ -481,6 +498,19 @@ class AsTransactionStore:
                 result["bodies_purged"],
                 result["unprocessed_dropped"],
             )
+        # 发言去重账本按同一保留期清理（B 线 PR2）：过期键对应的旧事务也已被
+        # 清理，重放不会再发生；不删则会无限增长。失败只记日志。
+        try:
+            removed = self.purge_speech_dedupe(retention)
+        except Exception as exc:  # noqa: BLE001 - 清理是尽力而为
+            _log.warning(
+                "AS speech dedupe purge failed: %s", type(exc).__name__
+            )
+        else:
+            if removed:
+                _log.info(
+                    "AS speech dedupe purge removed %d expired key(s)", removed
+                )
         return result
 
     def start_purge_scheduler(self, interval_seconds: float) -> threading.Thread:
@@ -526,6 +556,52 @@ class AsTransactionStore:
         self._purge_stop = None
         self._purge_thread = None
 
+    # ------------------------------------------------- speech dedupe ledger
+    def speech_dedupe_seen(self, key: str) -> bool:
+        """该发言幂等键是否已在账本里（只在成功发言后写入）。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM as_speech_dedupe WHERE key = ?", (key,)
+            ).fetchone()
+            return row is not None
+
+    def speech_dedupe_mark(self, key: str) -> None:
+        """成功发言后写入幂等键；重复写入保持幂等。"""
+        now_str = iso_utc(utcnow())
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT INTO as_speech_dedupe(key, created_at, sent_at)"
+                    " VALUES (?, ?, ?)"
+                    " ON CONFLICT(key) DO UPDATE SET"
+                    " sent_at = excluded.sent_at",
+                    (key, now_str, now_str),
+                )
+
+    def purge_speech_dedupe(self, retention_days: int, now: Optional[datetime] = None) -> int:
+        """删除超过保留期的发言去重行（与事务保留期同一套口径）。
+
+        只删 `created_at < cutoff` 的行，返回删除条数。**不删未过期的行**：
+        过早删除会让重放的旧事务重新发言。
+        """
+        if retention_days < 1:
+            raise ValueError("retention_days must be >= 1")
+        current = now if now is not None else utcnow()
+        cutoff = iso_utc(current - timedelta(days=retention_days))
+        with self._lock:
+            with self._conn:
+                cur = self._conn.execute(
+                    "DELETE FROM as_speech_dedupe WHERE created_at < ?", (cutoff,)
+                )
+                return cur.rowcount
+
+    def speech_dedupe_count(self) -> int:
+        """账本行数（仅供测试 / 运维检查）。"""
+        with self._lock:
+            return int(
+                self._conn.execute("SELECT COUNT(*) FROM as_speech_dedupe").fetchone()[0]
+            )
+
 
 def build_as_txn_store(
     db_path: Optional[str],
@@ -548,3 +624,26 @@ def build_as_txn_store(
         if purge_interval_seconds > 0:
             store.start_purge_scheduler(purge_interval_seconds)
     return store
+
+
+class PersistentSpeechDedupe:
+    """基于 `as_speech_dedupe` 表的发言去重账本（B 线 PR2，contract §1.7.8 ④）。
+
+    与 `as_consumer.InMemorySpeechDedupe` 接口相同（`seen` / `mark`），但状态
+    落在 AS 事务库里：**进程重启 / 换一个 store 实例打开同一个文件**都不会
+    重新发言（at-least-once 消费 + 持久化幂等键 = 实际效果至多一次发言）。
+
+    只在成功投递后写入：模型调用前占位会在进程崩溃时吞掉未送达的回复。
+    """
+
+    def __init__(self, store: AsTransactionStore) -> None:
+        self._store = store
+
+    def seen(self, key: str) -> bool:
+        return self._store.speech_dedupe_seen(key)
+
+    def mark(self, key: str) -> None:
+        self._store.speech_dedupe_mark(key)
+
+    def __len__(self) -> int:
+        return self._store.speech_dedupe_count()
