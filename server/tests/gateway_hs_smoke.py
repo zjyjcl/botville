@@ -27,8 +27,10 @@ or tuwunel):
         and still exactly one stored row (idempotent by txnId). A wrong
         hs_token must get 403.
 
-Fixtures do not pile up: the human user (with one fixed device), the
-@ai_gwsmoke user and the room are reused across runs. Their ids and the
+Fixtures do not pile up: the human user @gwsmoke (one fixed device, password
+derived from the local registration token so even a deleted fixture file
+logs back into the same account), @ai_gwsmoke and the room are reused across
+runs. Their ids and the
 human's password / access token live in --fixture-file (default
 <env-file dir>/generated/gateway-hs-smoke.json, gitignored, mode 0600), keyed
 by --hs-url. They are re-created only when the homeserver no longer knows
@@ -50,6 +52,8 @@ a query string, body or header value). First failure exits non-zero.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -65,6 +69,7 @@ REQUEST_TIMEOUT = 15.0
 SUPPORTED_STAGES = ("m.login.registration_token", "m.login.dummy")
 APPSERVICE_ID = "botville-gateway"
 AI_FIXTURE_LOCALPART = "ai_gwsmoke"
+HUMAN_FIXTURE_LOCALPART = "gwsmoke"
 DEVICE_ID = "GWSMOKE"
 AS_TXN_DB_PATH = "/var/lib/botville-gateway/as_transactions.db"
 
@@ -213,8 +218,12 @@ def wait_for_health(gateway_url, timeout):
     )
 
 
-def register_user(hs_url, registration_token):
+def register_user(hs_url, registration_token, username=None, password=None):
     """Generic UIA register; returns (user_id, access_token, password), never printed.
+
+    With a fixed `username` (and its `password`), returns None when the
+    homeserver says the name is taken (M_USER_IN_USE) so the caller can fall
+    back. Without one, a random gwsmoke_<hex> name is used.
 
     Retries HTTP 429/503: Synapse's default rc_registration burst is small, so a
     smoke run right after `make e2e` seed can be rate-limited for a few seconds.
@@ -223,9 +232,9 @@ def register_user(hs_url, registration_token):
     deadline = time.monotonic() + 60
     last_status = 0
     while time.monotonic() < deadline:
-        username = "gwsmoke_" + secrets.token_hex(4)
-        password = secrets.token_hex(16)
-        body = {"username": username, "password": password, "device_id": DEVICE_ID}
+        name = username or "gwsmoke_" + secrets.token_hex(4)
+        secret = password if username else secrets.token_hex(16)
+        body = {"username": name, "password": secret, "device_id": DEVICE_ID}
         flow = None
         rate_limited = False
         for _ in range(12):
@@ -236,7 +245,14 @@ def register_user(hs_url, registration_token):
                 access_token = resp.get("access_token")
                 if not user_id or not access_token:
                     http_fail("POST", register_url, status, "missing user_id or access_token")
-                return user_id, access_token, password
+                return user_id, access_token, secret
+            if (
+                username
+                and status == 400
+                and isinstance(resp, dict)
+                and resp.get("errcode") == "M_USER_IN_USE"
+            ):
+                return None
             if status in (429, 503):
                 rate_limited = True
                 break
@@ -329,8 +345,27 @@ def password_login(hs_url, user_id, password):
     return None
 
 
+def fixture_password(registration_token):
+    """Deterministic password of the fixed @gwsmoke user.
+
+    HMAC of the local BOTVILLE_REGISTRATION_TOKEN, so a lost fixture file does
+    not force a new user: the same @gwsmoke account is logged into again.
+    Never printed. Anyone holding the registration token could already
+    register accounts, so this grants nothing extra (a throwaway test user).
+    """
+    return hmac.new(
+        registration_token.encode("utf-8"), b"botville.gwsmoke.fixture.v1", hashlib.sha256
+    ).hexdigest()
+
+
 def ensure_human(hs_url, registration_token, fixture):
-    """Reuse the fixture user when the HS still knows it; else register one.
+    """Reuse the fixture user; never pile up new users.
+
+    Order: the stored token (whoami) -> the stored password (login on the
+    fixed device) -> the fixed @gwsmoke user with its derived password (login,
+    else register). Only if @gwsmoke exists with another password (e.g. the
+    registration token was rotated) is a random gwsmoke_<hex> user created,
+    once, and then reused through the fixture file.
 
     Returns (user_id, access_token); updates `fixture` in place.
     """
@@ -344,7 +379,14 @@ def ensure_human(hs_url, registration_token, fixture):
         if token and whoami(hs_url, token) == user_id:
             fixture["access_token"] = token
             return user_id, token
-    user_id, token, password = register_user(hs_url, registration_token)
+    password = fixture_password(registration_token)
+    token = password_login(hs_url, HUMAN_FIXTURE_LOCALPART, password)
+    user_id = whoami(hs_url, token) if token else None
+    if not user_id:
+        created = register_user(hs_url, registration_token, HUMAN_FIXTURE_LOCALPART, password)
+        if created is None:
+            created = register_user(hs_url, registration_token)
+        user_id, token, password = created
     fixture.clear()
     fixture.update({"user_id": user_id, "password": password, "access_token": token})
     return user_id, token
@@ -398,12 +440,13 @@ def hs_ping(hs_url, as_token):
         if status == 200 and isinstance(resp, dict):
             print("PASS: homeserver -> gateway ping (/_matrix/app/v1/ping)")
             return
-        if status in (401, 403):
-            # Auth problems (wrong/unknown as_token, AS not registered for
-            # this token) never heal by waiting: fail now.
-            http_fail("POST", url, status, "appservice ping: authentication rejected")
+        if 400 <= status < 500 and status != 429:
+            # 4xx other than 429 never heals by waiting (401/403: wrong or
+            # unknown as_token; 400/404: bad request or AS id): fail now.
+            http_fail("POST", url, status, "appservice ping: client error, not retried")
         # 429 / 5xx (502/504: the HS could not reach the AS yet, e.g. just
-        # restarted) / unreachable: transient, retry until the deadline.
+        # restarted) / unreachable (status 0): transient, retry until the
+        # deadline.
         time.sleep(3)
     http_fail("POST", url, status, "appservice ping")
 

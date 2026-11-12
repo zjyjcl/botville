@@ -84,8 +84,8 @@ class SmokeUnitTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
-    def test_ping_fails_fast_on_auth_errors(self):
-        for status in (401, 403):
+    def test_ping_fails_fast_on_client_errors(self):
+        for status in (400, 401, 403, 404):
             with self.subTest(status=status):
                 self.srv.routes[("POST", PING)] = (status, {"errcode": "M_FORBIDDEN"})
                 start = time.monotonic()
@@ -110,6 +110,56 @@ class SmokeUnitTest(unittest.TestCase):
             smoke.time.sleep = orig_sleep
         self.assertIn("PASS", out.getvalue())
         self.assertEqual(self.srv.count("POST", PING), 3)
+
+    def test_lost_fixture_logs_back_into_the_fixed_user(self):
+        """Deleting the fixture file must not create another user: the fixed
+        @gwsmoke account is logged into with its derived password."""
+        reg = SECRETS["BOTVILLE_REGISTRATION_TOKEN"]
+        derived = smoke.fixture_password(reg)
+        self.assertEqual(derived, smoke.fixture_password(reg))  # deterministic
+        self.assertNotIn(reg, derived)
+        new_token = "sentinel-relogin-token-0123456789"
+
+        def login(h):
+            body = json.loads(self.srv.calls[-1][3])
+            ok = body["identifier"]["user"] == "gwsmoke" and body["password"] == derived
+            return (200, {"access_token": new_token}) if ok else (403, {"errcode": "M_FORBIDDEN"})
+
+        self.srv.routes[("POST", "/_matrix/client/v3/login")] = login
+        self.srv.routes[("GET", "/_matrix/client/v3/account/whoami")] = (
+            lambda h: (200, {"user_id": "@gwsmoke:localhost"})
+            if h.headers.get("Authorization") == "Bearer " + new_token
+            else (401, {"errcode": "M_UNKNOWN_TOKEN"})
+        )
+        fixture = {}
+        user_id, token = smoke.ensure_human(self.srv.url, reg, fixture)
+        self.assertEqual((user_id, token), ("@gwsmoke:localhost", new_token))
+        self.assertEqual(self.srv.count("POST", "/_matrix/client/v3/register"), 0)
+        self.assertEqual(fixture["user_id"], "@gwsmoke:localhost")
+
+    def test_fixed_user_registered_first_time_random_only_if_taken(self):
+        reg = SECRETS["BOTVILLE_REGISTRATION_TOKEN"]
+        self.srv.routes[("POST", "/_matrix/client/v3/login")] = (403, {"errcode": "M_FORBIDDEN"})
+        names = []
+
+        def register(h):
+            body = json.loads(self.srv.calls[-1][3])
+            names.append(body["username"])
+            if body["username"] == "gwsmoke" and taken[0]:
+                return 400, {"errcode": "M_USER_IN_USE"}
+            return 200, {"user_id": "@{}:localhost".format(body["username"]), "access_token": USER_TOKEN}
+
+        self.srv.routes[("POST", "/_matrix/client/v3/register")] = register
+        taken = [False]
+        user_id, _ = smoke.ensure_human(self.srv.url, reg, {})
+        self.assertEqual(user_id, "@gwsmoke:localhost")
+        self.assertEqual(names, ["gwsmoke"])
+        taken[0] = True
+        names.clear()
+        user_id, _ = smoke.ensure_human(self.srv.url, reg, {})
+        self.assertTrue(user_id.startswith("@gwsmoke_"))
+        self.assertEqual(names[0], "gwsmoke")
+        self.assertEqual(len(names), 2)
 
     def test_fixture_user_is_reused(self):
         self.srv.routes[("GET", "/_matrix/client/v3/account/whoami")] = (

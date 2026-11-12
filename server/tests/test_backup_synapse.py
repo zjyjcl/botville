@@ -42,12 +42,12 @@ for arg in "$@"; do
     esac
 done
 # compose run ... tar -czf /backup/<name>.tar.gz  -> write that artifact.
-if [ "${1-}" = run ] || printf '%s' "$*" | grep -q 'tar -czf /backup/'; then
+if [ "${1-}" = run ] || [[ "$*" == *'tar -czf /backup/'* ]]; then
     dest="${FAKE_BACKUP_DIR:?}"
-    if printf '%s' "$*" | grep -q 'gateway-data.tar.gz'; then
+    if [[ "$*" == *'gateway-data.tar.gz'* ]]; then
         printf 'fake-gateway-tar\\n' > "${dest}/gateway-data.tar.gz"
         chmod 600 "${dest}/gateway-data.tar.gz"
-    elif printf '%s' "$*" | grep -q 'synapse-data.tar.gz'; then
+    elif [[ "$*" == *'synapse-data.tar.gz'* ]]; then
         printf 'fake-synapse-tar\\n' > "${dest}/synapse-data.tar.gz"
         chmod 600 "${dest}/synapse-data.tar.gz"
     fi

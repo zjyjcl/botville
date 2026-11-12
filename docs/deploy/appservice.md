@@ -216,11 +216,16 @@ sender → **400 `request.invalid`**；房间别名不存在 → **404
   - 验收：`make gateway-hs-smoke`——whoami、OpenID userinfo，以及 AS 事务：HS→
     网关 ping，`@ai_*` 所在房间的消息被推送并落库，网关重启后重放同一 txnId 只存
     一份，错误 hs_token 得 403。不打印 token；失败只报 HTTP 状态和完整 URL；
-    ping 遇 401/403（token 不对、未注册）立即失败，429 / 5xx 才重试。
-    夹具不会越积越多：人类测试用户（固定 device）、`@ai_gwsmoke` 和测试房间跨次复用，
-    状态记在 `server/compose/generated/gateway-hs-smoke.json`（gitignore，0600，
-    按 HS 地址分开）；HS 不认识它们时（如 `down -v` 之后）才重建，被替换的房间会
-    先退出并忘记。
+    ping 遇 429 以外的 4xx（如 401/403 token 不对、404 未注册）立即失败，只有
+    429 / 5xx / 连不上才重试。
+    夹具不会越积越多：人类测试用户固定为 `@gwsmoke`（固定 device，密码由本地
+    `BOTVILLE_REGISTRATION_TOKEN` 经 HMAC 推导，不打印）、`@ai_gwsmoke` 和测试房间
+    跨次复用，状态记在 `server/compose/generated/gateway-hs-smoke.json`（gitignore，
+    0600，按 HS 地址分开；`generated/` 目录本身 0700）。手动删掉这个文件也不会多出
+    用户：下次用推导出的密码重新登录同一个 `@gwsmoke`。只有 `@gwsmoke` 已存在但密码
+    对不上（例如轮换过注册 token）时，才新建一个 `gwsmoke_<随机>` 用户，之后通过
+    夹具文件复用；房间在 HS 不认识时（如 `down -v` 之后）才重建，被替换的房间会先
+    退出并忘记。
 
 ## 角色引擎（模型与人设）
 
@@ -244,6 +249,11 @@ B 线 PR2（角色引擎回复）读的变量，compose 原样透传给 `gateway
 
 **人设文件（只读挂载）**
 
+- **预检**：`make up GATEWAY=1` 与 `make config` 在调用 compose 之前跑
+  `server/scripts/gateway-preflight.sh`：`BOTVILLE_GATEWAY_PERSONAS_DIR` 指向的目录
+  不存在就直接报错退出（否则 docker 会把缺失的挂载源建成 root 的空目录，网关
+  悄悄没有人设）；`GATEWAY_PERSONAS_FILE` 指向的文件不在该目录里只给警告。
+  `make config` 只做校验：init、预检、`compose config --quiet`。
 - compose **总是**把 `server/compose/gateway-personas/` 只读挂到
   `/etc/botville-gateway`。这个目录随仓库提供，里面只有 `README.md` 和虚构的
   `personas.example.json`，所以没配人设时挂载、`compose config` 和网关启动都不会

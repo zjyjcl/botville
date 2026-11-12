@@ -38,7 +38,7 @@
 
 COMPOSE_FILE := server/compose/docker-compose.yml
 ENV_FILE := server/compose/.env
-PROJECT ?= $(shell sed -n 's/^COMPOSE_PROJECT_NAME=//p' $(ENV_FILE) 2>/dev/null | head -n 1)
+PROJECT ?= $(shell sed -n '/^COMPOSE_PROJECT_NAME=/{s///p;q;}' $(ENV_FILE) 2>/dev/null)
 ifeq ($(strip $(PROJECT)),)
 PROJECT := botville
 endif
@@ -131,7 +131,7 @@ endif
 E2E_PHASE ?= seed
 E2E_STATE ?= backups/e2e-state.json
 
-.PHONY: init up down logs smoke ps backup restore backup-gateway restore-gateway \
+.PHONY: init up down logs smoke ps config gateway-preflight backup restore backup-gateway restore-gateway \
 	e2e push-e2e appservice-e2e gateway-hs-smoke federation-e2e federation-down
 
 init:
@@ -152,6 +152,7 @@ init:
 up:
 	BOTVILLE_APPSERVICE_URL=$(APPSERVICE_URL) bash server/scripts/init.sh
 ifneq ($(GATEWAY_PROFILE),)
+	bash server/scripts/gateway-preflight.sh $(ENV_FILE)
 	$(COMPOSE) --profile gateway build gateway
 endif
 	@if [ -f $(APPSERVICE_URL_MARKER) ]; then \
@@ -172,6 +173,21 @@ endif
 ifeq ($(HS),continuwuity)
 	COMPOSE='$(COMPOSE)' bash server/scripts/bootstrap-continuwuity.sh
 endif
+
+# Gateway preflight on its own (also part of `up GATEWAY=1` and `config`):
+# a custom BOTVILLE_GATEWAY_PERSONAS_DIR must exist, otherwise fail here
+# instead of at `up` (docker would create a missing bind source as an empty
+# root-owned dir). See server/scripts/gateway-preflight.sh.
+gateway-preflight:
+	bash server/scripts/gateway-preflight.sh $(ENV_FILE)
+
+# Validate the whole configuration without starting anything: init (renders
+# .env/generated), gateway preflight, then `compose config --quiet` for the
+# active HS with the push and gateway profiles (like down/ps/logs). --quiet on
+# purpose: plain `config` prints interpolated values (secrets included).
+config: init gateway-preflight
+	$(GATEWAY_HS_ENV) $(COMPOSE) --profile $(HS) --profile push --profile gateway config --quiet
+	@echo "compose config OK ($(HS) + push + gateway)"
 
 down:
 	$(COMPOSE) --profile $(HS) --profile push --profile gateway down --remove-orphans

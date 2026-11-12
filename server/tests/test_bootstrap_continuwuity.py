@@ -503,6 +503,16 @@ class InitScriptTest(unittest.TestCase):
         self.assertIn("GATEWAY_MODEL_API_KEY", proc.stdout)
         self.assertEqual(self.env_value("GATEWAY_MODEL_API_KEY"), "")
 
+    def test_generated_dir_is_private(self):
+        proc = self.run_init()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        mode = os.stat(self.tmp / "compose" / "generated").st_mode & 0o777
+        self.assertEqual(mode, 0o700)
+        # Re-tightened on every run (a hand-made 0755 dir is fixed too).
+        os.chmod(self.tmp / "compose" / "generated", 0o755)
+        self.assertEqual(self.run_init().returncode, 0)
+        self.assertEqual(os.stat(self.tmp / "compose" / "generated").st_mode & 0o777, 0o700)
+
     def test_fresh_run_creates_env_with_secrets(self):
         proc = self.run_init()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
