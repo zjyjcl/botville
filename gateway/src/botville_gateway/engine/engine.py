@@ -97,12 +97,16 @@ class EngineHooks(ConsumerHooks):
         service: GatewayService,
         dedupe: Optional[SpeechDedupe] = None,
         memory_store: Optional[object] = None,
+        memory_embedding: Optional[object] = None,
+        memory_vectors: Optional[object] = None,
     ) -> None:
         self._personas = personas
         self._client = client
         self._service = service
         self._dedupe = dedupe
         self._memory_store = memory_store
+        self._memory_embedding = memory_embedding
+        self._memory_vectors = memory_vectors
         self.stats = ConsumerStats()
         self._memory_failures = 0
         self._memory_warning_at = float('-inf')
@@ -215,12 +219,28 @@ class EngineHooks(ConsumerHooks):
             scope_kind, scope_key, counterpart = self._memory_scope(persona, ctx)
             try:
                 from ..memory.recall import assemble_recall
+                from ..memory.summary import StoreSummaryProvider
+                vector_recall = None
+                if self._memory_embedding is not None and self._memory_vectors is not None:
+                    from ..memory.worker import budgeted_embed
+                    from ..memory.vector import VectorRecall
+                    try:
+                        query = budgeted_embed(self._memory_embedding, self._service,
+                                               persona.user_id, text)
+                        vector_recall = VectorRecall(self._memory_vectors, query_vec=query,
+                                                     model=self._memory_embedding.config.model,
+                                                     dim=self._memory_embedding.dimension)
+                    except Exception:
+                        # Vector enrichment is optional; never defer a human reply.
+                        self.stats.inc('memory_vector_skipped')
                 messages = assemble_recall(
                     self._memory_store, persona_id=persona.user_id,
                     scope_kind=scope_kind, scope_key=scope_key,
                     counterpart=counterpart,
                     mentioned_counterparts=ctx.mentioned_user_ids,
                     budget=2000,
+                    summary_provider=StoreSummaryProvider(self._memory_store),
+                    vector_recall=vector_recall,
                 )
                 # The current event must be visible even when pinned/profile
                 # memory consumes the recall allowance.  It remains untrusted.

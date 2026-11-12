@@ -712,12 +712,11 @@ class PolicyEngine:
         since = now - timedelta(seconds=window)
         use_peer_filter = (layer == LAYER_PEER and peer_id is not None)
         events = sorted(
-            self._store.events_in_window(
+            [e for e in self._store.events_in_window(
                 persona_id=persona_id,
-                kind=EventKind.SENT,
                 since=since,
                 peer_id=peer_id if use_peer_filter else None,
-            ),
+            ) if e.kind in (EventKind.SENT, EventKind.MEMORY)],
             key=lambda e: e.recorded_at,
         )
         used = sum(e.tokens_in + e.tokens_out for e in events)

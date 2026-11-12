@@ -165,6 +165,7 @@ class ModelClient:
         messages: List[Dict[str, str]],
         persona: Optional["object"] = None,
         model: Optional[str] = None,
+        max_tokens: Optional[int] = None,
     ) -> str:
         """一次 chat completion；返回助手消息正文。
 
@@ -181,6 +182,8 @@ class ModelClient:
         if not self._config.configured:
             raise ModelError("the model is not configured")
         payload = self._build_payload(system_text, messages, persona, model)
+        if max_tokens is not None:
+            payload['max_tokens'] = max_tokens
         raw = self._post(payload, persona)
         return self._extract_text(raw)
 

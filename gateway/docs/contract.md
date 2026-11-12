@@ -728,7 +728,8 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
   的任何裁决。具体顺序为 `GatewayService.evaluate_policy → model.complete →
   GatewayService.send_ai_message`：预检无副作用，任何非 `allow` 裁决都不调模型；发送前再次裁决、
   预留额度，成功后提交 SENT 用量、token 预算、防刷屏与 AI 互聊计数。引擎统一按字符数
-  `estimate_tokens(text) = max(1, len(text) // 4 + 1)` 粗略估算 token：预检累加系统提示词、
+  `estimate_tokens(text)` 对 CJK 汉字（含扩展）、假名、韩文、全角与 CJK 标点约按每字 1 token，
+  非空文本合计为 `CJK字符数 + 非CJK字符数 // 4 + 1`（空文本为 0）：预检累加系统提示词、
   每条上下文消息及 `max_reply_chars` 长度回复的估算；发送时仅估算截断后的实际回复。
   此估算不是模型 tokenizer 的精确计数。发送时发生限额竞态
   则跳过、计数且不写发言去重账本；Matrix 不可达/暂不可用映射为
@@ -893,21 +894,22 @@ ephemeral 不在 AS 注册里开启，忽略。
 跟随重定向。任何成员缓存或查询失败均 fail-closed，只按结构化/正文 mentions 判定并计
 `room_member_errors`，不会把群聊误判为单聊。
 
-**⑩ 四层记忆（B2.6：PR3a 已实现；PR3b / PR3c 待实现）**
+**⑩ 四层记忆（B2.6：PR3a / PR3b 已实现；PR3c 待实现）**
 
 四层为①最近对话、②滚动摘要、③长期档案、④向量检索。以下为完整批准规则；
-标为 PR3b / PR3c 的能力当前不启用。
+PR3c 的 HTTP 主人端点当前不启用。
 
-- **R1 Embedding（PR3b）**：OpenAI 兼容 `{BASE}/embeddings`；计划配置
+- **R1 Embedding（PR3b，已实现）**：OpenAI 兼容 `{BASE}/embeddings`；配置
   `GATEWAY_EMBEDDING_BASE_URL`（空 = 复用 `GATEWAY_MODEL_BASE_URL`）、
   `GATEWAY_EMBEDDING_MODEL`（空 = ④关闭）、`GATEWAY_EMBEDDING_API_KEY`
-  （可选，空 = 复用模型密钥；不进日志、/health 或错误）、`GATEWAY_EMBEDDING_DIM`。
+  （可选，空 = 复用模型密钥；不进日志、/health 或错误）、`GATEWAY_EMBEDDING_DIM`（默认 0：
+  接受第一条返回维度并固定；正整数要求匹配）。
   无 embedding 模型时降级为① + ② + ③ + pinned，/health 不 degraded。
   模型或维度改变后，旧向量标记待重建，由空闲批处理重建。
   **当 embedding 复用模型端点和密钥时，DM 原文会发送给同一个模型提供方。**
-- **R2 滚动摘要（PR3b）**：某会话未摘要原文超过 N 条（默认 40）或 M tokens 时排队，
-  仅空闲批处理执行；空闲 = 消费者 X 秒没有新事务（默认 120 秒），每批最多 K 个会话。
-  M、K 具体值留 PR3b 确定。计划配置 `GATEWAY_MEMORY_SUMMARY_MODEL`
+- **R2 滚动摘要（PR3b，已实现）**：某会话未摘要原文超过 40 条或 4000 tokens 时排队，
+  仅空闲批处理执行；
+  空闲 = 消费者 120 秒没有新事务且无待处理事务，每批最多 8 个 scope。配置 `GATEWAY_MEMORY_SUMMARY_MODEL`
   （空 = `GATEWAY_MODEL_NAME`）。摘要与抽取调用先 evaluate（内部 kind=memory），
   计入该 persona 的 token 预算；blocked、静默或预算不足时延后：真人回复优先，整理延后。
   摘要按对象分别存：DM 为 (persona, counterpart)，群为 (persona, room)。
@@ -916,8 +918,8 @@ ephemeral 不在 AS 注册里开启，忽略。
   likes、dislikes、location、occupation、language、pronouns、notes。
   **无 intimacy / 亲密度字段**（留 B2.8 关系模块）。仅可信本服人类内容可抽取为事实；
   外服 / untrusted 永不进入档案。AI 自己的回复进①，但永不抽取。
-  PR3a 提供 Extractor 接口和结果应用规则，**回复热路径不调用抽取模型**；
-  自动模型抽取与调度留 PR3b 空闲 worker。
+  **回复热路径不调用抽取模型**；PR3b 空闲 worker 仅处理新、可信本服人类 user-role 项，
+  输入隔离、严格 JSON 白名单解析，逐项 watermark 防止重复处理。
 - **R4 主人 API（PR3a / PR3c）**：PR3a 仅内部 Python API + 管理员 CLI，
   支持条目及事实的 list/view/delete/pin/unpin、set fact；所有操作要求 caller 等于
   persona.owner_user_id，否则抛专用权限异常。人设可选 owner_user_id 必须是本服用户
@@ -927,10 +929,10 @@ ephemeral 不在 AS 注册里开启，忽略。
   v1 只有主人可查看、删除、钉住；非主人删除请求经主人处理。
   HTTP `/v1/memories*` 属 PR3c minor additive，开工前先将端点草案交总管；
   修改 gateway.v1.yaml 必须获得总管批准。
-- **R5 lite/full（PR3b）**：lite 仅 stdlib，float32 BLOB 存 memory.db，纯 Python cosine；
+- **R5 lite/full（PR3b，已实现）**：lite 仅 stdlib，float32 BLOB 存 memory.db，纯 Python cosine；
   sqlite-vec 可选加速，仅当 sqlite3 enable_load_extension 可用且扩展可加载时自动启用，
   否则回退 Python。pgvector 仅定义 VectorStore 接口，full 实现不在本轮。
-  计划配置 `GATEWAY_MEMORY_VECTOR_BACKEND=none|python|sqlite-vec`，默认 python，
+  配置 `GATEWAY_MEMORY_VECTOR_BACKEND=none|python|sqlite-vec`，默认 python，
   仅配置 embedding 模型时生效。
 - **R6 存储与开关（PR3a）**：`GATEWAY_MEMORY_DB_PATH` 默认空 = 模块关闭，
   引擎继续 PR2 进程内 ring buffer。启用后独立 SQLite memory.db，WAL，版本化增量
@@ -943,7 +945,8 @@ ephemeral 不在 AS 注册里开启，忽略。
   回复）经 isolation.build_untrusted_segment 包裹，每条最多 8000 Unicode 码点，注记
   layer / time / trust，全部进入不可信数据区，永不进入 system。日志不含记忆正文、
   消息正文、原始 txn ID、token 或密钥。PR3a SummaryProvider / VectorRecall 可插拔接口
-  默认返回空，不建摘要 / 向量数据。当前真人输入另外隔离追加，不计入历史召回预算，
+  由 PR3b 接入真实摘要及向量召回，④每次同 scope 最多扫描 500 条，返回 top-5，并与原文及摘要去重。
+  向量查询预算不足或失败时跳过该层，继续真人回复。当前真人输入另外隔离追加，不计入历史召回预算，
   但完整提示词和预留回复均参与既有 token 预算预检。记忆 DB 读写错误延后事件，不回退房间 ring buffer。
   连续记忆 DB 瞬态失败按 30 秒倍增、上限 1 小时重试，不消耗 attempts；完整记忆操作成功后重置连续计数。
   引擎 stats 暴露 `memory_db_unavailable_consecutive`，每次连续失败达到 5 时增加
@@ -964,8 +967,8 @@ ephemeral 不在 AS 注册里开启，忽略。
   不豁免撤回。主人删除条目时为 event_id、删除事实时为其来源事件写永久墓碑，
   主人墓碑不随保留期清理，防止重放复活；set-fact 的 counterpart 必须是格式合法的
   本服真人 ID（域名与 GATEWAY_MATRIX_SERVER_NAME 大小写不敏感相等，localpart 不以 ai_ 开头）。
-  PR3a 实现①、③、墓碑；PR3b 补② dirty 重算和④删除。
-- **R10 Trust（PR3a；④ PR3b）**：任何入站文本都可进①（及未来④）并携带 trust，
+  PR3a 实现①、③、墓碑；PR3b 已补② dirty 重算和④删除（含主人删除、保留清理）。
+- **R10 Trust（PR3a；④ PR3b 已实现）**：任何入站文本都可进①及已配置的④并携带 trust，
   召回始终放数据区；③只来自 trusted 本服发送者。引擎成功发送后立即标记发言去重键，
   再尽力将自身回复记录到①；写入失败仅增加 `memory_write_errors` 并记录异常类型名，
   不抛出异常或触发重发。回执缺少 `matrix_event_id` 时使用稳定的 `spk:` + 发言幂等键，
@@ -973,8 +976,9 @@ ephemeral 不在 AS 注册里开启，忽略。
   `memory_write_errors` 在引擎 stats 可见；接受的取舍是已标记发送后的记忆写入失败，
   该条助手记忆永久缺失，重放不会补写。当前不回填 `spk:` 占位的真实 event_id；
   若回执缺 ID，后续对真实 Matrix 事件的撤回无法匹配该占位记忆，需主人删除或到期清理。
-- **R11 空闲 worker（PR3b）**：独立 daemon 线程，与消费者共享空闲信号，遵守 §1.7.4
-  单进程假设；模型 / embedding 瞬态失败退避，每轮有最大批量。
+- **R11 空闲 worker（PR3b，已实现）**：独立 daemon 线程 `memory-idle-worker`，与消费者共享
+  注入时钟的活动信号，遵守 §1.7.4 单进程假设；模型 / embedding / memory DB 瞬态失败从 30 秒
+  指数退避、上限 1 小时，每轮最多 8 个 scope；端口绑定后才启动，关闭时 join。
 - **R12 拆分顺序**：PR3a 为本 PR（存储、档案规则、隔离召回、主人内部 API/CLI、接线及
   保留清理）；PR3b 为摘要、向量、空闲批处理；PR3c 为需批准 YAML 的主人 HTTP 端点。
   每个 PR 在前一个合并后再开。
@@ -983,8 +987,13 @@ ephemeral 不在 AS 注册里开启，忽略。
   摘要和抽取输入中的外服内容放不可信数据区；从不可信内容产生的摘要本身仍为不可信
   输出，永不替代或进入 system。外服内容可供摘要，但不得成为③档案抽取来源。
 
-PR3a 仅解析 R6 的三个新环境变量；R1、R2、R5 的环境变量均为 PR3b 计划，当前设置
-不启用摘要、embedding 或向量检索。不增加 HTTP 端点、/v1 字段、状态码、错误码或 OpenAPI。
+PR3b 解析 R1/R2/R5 配置并在记忆启用且模型或 embedding 已配置时启动整理；不增加 HTTP 端点、
+/v1 字段、状态码、错误码或 OpenAPI。摘要、抽取、embedding 均先走内部 `memory` 策略裁决及
+token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，但计入 token window。为真人回复
+保留有效 token-window cap 的 20%，裁决 block/defer（含静默）时延后整理。现有策略只有滑动
+窗口 token cap，因此复用该窗口而不新增每日限额。每次模型调用预留 2048 输出 tokens，并以
+`max_tokens=2048` 限制生成；输入及预留在调用前原子记账，失败时因远端用量未知仍保留保守扣账。
+运行中的请求完成后才关闭 worker；新事务到达后不再发起下一次整理调用。
 
 **⑪ 主动发言（不入本 PR）**
 
@@ -1617,6 +1626,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 ### 5.5 Changelog
 
 | 版本 | 日期 | 变更 |
+| 0.1.0 | 2026-11-13 | [B 线 PR3b memory-idle，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 实现空闲批处理滚动摘要、可信本服人类事实抽取、embedding 与 scope 隔离向量召回；memory-idle-worker 在端口绑定后启动，真人回复优先，内部 memory token 用量照常计入预算而不暴露新 /v1 枚举。新增 summaries/vectors 加法迁移、撤回 dirty 重算及 sqlite-vec 回退；/v1 服务端 token floor 现将 CJK 按约 1 token/字估算（字段/状态无变化）。 |
 |---|---|---|
 | 0.1.0 | 2026-11-13 | [B 线 #205 nits，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 主人删除永久墓碑、记忆读取失败延后、DB 指数退避与告警计数、本服真人 counterpart 校验、旧库权限收紧、召回 SQL 上限、CJK token 估算及并发单行 schema 迁移；明确助手记忆尽力写入与 spk 占位撤回限制。 |
 | 0.1.0 | 2026-11-13 | [B 线 PR3a memory，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] B2.6 可选 SQLite 记忆基础：①持久化对话、③档案规则、scope 隔离与预算召回、主人内部 Python API / CLI、owner_user_id 校验、撤回墓碑及保留清理；三个 memory 配置默认关闭并保持 PR2 ring buffer。⑩写明完整批准规则及 PR3b 摘要/向量/空闲整理、PR3c HTTP 边界；无热路径模型抽取，不改 compose。 |
@@ -1727,7 +1737,8 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
   （防刷屏冷却未结束，code: `anti_spam.cooldown`）、`ai_loop.per_hour`（同会话任意 AI 互聊
   达到 `max_ai_messages_per_hour`，code: `ai_loop.tripped`）、`message.length`（正文长度超过
   owner/peer 分层 `max_message_chars`，code: `message.length`）。熔断语义见 [§6.3](#63-熔断语义b22)。
-- **token 预算**：评估时按 `token_estimate`（缺省按正文长度估算）**预扣**，
+- **token 预算**：评估时按 `token_estimate`（缺省按正文长度估算：CJK 汉字、假名、韩文、
+  全角与 CJK 标点约每字 1 token，其余按字符数除以 4）**预扣**，
   投递成功后实际入账（`usage_delta.tokens_out`）。计量取
   `max(token_estimate, estimate_tokens(content))`（B3）：客户端给的值只是**下限**，
   不能低于按正文的估算，否则 `token_estimate: 0` 能绕过预算（`tokens_per_window: 0`

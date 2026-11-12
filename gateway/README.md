@@ -306,6 +306,12 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_MEMORY_DB_PATH` | 空 | 可选记忆 SQLite 路径；空 = 关闭，继续 ring buffer；新库 0600、WAL，备份敏感 |
 | `GATEWAY_MEMORY_RETENTION_DAYS` | `90` | 保留天数 ≥1；pinned 不到期，撤回仍删除 |
 | `GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS` | `86400` | 启动清理及后台间隔（秒）；0 关闭清理，非零 ≥60；模块关闭也校验 |
+| `GATEWAY_MEMORY_SUMMARY_MODEL` | `GATEWAY_MODEL_NAME` | 空闲滚动摘要/事实抽取所用模型名；空时复用聊天模型名。仅模型已配置时启用这些整理任务 |
+| `GATEWAY_EMBEDDING_BASE_URL` | `GATEWAY_MODEL_BASE_URL` | OpenAI 兼容 embeddings 基址；embedding 模型已配置但有效基址为空，拒绝启动 |
+| `GATEWAY_EMBEDDING_MODEL` | 空 | embedding 模型名；空 = 第④层向量检索关闭 |
+| `GATEWAY_EMBEDDING_API_KEY` | `GATEWAY_MODEL_API_KEY` | 可选 embedding 密钥；空时复用聊天模型密钥；不进日志、`/health`、错误体或 `repr` |
+| `GATEWAY_EMBEDDING_DIM` | `0` | `0` 接受首个响应维度并固定；正整数要求响应维度匹配；负数拒绝启动 |
+| `GATEWAY_MEMORY_VECTOR_BACKEND` | `python` | `none`、`python` 或 `sqlite-vec`；后者无法加载时静默回退 Python，仅 embedding 已配置时有效 |
 | `GATEWAY_PERSONAS_FILE` | 空 | 只读人设 JSON（B2.4，契约 §1.7.8 ②）。空 = 无人设 → 内置引擎**永不发言**（消费者仍记录/计数）。启动期校验 schema / 本服 `@ai_*` / `credential_ref` 形状 / `max_reply_chars` 范围，非法**拒绝启动**（错误信息不回显文件内容）。示例见 [`examples/personas.example.json`](examples/personas.example.json)；**真实人设不进仓库** |
 | `GATEWAY_MODEL_BASE_URL` | 空 | OpenAI 兼容模型基址（B2.4，契约 §1.7.8 ⑫）。空 = **未配置模型**：引擎不发言、`/health` 不 degraded。非空时必须是 `http://` / `https://` URL。请求形如 `POST {BASE_URL}/chat/completions` |
 | `GATEWAY_MODEL_NAME` | 空 | 模型名。配置了 `GATEWAY_MODEL_BASE_URL` 时**必填**，否则拒绝启动。人设可用 `model` 字段覆盖 |
@@ -318,7 +324,7 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 `.env.example` 只是占位，本雏形**不读取 `.env` 文件**（避免引入 python-dotenv）；
 由部署侧注入环境变量。
 
-### 可选持久化记忆（B2.6 PR3a）
+### 可选持久化记忆（B2.6 PR3a / PR3b）
 
 设置 `GATEWAY_MEMORY_DB_PATH` 启用持久化最近对话与档案；空则保留 PR2 ring buffer。
 保留期默认 90 天，清理间隔默认 86400 秒（0 关闭清理）。记忆按 persona 与 DM 对象 /
@@ -340,14 +346,17 @@ set-fact 另需 `--value`，可用 `--visibility shared` 显式共享（默认 d
 CLI 是离线管理工具，请在网关停止后使用；单进程部署假设同 AS 消费者。
 完整规则见 [contract.md §1.7.8 ⑩](docs/contract.md)。
 
-Schema 版本表为 `memory_schema`；v1 建立 `memory_items`、`memory_facts`、
-`memory_tombstones`，v2 增量加入条目的显式 visibility 及清理索引，重复打开幂等。
-摘要、向量表尚未创建。撤回按事件全局删除各 persona 副本，墓碑也按保留期清理。
+Schema 版本表为 `memory_schema`；已有 v1/v2 后的加法迁移建立 `memory_summaries` 与
+`memory_vectors`。摘要按 DM 对象或群房间分区；撤回、主人删除和保留清理会删除向量，并把覆盖
+该事件的摘要标为 dirty，以剩余条目重算。墓碑也按保留期清理。
 当前真人输入另作隔离段附在召回之后，不挤占 2000-token 历史预算；完整提示词仍参与
 既有策略预算预检。记忆读写失败会重试，不回退到可能混合作用域的房间历史。
 
-PR3a 不在回复热路径调用档案抽取模型；自动抽取、摘要、向量和空闲 worker 留 PR3b。
-无 embedding 不影响 health。未来 embedding 若复用模型端点与密钥，**DM 原文将发送到
+PR3b 仍不在回复热路径调用档案抽取模型：独立 `memory-idle-worker` 仅在消费者 120 秒没有
+新事务、且消费者无待处理事务时整理，每轮最多 8 个 scope；瞬态模型、embedding 或 memory DB
+错误从 30 秒指数退避到 1 小时。整理先走内部 `memory` 策略评估并记录 token 用量；该内部事件
+不出现在公开事件列表，仍计入 token 窗口。为真人回复保留有效 token-window 上限的 20%，quiet
+hours 或 block/defer 时静默延期。无 embedding 不影响 health。embedding 若复用模型端点与密钥，**DM 原文将发送到
 同一个模型提供方**；当前启用模型回复时，召回的 DM 内容也随上下文发送给配置的模型
 提供方。PR3c 才增加主人 HTTP 端点，需先获总管批准。Compose 透传由 A 线后续完成。
 

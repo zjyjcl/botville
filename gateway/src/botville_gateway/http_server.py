@@ -1299,6 +1299,12 @@ class GatewayServer(http.server.ThreadingHTTPServer):
             self.memory_purger = MemoryPurger(
                 self.memory_store, config.memory_purge_interval_seconds
             )
+        self.memory_worker = None
+        self.memory_idle = None
+        self.memory_embedding = None
+        self.memory_vectors = None
+        self.memory_vector_stats = {}
+        self._build_memory_worker(config, service)
         # B 线 PR1（contract §1.7.8）：进程内 AS 事务消费者。
         # GATEWAY_CONSUMER_ENABLED=false（默认）时不起线程、不唤醒，行为与现在完全一致。
         # 开启但 as_txn_db_path 未配置时打 warning 且不起线程（不拒绝启动）。
@@ -1357,7 +1363,11 @@ class GatewayServer(http.server.ThreadingHTTPServer):
                     dedupe=None if hooks else PersistentSpeechDedupe(self.as_txn_store),
                 )
                 # 注册唤醒钩子：事务落库成功后立即唤醒消费线程。
-                self.as_txn_store.set_on_new_transaction(consumer.wake)
+                def wake_consumers():
+                    if self.memory_idle is not None:
+                        self.memory_idle.notify()
+                    consumer.wake()
+                self.as_txn_store.set_on_new_transaction(wake_consumers)
                 self.as_consumer = consumer
         log_startup_warnings(config)
         super().__init__((config.host, config.port), GatewayHandler)
@@ -1366,6 +1376,43 @@ class GatewayServer(http.server.ThreadingHTTPServer):
             self.as_consumer.start()
         if self.memory_purger is not None:
             self.memory_purger.start()
+        if self.memory_worker is not None:
+            self.memory_worker.start()
+
+    def _build_memory_worker(self, config, service):
+        if self.memory_store is None:
+            return
+        from .memory.worker import IdleSignal, MemoryIdleWorker
+        from .memory.embedding import EmbeddingClient, EmbeddingConfig
+        from .memory.vector import build_vector_store
+        model_config = ModelConfig(
+            base_url=(config.model_base_url or '').rstrip('/'),
+            model=config.model_name or '', _api_key=config.model_api_key,
+            timeout_seconds=config.model_timeout_seconds)
+        embedding_config = EmbeddingConfig(
+            base_url=(config.embedding_base_url or config.model_base_url or '').rstrip('/'),
+            model=config.embedding_model or '', dim=config.embedding_dim,
+            _api_key=config.embedding_api_key or config.model_api_key)
+        if not model_config.configured and not embedding_config.configured:
+            return
+        personas = load_personas(config.personas_file, server_name=config.matrix_server_name,
+                                 max_message_chars=config.max_message_chars)
+        self.memory_idle = IdleSignal(pending=lambda: bool(
+            self.as_txn_store is not None and
+            self.as_txn_store.oldest_unprocessed_received_at() is not None))
+        if self.as_txn_store is not None:
+            self.as_txn_store.set_on_new_transaction(self.memory_idle.notify)
+        if embedding_config.configured and config.memory_vector_backend != 'none':
+            self.memory_embedding = EmbeddingClient(
+                embedding_config, timeout_seconds=config.model_timeout_seconds)
+            self.memory_vectors = build_vector_store(self.memory_store, config.memory_vector_backend,
+                                                          stats=self.memory_vector_stats)
+        self.memory_worker = MemoryIdleWorker(
+            self.memory_store, service, personas, idle_signal=self.memory_idle,
+            model_client=ModelClient(model_config) if model_config.configured else None,
+            summary_model=config.memory_summary_model or config.model_name or '',
+            embedding=self.memory_embedding, vectors=self.memory_vectors,
+            server_name=config.matrix_server_name or '')
 
     def _build_engine_hooks(
         self, config: Config, service: GatewayService
@@ -1417,6 +1464,8 @@ class GatewayServer(http.server.ThreadingHTTPServer):
             service=service,
             dedupe=PersistentSpeechDedupe(self.as_txn_store),
             memory_store=self.memory_store,
+            memory_embedding=self.memory_embedding,
+            memory_vectors=self.memory_vectors,
         )
 
     def server_close(self) -> None:
@@ -1431,6 +1480,9 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         store = getattr(self, "as_txn_store", None)
         if store is not None:
             store.stop_purge_scheduler()
+        memory_worker = getattr(self, "memory_worker", None)
+        if memory_worker is not None:
+            memory_worker.stop()
         memory_purger = getattr(self, "memory_purger", None)
         if memory_purger is not None:
             memory_purger.stop()

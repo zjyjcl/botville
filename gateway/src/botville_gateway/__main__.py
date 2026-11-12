@@ -104,6 +104,13 @@ def main(argv=None) -> int:
             "  (AS consumer: enabled — the built-in engine speaks via "
             "policy evaluate -> model -> send for the configured personas)"
         )
+    if getattr(server, 'memory_worker', None) is None:
+        print("  (memory idle worker: disabled)")
+    else:
+        print(
+            "  (memory idle worker: enabled; idle 120s, bounded rounds; "
+            f"vector backend={config.memory_vector_backend}, dimension={config.embedding_dim})"
+        )
     print(f"transport: {type(transport).__name__} (GATEWAY_MATRIX_TRANSPORT={config.matrix_transport})")
     try:
         server.serve_forever()
