@@ -15,7 +15,7 @@ from botville_gateway.as_consumer import TransientUnavailable
 from botville_gateway.engine.model_client import ModelError
 from botville_gateway.memory.embedding import EmbeddingClient, EmbeddingConfig
 from botville_gateway.memory.store import MemoryStore
-from botville_gateway.memory.vector import PythonVectorStore, build_vector_store
+from botville_gateway.memory.vector import PythonVectorStore, SqliteVecStore, build_vector_store
 
 
 class _Server(BaseHTTPRequestHandler):
@@ -110,6 +110,24 @@ class VectorTests(unittest.TestCase):
         self.assertEqual([row['text'] for row in rows], ['new','middle'])
         self.assertAlmostEqual(rows[0]['score'], 2**-0.5)
         self.assertNotIn(ids[0], [row['item_id'] for row in rows])
+
+    def test_sqlite_vec_searches_entire_scope_not_portable_scan_limit(self):
+        # Exercise the optional SQL path without an extension: this minimal
+        # deterministic function makes the oldest exact vector rank first.
+        self.memory._db.create_function('vec_distance_cosine', 2,
+                                        lambda left, right: 0.0 if left == right else 1.0)
+        old = self.item('old-best', 'old-best')
+        self.vectors.upsert(persona_id='p', scope_kind='dm', scope_key='u', item_id=old,
+                            model='m', vector=[1, 0])
+        for number in range(500):
+            item = self.item('new-%d' % number, 'new')
+            self.vectors.upsert(persona_id='p', scope_kind='dm', scope_key='u', item_id=item,
+                                model='m', vector=[0, 1])
+        vectors = object.__new__(SqliteVecStore)
+        vectors.store, vectors.scan_limit = self.memory, 2
+        rows = vectors.search(persona_id='p', scope_kind='dm', scope_key='u',
+                              query_vec=[1, 0], model='m', dim=2, k=1)
+        self.assertEqual([old], [row['item_id'] for row in rows])
 
     def test_dirty_summary_removes_summary_vector(self):
         item = self.item('event', 'source')

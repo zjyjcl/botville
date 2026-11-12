@@ -114,7 +114,7 @@ class StoreNits(unittest.TestCase):
             try:
                 for name in (path, path+'-wal', path+'-shm'):
                     self.assertEqual(os.stat(name).st_mode & 0o777, 0o600)
-                self.assertEqual([tuple(r) for r in second._db.execute('SELECT * FROM memory_schema')], [(1, 3)])
+                self.assertEqual([tuple(r) for r in second._db.execute('SELECT * FROM memory_schema')], [(1, 4)])
                 with self.assertRaises(sqlite3.IntegrityError):
                     second._db.execute('INSERT INTO memory_schema VALUES(2,2)')
                 second._db.rollback()

@@ -53,7 +53,7 @@ class MemoryStoreTests(unittest.TestCase):
             store = MemoryStore(path)
             self.assertEqual(store.facts("p", "u")[0]["value"], "saved")
             self.assertEqual(store.facts("p", "u")[0]["visibility"], "dm_only")
-            self.assertEqual(store._db.execute("SELECT version FROM memory_schema").fetchone()[0], 3)
+            self.assertEqual(store._db.execute("SELECT version FROM memory_schema").fetchone()[0], 4)
 
     def test_retention_pinned_and_tombstone_expiry(self):
         store = MemoryStore(":memory:", retention_days=1)

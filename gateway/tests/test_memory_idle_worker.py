@@ -21,7 +21,7 @@ class Clock:
 
 class Service:
     def __init__(self): self.calls = []
-    def authorize_memory_call(self, persona_id, estimate): self.calls.append((persona_id, estimate)); return True
+    def authorize_memory_call(self, persona_id, estimate, **kwargs): self.calls.append((persona_id, estimate)); return True
     def record_memory_usage(self, **kwargs): pass
 
 class Client:

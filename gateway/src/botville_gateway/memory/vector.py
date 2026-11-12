@@ -30,6 +30,12 @@ def _values(blob: bytes) -> array:
 
 
 class PythonVectorStore:
+    """Portable cosine store scanning only the newest N (default 500) scope rows.
+
+    The bounded scan is recency based, never a preselected "most relevant"
+    set: pure Python has no index for that ranking.  sqlite-vec may search the
+    complete scoped corpus once its native index is in use.
+    """
     def __init__(self, store: MemoryStore, scan_limit: int = VECTOR_SCAN_LIMIT) -> None:
         self.store, self.scan_limit = store, scan_limit
         with store._lock, store._db:
@@ -133,7 +139,12 @@ class PythonVectorStore:
 
 
 class SqliteVecStore(PythonVectorStore):
-    """Best-effort optional accelerator. Extension absence is deliberately invisible."""
+    """Best-effort optional accelerator which searches every row in a scope.
+
+    Unlike :class:`PythonVectorStore`, sqlite-vec ranks the complete scoped
+    corpus in SQL; ``scan_limit`` exists only for compatibility and for its
+    portable fallback.  Extension absence is deliberately invisible.
+    """
     def __init__(self, store: MemoryStore, scan_limit: int = VECTOR_SCAN_LIMIT) -> None:
         try:
             with store._lock:
@@ -156,22 +167,21 @@ class SqliteVecStore(PythonVectorStore):
         if not query:
             return []
         try:
-            conditions = ['persona_id=?', 'scope_kind=?', 'scope_key=?']
+            conditions = ['memory_vectors.persona_id=?', 'memory_vectors.scope_kind=?', 'memory_vectors.scope_key=?']
             args: List[Any] = [kwargs['persona_id'], kwargs['scope_kind'], kwargs['scope_key']]
             if kwargs.get('model'):
-                conditions.append('model=?'); args.append(kwargs['model'])
+                conditions.append('memory_vectors.model=?'); args.append(kwargs['model'])
             if kwargs.get('dim'):
-                conditions.append('dim=?'); args.append(kwargs['dim'])
-            args.extend([self.scan_limit, _blob(query), kwargs.get('k', VECTOR_TOP_K)])
+                conditions.append('memory_vectors.dim=?'); args.append(kwargs['dim'])
+            args = [_blob(query)] + args + [kwargs.get('k', VECTOR_TOP_K)]
             with self.store._lock:
-                rows = self.store._db.execute('''WITH bounded AS (
-                    SELECT * FROM memory_vectors WHERE ''' + ' AND '.join(conditions) + ''' ORDER BY id DESC LIMIT ?)
-                    SELECT bounded.*, memory_items.text AS item_text, memory_items.trust AS item_trust,
+                rows = self.store._db.execute('''SELECT memory_vectors.*, memory_items.text AS item_text, memory_items.trust AS item_trust,
                     memory_items.created_at AS item_created_at, memory_summaries.text AS summary_text,
                     memory_summaries.trust AS summary_trust, memory_summaries.updated_at AS summary_updated_at,
-                    vec_distance_cosine(bounded.vec, ?) AS distance
-                    FROM bounded LEFT JOIN memory_items ON memory_items.id=bounded.item_id
-                    LEFT JOIN memory_summaries ON memory_summaries.id=bounded.summary_id AND memory_summaries.dirty=0
+                    vec_distance_cosine(memory_vectors.vec, ?) AS distance
+                    FROM memory_vectors LEFT JOIN memory_items ON memory_items.id=memory_vectors.item_id
+                    LEFT JOIN memory_summaries ON memory_summaries.id=memory_vectors.summary_id AND memory_summaries.dirty=0
+                    WHERE ''' + ' AND '.join(conditions) + '''
                     ORDER BY distance LIMIT ?''', args).fetchall()
             return [dict(row, text=row['item_text'] or row['summary_text'] or '',
                          trust=row['item_trust'] or row['summary_trust'] or 'untrusted',

@@ -41,28 +41,30 @@ class IdleSignal:
 
 
 class BudgetedModel:
-    def __init__(self, client, service, persona_id, ready=lambda: True):
+    def __init__(self, client, service, persona_id, ready=lambda: True, conversation_id=None):
         self.client, self.service, self.persona_id, self.ready = client, service, persona_id, ready
         self.config = client.config
+        self.usage_scope = {} if conversation_id is None else {"conversation_id": conversation_id}
 
     def complete(self, **kwargs):
         from ..engine.engine import estimate_tokens
         estimate = (estimate_tokens(kwargs['system_text']) +
                     sum(estimate_tokens(m['content']) for m in kwargs['messages']) +
                     MEMORY_OUTPUT_RESERVE)
-        if not self.ready() or not self.service.authorize_memory_call(self.persona_id, estimate):
+        if not self.ready() or not self.service.authorize_memory_call(self.persona_id, estimate, **self.usage_scope):
             raise MemoryDeferred()
         result = self.client.complete(**kwargs, max_tokens=MEMORY_OUTPUT_RESERVE)
         extra = estimate_tokens(result) - MEMORY_OUTPUT_RESERVE
         if extra > 0:
-            self.service.record_memory_usage(persona_id=self.persona_id, tokens=extra)
+            self.service.record_memory_usage(persona_id=self.persona_id, tokens=extra, **self.usage_scope)
         return result
 
 
-def budgeted_embed(client, service, persona_id, text, *, ready=lambda: True):
+def budgeted_embed(client, service, persona_id, text, *, ready=lambda: True, conversation_id=None):
     from ..engine.engine import estimate_tokens
     estimate = estimate_tokens(text) + 32
-    if not ready() or not service.authorize_memory_call(persona_id, estimate):
+    usage_scope = {} if conversation_id is None else {"conversation_id": conversation_id}
+    if not ready() or not service.authorize_memory_call(persona_id, estimate, **usage_scope):
         raise MemoryDeferred()
     return client.embed(text)
 
@@ -80,6 +82,7 @@ class MemoryIdleWorker:
         self._thread = None
         self._cursor = ('', '', '')
         self._failures, self._retry_at = 0, 0.0
+        self._scope_backoff = {}
 
     def ready(self):
         return not self._stop.is_set() and self.idle_signal.idle()
@@ -120,6 +123,10 @@ class MemoryIdleWorker:
                 if not self.ready():
                     break
                 next_cursor = tuple(scope[k] for k in ('persona_id', 'scope_kind', 'scope_key'))
+                failures, retry_at = self._scope_backoff.get(next_cursor, (0, 0.0))
+                if self.clock() < retry_at:
+                    self._cursor = next_cursor
+                    continue
                 persona = self.personas.get(scope['persona_id'])
                 if persona is None:
                     self._cursor = next_cursor
@@ -127,8 +134,16 @@ class MemoryIdleWorker:
                 count += 1
                 try:
                     self._process_scope(scope, persona)
+                    self._scope_backoff.pop(next_cursor, None)
+                except (TransientUnavailable, sqlite3.Error, OSError):
+                    raise
                 except MemoryDeferred:
                     self.stats.inc('deferred')
+                except Exception:
+                    failures += 1
+                    self._scope_backoff[next_cursor] = (failures, self.clock() +
+                        min(3600, 30 * 2 ** min(failures - 1, 7)))
+                    self.stats.inc('permanent_failures')
                 self._cursor = next_cursor
             self._failures = 0
             self.stats.inc('rounds')
@@ -142,9 +157,20 @@ class MemoryIdleWorker:
             self.stats.inc('permanent_failures')
         return count
 
+    def _conversation_id(self, scope):
+        if scope['scope_kind'] == 'group':
+            return scope['scope_key']
+        with self.store._lock:
+            row = self.store._db.execute('''SELECT room_id FROM memory_items
+                WHERE persona_id=? AND scope_kind=? AND scope_key=?
+                  AND room_id IS NOT NULL ORDER BY id DESC LIMIT 1''',
+                (scope['persona_id'], scope['scope_kind'], scope['scope_key'])).fetchone()
+        return row['room_id'] if row else None
+
     def _process_scope(self, scope, persona):
         if self.model_client is not None:
-            model = BudgetedModel(self.model_client, self.service, scope['persona_id'], self.ready)
+            model = BudgetedModel(self.model_client, self.service, scope['persona_id'], self.ready,
+                                  conversation_id=self._conversation_id(scope))
             generate_summary(self.store, model, **scope, model=self.summary_model, persona=persona)
             with self.store._lock:
                 items = [dict(row) for row in self.store._db.execute('''SELECT * FROM memory_items
@@ -176,7 +202,7 @@ class MemoryIdleWorker:
                 ORDER BY i.id LIMIT ?''', (*scope.values(), model, dim, dim, MEMORY_ITEMS_PER_SCOPE))]
         for item in items:
             vector = budgeted_embed(self.embedding, self.service, scope['persona_id'],
-                                    item['text'], ready=self.ready)
+                                    item['text'], ready=self.ready, conversation_id=self._conversation_id(scope))
             self.vectors.upsert(**scope, item_id=item['id'], vector=vector, model=model,
                                 expected_text=item['text'])
         summary = self.store.summary(**scope)
@@ -187,7 +213,7 @@ class MemoryIdleWorker:
                     (summary['id'], model, self.embedding.dimension)).fetchone()
             if row is None:
                 vector = budgeted_embed(self.embedding, self.service, scope['persona_id'],
-                                        summary['text'], ready=self.ready)
+                                        summary['text'], ready=self.ready, conversation_id=self._conversation_id(scope))
                 # The vector store checks live source metadata before insertion.
                 self.vectors.upsert(**scope, summary_id=summary['id'], vector=vector, model=model,
                                     expected_text=summary['text'])

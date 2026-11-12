@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 MEMORY_PURGE_INTERVAL_MIN_SECONDS = 60
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _log = logging.getLogger(__name__)
 
 
@@ -86,6 +86,10 @@ _MIGRATIONS = {
            BEGIN DELETE FROM memory_vectors WHERE summary_id=OLD.id; END''',
         '''CREATE TRIGGER IF NOT EXISTS memory_vectors_summary_update AFTER UPDATE ON memory_summaries
            BEGIN DELETE FROM memory_vectors WHERE summary_id=OLD.id; END''',
+    ),
+    4: (
+        "UPDATE memory_facts SET trust='owner' WHERE source='owner'",
+        "UPDATE memory_facts SET trust='derived' WHERE source='extraction'",
     ),
 }
 
@@ -336,9 +340,12 @@ class MemoryStore:
         from .profile import FACT_KEYS
 
         if (key not in FACT_KEYS or visibility not in ('dm_only', 'shared')
-                or source not in ('owner', 'extraction') or trust != 'trusted'
+                or source not in ('owner', 'extraction')
+                or trust not in ('trusted', 'owner', 'derived')
                 or not isinstance(value, str) or not value or not persona_id or not counterpart):
             raise ValueError('invalid memory fact')
+        # Provenance determines trust; legacy callers may still pass trusted.
+        trust = 'owner' if source == 'owner' else 'derived'
         ids = list(dict.fromkeys(source_event_ids or []))
         if any(not isinstance(event, str) or not event for event in ids):
             raise ValueError('invalid memory fact source')

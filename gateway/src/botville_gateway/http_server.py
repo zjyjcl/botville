@@ -30,6 +30,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import hmac
 import http.server
 import json
@@ -1399,7 +1401,7 @@ class GatewayServer(http.server.ThreadingHTTPServer):
                                  max_message_chars=config.max_message_chars)
         self.memory_idle = IdleSignal(pending=lambda: bool(
             self.as_txn_store is not None and
-            self.as_txn_store.oldest_unprocessed_received_at() is not None))
+            self.as_txn_store.has_processable_transactions(datetime.now(timezone.utc))))
         if self.as_txn_store is not None:
             self.as_txn_store.set_on_new_transaction(self.memory_idle.notify)
         if embedding_config.configured and config.memory_vector_backend != 'none':

@@ -906,15 +906,22 @@ PR3c 的 HTTP 主人端点当前不启用。
   接受第一条返回维度并固定；正整数要求匹配）。
   无 embedding 模型时降级为① + ② + ③ + pinned，/health 不 degraded。
   模型或维度改变后，旧向量标记待重建，由空闲批处理重建。
-  **当 embedding 复用模型端点和密钥时，DM 原文会发送给同一个模型提供方。**
+
+  > **警告：配置独立 embedding 提供方时，DM 和群聊文本会发送给该 embedding 提供方；
+  > 当 embedding 复用模型端点和密钥时，则发送给同一个模型提供方。**
 - **R2 滚动摘要（PR3b，已实现）**：某会话未摘要原文超过 40 条或 4000 tokens 时排队，
-  仅空闲批处理执行；
-  空闲 = 消费者 120 秒没有新事务且无待处理事务，每批最多 8 个 scope。配置 `GATEWAY_MEMORY_SUMMARY_MODEL`
+  单次输入另以 6000 tokens 封顶；超出时按最早完整条目分块，后续空闲轮次继续推进覆盖水位。
+  单条本身超过该上限时仅输入其有界前缀后推进水位，以避免永久停滞。仅空闲批处理执行；
+  空闲 = 消费者 120 秒没有新事务且无**当前可处理**事务（`next_attempt_at IS NULL OR <= now`，已 failed/purged/processed
+  的行不计），每批最多 8 个 scope。配置 `GATEWAY_MEMORY_SUMMARY_MODEL`
   （空 = `GATEWAY_MODEL_NAME`）。摘要与抽取调用先 evaluate（内部 kind=memory），
   计入该 persona 的 token 预算；blocked、静默或预算不足时延后：真人回复优先，整理延后。
   摘要按对象分别存：DM 为 (persona, counterpart)，群为 (persona, room)。
-- **R3 档案事实（PR3a）**：支持主人显式写入及模型抽取结果应用；模型永不覆盖主人写入
-  或 pinned 事实，其余同 key 后写覆盖。白名单常量限定 name、nickname、birthday、
+- **R3 档案事实（PR3a）**：支持主人显式写入及模型抽取结果应用；主人写入 `trust=owner`，模型抽取
+  `trust=derived`（旧行幂等迁移：`source=owner → owner`、`source=extraction → derived`）；召回时两类
+  事实分别以「主人写入」与「模型抽取」标签成组，但都只在不可信数据区。模型永不覆盖主人写入
+  或 pinned 事实，其余同 key 后写覆盖。可信本地人类写入的指令式文字可以作为档案值保存，
+  但召回时始终位于不可信数据区，绝不进入 system，也绝不作为指令执行。白名单常量限定 name、nickname、birthday、
   likes、dislikes、location、occupation、language、pronouns、notes。
   **无 intimacy / 亲密度字段**（留 B2.8 关系模块）。仅可信本服人类内容可抽取为事实；
   外服 / untrusted 永不进入档案。AI 自己的回复进①，但永不抽取。
@@ -945,10 +952,13 @@ PR3c 的 HTTP 主人端点当前不启用。
   回复）经 isolation.build_untrusted_segment 包裹，每条最多 8000 Unicode 码点，注记
   layer / time / trust，全部进入不可信数据区，永不进入 system。日志不含记忆正文、
   消息正文、原始 txn ID、token 或密钥。PR3a SummaryProvider / VectorRecall 可插拔接口
-  由 PR3b 接入真实摘要及向量召回，④每次同 scope 最多扫描 500 条，返回 top-5，并与原文及摘要去重。
+  由 PR3b 接入真实摘要及向量召回：纯 Python 后端④每次在同 scope 只扫描最新 500 条（按写入
+  顺序，不是先选「最相关」500 条），返回 top-5，并与原文及摘要去重；启用 sqlite-vec 时查询
+  覆盖该 scope 的全部向量。
   向量查询预算不足或失败时跳过该层，继续真人回复。当前真人输入另外隔离追加，不计入历史召回预算，
   但完整提示词和预留回复均参与既有 token 预算预检。记忆 DB 读写错误延后事件，不回退房间 ring buffer。
-  连续记忆 DB 瞬态失败按 30 秒倍增、上限 1 小时重试，不消耗 attempts；完整记忆操作成功后重置连续计数。
+  连续记忆 DB/模型/网络瞬态失败按全局 30 秒倍增、上限 1 小时重试，不消耗 attempts；永久错误仅按
+  (persona, scope) 30 秒倍增、上限 1 小时退避，不阻塞其他 scope；完整记忆操作成功后重置相应计数。
   引擎 stats 暴露 `memory_db_unavailable_consecutive`，每次连续失败达到 5 时增加
   `memory_db_alerts`；达到阈值后 warning 每小时最多一次，仅含异常类型名（进程重启重置这些状态）。
   召回 SQL 按 pinned 优先限取 200 条对话、每对象 100 条事实，最多 100 个对象；
@@ -1626,8 +1636,9 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 ### 5.5 Changelog
 
 | 版本 | 日期 | 变更 |
-| 0.1.0 | 2026-11-13 | [B 线 PR3b memory-idle，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 实现空闲批处理滚动摘要、可信本服人类事实抽取、embedding 与 scope 隔离向量召回；memory-idle-worker 在端口绑定后启动，真人回复优先，内部 memory token 用量照常计入预算而不暴露新 /v1 枚举。新增 summaries/vectors 加法迁移、撤回 dirty 重算及 sqlite-vec 回退；/v1 服务端 token floor 现将 CJK 按约 1 token/字估算（字段/状态无变化）。 |
 |---|---|---|
+| 0.1.0 | 2026-11-13 | [B 线 #207 nits，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 抽取事实标为 derived 并与主人事实分别隔离召回；空闲门忽略尚未到期的 defer 事务；永久错误按 scope 退避而非全局阻塞；摘要输入按 6000 tokens 最早分块滚动；纯 Python 向量仅扫 scope 最新 500 条、sqlite-vec 覆盖全 scope；回复 query embedding 先预留预算；memory usage 归属 persona/会话；补独立 embedding 提供方 DM/群聊文本披露，以及可信本地人类指令式档案值永不执行的边界。 |
+| 0.1.0 | 2026-11-13 | [B 线 PR3b memory-idle，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 实现空闲批处理滚动摘要、可信本服人类事实抽取、embedding 与 scope 隔离向量召回；memory-idle-worker 在端口绑定后启动，真人回复优先，内部 memory token 用量照常计入预算而不暴露新 /v1 枚举。新增 summaries/vectors 加法迁移、撤回 dirty 重算及 sqlite-vec 回退；/v1 服务端 token floor 现将 CJK 按约 1 token/字估算（字段/状态无变化）。 |
 | 0.1.0 | 2026-11-13 | [B 线 #205 nits，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 主人删除永久墓碑、记忆读取失败延后、DB 指数退避与告警计数、本服真人 counterpart 校验、旧库权限收紧、召回 SQL 上限、CJK token 估算及并发单行 schema 迁移；明确助手记忆尽力写入与 spk 占位撤回限制。 |
 | 0.1.0 | 2026-11-13 | [B 线 PR3a memory，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] B2.6 可选 SQLite 记忆基础：①持久化对话、③档案规则、scope 隔离与预算召回、主人内部 Python API / CLI、owner_user_id 校验、撤回墓碑及保留清理；三个 memory 配置默认关闭并保持 PR2 ring buffer。⑩写明完整批准规则及 PR3b 摘要/向量/空闲整理、PR3c HTTP 边界；无热路径模型抽取，不改 compose。 |
 | 0.1.0 | 2026-11-13 | [B 线 #203 复审 nits，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 成员查询增加有界负缓存、全局熔断与 5 秒超时；独立验证 LRU、TTL、拒绝重定向和错误脱敏；静默重放上下文按 event_id 去重；处理时间使用注入时钟；公开只读 persona_ids；补充稳定 HMAC 密钥及重启窗口内模型重复调用和计费限制。 |
