@@ -422,6 +422,29 @@ class TestEngineHooks(unittest.TestCase):
         self.assertEqual(transport.sent[0].sender_id, AI_A)
         self.assertEqual(transport.sent[0].text, "你好！")
 
+    def test_memory_scope_requires_confirmed_strict_dm(self):
+        ctx = self._make_ctx()
+        persona = _make_persona()
+        self.assertEqual(EngineHooks._memory_scope(persona, ctx)[0], "group")
+        strict_dm = ctx.__class__(**dict(ctx.__dict__, room_members_confirmed=True,
+                                         room_is_dm=True, room_ai_user_ids=(AI_A,)))
+        self.assertEqual(EngineHooks._memory_scope(persona, strict_dm)[0], "dm")
+        unconfirmed = ctx.__class__(**dict(strict_dm.__dict__, room_members_confirmed=False))
+        self.assertEqual(EngineHooks._memory_scope(persona, unconfirmed)[0], "group")
+
+    def test_engine_passes_auto_join_only_for_confirmed_dm(self):
+        hooks, _ = self._hooks("ok")
+        hooks._service.send_ai_message = mock.Mock(return_value={
+            "outcome": "sent", "delivery": {"matrix_event_id": "$sent"},
+        })
+        group = self._make_ctx(event_id="$group")
+        hooks.on_human_text(group)
+        self.assertFalse(hooks._service.send_ai_message.call_args.kwargs["allow_auto_join"])
+        dm = group.__class__(**dict(group.__dict__, event_id="$dm", room_members_confirmed=True,
+                                    room_is_dm=True, room_ai_user_ids=(AI_A,)))
+        hooks.on_human_text(dm)
+        self.assertTrue(hooks._service.send_ai_message.call_args.kwargs["allow_auto_join"])
+
     def test_idempotency_key_matches(self):
         hooks, transport = self._hooks("hi")
         ctx = self._make_ctx(event_id="$unique")
@@ -488,7 +511,7 @@ class TestEngineHooks(unittest.TestCase):
             memory_vectors=PythonVectorStore(store))
         ctx = self._make_ctx()
         ctx = ctx.__class__(**dict(ctx.__dict__, room_members_confirmed=True,
-                                   room_ai_user_ids=(AI_A,)))
+                                   room_is_dm=True, room_ai_user_ids=(AI_A,)))
         hooks.on_human_text(ctx)
         embedding.embed.assert_not_called()
         self.assertEqual(transport.sent, [])
@@ -510,7 +533,7 @@ class TestEngineHooks(unittest.TestCase):
             memory_vectors=PythonVectorStore(store))
         ctx = self._make_ctx()
         ctx = ctx.__class__(**dict(ctx.__dict__, room_members_confirmed=True,
-                                   room_ai_user_ids=(AI_A,)))
+                                   room_is_dm=True, room_ai_user_ids=(AI_A,)))
         hooks.on_human_text(ctx)
         embedding.embed.assert_called_once_with('hello')
         self.assertGreater(service.get_usage(persona_id=AI_A)["totals"]["tokens_total"], 0)
@@ -529,7 +552,7 @@ class TestEngineHooks(unittest.TestCase):
             memory_vectors=PythonVectorStore(store))
         ctx = self._make_ctx()
         ctx = ctx.__class__(**dict(ctx.__dict__, room_members_confirmed=True,
-                                   room_ai_user_ids=(AI_A,)))
+                                   room_is_dm=True, room_ai_user_ids=(AI_A,)))
         with self.assertRaises(Exception) as deferred:
             hooks.on_human_text(ctx)
         self.assertEqual(type(deferred.exception).__name__, 'DeferredUntil')
@@ -554,7 +577,7 @@ class TestEngineHooks(unittest.TestCase):
             memory_vectors=PythonVectorStore(store))
         ctx = self._make_ctx()
         ctx = ctx.__class__(**dict(ctx.__dict__, room_members_confirmed=True,
-                                   room_ai_user_ids=(AI_A,)))
+                                   room_is_dm=True, room_ai_user_ids=(AI_A,)))
         hooks.on_human_text(ctx)
         embedding.embed.assert_called_once()
         client._post.assert_not_called()

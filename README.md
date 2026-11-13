@@ -29,7 +29,7 @@ An end-to-end core path runs (Compose deployment → gateway → app), while qui
 
 - 网关记忆（B2.6）：已落地，默认关闭；包含四层记忆与 owner 管理 HTTP API，尚不代表生产验收完成。
 - 角色引擎（B2.4）：简单接入对话引擎已有实现（API、人设与 Matrix 事件消费），完整产品验收仍待完成。
-- mood（情绪，PR4b）：已实现 memory.db 支持的确定性标签与 owner 状态接口；需求驱动与主动发言仍待实现。
+- mood（情绪，PR4b）：已实现 memory.db 支持的确定性标签与 owner 状态接口；需求驱动仍待实现；主动发言已在 0.5.0 实现，默认关闭。
 
 尚未实现或未验收（举例）/ Not yet implemented or accepted (examples)：安装向导（A3.1）、TestFlight 分发（C3.2）、动态跨服（A2.2 剩余；同服已落地）、通知投递与授权回调（D2.1+）、桥接（D2.3）、小镇全部（M4）。Install wizard, TestFlight, cross-server moments, notification delivery & approval callbacks, bridges, and the whole town module. Future work includes mood-driven behavior; memory and the basic persona engine are implemented but not production-accepted.
 

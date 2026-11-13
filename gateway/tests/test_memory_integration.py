@@ -40,7 +40,7 @@ def context(event="$human", text="hello"):
     return ConsumerContext(event_type="message_text", event_id=event, room_id="!dm",
                            sender=HUMAN, trust="trusted", text=text,
                            persona_user_id=AI, target_user_ids=(AI,),
-                           room_ai_user_ids=(AI,), room_members_confirmed=True)
+                           room_ai_user_ids=(AI,), room_members_confirmed=True, room_is_dm=True)
 
 
 class IntegrationTests(unittest.TestCase):
@@ -54,6 +54,15 @@ class IntegrationTests(unittest.TestCase):
         hooks.on_human_text(context())
         self.assertEqual(len(transport.sent), 1)
         self.assertIsNone(hooks._memory_store)
+
+    def test_memory_disabled_ai_text_does_not_create_ring_buffer(self):
+        hooks = EngineHooks(personas={AI: Persona(AI, "brief")},
+            client=ModelClient(ModelConfig("", "", 1)),
+            service=GatewayService(config(), InMemoryMatrixTransport()))
+        hooks.on_ai_text(ConsumerContext(event_type="message_text", event_id="$ai", room_id="!group",
+            sender="@ai_remote:elsewhere.test", trust="untrusted", text="AI text",
+            room_ai_user_ids=(AI,), room_members_confirmed=True, room_is_dm=False))
+        self.assertEqual(len(hooks._buffers), 0)
 
     def test_memory_records_and_recall_is_data_zone(self):
         with tempfile.TemporaryDirectory() as d:
@@ -106,6 +115,35 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(len(store.items(AI, scope_kind="group", scope_key="!group")), 1)
             self.assertEqual(len(store.items(AI_TWO, scope_kind="group", scope_key="!group")), 1)
 
+    def test_other_ai_text_is_untrusted_group_memory_without_self_copy(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = MemoryStore(os.path.join(d, "memory.db"))
+            hooks = EngineHooks(personas={AI: Persona(AI, "x"), AI_TWO: Persona(AI_TWO, "x")},
+                client=ModelClient(ModelConfig("", "", 1)),
+                service=GatewayService(config(), InMemoryMatrixTransport()), memory_store=store)
+            # An external @ai_* is intentionally not a reply trigger, but its
+            # text is useful group context for each local persona.
+            ctx = ConsumerContext(event_type="message_text", event_id="$foreign-ai", room_id="!group",
+                sender="@ai_remote:elsewhere.test", trust="untrusted", text="AI context",
+                room_ai_user_ids=(AI, AI_TWO), room_members_confirmed=True, room_is_dm=False)
+            hooks.on_ai_text(ctx)
+            for persona_id in (AI, AI_TWO):
+                rows = store.items(persona_id, scope_kind="group", scope_key="!group")
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["trust"], "untrusted")
+                self.assertEqual(rows[0]["role"], "assistant")
+                from botville_gateway.memory.recall import assemble_recall
+                recalled = assemble_recall(store, persona_id=persona_id, scope_kind="group",
+                    scope_key="!group", budget=2000)
+                self.assertIn("<untrusted ", recalled[0]["content"])
+
+            own = ConsumerContext(event_type="message_text", event_id="$own", room_id="!group",
+                sender=AI, trust="trusted", text="own reply", room_ai_user_ids=(AI, AI_TWO),
+                room_members_confirmed=True, room_is_dm=False)
+            hooks.on_ai_text(own)
+            self.assertEqual(len(store.items(AI, scope_kind="group", scope_key="!group")), 1)
+            self.assertEqual(len(store.items(AI_TWO, scope_kind="group", scope_key="!group")), 2)
+
     def test_group_recall_uses_only_mentioned_shared_fact(self):
         with tempfile.TemporaryDirectory() as d:
             store = MemoryStore(os.path.join(d, "memory.db"))
@@ -123,6 +161,28 @@ class IntegrationTests(unittest.TestCase):
             hooks.on_human_text(ctx)
             self.assertIn("nickname: M", "".join(m["content"] for m in captured["messages"]))
             self.assertNotIn("nickname: M", captured["system_text"])
+
+    def test_multi_human_group_recall_never_reads_dm_memory(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = MemoryStore(os.path.join(d, "memory.db"))
+            store.add_item(persona_id=AI, scope_kind="dm", scope_key=HUMAN,
+                room_id="!dm", counterpart=HUMAN, event_id="$private", sender=HUMAN,
+                role="user", trust="trusted", text="DM_SECRET")
+            transport = InMemoryMatrixTransport()
+            hooks = EngineHooks(personas={AI: Persona(AI, "system rule")},
+                client=ModelClient(ModelConfig("https://example.invalid", "fake", 1)),
+                service=GatewayService(config(), transport), memory_store=store)
+            captured = {}
+            hooks._client.complete = lambda **kw: (captured.update(kw) or "ok")  # type: ignore[method-assign]
+            # room_is_dm=False represents a confirmed room with this persona
+            # plus multiple local humans; its scope must remain group.
+            ctx = ConsumerContext(event_type="message_text", event_id="$group-human", room_id="!group",
+                sender=HUMAN, trust="trusted", text="group question", target_user_ids=(AI,),
+                persona_user_id=AI, room_ai_user_ids=(AI,), room_members_confirmed=True,
+                room_is_dm=False)
+            hooks.on_human_text(ctx)
+            prompt = "".join(message["content"] for message in captured["messages"])
+            self.assertNotIn("DM_SECRET", prompt)
 
     def test_memory_write_failure_is_retryable_before_dedupe(self):
         class BrokenStore:

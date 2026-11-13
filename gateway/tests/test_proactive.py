@@ -453,6 +453,191 @@ class ProactiveTests(unittest.TestCase):
             'end': '23:59', 'timezone': 'UTC'}}, 'persona')
         self.assertTrue(settings['quiet_hours']['enabled'])
 
+    def test_enabled_without_prerequisites_warns(self):
+        from botville_gateway.http_server import GatewayServer
+        for missing in ('memory', 'model', 'members'):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
+                cfg = replace(self.config, host='127.0.0.1', port=0,
+                    memory_db_path=None if missing == 'memory' else os.path.join(directory, 'memory.db'),
+                    model_base_url=None if missing == 'model' else 'https://model.invalid/v1',
+                    model_name=None if missing == 'model' else 'fake', memory_purge_interval_seconds=0)
+                transport = InMemoryMatrixTransport()
+                if missing != 'members':
+                    transport.joined_members = lambda *_: ()
+                with self.assertLogs('botville_gateway.http_server', level='WARNING') as logs:
+                    server = GatewayServer(cfg, GatewayService(cfg, transport), transport)
+                try:
+                    self.assertIsNone(server.proactive_worker)
+                    self.assertEqual([r.getMessage() for r in logs.records],
+                        ['Proactive inactive: requires memory DB, model and membership transport'])
+                finally:
+                    server.server_close()
+
+    def test_quiet_hours_cross_midnight_with_timezone(self):
+        from zoneinfo import ZoneInfo
+        persona = replace(self.persona, proactive={**self.persona.proactive,
+            'quiet_hours': {'enabled': True, 'start': '22:00', 'end': '07:00',
+                            'timezone': 'Asia/Shanghai'}})
+        self.worker.personas = {persona.user_id: persona}
+        self.contact(age=2880)
+        for hour, minute, expected in ((23, 30, 0), (6, 59, 0), (7, 0, 1), (21, 59, 1)):
+            with self.subTest(hour=hour, minute=minute):
+                self.worker._write('DELETE FROM proactive_queue')
+                self.clock.now = datetime(2026, 11, 13, hour, minute,
+                    tzinfo=ZoneInfo('Asia/Shanghai')).astimezone(timezone.utc)
+                self.assertEqual(self.worker.run_once(), expected)
+
+    def test_missing_owner_log_throttled_and_bounded(self):
+        logger = 'botville_gateway.proactive'
+        with self.assertLogs(logger, level='INFO') as logs:
+            self.worker.run_once()
+            self.worker.run_once()
+            self.clock.now += timedelta(hours=24) - timedelta(seconds=1)
+            self.worker.run_once()
+        self.assertEqual([r.getMessage() for r in logs.records],
+                         ['Proactive owner skipped: no confirmed existing DM'])
+        self.clock.now += timedelta(seconds=1)
+        with self.assertLogs(logger, level='INFO'):
+            self.worker.run_once()
+        with patch('botville_gateway.proactive.OWNER_LOG_MAX_ENTRIES', 2):
+            for number in range(10):
+                list(self.worker.candidates(replace(self.persona,
+                    owner_user_id=f'@owner{number}:example.test'), self.clock.now))
+            self.assertEqual(len(self.worker._owner_log_times), 2)
+            with patch('botville_gateway.proactive._LOG.info') as info:
+                self.worker.run_once()
+                info.assert_not_called()
+
+    def _queue(self, key, state, age, room='!old'):
+        self.worker._write('''INSERT INTO proactive_queue
+            (key,persona_id,target_user_id,room_id,slot,state,body,created_at)
+            VALUES (?,?,?,?,?,?,?,?)''', (key, self.persona.user_id,
+                self.persona.owner_user_id, room, -len(self.worker._rows('SELECT * FROM proactive_queue')) - 1,
+                state, 'private', (self.clock.now - age).timestamp()))
+
+    def test_expired_mismatch_abandoned_and_new_slot_allowed(self):
+        self.contact()
+        self.members['!old'] = (*self.members['!owner'], '@extra:example.test')
+        self._queue('old', 'sending', timedelta(hours=25))
+        self.assertEqual(self.worker.run_once(), 1)
+        row = self.worker._rows("SELECT * FROM proactive_queue WHERE key='old'")[0]
+        self.assertEqual(row['state'], 'abandoned')
+        self.assertIsNone(row['body'])
+        self.assertEqual(self.worker.run_once(), 0)
+
+    def test_pending_age_boundary_valid_dm_and_lookup_failure_retained(self):
+        self._queue('young', 'queued', timedelta(hours=24))
+        self._queue('valid', 'sending', timedelta(hours=25), '!owner')
+        self.worker._maintain_queue(self.clock.now)
+        self.assertEqual([r['state'] for r in self.worker._rows(
+            'SELECT * FROM proactive_queue ORDER BY key')], ['sending', 'queued'])
+        self.clock.now += timedelta(seconds=1)
+        with patch.object(self.worker, 'members', side_effect=RuntimeError('unavailable')):
+            self.worker._maintain_queue(self.clock.now)
+        self.assertEqual(self.worker._rows("SELECT state FROM proactive_queue WHERE key='young'")[0]['state'], 'queued')
+        self.worker._maintain_queue(self.clock.now)
+        self.assertEqual(self.worker._rows("SELECT state FROM proactive_queue WHERE key='young'")[0]['state'], 'abandoned')
+
+    def test_pending_expiry_respects_three_long_ticks(self):
+        self.worker.config = replace(self.config, proactive_tick_seconds=86400)
+        self._queue('pending', 'queued', timedelta(days=2))
+        self.worker._maintain_queue(self.clock.now)
+        self.assertEqual(self.worker._rows('SELECT state FROM proactive_queue')[0]['state'], 'queued')
+        self.clock.now += timedelta(days=1, seconds=1)
+        self.worker._maintain_queue(self.clock.now)
+        self.assertEqual(self.worker._rows('SELECT state FROM proactive_queue')[0]['state'], 'abandoned')
+
+    def test_terminal_retention_cleanup(self):
+        for state in ('done', 'abandoned'):
+            self._queue(state + '-old', state, timedelta(days=31))
+            self._queue(state + '-fresh', state, timedelta(days=30))
+        self._queue('recent-delivery', 'done', timedelta(days=40))
+        self.worker._write("UPDATE proactive_queue SET sent_at=? WHERE key='recent-delivery'",
+                           (self.clock.now.timestamp(),))
+        self.worker._maintain_queue(self.clock.now)
+        self.assertEqual({r['key'] for r in self.worker._rows('SELECT * FROM proactive_queue')},
+                         {'done-fresh', 'abandoned-fresh', 'recent-delivery'})
+
+    def test_legacy_queue_migration_is_idempotent_and_preserves_replay(self):
+        self.worker._write('DROP TABLE proactive_queue')
+        self.worker._write('''CREATE TABLE proactive_queue (
+            key TEXT PRIMARY KEY, persona_id TEXT NOT NULL, target_user_id TEXT NOT NULL,
+            room_id TEXT NOT NULL, slot INTEGER NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('queued','sending','done')),
+            body TEXT, tokens INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL,
+            sent_at REAL, UNIQUE(persona_id,target_user_id,slot))''')
+        self._queue('legacy', 'sending', timedelta(hours=1), '!owner')
+        before = self.worker._rows('SELECT * FROM proactive_queue')
+        self.worker._migrate_queue()
+        self.worker._migrate_queue()
+        self.assertEqual(self.worker._rows('SELECT * FROM proactive_queue'), before)
+        self.worker._write("UPDATE proactive_queue SET state='abandoned'")
+
+    def test_confirmed_dm_sends_without_auto_join(self):
+        from botville_gateway.matrix_appservice import AppServiceMatrixTransport
+        transport = AppServiceMatrixTransport(homeserver_url='https://matrix.invalid',
+            as_token='test-placeholder', server_name='example.test')
+        self.worker.service = GatewayService(self.config, transport, now_fn=self.clock)
+        self.worker.members = transport.joined_members
+        self.contact()
+        def request(method, path, **kwargs):
+            if method == 'GET' and path.endswith('/joined_members'):
+                return {'joined': {uid: {} for uid in self.members['!owner']}}
+            if method == 'PUT' and '/send/m.room.message/' in path:
+                return {'event_id': '$test'}
+            self.fail('unexpected Matrix request')
+        with patch.object(transport, '_request', side_effect=request), \
+                patch.object(transport, 'ensure_user'), patch.object(transport, 'join') as join, \
+                patch.object(transport, 'send_text', wraps=transport.send_text) as send:
+            self.assertEqual(self.worker.run_once(), 1)
+        join.assert_not_called()
+        self.assertFalse(send.call_args.kwargs.get('allow_auto_join', False))
+
+    def test_proactive_forbidden_rechecks_after_join(self):
+        from botville_gateway.matrix import DeliveryError
+        from botville_gateway.matrix_appservice import AppServiceMatrixTransport
+        transport = AppServiceMatrixTransport(homeserver_url='https://matrix.invalid',
+            as_token='test-placeholder', server_name='example.test')
+        self.worker.service = GatewayService(self.config, transport, now_fn=self.clock)
+        self.worker.members = transport.joined_members
+        self.contact()
+        calls = []
+        def request(method, path, **kwargs):
+            calls.append((method, path))
+            if method == 'GET' and path.endswith('/joined_members'):
+                return {'joined': {uid: {} for uid in self.members['!owner']}}
+            if method == 'POST' and '/join/' in path:
+                return {'room_id': '!owner'}
+            if method == 'PUT':
+                if sum(m == 'PUT' for m, _ in calls) == 1:
+                    raise DeliveryError('M_FORBIDDEN', 'not joined')
+                return {'event_id': '$after-join'}
+            self.fail('unexpected Matrix request')
+        with patch.object(transport, '_request', side_effect=request), \
+                patch.object(transport, 'ensure_user'), \
+                patch.object(transport, 'send_text', wraps=transport.send_text) as send:
+            self.assertEqual(self.worker.run_once(), 1)
+        self.assertFalse(send.call_args.kwargs.get('allow_auto_join', False))
+        self.assertEqual([m for m, _ in calls][-4:], ['PUT', 'POST', 'GET', 'PUT'])
+
+    def test_recent_contacts_recheck_legacy_dm_membership(self):
+        self.worker.config = replace(self.config, proactive_recent_contacts_enabled=True)
+        target = '@friend:example.test'
+        self.contact(target, '!friend')
+        for members in ((self.persona.user_id, target, '@extra:example.test'),
+                        (self.persona.user_id, target)):
+            self.members['!friend'] = members
+            self.assertEqual(self.worker.run_once(), int(len(members) == 2))
+
+    def test_recent_contacts_exclude_appservice_sender(self):
+        from botville_gateway.as_consumer import DEFAULT_AS_SENDER_LOCALPART
+        self.worker.config = replace(self.config, proactive_recent_contacts_enabled=True)
+        target = '@' + DEFAULT_AS_SENDER_LOCALPART + ':example.test'
+        self.contact(target, '!service')
+        self.members['!service'] = (self.persona.user_id, target)
+        self.assertEqual(self.worker.run_once(), 0)
+        self.assertEqual(self.client.calls, [])
+
     def test_config_ranges_and_contract_defaults(self):
         with self.assertRaises(ConfigError): Config(proactive_enabled=True)
         with self.assertRaises(ConfigError): Config(proactive_tick_seconds=29)

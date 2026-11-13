@@ -67,6 +67,7 @@ class MatrixTransport(Protocol):
         reply_to: Optional[str] = None,
         content_type: str = "text",
         txn_id: Optional[str] = None,
+        allow_auto_join: bool = False,
     ) -> SentEvent:
         """以 `sender_id` 身份向 `room_id` 发送消息。失败抛 DeliveryError。
 
@@ -127,6 +128,7 @@ class InMemoryMatrixTransport:
         reply_to: Optional[str] = None,
         content_type: str = "text",
         txn_id: Optional[str] = None,
+        allow_auto_join: bool = False,
     ) -> SentEvent:
         if self.fail:
             raise DeliveryError("matrix.unavailable", "in-memory transport is set to fail")

@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -153,6 +154,7 @@ def should_reply(
     mentions: Iterable[str] = (),
     reply_to_sender: Optional[str] = None,
     is_ai_sender: bool = False,
+    room_is_dm: bool = False,
 ) -> bool:
     """纯决策函数：这条消息是否应触发 AI 回复（contract §1.7.8 第 10 条）。
 
@@ -160,9 +162,9 @@ def should_reply(
 
     1. `sender` 自己是 AI（`is_ai_sender` 或 sender ∈ `room_ai_user_ids`）→ 否
        （防循环；AI 互聊由 §6.3 熔断处理）。
-    2. 房间里**恰好一个** AI（排除 sender）→ 是（单聊必回）。
+    2. 仅已确认的 DM（`room_is_dm`）且有唯一 AI → 是（单聊必回）。
     3. 群聊：被 **@** 时回——`mentions`（`m.mentions.user_ids`）里有该 AI，或
-       正文出现该 AI 的**完整** user ID；或被该 AI **回复**时回。
+       正文出现该 AI 的**完整** user ID；或回复该 AI 的消息时回。
     4. 其余（无 AI / 多个 AI 但未被 @ / 未被回复）→ 否。
 
     `reply_to_sender` 是**被回复事件**（`m.in_reply_to.event_id` 指向的事件）的
@@ -177,12 +179,12 @@ def should_reply(
     others = [uid for uid in ai_ids if uid != sender]
     if not others:
         return False
-    if len(others) == 1:
+    if room_is_dm and len(others) == 1:
         return True
     mention_set = {m for m in mentions if m}
     reply_target_is_ai = reply_to_sender is not None and reply_to_sender in others
     for uid in others:
-        if uid in mention_set or uid in text:
+        if uid in mention_set or _has_full_user_id(text, uid):
             return True
     return reply_target_is_ai
 
@@ -304,6 +306,10 @@ class ConsumerContext:
     # room's local-AI membership.  Memory must never turn a guessed DM into a
     # DM scope.
     room_members_confirmed: bool = False
+    # True only for a confirmed room containing exactly this persona and one
+    # trusted local human.  Every other room, including lookup failures, is a
+    # group for routing and memory purposes.
+    room_is_dm: bool = False
     mentioned_user_ids: Tuple[str, ...] = ()
 
 
@@ -423,11 +429,15 @@ class AsTransactionConsumer:
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
         batch_limit: int = DEFAULT_BATCH_LIMIT,
         max_text_codepoints: int = MAX_TEXT_CODEPOINTS,
+        group_max_responders: int = 3,
+        persona_user_ids: Sequence[str] = (),
     ) -> None:
         if poll_interval <= 0:
             raise ValueError("poll_interval must be > 0")
         if batch_limit < 1:
             raise ValueError("batch_limit must be >= 1")
+        if not 1 <= group_max_responders <= 20:
+            raise ValueError("group_max_responders must be between 1 and 20")
         self._store = store
         self._hooks = hooks if hooks is not None else ConsumerHooks()
         self._service = service
@@ -452,6 +462,10 @@ class AsTransactionConsumer:
         self._poll_interval = poll_interval
         self._batch_limit = batch_limit
         self._max_text_codepoints = max_text_codepoints
+        self._group_max_responders = group_max_responders
+        self._persona_user_ids = tuple(
+            user_id for user_id in persona_user_ids if self._is_local_ai(user_id)
+        )
 
         self._stats = ConsumerStats()
         self._stop = threading.Event()
@@ -679,11 +693,22 @@ class AsTransactionConsumer:
             mentions = fields.get("mentions") or ()
             reply_event_id = fields.get("reply_to_event_id")
             reply_to_sender = self._reply_target_sender(reply_event_id, room_id)
-            room_ai_user_ids, room_members_confirmed = self._confirmed_room_ai_ids(room_id)
+            room_ai_user_ids, room_members_confirmed, room_is_dm, dm_human_user_id = self._confirmed_room_ai_ids(room_id)
+            # A stale/foreign event sender must not inherit the private DM
+            # scope merely because the current membership snapshot is a pair.
+            room_is_dm = room_is_dm and (is_ai or sender == dm_human_user_id)
             reply_ai_ids = list(room_ai_user_ids)
-            for mentioned in mentions:
-                if self._is_local_ai(mentioned) and mentioned not in reply_ai_ids:
-                    reply_ai_ids.append(mentioned)
+            # A failed member lookup is group/fail-closed, but it must still
+            # permit an explicit full-ID mention or reply to a configured
+            # local persona.
+            if not room_is_dm:
+                for persona_id in self._persona_user_ids:
+                    if persona_id not in reply_ai_ids:
+                        reply_ai_ids.append(persona_id)
+            if not room_is_dm:
+                for mentioned in mentions:
+                    if self._is_local_ai(mentioned) and mentioned not in reply_ai_ids:
+                        reply_ai_ids.append(mentioned)
             targets = self._reply_targets(
                 room_id=room_id,
                 text=text,
@@ -692,7 +717,11 @@ class AsTransactionConsumer:
                 reply_to_sender=reply_to_sender,
                 is_ai_sender=is_ai,
                 ai_ids=reply_ai_ids,
+                room_is_dm=room_is_dm,
             )
+            if not room_is_dm and len(targets) > self._group_max_responders:
+                self._stats.inc("group_responder_skips", len(targets) - self._group_max_responders)
+                targets = targets[:self._group_max_responders]
             target = targets[0] if targets else None
             reply = bool(targets)
             ctx = ConsumerContext(
@@ -711,6 +740,7 @@ class AsTransactionConsumer:
                 reply_to_event_id=reply_event_id,
                 room_ai_user_ids=tuple(room_ai_user_ids),
                 room_members_confirmed=room_members_confirmed,
+                room_is_dm=room_is_dm,
                 mentioned_user_ids=tuple(uid for uid in mentions if isinstance(uid, str)),
             )
             if is_ai:
@@ -903,7 +933,7 @@ class AsTransactionConsumer:
                 ids.append(uid)
         return ids
 
-    def _confirmed_room_ai_ids(self, room_id: Optional[str]) -> Tuple[Tuple[str, ...], bool]:
+    def _confirmed_room_ai_ids(self, room_id: Optional[str]) -> Tuple[Tuple[str, ...], bool, bool, Optional[str]]:
         """Membership-only local AI list for memory scoping.
 
         Mentions are suitable for deciding who should reply, but are not proof
@@ -911,16 +941,34 @@ class AsTransactionConsumer:
         unconfirmed result and memory uses group scope fail-closed.
         """
         if not room_id or self._room_members is None:
-            return (), False
+            return (), False, False, None
         try:
+            members = tuple(dict.fromkeys(
+                uid for uid in self._room_members(room_id) or () if isinstance(uid, str)
+            ))
             ids = []
-            for user_id in self._room_members(room_id) or ():
+            for user_id in members:
                 if self._is_local_ai(user_id) and user_id not in ids:
                     ids.append(user_id)
-            return tuple(ids), True
+            # Q5: a DM is exactly one local persona plus one local human.  AS
+            # senders, foreign users, and any extra member make it a group.
+            humans = [user_id for user_id in members if self._is_local_human(user_id)]
+            is_dm = len(members) == 2 and len(ids) == 1 and len(humans) == 1
+            return tuple(ids), True, is_dm, humans[0] if is_dm else None
         except Exception:
             self._stats.inc("room_member_errors")
-            return (), False
+            return (), False, False, None
+
+    def _is_local_human(self, user_id: str) -> bool:
+        parsed = _split_user_id(user_id)
+        if parsed is None or self._server_name is None:
+            return False
+        localpart, domain = parsed
+        return (
+            domain.lower() == self._server_name
+            and not localpart.startswith(AI_LOCALPART_PREFIX)
+            and localpart != self._as_sender_localpart
+        )
 
     def _reply_targets(
         self,
@@ -932,13 +980,14 @@ class AsTransactionConsumer:
         reply_to_sender: Optional[str],
         is_ai_sender: bool,
         ai_ids: Optional[Sequence[str]] = None,
+        room_is_dm: bool = False,
     ) -> Tuple[str, ...]:
         """本条消息应回复的**全部**本服 AI，按提及顺序（PR2 逐个发言）。
 
         - sender 自己是 AI → 空（防循环）；
-        - 单聊（房间里恰好一个本服 AI）→ 该 AI（必回）；
+        - 已确认 DM（成员恰为该本服 AI 和一个本服人类）→ 该 AI（必回）；
         - 群聊 → 被 `m.mentions.user_ids` 点名或被正文写出完整 user ID 的本服
-          AI，按 mention 顺序；此外若被某个本服 AI 回复（`reply_to_sender` 是
+          AI，按 mention 顺序；此外若回复某个本服 AI 的消息（`reply_to_sender` 是
           它）→ 也回（追加在末尾，去重）。
         - 外服 `@ai_*` 永不在结果里（`_is_local_ai` fail-closed）。
         """
@@ -948,7 +997,7 @@ class AsTransactionConsumer:
         others = [uid for uid in ai_ids if uid != sender]
         if not others:
             return ()
-        if len(others) == 1:
+        if room_is_dm and len(others) == 1:
             return (others[0],)
 
         targets: list = []
@@ -956,7 +1005,9 @@ class AsTransactionConsumer:
             if uid in others and uid not in targets:
                 targets.append(uid)
         # 无结构化提及时按正文首次出现顺序；其余正文提及追加在结构化列表后。
-        for uid in sorted((uid for uid in others if uid in text), key=text.index):
+        for uid in sorted(
+            (uid for uid in others if _has_full_user_id(text, uid)), key=text.index
+        ):
             if uid not in targets:
                 targets.append(uid)
         if reply_to_sender is not None and reply_to_sender in others:
@@ -1073,3 +1124,11 @@ def _mentions_of(content: Dict[str, Any]) -> Tuple[str, ...]:
     if not isinstance(ids, list):
         return ()
     return tuple(uid for uid in ids if isinstance(uid, str))
+
+
+def _has_full_user_id(text: str, user_id: str) -> bool:
+    """Match a complete Matrix ID, never a prefix of a longer user ID."""
+    return re.search(
+        r"(?<![A-Za-z0-9._=-])" + re.escape(user_id) + r"(?![A-Za-z0-9._=-])",
+        text,
+    ) is not None

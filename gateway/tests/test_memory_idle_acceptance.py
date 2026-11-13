@@ -79,7 +79,8 @@ class Acceptance(unittest.TestCase):
             memory_store=self.store, memory_embedding=embedding, memory_vectors=PythonVectorStore(self.store))
         context = ConsumerContext(event_type='message_text', event_id='$human', room_id='!r',
             sender=HUMAN, text='hello', trust='trusted', persona_user_id=AI,
-            target_user_ids=(AI,), room_ai_user_ids=(AI,), room_members_confirmed=True)
+            target_user_ids=(AI,), room_ai_user_ids=(AI,), room_members_confirmed=True,
+            room_is_dm=True)
         with patch.object(client, 'complete', return_value='answer'):
             hooks.on_human_text(context)
         self.assertEqual(len(transport.sent), 1)
@@ -113,7 +114,8 @@ class Acceptance(unittest.TestCase):
             memory_vectors=PythonVectorStore(self.store))
         context = ConsumerContext(event_type='message_text', event_id='$budget', room_id='!r',
             sender=HUMAN, text='hello', trust='trusted', persona_user_id=AI,
-            target_user_ids=(AI,), room_ai_user_ids=(AI,), room_members_confirmed=True)
+            target_user_ids=(AI,), room_ai_user_ids=(AI,), room_members_confirmed=True,
+            room_is_dm=True)
         with patch.object(client, 'complete', return_value='answer'):
             hooks.on_human_text(context)
         self.assertEqual(requests, [])

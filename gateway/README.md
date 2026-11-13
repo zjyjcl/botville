@@ -247,7 +247,7 @@ class MatrixTransport(Protocol):
   application service 身份对接真实 homeserver——`m.login.application_service`
   在 exclusive 命名空间内免密建号、`?user_id=` masquerade 以 `@ai_*` 身份
   join / send（`PUT /_matrix/client/v3/rooms/{roomId}/send/m.room.message/{txnId}`）、
-  未加入房间（`M_FORBIDDEN`）自动 join 后重试一次、命名空间外 sender 客户端侧
+  未加入房间（`M_FORBIDDEN`）自动 join 后复核，仅 DM 重试一次，否则退出并报错、命名空间外 sender 客户端侧
   直接拒绝。只用 Matrix 标准接口；部署侧注册方式与 token 约定见
   [`docs/deploy/appservice.md`](../docs/deploy/appservice.md)。对真实 Synapse /
   Tuwunel 的验收是 `make appservice-e2e`（CI `appservice-e2e` job）。
@@ -328,6 +328,7 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_AS_MAX_BODY_BYTES` | `16777216` | AS 回调请求体上限（字节，**16 MiB**；正整数，最大 256 MiB）。与 `/v1` 的 1 MiB 上限**相互独立**；超限 → `413 M_TOO_LARGE` |
 | `GATEWAY_AS_TXN_RETENTION_DAYS` | `90` | AS 事务库保留天数（正整数，`<1` 拒绝启动）。超过保留期的事务**不删行**：只清空原始请求体并写 `purged_at`（墓碑保留 `txn_id` / 接收时间 / `processed_at`），重放仍 `200 {}` 且不重落库；过期未消费事务按丢弃处理。**校验与 `GATEWAY_AS_TXN_DB_PATH` 是否配置无关**——非法值在任何情况下都拒绝启动。清理只在同时配置了库路径且间隔非 0 时运行。见 [docs/contract.md](docs/contract.md) §1.7.7 |
 | `GATEWAY_AS_TXN_PURGE_INTERVAL_SECONDS` | `86400` | AS 事务保留期清理间隔（秒）：启动先跑一次，之后后台按间隔跑，失败只记日志（不记 token / 事件体）。`0` = 关闭（启动不跑、不起线程，库会持续增长）；非 0 时 **≥60**，否则拒绝启动。**校验与 `GATEWAY_AS_TXN_DB_PATH` 是否配置无关**。见 [docs/contract.md](docs/contract.md) §1.7.7 |
+| `GATEWAY_GROUP_MAX_RESPONDERS` | `3` | 每条群聊人类消息最多回复的 AI 数，按提及顺序；int，范围 1–20，非法/越界拒绝启动且错误不回显值。超出者跳过并计数，DM 不受影响 |
 | `GATEWAY_CONSUMER_ENABLED` | `false` | 进程内 AS 事务消费者（B 线 PR1，契约 §1.7.8）总开关。**默认 false = 行为与之前完全一致**（不起线程、不唤醒）。开启后：事务落库立即唤醒 + 5 秒兜底轮询，按 rowid 顺序消费，做事件分类 / trust / 防循环 / 计数并调用钩子。开启但 `GATEWAY_AS_TXN_DB_PATH` 未配置 → 启动 warning 且不起线程（不拒绝启动）；开启但未配置模型/人设 → 只记录计数，`/health` 不 degraded |
 | `GATEWAY_MEMORY_DB_PATH` | 空 | 可选记忆 SQLite 路径；空 = 关闭，继续 ring buffer；新库 0600、WAL，备份敏感 |
 | `GATEWAY_MEMORY_OWNER_CAN_READ_DM` | `false` | 主人是否可读 DM 正文/事实值；严格布尔解析，关闭仍可管理元数据和写入 |
@@ -532,3 +533,14 @@ npx --yes @redocly/cli lint gateway/openapi/gateway.v1.yaml
 - 成员查询单次超时 5 秒；房间失败缓存 60 秒，跨房间连续失败 3 次后全局熔断 60 秒，冷却到期允许重试，成功清零。有效成员缓存仍可用；无有效缓存时抛错，由 consumer 回退到 mentions 并计 `room_member_errors`。正、负缓存均有房间数量上限。
 - 静默延后事件重放时，按 event_id 对仍在有界上下文缓冲中的人类消息去重。
 - `processed_at`、`failed_at` 与 `next_attempt_at` 使用 consumer 注入时钟的本批次时间；store 的 `mark_processed(now=...)` 未传时默认墙钟。入站 `received_at` 和独立 speech 去重账本的 `created_at` / `sent_at` 有意使用实际写入墙钟，供接收审计和保留清理，不参与 consumer 的重试调度。
+
+### B2.8a 群聊与 DM 边界
+
+只有完整 joined 成员恰好为一个本服 persona 和一个本服人类（非 AI、非 AS sender）才算 DM；
+单 AI + 多人、含外服成员、多个 AI 或成员未确认/查询失败均按群聊处理，不召回 DM 记忆。
+群聊仅显式提及 AI 完整 user ID 或回复其消息时开口，`@room` 广播不产生目标。
+AS 发送遇 `M_FORBIDDEN` 默认 join 后复核：仅 DM 继续发送，否则立即退出并报错；
+已确认 DM 的引擎回复跳过复核，join 后重试一次；HTTP 与主动发言走默认复核路径；
+HTTP 消息与主动发言复核为非 DM 后立即尝试退出，不重试发送。
+开启 memory 后，同群其他 AI 文本写入 group 记忆，trust=untrusted，以 role=assistant 和 sender
+保留 AI 来源，召回只进入不可信数据区；自身回声不重复记录。memory 关闭时 AI 入站不追加 ring buffer。

@@ -1497,6 +1497,8 @@ class GatewayServer(http.server.ThreadingHTTPServer):
                     sender_fetcher=getattr(transport, "event_sender", None),
                     room_members=self.room_member_source.members,
                     room_member_observer=self.room_member_source.observe_member_event,
+                    group_max_responders=config.group_max_responders,
+                    persona_user_ids=personas,
                     # Engine persists each persona separately; consumer completion
                     # must not share the first persona key on partial failures.
                     dedupe=None if hooks else PersistentSpeechDedupe(self.as_txn_store),
@@ -1535,7 +1537,7 @@ class GatewayServer(http.server.ThreadingHTTPServer):
                     mood_label_provider=(self._proactive_mood_label
                                          if self.mood_service is not None else None))
             else:
-                logging.getLogger(__name__).info(
+                logging.getLogger(__name__).warning(
                     'Proactive inactive: requires memory DB, model and membership transport')
         log_startup_warnings(config)
         super().__init__((config.host, config.port), GatewayHandler)

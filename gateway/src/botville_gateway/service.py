@@ -836,6 +836,7 @@ class GatewayService:
         payload: Dict[str, Any],
         *,
         idempotency_key: Optional[str] = None,
+        allow_auto_join: bool = False,
         proactive_reservation: Optional[Reservation] = None,
     ) -> Dict[str, Any]:
         if not isinstance(conversation_id, str) or not conversation_id:
@@ -906,7 +907,7 @@ class GatewayService:
             txn_id = self._txn_id_for(idempotency_key)
             ledger_txn = txn_id if idempotency_key else None
             try:
-                event = self._transport.send_text(
+                send_kwargs = dict(
                     room_id=conversation_id,
                     sender_id=validated["sender"],
                     text=validated["text"],
@@ -914,6 +915,11 @@ class GatewayService:
                     content_type=validated["content_type"],
                     txn_id=txn_id,
                 )
+                # Keep existing third-party/fake transports compatible: only
+                # the explicit DM recovery path needs the new opt-in keyword.
+                if allow_auto_join:
+                    send_kwargs["allow_auto_join"] = True
+                event = self._transport.send_text(**send_kwargs)
             except DeliveryError as exc:
                 # 投递失败：回滚预留，不记账、不占名额；再映射为 5xx 传输错误。
                 self._rollback(reservation)
