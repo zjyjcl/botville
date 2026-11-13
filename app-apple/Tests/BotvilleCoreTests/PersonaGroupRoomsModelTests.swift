@@ -225,6 +225,26 @@ final class PersonaGroupRoomsModelTests: XCTestCase {
             model.errorMessage, "群状态已变化，已刷新；群设置未能刷新：网关请求失败，请稍后重试。")
         XCTAssertFalse(model.settings.hasLoaded)
         XCTAssertFalse(model.canEnableMentionOnly)
+        // Settings never reloaded, so mention_only must stay local: no PATCH.
+        await model.setMode(roomRef: ref("a"), mode: .mentionOnly)
+        let sent = await client.modeRequests()
+        XCTAssertEqual(sent, [.muted])
+    }
+
+    func testConflictCombinedMessageStatesSettingsErrorOnce() async {
+        let client = RoomsScriptClient(
+            pages: [.success(page([room("a")], nil, false)),
+                    .success(page([room("a", mode: "muted")], nil, false))],
+            modes: [.failure(.problem(status: 409, code: "room.state_conflict"))],
+            personas: [.success(owner(groups(true, .owner))), .failure(.httpStatus(503))])
+        let model = roomsModel(client)
+        await model.load()
+        await model.setMode(roomRef: ref("a"), mode: .muted)
+        let message = model.errorMessage ?? ""
+        XCTAssertEqual(message, "群状态已变化，已刷新；群设置未能刷新：\(model.settings.errorMessage ?? "<nil>")")
+        XCTAssertEqual(message.components(separatedBy: "网关请求失败，请稍后重试。").count - 1, 1)
+        XCTAssertEqual(message.components(separatedBy: "群设置未能刷新").count - 1, 1)
+        XCTAssertEqual(message.components(separatedBy: "已刷新").count - 1, 1)
     }
 
     func testNotFoundRefreshWithFailedSettingsStillReportsRoomsRefreshed() async {

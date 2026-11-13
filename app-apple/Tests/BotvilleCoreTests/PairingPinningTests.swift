@@ -196,6 +196,17 @@ final class PairingPinningTests: XCTestCase {
         XCTAssertThrowsError(try TLSFixture(san: "IP:127.0.0.1", openssl: "/usr/bin/false", parentDirectory: parent))
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: parent.path), [])
     }
+
+    func testTLSFixtureCleansDefaultBuildDirectoryWhenOpenSSLFails() throws {
+        // Check the default .build parent through this fixture's own unique
+        // directory name. A scan of every pairing-fixture-* entry would race
+        // with fixtures created by other parallel test processes.
+        let name = "pairing-fixture-\(UUID().uuidString)"
+        let directory = TLSFixture.defaultParentDirectory.appendingPathComponent(name)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        XCTAssertThrowsError(try TLSFixture(san: "IP:127.0.0.1", openssl: "/usr/bin/false", directoryName: name))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
     func testRejectedTLSRequestMapsToCertificateMismatch() async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -390,10 +401,11 @@ private final class TLSFixture {
     let certificate: URL
     let issuerCertificate: URL?
     let fingerprint: Data
+    static let defaultParentDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent(".build")
 
-    init(san: String?, eku: String? = "serverAuth", days: Int = 1, validity: Validity = .current, commonName: String = "127.0.0.1", issuer: Issuer = .selfSigned, openssl: String = "/usr/bin/openssl", parentDirectory: URL? = nil) throws {
-        let parent = parentDirectory ?? URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent(".build")
-        directory = parent.appendingPathComponent("pairing-fixture-\(UUID().uuidString)")
+    init(san: String?, eku: String? = "serverAuth", days: Int = 1, validity: Validity = .current, commonName: String = "127.0.0.1", issuer: Issuer = .selfSigned, openssl: String = "/usr/bin/openssl", parentDirectory: URL? = nil, directoryName: String = "pairing-fixture-\(UUID().uuidString)") throws {
+        let parent = parentDirectory ?? Self.defaultParentDirectory
+        directory = parent.appendingPathComponent(directoryName)
         key = directory.appendingPathComponent("key.pem")
         certificate = directory.appendingPathComponent("cert.pem")
         issuerCertificate = issuer == .certificateAuthority ? directory.appendingPathComponent("ca-cert.pem") : nil
@@ -471,7 +483,10 @@ private final class TLSFixture {
         if let san { contents += "subjectAltName = \(san)\n" }
         if let eku { contents += "extendedKeyUsage = \(eku)\n" }
         try contents.write(to: extensions, atomically: true, encoding: .utf8)
-        try run(openssl, ["x509", "-req", "-in", request.path, "-CA", caCertificate.path, "-CAkey", caKey.path, "-CAcreateserial", "-out", certificate.path, "-days", String(days), "-extfile", extensions.path, "-extensions", "leaf"])
+        // Keep the serial file inside this fixture. Without -CAserial, the system
+        // openssl writes .srl to the working directory shared by parallel workers.
+        let serial = directory.appendingPathComponent("ca-cert.srl")
+        try run(openssl, ["x509", "-req", "-in", request.path, "-CA", caCertificate.path, "-CAkey", caKey.path, "-CAcreateserial", "-CAserial", serial.path, "-out", certificate.path, "-days", String(days), "-extfile", extensions.path, "-extensions", "leaf"])
     }
 }
 
