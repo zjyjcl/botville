@@ -256,6 +256,13 @@ class MemoryStore:
                     END''')
                 self._db.execute('UPDATE memory_schema SET version=?', (next_version,))
 
+            # Additive B2.8b repair, including existing schema-10 databases.
+            columns = {row[1] for row in self._db.execute('PRAGMA table_info(group_invites)')}
+            if 'status' not in columns:
+                self._db.execute("ALTER TABLE group_invites ADD COLUMN status TEXT NOT NULL DEFAULT 'done' CHECK(status IN ('pending','done'))")
+            if 'attempt_owner' not in columns:
+                self._db.execute("ALTER TABLE group_invites ADD COLUMN attempt_owner TEXT")
+
             columns = {row[1] for row in self._db.execute('PRAGMA table_info(memory_tombstones)')}
             if 'permanent' not in columns:
                 self._db.execute('ALTER TABLE memory_tombstones ADD COLUMN permanent INTEGER NOT NULL DEFAULT 0')

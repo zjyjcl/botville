@@ -4,8 +4,8 @@
 
 Uses the memory connection under its lock, with separate tables and no retention
 purge: forgetting an invite would allow old AS transactions to join again.
-One gateway consumer owns a memory DB. A committed claim precedes side effects;
-a crash can leave an invitation unhandled but cannot replay join/leave.
+One gateway consumer owns a memory DB. Pending attempts may replay after restart
+or five minutes; Matrix join/leave are idempotent for joined/left rooms.
 """
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 
 from .as_consumer import ConsumerStats, DEFAULT_AS_SENDER_LOCALPART
 from .engine.personas import _is_local_owner
@@ -34,6 +35,7 @@ class GroupInvites:
         self.stats = ConsumerStats()
         self._lock = threading.RLock()
         self._rate = {}
+        self._attempt_owner = uuid.uuid4().hex
         if enabled and store is None:
             _LOG.warning('Groups disabled: memory database is not configured')
 
@@ -60,6 +62,25 @@ class GroupInvites:
 
     def is_disabled(self, persona, room):
         return self._state(persona, room) in ('encrypted_disabled', 'rejected_encrypted')
+
+    def is_left(self, persona, room):
+        return self._state(persona, room) == 'left'
+
+    def on_membership(self, ctx):
+        if (self.store is None or ctx.persona_user_id not in self.personas
+                or not ctx.room_id or ctx.membership not in ('leave', 'ban')):
+            return
+        with self._lock, self.store._lock, self.store._db:
+            self.store._db.execute("""UPDATE group_rooms SET state='left',updated_at=?
+                WHERE persona_id=? AND room_key=?
+                AND state IN ('accepted','encrypted_disabled','rejected_encrypted')""",
+                (time.time(), ctx.persona_user_id, self._key('room', ctx.room_id)))
+
+    def _done(self, key):
+        with self.store._lock, self.store._db:
+            self.store._db.execute(
+                "UPDATE group_invites SET status='done',processed_at=? WHERE invite_key=?",
+                (time.time(), key))
 
     def _record(self, persona, room, inviter, state):
         now = time.time()
@@ -111,16 +132,22 @@ class GroupInvites:
             return
         pid, room, inviter = persona.user_id, ctx.room_id, ctx.sender
         with self._lock:
+            key = self._key('invite', pid, ctx.event_id)
+            now = time.time()
             with self.store._lock, self.store._db:
-                claimed = self.store._db.execute(
-                    'INSERT OR IGNORE INTO group_invites VALUES(?,?)',
-                    (self._key('invite', pid, ctx.event_id), time.time())).rowcount
-            if not claimed:
-                self.stats.inc('duplicate')
-                return
-            # Count every new invitation, including policy rejects. The reason
-            # chain remains deterministic; no unbounded event/persona buckets.
-            limited = self._limited(pid)
+                row = self.store._db.execute(
+                    'SELECT status,processed_at,attempt_owner FROM group_invites WHERE invite_key=?',
+                    (key,)).fetchone()
+                if row and (row[0] == 'done' or (
+                        row[2] == self._attempt_owner and now - row[1] < 300)):
+                    self.stats.inc('duplicate')
+                    return
+                self.store._db.execute("""INSERT INTO group_invites
+                    (invite_key,processed_at,status,attempt_owner) VALUES(?,?,'pending',?)
+                    ON CONFLICT(invite_key) DO UPDATE SET processed_at=excluded.processed_at,
+                    attempt_owner=excluded.attempt_owner""", (key, now, self._attempt_owner))
+            # Only new invitations consume the rate budget.
+            limited = self._limited(pid) if row is None else False
             reason = None
             if not persona.groups.get('enabled', False):
                 reason = 'groups_disabled'
@@ -150,6 +177,8 @@ class GroupInvites:
                     self.transport.leave(room, pid)
                 except Exception:
                     self._result('leave_failed')
+                    return
+                self._done(key)
                 return
             try:
                 self.transport.join(room, pid)
@@ -167,6 +196,9 @@ class GroupInvites:
                     self.transport.leave(room, pid)
                 except Exception:
                     self._result('leave_failed')
+                    return
+                self._done(key)
                 return
             self._record(pid, room, inviter, 'accepted')
+            self._done(key)
             self._result('accepted')

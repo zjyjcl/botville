@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -50,6 +51,104 @@ class GroupTests(unittest.TestCase):
 
     def invite(self, **kwargs):
         self.groups.on_invite_to_ai(self.ctx(**kwargs))
+
+    def test_membership_departure_and_reinvite(self):
+        hooks = EngineHooks(personas={AI: self.persona}, client=Mock(),
+                            service=Mock(), group_invites=self.groups)
+        consumer = AsTransactionConsumer(Mock(), hooks=hooks, server_name='local.test')
+        for index, (membership, sender, encrypted) in enumerate((
+                ('leave', OWNER, False), ('ban', OWNER, False),
+                ('leave', AI, True), ('ban', OWNER, True))):
+            with self.subTest(membership=membership, sender=sender, encrypted=encrypted):
+                self.invite(event_id=f'$before{index}')
+                if encrypted:
+                    self.groups.disable_encrypted(ROOM)
+                consumer._dispatch_event({'type': 'm.room.member', 'event_id': '$depart',
+                    'room_id': ROOM, 'sender': sender, 'state_key': AI,
+                    'content': {'membership': membership}})
+                self.assertEqual(self.groups._state(AI, ROOM), 'left')
+                tr = AppServiceMatrixTransport(homeserver_url='http://localhost',
+                    as_token='private-token', server_name='local.test',
+                    accepted_group=self.groups.is_accepted, left_group=self.groups.is_left,
+                    disabled_group=self.groups.is_disabled)
+                tr.ensure_user = Mock()
+                tr.join = Mock()
+                error = DeliveryError('M_FORBIDDEN', 'denied')
+                tr._request = Mock(side_effect=error)
+                with self.assertRaises(DeliveryError) as caught:
+                    tr.send_text(room_id=ROOM, sender_id=AI, text='body', allow_auto_join=True)
+                self.assertIs(caught.exception, error)
+                tr.join.assert_not_called()
+                self.assertEqual(tr._request.call_count, 1)
+                self.invite(event_id=f'$after{index}')
+                self.assertTrue(self.groups.is_accepted(AI, ROOM))
+
+    def test_encrypted_decline_self_leave_is_left(self):
+        self.invite(invite_encrypted=True)
+        self.groups.on_membership(self.ctx(membership='leave', sender=AI))
+        self.assertTrue(self.groups.is_left(AI, ROOM))
+
+    def test_join_crash_pending_replay(self):
+        for restart in (False, True):
+            with self.subTest(restart=restart):
+                event = '$crash' + str(restart)
+                with patch.object(self.groups, '_record', side_effect=SystemExit):
+                    with self.assertRaises(SystemExit):
+                        self.invite(event_id=event)
+                row = self.store._db.execute(
+                    "SELECT status FROM group_invites WHERE invite_key=?",
+                    (self.groups._key('invite', AI, event),)).fetchone()
+                self.assertEqual(row[0], 'pending')
+                calls = self.transport.join.call_count
+                self.invite(event_id=event)
+                self.assertEqual(self.transport.join.call_count, calls)
+                if restart:
+                    self.groups = self.make()
+                    self.invite(event_id=event)
+                else:
+                    with patch('botville_gateway.groups.time.time', return_value=time.time() + 301):
+                        self.invite(event_id=event)
+                self.assertEqual(self.transport.join.call_count, calls + 1)
+                self.assertEqual(self.store._db.execute(
+                    "SELECT count(*) FROM group_rooms WHERE state='accepted'").fetchone()[0], 1)
+                self.invite(event_id=event)
+                self.assertEqual(self.transport.join.call_count, calls + 1)
+
+    def test_crash_after_accepted_before_done_upserts_once(self):
+        with patch.object(self.groups, '_done', side_effect=SystemExit):
+            with self.assertRaises(SystemExit):
+                self.invite()
+        self.assertTrue(self.groups.is_accepted(AI, ROOM))
+        self.groups = self.make()
+        self.invite()
+        self.invite()
+        self.assertEqual(self.transport.join.call_count, 2)
+        self.assertEqual(self.store._db.execute(
+            "SELECT count(*) FROM group_rooms WHERE state='accepted'").fetchone()[0], 1)
+        self.assertEqual(self.store._db.execute(
+            'SELECT status FROM group_invites').fetchone()[0], 'done')
+
+    def test_pending_leave_failure_retries_after_restart(self):
+        self.transport.leave.side_effect = RuntimeError('private')
+        self.invite(invite_encrypted=True)
+        self.assertEqual(self.store._db.execute('SELECT status FROM group_invites').fetchone()[0], 'pending')
+        self.transport.leave.side_effect = None
+        self.groups = self.make()
+        self.invite(invite_encrypted=True)
+        self.invite(invite_encrypted=True)
+        self.assertEqual(self.transport.leave.call_count, 2)
+        self.assertEqual(self.store._db.execute('SELECT status FROM group_invites').fetchone()[0], 'done')
+
+    def test_legacy_schema_ten_claims_remain_done(self):
+        self.store._db.executescript("DROP TABLE group_invites; CREATE TABLE group_invites (invite_key TEXT PRIMARY KEY, processed_at REAL NOT NULL);")
+        self.store._db.execute('INSERT INTO group_invites VALUES (?,0)',
+                               (self.groups._key('invite', AI, '$private'),))
+        self.store._db.commit()
+        other = MemoryStore(self.path, hmac_secret=SECRET)
+        self.addCleanup(other.close)
+        groups = GroupInvites(other, self.transport, {AI: self.persona}, enabled=True, server_name='local.test')
+        groups.on_invite_to_ai(self.ctx())
+        self.transport.join.assert_not_called()
 
     def test_default_off_noop(self):
         self.groups = self.make(enabled=False)
@@ -170,7 +269,7 @@ class GroupTests(unittest.TestCase):
         groups.on_invite_to_ai(self.ctx(invite_encrypted=True))
         self.transport.leave.assert_called_once()
 
-    def test_failure_claim_prevents_replay(self):
+    def test_pending_failure_defers_immediate_replay(self):
         self.transport.join.side_effect = RuntimeError('secret')
         self.invite()
         self.invite()

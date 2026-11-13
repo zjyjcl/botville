@@ -921,8 +921,15 @@ ephemeral 不在 AS 注册里开启，忽略。
   当前所有操作自带真实 room_id，因此表内**不额外保存 room_id 原值**；persona_id 为内部关联键，不打印。
   `is_accepted(persona, room_id)` 为传输层注入的许可回调。
 - `group_invites` 用 `(persona,event_id)` 的 HMAC 持久化去重，不随记忆保留期清理。
-  网络动作前提交 claim，重启或重放不会重复 join/leave；这是 at-most-once 尝试：
-  claim 后崩溃/网络失败可能留下未完成邀请，需新邀请事件重新处理，不宣称网络与 SQLite 原子提交。
+  网络动作前提交 pending、processed_at（本次尝试时间）和 attempt_owner；完成 join/leave 与房间记录后标记 done。
+  done 重放跳过；pending 在 5 分钟后或处理实例重启后可重试，重试不占新邀请限频额度。
+  这是至少一次处理：Matrix join/leave 对已加入/已离开的房间是幂等的；group_rooms 主键 upsert
+  保证同一 persona/room 只有一条记录，不宣称网络与 SQLite 原子提交。网络失败保留 pending。
+  schema 10 原有表原位补列；旧 claim 无法判断是否完成，兼容保留为 done。
+- 收到本服已配置 persona 的 m.room.member，state_key 指向该 persona 且 membership 为 leave/ban，
+  无论 sender 是本人或踢人者，accepted/encrypted_disabled（以及 rejected_encrypted）均转为 left。
+  ban 统一使用 left，表示不再具有群发送恢复许可。发送 M_FORBIDDEN 时先检查 left，直接上抛，
+  不 join、不重试，即使 allow_auto_join 开启也一样。新 event_id 的再邀请重新走完整判定链。
 - 收到 `m.room.encryption` state 事件，accepted 房间标记 encrypted_disabled，不自动 leave；
   引擎在模型调用前跳过，AS 传输发送前再次检查（覆盖 HTTP 发言与模型调用期间的状态变化）。
   关闭开关后仍保留这项拦截。HTTP `403 conversation.e2ee` 的状态码映射与 policy/evaluate 留给 B2.8c；
@@ -997,7 +1004,7 @@ DM 不受此上限影响。`m.mentions.room=true`（`@room`）本身不产生目
 不以 `ai_` 开头且不是 AS sender，domain 与配置的 `server_name` 大小写不敏感匹配；未配置 server_name
 或成员查询失败均视为非 DM。join 失败直接上抛；非 DM 尝试 leave 后上抛原 `M_FORBIDDEN`，
 leave 失败仅记无敏感信息 WARNING；非 `M_FORBIDDEN` 不 join。成功复核后仅重试一次；
-B2.8b 通过注入回调允许 `group_rooms.state=accepted` 的房间 join 后重试，无需 DM 复核；其他房间保持上述 B2.8a 行为。
+B2.8b 首先通过 left 回调阻止退群/被踢/封禁后的任何自动 rejoin；再通过注入回调允许 `group_rooms.state=accepted` 的房间 join 后重试，无需 DM 复核；其他房间保持上述 B2.8a 行为。
 
 **⑩ 四层记忆（B2.6：PR3a / PR3b / PR3c 已实现）**
 

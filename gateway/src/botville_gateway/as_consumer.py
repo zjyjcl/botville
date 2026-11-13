@@ -313,6 +313,7 @@ class ConsumerContext:
     mentioned_user_ids: Tuple[str, ...] = ()
     invite_encrypted: bool = False
     encryption_state: bool = False
+    membership: Optional[str] = None
 
 
 class ConsumerHooks:
@@ -809,8 +810,10 @@ class AsTransactionConsumer:
             sender=sender,
             trust=trust,
             encryption_state=fields.get("encryption_state", False),
+            membership=fields.get("membership"),
+            persona_user_id=fields.get("target_user_id"),
         )
-        if ctx.encryption_state:
+        if ctx.encryption_state or ctx.membership:
             # A failed durable disable must retry the transaction, not discard
             # the only notification that this room became encrypted.
             self._hooks.on_other(ctx)
@@ -864,6 +867,9 @@ class AsTransactionConsumer:
                 fields["redacts_event_id"] = redacts
             return EVENT_REDACTION, fields
         if event_type == "m.room.member":
+            if content.get("membership") in ("leave", "ban") and self._is_local_ai(event.get("state_key")):
+                fields["membership"] = content["membership"]
+                fields["target_user_id"] = event["state_key"]
             if content.get("membership") == "invite":
                 state_key = event.get("state_key")
                 if self._is_local_ai(state_key):

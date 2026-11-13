@@ -100,12 +100,14 @@ class AppServiceMatrixTransport:
         health_cache_seconds: float = 5.0,
         accepted_group: Optional[Callable[[str, str], bool]] = None,
         disabled_group: Optional[Callable[[str, str], bool]] = None,
+        left_group: Optional[Callable[[str, str], bool]] = None,
     ) -> None:
         if room_cache_ttl_seconds < 0:
             raise ValueError(
                 "room_cache_ttl_seconds must be >= 0 (0 disables the "
                 "alias->room cache), got {!r}".format(room_cache_ttl_seconds)
             )
+        self.left_group = left_group
         self.accepted_group = accepted_group
         self.disabled_group = disabled_group
         self._base = homeserver_url.rstrip("/")
@@ -413,6 +415,8 @@ class AppServiceMatrixTransport:
             resp = self._request("PUT", path, body=content, query={"user_id": sender})
         except DeliveryError as exc:
             if exc.code != "M_FORBIDDEN":
+                raise
+            if self.left_group is not None and self.left_group(sender, room):
                 raise
             self.join(room, sender)
             accepted = self.accepted_group is not None and self.accepted_group(sender, room)

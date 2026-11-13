@@ -124,6 +124,8 @@ class EngineHooks(ConsumerHooks):
             self._group_invites.on_invite_to_ai(ctx)
 
     def on_other(self, ctx: ConsumerContext) -> None:
+        if self._group_invites is not None and ctx.membership:
+            self._group_invites.on_membership(ctx)
         if self._group_invites is not None and ctx.encryption_state and ctx.room_id:
             self._group_invites.disable_encrypted(ctx.room_id)
 

@@ -1461,6 +1461,7 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         if hasattr(transport, "accepted_group"):
             transport.accepted_group = self.group_invites.is_accepted
             transport.disabled_group = self.group_invites.is_disabled
+            transport.left_group = self.group_invites.is_left
         self.personas_timestamp = iso_utc(service.started_at)
         if config.personas_file:
             try:
