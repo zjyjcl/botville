@@ -13,6 +13,7 @@
 		A10000000000000000000005 /* BotvilleCore in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000031 /* BotvilleCore */; };
 		A10000000000000000000006 /* DynamicUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000016 /* DynamicUI.swift */; };
 		C24000000000000000000001 /* MemoryViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = C24000000000000000000002 /* MemoryViews.swift */; };
+		C25000000000000000000001 /* AIProfileView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C25000000000000000000002 /* AIProfileView.swift */; };
 		A10000000000000000000007 /* ModuleWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000017 /* ModuleWebView.swift */; };
 		A10000000000000000000008 /* PairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000018 /* PairingView.swift */; };
 		A10000000000000000000009 /* PushDiagnosticsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000019 /* PushDiagnosticsView.swift */; };
@@ -55,6 +56,7 @@
 		A10000000000000000000015 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = BotvilleApp/Info.plist; sourceTree = SOURCE_ROOT; };
 		A10000000000000000000016 /* DynamicUI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = DynamicUI.swift; path = Sources/BotvilleApp/DynamicUI.swift; sourceTree = SOURCE_ROOT; };
 		C24000000000000000000002 /* MemoryViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MemoryViews.swift; path = Sources/BotvilleApp/MemoryViews.swift; sourceTree = SOURCE_ROOT; };
+		C25000000000000000000002 /* AIProfileView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AIProfileView.swift; path = Sources/BotvilleApp/AIProfileView.swift; sourceTree = SOURCE_ROOT; };
 		A10000000000000000000017 /* ModuleWebView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ModuleWebView.swift; path = Sources/BotvilleApp/ModuleWebView.swift; sourceTree = SOURCE_ROOT; };
 		A10000000000000000000018 /* PairingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PairingView.swift; path = Sources/BotvilleApp/PairingView.swift; sourceTree = SOURCE_ROOT; };
 		A10000000000000000000019 /* PushDiagnosticsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PushDiagnosticsView.swift; path = Sources/BotvilleApp/PushDiagnosticsView.swift; sourceTree = SOURCE_ROOT; };
@@ -110,6 +112,7 @@
 				A10000000000000000000018 /* PairingView.swift */,
 				A10000000000000000000016 /* DynamicUI.swift */,
 				C24000000000000000000002 /* MemoryViews.swift */,
+				C25000000000000000000002 /* AIProfileView.swift */,
 				A10000000000000000000019 /* PushDiagnosticsView.swift */,
 				A1000000000000000000001C /* ForegroundInAppBanner.swift */,
 				A1000000000000000000001A /* BotvilleApp.entitlements */,
@@ -217,6 +220,7 @@
 				A10000000000000000000007 /* ModuleWebView.swift in Sources */,
 				A10000000000000000000006 /* DynamicUI.swift in Sources */,
 				C24000000000000000000001 /* MemoryViews.swift in Sources */,
+				C25000000000000000000001 /* AIProfileView.swift in Sources */,
 				A10000000000000000000008 /* PairingView.swift in Sources */,
 				A10000000000000000000009 /* PushDiagnosticsView.swift in Sources */,
 				A1000000000000000000000A /* ForegroundInAppBanner.swift in Sources */,

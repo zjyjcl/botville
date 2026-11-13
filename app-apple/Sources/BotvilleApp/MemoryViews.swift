@@ -55,7 +55,7 @@ struct MyAIListView: View {
                     ForEach(model.personas) { persona in
                         NavigationLink {
                             PersonaMemoryView(
-                                persona: persona, client: modelClient, manifest: manifest)
+                                persona: persona, client: modelClient)
                         } label: {
                             Label(persona.displayName, systemImage: "person.crop.circle")
                         }
@@ -133,7 +133,7 @@ private final class MemoryListModel: ObservableObject {
     }
 
     func remove(_ memory: Memory) async -> MemoryMutationResult {
-        guard memory.canMutate, !isLoading, !isLoadingMore, mutatingIDs.insert(memory.id).inserted
+        guard memory.actions.canDelete, !isLoading, !isLoadingMore, mutatingIDs.insert(memory.id).inserted
         else {
             return .failed("当前操作尚未完成，请稍后再试。")
         }
@@ -150,7 +150,7 @@ private final class MemoryListModel: ObservableObject {
     }
 
     func togglePin(_ memory: Memory) async -> MemoryMutationResult {
-        guard memory.canPin, !isLoading, !isLoadingMore, mutatingIDs.insert(memory.id).inserted
+        guard memory.actions.canTogglePin, !isLoading, !isLoadingMore, mutatingIDs.insert(memory.id).inserted
         else {
             return .failed("当前操作尚未完成，请稍后再试。")
         }
@@ -183,24 +183,20 @@ private enum MemoryMutationResult {
 private struct PersonaMemoryView: View {
     let persona: MemoryPersona
     let client: any GatewayClient
-    let manifest: GatewayCapabilityManifest?
     @StateObject private var model: MemoryListModel
     @State private var pendingDeletion: Memory?
 
-    init(persona: MemoryPersona, client: any GatewayClient, manifest: GatewayCapabilityManifest?) {
+    init(persona: MemoryPersona, client: any GatewayClient) {
         self.persona = persona
         self.client = client
-        self.manifest = manifest
         _model = StateObject(wrappedValue: MemoryListModel(personaID: persona.id, client: client))
     }
 
     var body: some View {
         List {
-            if MemoryPresentationPolicy.shouldShowOwnerDisclosure(in: manifest) {
-                Section {
-                    Label(MemoryPresentationPolicy.disclosureText, systemImage: "info.circle")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }
+            Section {
+                Label(MemoryPresentationPolicy.ownerExplanationText, systemImage: "info.circle")
+                    .font(.footnote).foregroundStyle(.secondary)
             }
             if let message = model.errorMessage {
                 Section {
@@ -218,8 +214,27 @@ private struct PersonaMemoryView: View {
                     } label: {
                         MemoryRow(memory: memory)
                     }
+                    .contextMenu {
+                        if memory.actions.canTogglePin {
+                            Button(memory.pinned ? "取消固定" : "固定记忆") {
+                                Task { _ = await model.togglePin(memory) }
+                            }
+                        }
+                        if memory.actions.canDelete {
+                            Button("删除", role: .destructive) { pendingDeletion = memory }
+                        }
+                    }
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                        if memory.canMutate {
+                        if memory.actions.canTogglePin {
+                            Button {
+                                Task { _ = await model.togglePin(memory) }
+                            } label: {
+                                Label(memory.pinned ? "取消固定" : "固定记忆",
+                                      systemImage: memory.pinned ? "pin.slash" : "pin")
+                            }
+                            .tint(memoryAccent)
+                        }
+                        if memory.actions.canDelete {
                             Button(role: .destructive) {
                                 pendingDeletion = memory
                             } label: {
@@ -327,9 +342,9 @@ private struct MemoryDetailView: View {
                     LabeledContent("范围", value: memoryScopeTitle(memory.scope.kind))
                     LabeledContent("更新时间") { Text(memory.updatedAt, style: .date) }
                 }
-                if memory.canMutate {
+                if memory.actions.canDelete {
                     Section {
-                        if memory.canPin {
+                        if memory.actions.canTogglePin {
                             Button(memory.pinned ? "取消固定" : "固定记忆") { Task { await pin() } }
                         }
                         Button("删除记忆", role: .destructive) { showDeleteConfirmation = true }

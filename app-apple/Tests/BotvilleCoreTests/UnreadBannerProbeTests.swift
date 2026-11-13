@@ -24,6 +24,9 @@ final class UnreadBannerProbeTests: XCTestCase {
             XCTAssertTrue(lines.last!.contains("source=\(source.rawValue)"))
             XCTAssertTrue(lines.last!.contains("before=3 after=0 muted=true"))
         }
+        UnreadBannerProbeLog.unread(.sdkInfoUnavailable, roomID: room, before: nil, after: nil, now: 42)
+        XCTAssertTrue(lines.last!.contains("source=sdkInfoUnavailable"))
+        XCTAssertTrue(lines.last!.contains("before=- after=-"))
         for outcome in UnreadBannerProbeLog.RefreshOutcome.allCases {
             UnreadBannerProbeLog.refresh(refresh, online: true, outcome: outcome, now: 42)
             XCTAssertTrue(lines.last!.contains("online=true outcome=\(outcome.rawValue)"))
@@ -68,6 +71,22 @@ final class UnreadBannerProbeTests: XCTestCase {
         for line in lines {
             for raw in [room, value.eventID!, value.title, value.preview] { XCTAssertFalse(line.contains(raw)) }
         }
+    }
+
+    func testSuppressionBatchKeepsLatestPerKeyAndRemainsBounded() {
+        var latest = ForegroundSyncSuppressionBatch()
+        latest.enqueue(reason: .muted, roomID: "!one:test", now: 1)
+        latest.enqueue(reason: .muted, roomID: "!one:test", now: 2)
+        XCTAssertEqual(latest.drain(), [.init(reason: .muted, roomID: "!one:test", now: 2)])
+
+        var batch = ForegroundSyncSuppressionBatch()
+        for index in 0...ForegroundSyncSuppressionBatch.maximumPending {
+            batch.enqueue(reason: .notForeground, roomID: "!\(index):test", now: 3)
+        }
+        let entries = batch.drain()
+        XCTAssertLessThanOrEqual(entries.count, ForegroundSyncSuppressionBatch.maximumPending)
+        XCTAssertEqual(entries.last?.roomID, "!\(ForegroundSyncSuppressionBatch.maximumPending):test")
+        XCTAssertTrue(batch.drain().isEmpty)
     }
 
     func testReadReceiptRecordsLocalZeroOnlyOnSuccess() {

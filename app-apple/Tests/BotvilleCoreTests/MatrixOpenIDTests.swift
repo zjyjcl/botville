@@ -496,7 +496,7 @@ final class MatrixOpenIDTests: XCTestCase {
             defer { returned.fulfill() }
             return try await provider.token()
         }
-        await gate.waitUntilStarted()
+        try await gate.waitUntilStarted()
         pending.cancel()
         await fulfillment(of: [returned], timeout: 2)
         await gate.release()
@@ -522,7 +522,7 @@ final class MatrixOpenIDTests: XCTestCase {
             defer { returned.fulfill() }
             return try await provider.token()
         }
-        await gate.waitUntilStarted()
+        try await gate.waitUntilStarted()
         let survivor = Task { try await provider.token() }
         cancelled.cancel()
         await fulfillment(of: [returned], timeout: 2)
@@ -546,7 +546,7 @@ final class MatrixOpenIDTests: XCTestCase {
             let durations = OpenIDWaits()
             let provider = MatrixOpenIDTokenProvider(requestTimeout: input, timeoutSleep: {
                 await durations.record($0)
-                await gate.waitUntilStarted()
+                try await gate.waitUntilStarted()
             }) { await gate.issue() }
             do { _ = try await provider.token(); XCTFail("Expected normalized deadline") }
             catch { XCTAssertTrue(error as? MatrixOpenIDError == .requestTimedOut) }
@@ -554,6 +554,18 @@ final class MatrixOpenIDTests: XCTestCase {
             XCTAssertEqual(observed, [expected])
             await gate.release()
             await provider.shutdown()
+        }
+    }
+
+    func testGateStartWaitTimesOutInsteadOfHanging() async {
+        let gate = OpenIDGate()
+        do {
+            try await gate.waitUntilStarted(timeout: .milliseconds(1))
+            XCTFail("Expected the test helper timeout")
+        } catch let error as OpenIDGateError {
+            XCTAssertEqual(error, .startTimedOut)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
         }
     }
 
@@ -603,8 +615,8 @@ final class MatrixOpenIDTests: XCTestCase {
             return failed
         } }
         await fulfillment(of: [started], timeout: 2)
-        await gate.waitUntilStarted()
-        await deadline.waitUntilStarted()
+        try await gate.waitUntilStarted()
+        try await deadline.waitUntilStarted()
         // Give launched callers time to join the suspended flight, as in the
         // existing concurrent source-failure test. The source count below also
         // checks that no caller accidentally started another flight.
@@ -643,7 +655,7 @@ final class MatrixOpenIDTests: XCTestCase {
             defer { returned.fulfill() }
             return try await provider.token()
         }
-        await gate.waitUntilStarted()
+        try await gate.waitUntilStarted()
         await fulfillment(of: [slept], timeout: 2)
         await fulfillment(of: [returned], timeout: 0.05)
         await gate.release()
@@ -673,8 +685,8 @@ final class MatrixOpenIDTests: XCTestCase {
             defer { returned.fulfill() }
             return try await provider.token()
         }
-        await gate.waitUntilStarted()
-        await deadline.waitUntilStarted()
+        try await gate.waitUntilStarted()
+        try await deadline.waitUntilStarted()
         await deadline.release()
         await fulfillment(of: [returned], timeout: 2)
         do { _ = try await pending.value; XCTFail("Expected timeout") }
@@ -700,7 +712,7 @@ final class MatrixOpenIDTests: XCTestCase {
             _ = await gate.issue()
             return try await provider.token()
         }
-        await gate.waitUntilStarted()
+        try await gate.waitUntilStarted()
         pending.cancel()
         await gate.release()
         do { _ = try await pending.value; XCTFail("Expected caller cancellation") }
@@ -730,7 +742,7 @@ final class MatrixOpenIDTests: XCTestCase {
             defer { returned.fulfill() }
             return try await provider.token()
         }
-        await gate.waitUntilStarted()
+        try await gate.waitUntilStarted()
         await provider.shutdown()
         await fulfillment(of: [returned], timeout: 2)
         await gate.release()
@@ -782,12 +794,24 @@ private actor OpenIDSource {
 private actor OpenIDGate {
     var continuation: CheckedContinuation<MatrixOpenIDToken, Never>?
     func issue() async -> MatrixOpenIDToken { await withCheckedContinuation { continuation = $0 } }
-    func waitUntilStarted() async { while continuation == nil { await Task.yield() } }
+    func waitUntilStarted(timeout: Duration = .seconds(2)) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while continuation == nil {
+            guard clock.now < deadline else { throw OpenIDGateError.startTimedOut }
+            try Task.checkCancellation()
+            await Task.yield()
+        }
+    }
     func release() {
         continuation?.resume(returning: MatrixOpenIDToken(accessToken: "synthetic-openid", tokenType: "Bearer",
             matrixServerName: "matrix.test", expiresInSeconds: 3600))
         continuation = nil
     }
+}
+
+private enum OpenIDGateError: Error, Equatable {
+    case startTimedOut
 }
 
 private final class OpenIDClock: @unchecked Sendable {

@@ -138,6 +138,21 @@ final class ForegroundInAppBannerTests: XCTestCase {
         withExtendedLifetime(observation) { XCTAssertNil(store.current) }
     }
 
+    func testStoreReplacesSameRoomWithANewerEventAndOldTimerCannotDismissIt() async {
+        let clock = TestClock()
+        let store = ForegroundInAppBannerStore(displayDuration: .seconds(3), sleep: { duration in await clock.sleep(duration) })
+        store.updateContext(isForeground: true, visibleRoomID: nil, isInputActive: false)
+        let first = candidate(eventID: "$same-room-one")
+        let second = candidate(roomID: first.roomID, eventID: "$same-room-two", date: date.addingTimeInterval(1))
+        store.receive(first)
+        await clock.waitForSleeps(1)
+        store.receive(second)
+        await clock.waitForSleeps(2)
+        await clock.advance()
+        await Task.yield()
+        XCTAssertEqual(store.current, second)
+    }
+
     func testStoreDoesNotRestartTimerForTheSameCandidate() async {
         let clock = TestClock()
         let store = ForegroundInAppBannerStore(displayDuration: .seconds(3), sleep: { duration in await clock.sleep(duration) })

@@ -21,6 +21,14 @@ final class ForegroundSyncNotificationBridge: SyncNotificationListener, @uncheck
     private var epoch = UUID()
     private var seen = Set<String>()
     private var order = [String]()
+#if DEBUG
+    // Keep DEBUG-only own-message dedupe independent from production candidates.
+    private var ownSeen = Set<String>()
+    private var ownOrder = [String]()
+    private let suppressionLock = NSLock()
+    private var suppressionBatch = ForegroundSyncSuppressionBatch()
+    private var isSuppressionDrainScheduled = false
+#endif
 
     init(userID: String, continuation: AsyncStream<ForegroundSyncEvent>.Continuation) {
         self.userID = userID
@@ -43,8 +51,25 @@ final class ForegroundSyncNotificationBridge: SyncNotificationListener, @uncheck
     func onNotification(notification: NotificationItem, roomId: String) {
         let context = lock.withLock { (ready, active, epoch) }
 #if DEBUG
-        if case .timeline(let event) = notification.event, event.senderId() == userID {
-            recordSuppression(.ownMessage, roomID: roomId)
+        guard let eventID = Self.messageLikeEventID(notification) else { return }
+        let isOwn = Self.isOwnMessage(notification, userID: userID)
+        if isOwn {
+            lock.withLock {
+                let key = roomId + "|" + eventID
+                guard ownSeen.insert(key).inserted else {
+                    recordSuppression(.alreadyHandled, roomID: roomId)
+                    return
+                }
+                ownOrder.append(key)
+                if ownOrder.count > 2048 { ownSeen.remove(ownOrder.removeFirst()) }
+                // The own-message signal follows the same message filter and
+                // deduplication window as candidates without entering their state.
+                let reason: UnreadBannerProbeLog.BannerReason = !context.0 ? .initialSync
+                    : (!context.1 || !active ? .notForeground
+                        : (context.2 == epoch ? .ownMessage : .staleVisibility))
+                recordSuppression(reason, roomID: roomId)
+            }
+            return
         }
 #endif
         guard let candidate = Self.candidate(notification: notification, roomID: roomId, userID: userID),
@@ -75,8 +100,26 @@ final class ForegroundSyncNotificationBridge: SyncNotificationListener, @uncheck
     private func recordSuppression(_ reason: UnreadBannerProbeLog.BannerReason, roomID: String) {
         // Capture monotonic time at the SDK callback, before the actor hop.
         let now = ProcessInfo.processInfo.systemUptime
-        Task { @MainActor in
-            UnreadBannerProbeLog.banner(roomID: roomID, reason: reason, now: now)
+        let scheduleDrain = suppressionLock.withLock {
+            suppressionBatch.enqueue(reason: reason, roomID: roomID, now: now)
+            guard !isSuppressionDrainScheduled else { return false }
+            isSuppressionDrainScheduled = true
+            return true
+        }
+        guard scheduleDrain else { return }
+        Task { @MainActor [weak self] in
+            self?.drainSuppressions()
+        }
+    }
+
+    @MainActor
+    private func drainSuppressions() {
+        let entries = suppressionLock.withLock {
+            isSuppressionDrainScheduled = false
+            return suppressionBatch.drain()
+        }
+        for entry in entries {
+            UnreadBannerProbeLog.banner(roomID: entry.roomID, reason: entry.reason, now: entry.now)
         }
     }
 #endif
@@ -103,4 +146,54 @@ final class ForegroundSyncNotificationBridge: SyncNotificationListener, @uncheck
             title: text.title ?? roomID,
             preview: notification.roomInfo.isEncrypted == true ? "加密消息" : text.body)
     }
+
+
+#if DEBUG
+    private static func messageLikeEventID(_ notification: NotificationItem) -> String? {
+        guard case .timeline(let event) = notification.event,
+              case .messageLike(let content) = try? event.content() else { return nil }
+        switch content {
+        case .roomMessage, .roomEncrypted, .sticker: return event.eventId()
+        default: return nil
+        }
+    }
+
+    private static func isOwnMessage(_ notification: NotificationItem, userID: String) -> Bool {
+        guard case .timeline(let event) = notification.event else { return false }
+        return event.senderId() == userID
+    }
+#endif
 }
+
+#if DEBUG
+struct ForegroundSyncSuppressionBatch {
+    struct Entry: Equatable {
+        let reason: UnreadBannerProbeLog.BannerReason
+        let roomID: String
+        let now: TimeInterval
+    }
+
+    static let maximumPending = 256
+    private var entries = [String: Entry]()
+    private var order = [String]()
+
+    mutating func enqueue(reason: UnreadBannerProbeLog.BannerReason, roomID: String, now: TimeInterval) {
+        let key = reason.rawValue + "|" + roomID
+        if entries[key] == nil {
+            order.append(key)
+            if order.count > Self.maximumPending {
+                entries.removeValue(forKey: order.removeFirst())
+            }
+        }
+        entries[key] = Entry(reason: reason, roomID: roomID, now: now)
+    }
+
+    mutating func drain() -> [Entry] {
+        defer {
+            entries.removeAll(keepingCapacity: true)
+            order.removeAll(keepingCapacity: true)
+        }
+        return order.compactMap { entries[$0] }
+    }
+}
+#endif

@@ -54,6 +54,21 @@ final class MemoryClientTests: XCTestCase {
         XCTAssertFalse(page.items[0].canPin)
     }
 
+    func testDecodedRedactedMemoryOffersDeleteAndExistingPinRemovalOnly() throws {
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: memoryData()) as? [String: Any])
+        object["redacted"] = true
+        object["text"] = NSNull()
+        for pinned in [false, true] {
+            object["pinned"] = pinned
+            let memory = try GatewayCoding.decoder.decode(
+                Memory.self, from: JSONSerialization.data(withJSONObject: object))
+            XCTAssertTrue(memory.actions.canDelete)
+            XCTAssertFalse(memory.actions.canPin)
+            XCTAssertEqual(memory.actions.canUnpin, pinned)
+            XCTAssertEqual(memory.canPin, pinned)
+        }
+    }
+
     func testMemoryRequestsUseExactPathsAndRepeatedQuery() throws {
         let client = try HTTPGatewayClient(
             baseURL: "https://gateway.example.invalid", token: "site-token")

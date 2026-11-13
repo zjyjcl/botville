@@ -1128,6 +1128,42 @@ final class MatrixServiceLifecycleTests: XCTestCase {
             notification: notification, roomID: "!push:matrix.test", userID: "@me:matrix.test"))
     }
 
+#if DEBUG
+    func testOwnMessageProbeFiltersDeduplicatesAndAttributesInitialSync() async {
+        var lines = [String]()
+        let initialSync = expectation(description: "initial own message is attributed to initial sync")
+        let alreadyHandled = expectation(description: "repeated own message is deduplicated")
+        let ownMessage = expectation(description: "ready own message is attributed")
+        UnreadBannerProbeLog.observer = { line in
+            lines.append(line)
+            if line.contains("reason=initialSync") { initialSync.fulfill() }
+            if line.contains("reason=alreadyHandled") { alreadyHandled.fulfill() }
+            if line.contains("reason=ownMessage") { ownMessage.fulfill() }
+        }
+        defer { UnreadBannerProbeLog.observer = nil }
+        var continuation: AsyncStream<ForegroundSyncEvent>.Continuation!
+        let stream = AsyncStream<ForegroundSyncEvent> { continuation = $0 }
+        let bridge = ForegroundSyncNotificationBridge(userID: "@me:matrix.test", continuation: continuation)
+        let initial = syncNotification(eventID: "$initial-own", body: "private", timestamp: 1,
+                                       sender: "@me:matrix.test")
+        bridge.onNotification(notification: initial, roomId: "!private:test")
+        bridge.onNotification(notification: initial, roomId: "!private:test")
+        await fulfillment(of: [initialSync, alreadyHandled], timeout: 2)
+        XCTAssertEqual(lines.filter { $0.contains("reason=initialSync") }.count, 1)
+        XCTAssertEqual(lines.filter { $0.contains("reason=ownMessage") }.count, 0)
+
+        bridge.finishInitialSync()
+        bridge.onNotification(notification: syncNotification(eventID: "$live-own", body: "private", timestamp: 2,
+                                                             sender: "@me:matrix.test"), roomId: "!private:test")
+        var nonMessage = initial
+        nonMessage.event = .invite(sender: "@me:matrix.test")
+        bridge.onNotification(notification: nonMessage, roomId: "!private:test")
+        await fulfillment(of: [ownMessage], timeout: 2)
+        XCTAssertEqual(lines.filter { $0.contains("reason=ownMessage") }.count, 1)
+        withExtendedLifetime(stream) {}
+    }
+#endif
+
     func testSyncNotificationsEmitEveryCurrentEventWithoutLatestEventReadback() async throws {
         let temporary = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: temporary) }
@@ -1856,9 +1892,10 @@ private final class FakeTimelineEvent: TimelineEvent, @unchecked Sendable {
     override func content() throws -> TimelineEventContent { .messageLike(content: .sticker) }
 }
 
-private func syncNotification(eventID: String, body: String, timestamp: UInt64, roomID: String = "!push:matrix.test") -> NotificationItem {
-    let event = FakeTimelineEvent(id: eventID, sender: "@sender:matrix.test", timestamp: timestamp)
-    let raw = "{\"type\":\"m.sticker\",\"event_id\":\"\(eventID)\",\"room_id\":\"\(roomID)\",\"sender\":\"@sender:matrix.test\",\"content\":{\"body\":\"\(body)\"}}"
+private func syncNotification(eventID: String, body: String, timestamp: UInt64, roomID: String = "!push:matrix.test",
+                              sender: String = "@sender:matrix.test") -> NotificationItem {
+    let event = FakeTimelineEvent(id: eventID, sender: sender, timestamp: timestamp)
+    let raw = "{\"type\":\"m.sticker\",\"event_id\":\"\(eventID)\",\"room_id\":\"\(roomID)\",\"sender\":\"\(sender)\",\"content\":{\"body\":\"\(body)\"}}"
     return NotificationItem(event: .timeline(event: event), rawEvent: raw,
                             senderInfo: NotificationSenderInfo(displayName: "Sender", avatarUrl: nil, isNameAmbiguous: false),
                             roomInfo: NotificationRoomInfo(displayName: "Push", avatarUrl: nil, canonicalAlias: nil, topic: nil, joinRule: nil,

@@ -592,6 +592,37 @@ public final class MatrixService: ObservableObject {
                                      openIDProvider: gatewayOpenIDProvider)
     }
 
+    /// Loads profile data only after the room's complete membership confirms a
+    /// one-to-one AI direct message. Results from a replaced session are never
+    /// returned to the UI.
+    public func aiProfile(roomID: String) async throws -> AIProfile? {
+        try Task.checkCancellation()
+        let session = sessionGeneration
+        guard isLoggedIn, !isLoggingOut, let client, let userID else { return nil }
+        let profile = try await AIProfileLoader.load(client: client, roomID: roomID,
+                                                     localUserID: userID, policy: aiParticipantPolicy)
+        guard session == sessionGeneration, !isLoggingOut, !Task.isCancelled else { throw CancellationError() }
+        return profile
+    }
+
+    /// The paired gateway is authoritative only for a local AI on the same
+    /// Matrix server name as the signed-in account. Network or stale-session
+    /// failures fail closed so the profile never infers owner access.
+    public func aiProfileDisclosure(aiUserID: String) async -> Bool {
+        let session = sessionGeneration
+        let localServerName = userID.flatMap(MemoryPresentationPolicy.matrixServerName(in:))
+        do {
+            guard let gateway = try confirmedGatewayClient() else { return false }
+            let manifest = try await gateway.capabilities()
+            guard session == sessionGeneration, !isLoggingOut, !Task.isCancelled else { return false }
+            return MemoryPresentationPolicy.shouldShowOwnerDisclosure(
+                in: manifest, aiUserID: aiUserID, localServerName: localServerName
+            )
+        } catch {
+            return false
+        }
+    }
+
     /// Invoked only after the UI's destructive confirmation. No successful
     /// load() is required, so malformed Keychain items can be deleted too.
     public func clearLocalSession() async throws {
@@ -869,6 +900,10 @@ public final class MatrixService: ObservableObject {
         }
 #endif
         var updated: [MatrixRoom] = []
+#if DEBUG
+        // Snapshot once so diagnostic reads do not turn a room refresh into O(n²).
+        let previousUnreadByRoom = Dictionary(uniqueKeysWithValues: rooms.map { ($0.id, $0.unreadCount) })
+#endif
         for room in client.rooms() {
             let membership: MatrixRoomMembership
             switch room.membership() {
@@ -878,14 +913,14 @@ public final class MatrixService: ObservableObject {
             }
             let info = try? await room.roomInfo()
 #if DEBUG
-            let previousUnread = rooms.first(where: { $0.id == room.id() })?.unreadCount
+            let previousUnread = previousUnreadByRoom[room.id()]
             if info?.numUnreadMessages == 0 {
                 UnreadBannerProbeLog.unread(.sdkUnreadZero, roomID: room.id(), before: previousUnread, after: 0,
                     muted: roomNotifications.isMuted(room.id()), refresh: refresh, online: onlineSyncGeneration != nil)
             }
             if info == nil {
                 UnreadBannerProbeLog.unread(.sdkInfoUnavailable, roomID: room.id(), before: previousUnread,
-                    after: 0, refresh: refresh, online: onlineSyncGeneration != nil)
+                    after: nil, refresh: refresh, online: onlineSyncGeneration != nil)
             }
 #endif
             let latest = await room.latestEvent()
@@ -930,7 +965,7 @@ public final class MatrixService: ObservableObject {
 #if DEBUG
             probeOutcome = .committed
             for room in updated where room.unreadCount == 0 {
-                if let before = rooms.first(where: { $0.id == room.id })?.unreadCount, before > 0 {
+                if let before = previousUnreadByRoom[room.id], before > 0 {
                     UnreadBannerProbeLog.unread(.refreshCommitZero, roomID: room.id, before: before, after: 0,
                         muted: roomNotifications.isMuted(room.id), refresh: refresh,
                         online: onlineSyncGeneration != nil, outcome: .committed)

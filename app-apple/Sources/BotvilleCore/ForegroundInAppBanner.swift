@@ -280,12 +280,12 @@ enum UnreadBannerProbeLog {
 
     static func fingerprint(_ roomID: String) -> String { TimelineTrace.fingerprint(roomID) }
 
-    static func unread(_ source: UnreadSource, roomID: String, before: UInt64?, after: UInt64,
+    static func unread(_ source: UnreadSource, roomID: String, before: UInt64?, after: UInt64?,
                        muted: Bool? = nil, refresh: UUID? = nil, online: Bool = false,
                        outcome: RefreshOutcome = .observed,
                        now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
         emit("unread_banner_probe t=\(now) source=\(source.rawValue) room=\(fingerprint(roomID))"
-             + " before=\(before.map(String.init) ?? "-") after=\(after) muted=\(muted.map(String.init) ?? "-")"
+             + " before=\(before.map(String.init) ?? "-") after=\(after.map(String.init) ?? "-") muted=\(muted.map(String.init) ?? "-")"
              + " refresh=\(TimelineTrace.fingerprint(refresh?.uuidString)) online=\(online) outcome=\(outcome.rawValue)")
     }
 
