@@ -333,6 +333,9 @@ class EngineHooks(ConsumerHooks):
                     "allow_deferred": False,
                 },
                 idempotency_key=idem_key,
+                # The consumer only sets room_is_dm after a complete joined
+                # member lookup; unknown and group rooms must not auto-join.
+                allow_auto_join=bool(ctx and ctx.room_members_confirmed and getattr(ctx, "room_is_dm", False)),
             )
         except GatewayDeliveryError as exc:
             # HS 暂时不可用 → transient；其余（命名空间/参数错误）→ 普通失败。
@@ -376,9 +379,36 @@ class EngineHooks(ConsumerHooks):
             raise self._memory_unavailable(exc) from None
         self._memory_recovered()
 
+    def on_ai_text(self, ctx: ConsumerContext) -> None:
+        """Archive other AI speech as untrusted group context, never reply."""
+        if (self._memory_store is None or not ctx.room_members_confirmed
+                or getattr(ctx, "room_is_dm", False) or not ctx.room_id
+                or not isinstance(ctx.sender, str) or not ctx.sender.startswith("@ai_")):
+            return
+        # Memory-off retains the existing ring-buffer behavior.  The sender
+        # guard excludes the AS sender, which is AI-side for loop prevention
+        # but is not an @ai_* persona source.
+        for persona_id in ctx.room_ai_user_ids:
+            persona = self._personas.get(persona_id)
+            if persona is None or persona.user_id == ctx.sender:
+                continue
+            try:
+                self._memory_store.add_item(
+                    persona_id=persona.user_id, scope_kind="group", scope_key=ctx.room_id,
+                    room_id=ctx.room_id, counterpart=ctx.sender or "",
+                    event_id=ctx.event_id or None, sender=ctx.sender,
+                    role="assistant", trust="untrusted",
+                    text=truncate_text(ctx.text, _RING_TEXT_LIMIT), source="event",
+                )
+            except Exception as exc:
+                self.stats.inc("memory_write_errors")
+                raise self._memory_unavailable(exc) from None
+        self._memory_recovered()
+
     @staticmethod
     def _memory_scope(persona: Persona, ctx: ConsumerContext) -> Tuple[str, str, str]:
-        if ctx.room_members_confirmed and len(ctx.room_ai_user_ids) == 1 and ctx.sender:
+        if (ctx.room_members_confirmed and getattr(ctx, "room_is_dm", False)
+                and ctx.sender and tuple(ctx.room_ai_user_ids) == (persona.user_id,)):
             return "dm", ctx.sender, ctx.sender
         return "group", ctx.room_id or "", ctx.sender or ""
 

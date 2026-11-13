@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 botville contributors
-"""Bounded local-AI room membership cache for the AS consumer.
+"""Bounded joined-room membership cache for the AS consumer.
 
 The cache is deliberately a routing aid, not an authority: a failed homeserver
 lookup raises so callers retain mention-only behaviour and count errors.
@@ -22,10 +22,10 @@ BREAKER_COOLDOWN_SECONDS = 60.0
 
 
 class RoomMemberSource:
-    """Return local joined AI members from a bounded cache or AS lookup.
+    """Return complete joined membership from a bounded cache or AS lookup.
 
-    ``observe_member_event`` accepts raw Matrix member events.  Only joined
-    local AI users are retained; leave and ban remove them, while invite does
+    ``observe_member_event`` accepts raw Matrix member events.  Only
+    joined users are retained; leave and ban remove them, while invite does
     not make a user a member.  Entries expire quickly so missed state events
     cannot make direct-message routing stale indefinitely.
     """
@@ -51,8 +51,7 @@ class RoomMemberSource:
         self._max_rooms = max_rooms
         self._monotonic = monotonic
         self._items: "OrderedDict[str, Tuple[set[str], float]]" = OrderedDict()
-        # Owner disclosure checks must never reuse the AI-only routing cache:
-        # their subject is normally a human Matrix user.  Cache the resulting
+        # Owner disclosure checks use a separate per-subject lookup. Cache the
         # boolean by room and subject, while still using the same bounded
         # failure/backoff path as ``members``.
         self._joined: "OrderedDict[Tuple[str, str], Tuple[bool, float]]" = OrderedDict()
@@ -79,10 +78,10 @@ class RoomMemberSource:
                 raise RuntimeError("room membership lookup temporarily unavailable")
             self._negative.pop(room_id, None)
         if self._fetcher is None or not self._personas:
-            return []
+            raise RuntimeError("room membership lookup unavailable")
         try:
             received = self._fetcher(room_id, self._personas)
-            ids = {uid for uid in received if isinstance(uid, str) and self._is_local_ai(uid)}
+            ids = {uid for uid in received if isinstance(uid, str)}
         except Exception:
             with self._lock:
                 failed_at = self._monotonic()
@@ -163,15 +162,21 @@ class RoomMemberSource:
             if joined_key in self._joined:
                 self._joined[joined_key] = (membership == "join", now + self._ttl)
                 self._joined.move_to_end(joined_key)
-            if not self._is_local_ai(state_key):
-                return
             cached = self._items.get(room_id)
-            ids = set(cached[0]) if cached is not None else set()
+            # A member event is only an increment.  It cannot establish a
+            # complete snapshot on a cold/expired entry, nor extend a known
+            # snapshot's TTL, because unseen members would turn a group into
+            # a guessed DM.
+            if cached is None or cached[1] <= now:
+                if cached is not None:
+                    del self._items[room_id]
+                return
+            ids = set(cached[0])
             if membership == "join":
                 ids.add(state_key)
             else:
                 ids.discard(state_key)
-            self._items[room_id] = (ids, now + self._ttl)
+            self._items[room_id] = (ids, cached[1])
             self._items.move_to_end(room_id)
             while len(self._items) > self._max_rooms:
                 self._items.popitem(last=False)

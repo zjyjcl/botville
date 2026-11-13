@@ -851,7 +851,7 @@ ephemeral 不在 AS 注册里开启，忽略。
   **fail-closed**：没有可识别的目标 AI，邀请一律归为 `other_state`。
 - sender 是 **本服 `@ai_*`**（localpart 以 `ai_` 开头且域名属本服）或**网关自身 AS
   sender**（`sender_localpart=botville-gateway`，本服）→ **不触发回复**，只记为 AI
-  发言事件并计数。AI 互聊由 §6.3 的 `ai_loop` 熔断处理。
+  发言事件并计数；群内其他 AI 文本可按⑩写入 untrusted 记忆。AI 互聊由 §6.3 的 `ai_loop` 熔断处理。
 - **外服 `@ai_*` sender 也按 AI 处理**：**保守**防跨服 AI 循环——不触发回复、计为 AI
   发言事件、**不**调用 `record_human_message`；其 trust 仍为 `untrusted`（§7.1）。
   否则两个部署的 AI 会互相把对方当人类、互相回复形成跨服循环。
@@ -876,13 +876,15 @@ ephemeral 不在 AS 注册里开启，忽略。
 
 **⑨ 何时开口（PR2 实际发言；PR1 只做纯决策函数）**
 
-`should_reply(...)` 是纯函数，输入 sender、房间 AI 成员、正文、`m.mentions.user_ids`、
+`should_reply(...)` 是纯函数，输入 sender、已确认的 DM 判定、房间 AI 成员、正文、`m.mentions.user_ids`、
 被回复对象，规则：
 
 1. sender 自己是 AI → **否**（防循环）；
-2. 房间里**恰好一个** AI → **是**（单聊必回）；
-3. 群聊：被 **@**（`m.mentions.user_ids` 含该 AI，或正文含其**完整** user ID）或被该 AI
-   **回复**（`content["m.relates_to"]["m.in_reply_to"]["event_id"]` 指向的事件 sender 是它）
+2. 完整 joined 成员**恰好为 {该 persona, 一个本服人类}** → **是**（DM 必回）。
+   本服人类指 domain 为本服、非 `@ai_*`、非 AS sender；其余房间一律为群，
+   包括单 AI + 多个人类、多个 AI、含外服成员。外服人类为 untrusted，不作为 DM 记忆对象；
+3. 群聊：被 **@**（`m.mentions.user_ids` 含该 AI，或正文含其**完整** user ID）或**回复该 AI 的消息**
+   （`content["m.relates_to"]["m.in_reply_to"]["event_id"]` 指向的事件 sender 是它）
    → **是**；
 4. 其余 → **否**。
 
@@ -890,20 +892,32 @@ ephemeral 不在 AS 注册里开启，忽略。
 事件写入 `event_id → sender`）+ 可选回填（AS 传输 `GET /_matrix/client/v3/rooms/{roomId}/event/{eventId}`）。
 回填失败 / 超时 / 查不到 → **按「不是回复」处理**（fail-closed），不影响事务继续处理。
 
-多个 AI 同时被 @ 时，**每个都回复**，按**提及顺序**串行执行（`target_user_ids` 保序；
-单线程消费者内逐个 `evaluate → model → send`，不并发）。
+群聊每条人类消息最多 `GATEWAY_GROUP_MAX_RESPONDERS` 个 AI 回复（int，默认 **3**，
+范围 **1–20**；非法或越界拒绝启动，错误不回显值）。按**提及顺序**串行执行，超出者跳过并计数；
+DM 不受此上限影响。`m.mentions.room=true`（`@room`）本身不产生目标，
+仅显式 user ID 提及或回复关系可触发群聊回复。
 
-生产消费者维护一个最多 **1000** 个房间、TTL **30 秒**的本服 AI 成员缓存：收到本服
-`@ai_*` 的 `m.room.member` 时，`join` 加入，`leave` / `ban` 移除，`invite` 不视为已加入。
+生产消费者维护一个最多 **1000** 个房间、TTL **30 秒**的**完整 joined 成员**缓存：收到
+`m.room.member` 时，`join` 加入，`leave` / `ban` 移除，`invite` 不视为已加入。
 缓存未命中时，传输层以已配置 persona 依次 masquerade 请求
 `GET /_matrix/client/v3/rooms/{roomId}/joined_members`，首个成功响应写入缓存；请求有超时且不
-跟随重定向。任何成员缓存或查询失败均 fail-closed，只按结构化/正文 mentions 判定并计
-`room_member_errors`，不会把群聊误判为单聊。
+跟随重定向。完整成员未确认或查询失败均按**群聊**处理，只按结构化/正文 mentions 或回复关系判定并计
+`room_member_errors`；记忆作用域必须为 group，绝不召回 DM 记忆。单个成员事件不构成完整成员确认。
+
+发送遇 `M_FORBIDDEN` 时，只有已确认 DM 的引擎回复允许自动 join 后重试一次；群聊及未知房间
+直接上抛，不 join。HTTP `POST /conversations/{id}/messages` 与主动发言路径默认不获此许可；
+B2.8b 可在明确的许可钩子加入已接受的 `group_rooms`。
 
 **⑩ 四层记忆（B2.6：PR3a / PR3b / PR3c 已实现）**
 
 四层为①最近对话、②滚动摘要、③长期档案、④向量检索。以下为完整批准规则；
 PR3c 的 HTTP 主人端点已启用。
+
+- **群内 AI 文本**：memory 开启时，`on_ai_text` 将本服或外服 `@ai_*` 的消息写入
+  同房间其他本服 persona 的 group 记忆，`trust=untrusted`；使用现有 `role=assistant`
+  与 `sender` 表示 AI 来源（无新增 origin 字段）。自己的消息由回复路径记录，不重复写入。
+  这些条目召回只进入 untrusted 数据区，绝不进入 system；AI sender 永不触发回复。
+  memory 关闭时保持原有行为，AI 入站钩子不追加 ring buffer。
 
 - **R1 Embedding（PR3b，已实现）**：OpenAI 兼容 `{BASE}/embeddings`；配置
   `GATEWAY_EMBEDDING_BASE_URL`（空 = 复用 `GATEWAY_MODEL_BASE_URL`）、
@@ -1728,6 +1742,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.4.0 | 2026-11-13 | [B2.8a 行为修正，无 API 字段变化] 一个 AI + 多个人类的房间现在只在被 @ 或被回复时回复；严格两人本服 DM、成员失败按群、群回复者上限、忽略 @room 广播、群 AI 文本记忆 untrusted、自动 join 仅 DM。 |
 | 0.4.0 | 2026-11-13 | [PR4b] 新增 owner-only `GET/PATCH /personas/{id}/state` 与 memory.db persona_state；新增 `GATEWAY_MOOD_ENABLED` / `GATEWAY_MOOD_HALF_LIFE_MINUTES`、确定性窗口规则及读时半衰期衰减。PersonaMood 删除 `neutral`、`anxious`，最终为 calm/happy/sad/excited/tired；详情增加 mood，列表项不变。模块关闭时通过 owner 校验后 404 `mood.disabled`。 |
 | 0.3.0 | 2026-11-13 | [PR4d additive] owner 文件签名 bio（500 码点），列表扩展与分级 GET 详情；本服非 owner 最小视图，跨服/无 owner/未知或非法 id 统一 404 persona.not_found。mood 可缺省/null 枚举，当前 null；自身和他人 bio 均不注入 system。 |
 | 0.2.0 | 2026-11-13 | [PR4a] 修正 caller token 格式与 GET /personas 无 owner 的 403 文档；修复不可变向量召回、策略先行、worker 有界停止与退避、E6 caller 隔离和 owner 配额、鉴权失败日志、保留期边界与摘要索引、SQL keyset 分页；明确 capabilities 顺序不可依赖并以示例测试守护输出；加固并发与本地 HTTP 测试。自 #211 起，所有布尔环境变量非法值的错误信息仅含变量名、不再回显输入值。本次不升契约版本。 |

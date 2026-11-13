@@ -56,7 +56,7 @@ from botville_gateway.as_consumer import (  # noqa: E402
     truncate_text,
 )
 from botville_gateway.as_txn_store import AsTransactionStore, build_as_txn_store, connect  # noqa: E402
-from botville_gateway.config import Config  # noqa: E402
+from botville_gateway.config import Config, ConfigError, load_config  # noqa: E402
 from botville_gateway.http_server import build_server  # noqa: E402
 
 # 明显假值；绝不是真实凭据
@@ -185,7 +185,18 @@ class TestShouldReply(unittest.TestCase):
     def test_single_ai_room_always_reply(self):
         self.assertTrue(should_reply(
             sender="@human:hs",
-            room_ai_user_ids=[self.AI_A],
+            room_ai_user_ids=[self.AI_A], room_is_dm=True,
+        ))
+
+    def test_single_ai_is_not_automatically_a_dm(self):
+        self.assertFalse(should_reply(
+            sender="@human:hs", room_ai_user_ids=[self.AI_A],
+        ))
+
+    def test_full_id_is_not_a_longer_domain_prefix(self):
+        self.assertFalse(should_reply(
+            sender="@human:hs", room_ai_user_ids=[self.AI_A],
+            text=self.AI_A + ".foreign.test",
         ))
 
     def test_group_no_mention_no_reply(self):
@@ -219,6 +230,124 @@ class TestShouldReply(unittest.TestCase):
             sender=self.AI_A,
             room_ai_user_ids=[self.AI_A],
         ))
+
+
+class TestQ5Routing(_TmpDb):
+    AI_A = "@ai_a:" + SERVER_NAME
+    AI_B = "@ai_b:" + SERVER_NAME
+
+    def test_dm_requires_exact_local_pair(self):
+        cases = (
+            ([self.AI_A, "@human:" + SERVER_NAME], True),
+            ([self.AI_A, "@one:" + SERVER_NAME, "@two:" + SERVER_NAME], False),
+            ([self.AI_A, "@human:other.test"], False),
+        )
+        for members, expected in cases:
+            consumer = self._make_consumer(room_members=lambda _room, m=members: m)
+            _ids, confirmed, is_dm, _human = consumer._confirmed_room_ai_ids("!r:" + SERVER_NAME)
+            self.assertTrue(confirmed)
+            self.assertEqual(is_dm, expected)
+
+    def test_failed_lookup_allows_explicit_target_but_not_dm(self):
+        seen = []
+        class Hooks(ConsumerHooks):
+            def on_human_text(self, ctx):
+                seen.append(ctx)
+        event = {"type": "m.room.message", "event_id": "$q5", "room_id": "!r:" + SERVER_NAME,
+                 "sender": "@human:" + SERVER_NAME,
+                 "content": {"msgtype": "m.text", "body": "ask " + self.AI_A}}
+        self.store.store_transaction("q5", json.dumps({"events": [event]}))
+        consumer = self._make_consumer(hooks=Hooks(), room_members=lambda _room: (_ for _ in ()).throw(RuntimeError()), persona_user_ids=(self.AI_A,))
+        consumer.run_once()
+        self.assertFalse(seen[0].room_is_dm)
+        self.assertEqual(seen[0].target_user_ids, (self.AI_A,))
+
+    def test_group_cap_preserves_mention_order(self):
+        ids = tuple("@ai_%d:" % i + SERVER_NAME for i in range(4))
+        seen = []
+        class Hooks(ConsumerHooks):
+            def on_human_text(self, ctx): seen.append(ctx)
+        event = {"type": "m.room.message", "event_id": "$cap", "room_id": "!r:" + SERVER_NAME,
+                 "sender": "@human:" + SERVER_NAME,
+                 "content": {"msgtype": "m.text", "body": "hi", "m.mentions": {"user_ids": list(reversed(ids))}}}
+        self.store.store_transaction("cap", json.dumps({"events": [event]}))
+        consumer = self._make_consumer(hooks=Hooks(), room_members=lambda _room: list(ids) + ["@human:" + SERVER_NAME], persona_user_ids=ids, group_max_responders=2)
+        consumer.run_once()
+        self.assertEqual(seen[0].target_user_ids, tuple(reversed(ids))[:2])
+        self.assertEqual(consumer.stats["group_responder_skips"], 2)
+
+    def test_group_responder_config_hides_bad_value(self):
+        for raw in ("0", "21", "bad"):
+            with self.assertRaises(ConfigError) as caught:
+                load_config({"GATEWAY_DEV_MODE": "true", "GATEWAY_GROUP_MAX_RESPONDERS": raw})
+            self.assertNotIn(raw, str(caught.exception))
+
+    def test_room_broadcast_has_no_persona_target(self):
+        seen = []
+        class Hooks(ConsumerHooks):
+            def on_human_text(self, ctx): seen.append(ctx)
+        event = {"type": "m.room.message", "event_id": "$room", "room_id": "!r:" + SERVER_NAME,
+                 "sender": "@human:" + SERVER_NAME,
+                 "content": {"msgtype": "m.text", "body": "all", "m.mentions": {"room": True}}}
+        self.store.store_transaction("room", json.dumps({"events": [event]}))
+        self._make_consumer(hooks=Hooks(), room_members=lambda _room: [self.AI_A, "@human:" + SERVER_NAME, "@other:" + SERVER_NAME], persona_user_ids=(self.AI_A,)).run_once()
+        self.assertEqual(seen[0].target_user_ids, ())
+
+    def test_dm_uses_confirmed_persona_with_multiple_configured_personas(self):
+        seen = []
+        class Hooks(ConsumerHooks):
+            def on_human_text(self, ctx): seen.append(ctx)
+        event = {"type": "m.room.message", "event_id": "$dm", "room_id": "!r:" + SERVER_NAME,
+                 "sender": "@human:" + SERVER_NAME,
+                 "content": {"msgtype": "m.text", "body": "ordinary text"}}
+        self.store.store_transaction("dm", json.dumps({"events": [event]}))
+        self._make_consumer(hooks=Hooks(), persona_user_ids=(self.AI_A, self.AI_B),
+            room_members=lambda _room: [self.AI_A, "@human:" + SERVER_NAME]).run_once()
+        self.assertTrue(seen[0].room_is_dm)
+        self.assertEqual(seen[0].target_user_ids, (self.AI_A,))
+
+    def test_nonmember_sender_never_inherits_dm_scope(self):
+        seen = []
+        class Hooks(ConsumerHooks):
+            def on_human_text(self, ctx): seen.append(ctx)
+        event = {"type": "m.room.message", "event_id": "$stale", "room_id": "!r:" + SERVER_NAME,
+                 "sender": "@former:" + SERVER_NAME,
+                 "content": {"msgtype": "m.text", "body": "ordinary text"}}
+        self.store.store_transaction("stale", json.dumps({"events": [event]}))
+        self._make_consumer(hooks=Hooks(), persona_user_ids=(self.AI_A,),
+            room_members=lambda _room: [self.AI_A, "@human:" + SERVER_NAME]).run_once()
+        self.assertFalse(seen[0].room_is_dm)
+        self.assertEqual(seen[0].target_user_ids, ())
+
+    def test_multi_human_room_ordinary_text_does_not_reply(self):
+        seen = []
+        class Hooks(ConsumerHooks):
+            def on_human_text(self, ctx): seen.append(ctx)
+        event = {"type": "m.room.message", "event_id": "$group", "room_id": "!r:" + SERVER_NAME,
+                 "sender": "@human:" + SERVER_NAME,
+                 "content": {"msgtype": "m.text", "body": "ordinary text"}}
+        self.store.store_transaction("group", json.dumps({"events": [event]}))
+        self._make_consumer(hooks=Hooks(), persona_user_ids=(self.AI_A,),
+            room_members=lambda _room: [self.AI_A, "@human:" + SERVER_NAME, "@other:" + SERVER_NAME]).run_once()
+        self.assertFalse(seen[0].room_is_dm)
+        self.assertEqual(seen[0].target_user_ids, ())
+
+    def test_failed_lookup_cached_ai_reply_remains_explicit_group_target(self):
+        seen = []
+        class Hooks(ConsumerHooks):
+            def on_human_text(self, ctx): seen.append(ctx)
+        events = [
+            {"type": "m.room.message", "event_id": "$ai", "room_id": "!r:" + SERVER_NAME,
+             "sender": self.AI_A, "content": {"msgtype": "m.text", "body": "prior"}},
+            {"type": "m.room.message", "event_id": "$reply", "room_id": "!r:" + SERVER_NAME,
+             "sender": "@human:" + SERVER_NAME,
+             "content": {"msgtype": "m.text", "body": "answer", "m.relates_to": {"m.in_reply_to": {"event_id": "$ai"}}}},
+        ]
+        self.store.store_transaction("reply", json.dumps({"events": events}))
+        self._make_consumer(hooks=Hooks(), persona_user_ids=(self.AI_A,),
+            room_members=lambda _room: (_ for _ in ()).throw(RuntimeError())).run_once()
+        self.assertFalse(seen[0].room_is_dm)
+        self.assertEqual(seen[0].target_user_ids, (self.AI_A,))
 
 
 # ---------------------------------------------------------------------------

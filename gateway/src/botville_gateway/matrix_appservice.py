@@ -339,6 +339,7 @@ class AppServiceMatrixTransport:
         reply_to: Optional[str] = None,
         content_type: str = "text",
         txn_id: Optional[str] = None,
+        allow_auto_join: bool = False,
     ) -> SentEvent:
         sender = self.resolve_sender(sender_id)
         room = self.resolve_room(room_id)
@@ -361,8 +362,10 @@ class AppServiceMatrixTransport:
         try:
             resp = self._request("PUT", path, body=content, query={"user_id": sender})
         except DeliveryError as exc:
-            # 未加入房间（M_FORBIDDEN）时自动 join 后重试一次；其余错误直接上抛。
-            if exc.code != "M_FORBIDDEN":
+            # Only an already-confirmed DM may recover a missing membership.
+            # B2.8b may add an accepted group_rooms decision here; it must not
+            # broaden this transport default.
+            if exc.code != "M_FORBIDDEN" or not allow_auto_join:
                 raise
             self.join(room, sender)
             resp = self._request("PUT", path, body=content, query={"user_id": sender})

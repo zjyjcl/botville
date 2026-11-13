@@ -85,6 +85,7 @@ DEFAULT_TIMEZONE = "Asia/Shanghai"
 # 而 `/limits` API 里的 0 表示「一个都不允许」（契约规则语义）。
 DEFAULT_TOKEN_BUDGET = 200_000
 DEFAULT_PROACTIVE_PER_DAY = 6
+DEFAULT_GROUP_MAX_RESPONDERS = 3
 DEFAULT_MAX_USAGE_EVENTS = 10_000
 # B2.2 #114-7 保留期：事件超过该时长即优先淘汰（默认 30 天）。
 DEFAULT_USAGE_RETENTION_SECONDS = 2_592_000
@@ -301,6 +302,20 @@ def _env_int_range(env: Mapping[str, str], name: str, default: int, *, minimum: 
     return value
 
 
+def _env_group_max_responders(env: Mapping[str, str]) -> int:
+    """Parse this routing limit without reflecting deployment input."""
+    raw = env.get("GATEWAY_GROUP_MAX_RESPONDERS")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_GROUP_MAX_RESPONDERS
+    try:
+        value = int(raw.strip())
+    except (TypeError, ValueError):
+        raise ConfigError("GATEWAY_GROUP_MAX_RESPONDERS must be an integer in range") from None
+    if not 1 <= value <= 20:
+        raise ConfigError("GATEWAY_GROUP_MAX_RESPONDERS must be in range")
+    return value
+
+
 def _env_mood_half_life(env: Mapping[str, str]) -> int:
     """Read the mood decay period without reflecting a deployment value."""
     raw = env.get("GATEWAY_MOOD_HALF_LIFE_MINUTES")
@@ -455,6 +470,8 @@ class Config:
     platform_token_budget: int = DEFAULT_TOKEN_BUDGET
     # B2.1：平台层主动发言/日上限（0 = 不限）
     platform_proactive_per_day: int = DEFAULT_PROACTIVE_PER_DAY
+    # Maximum local personas that may answer a single human group message.
+    group_max_responders: int = DEFAULT_GROUP_MAX_RESPONDERS
     # N7（契约 §6.3）：平台层 anti_spam / ai_loop。三个数值项 0 = 平台不设该项
     # （平台层省略对应键），非 0 时即平台底线，owner/peer 更宽松会被 422 拒绝。
     platform_max_consecutive_ai_messages: int = PLATFORM_MAX_CONSECUTIVE_AI_MESSAGES
@@ -568,6 +585,8 @@ class Config:
             raise ConfigError("platform_token_budget must be >= 0")
         if self.platform_proactive_per_day < 0:
             raise ConfigError("platform_proactive_per_day must be >= 0")
+        if not isinstance(self.group_max_responders, int) or isinstance(self.group_max_responders, bool) or not 1 <= self.group_max_responders <= 20:
+            raise ConfigError("GATEWAY_GROUP_MAX_RESPONDERS must be between 1 and 20")
         # 容量上限必须 ≥ 1：0 会让 store 立刻清空，滑动窗口永远看不到历史事件。
         if self.max_usage_events < 1:
             raise ConfigError("max_usage_events must be >= 1")
@@ -1178,6 +1197,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         platform_proactive_per_day=_env_int(
             source, "PLATFORM_PROACTIVE_PER_DAY", DEFAULT_PROACTIVE_PER_DAY
         ),
+        group_max_responders=_env_group_max_responders(source),
         # N7：三个数值项 0 = 平台不设该项；非 0 的区间由 Config 校验（fail-closed）。
         platform_max_consecutive_ai_messages=_env_int(
             source,

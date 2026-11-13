@@ -101,7 +101,7 @@ class TestRoomMemberSource(unittest.TestCase):
         self.source.members("room")
         self.assertEqual(self.calls, ["room", "room"])
 
-    def test_member_event_populates_cache_without_fetch(self):
+    def test_cold_member_event_does_not_establish_complete_cache(self):
         calls = []
         source = RoomMemberSource(
             fetcher=lambda room, personas: calls.append((room, personas)) or (AI_B,),
@@ -111,8 +111,24 @@ class TestRoomMemberSource(unittest.TestCase):
             "type": "m.room.member", "room_id": "!room:" + SERVER,
             "state_key": AI_A, "content": {"membership": "join"},
         })
-        self.assertEqual(source.members("!room:" + SERVER), [AI_A])
-        self.assertEqual(calls, [])
+        self.assertEqual(source.members("!room:" + SERVER), [AI_B])
+        self.assertEqual(calls, [("!room:" + SERVER, (AI_A, AI_B))])
+
+    def test_member_event_does_not_extend_snapshot_ttl(self):
+        now = [0.0]
+        source = RoomMemberSource(
+            fetcher=lambda room, personas: (AI_A, "@human:" + SERVER),
+            personas=(AI_A,), is_local_ai=_local_ai, ttl_seconds=30,
+            monotonic=lambda: now[0],
+        )
+        source.members("room")
+        now[0] = 29
+        source.observe_member_event({"type": "m.room.member", "room_id": "room",
+            "state_key": "@extra:" + SERVER, "content": {"membership": "join"}})
+        now[0] = 30
+        # The increment neither refreshed the entry nor created an incomplete
+        # replacement after expiry.
+        self.assertEqual(source.members("room"), [AI_A, "@human:" + SERVER])
 
     def test_leave_and_ban_remove_but_invite_does_not_add(self):
         source = RoomMemberSource(fetcher=None, personas=(AI_A,), is_local_ai=_local_ai)
@@ -122,7 +138,8 @@ class TestRoomMemberSource(unittest.TestCase):
                 "type": "m.room.member", "room_id": room, "state_key": AI_A,
                 "content": {"membership": membership},
             })
-        self.assertEqual(source.members(room), [])
+        with self.assertRaises(RuntimeError):
+            source.members(room)
 
     def test_fetch_failure_is_propagated_for_consumer_fail_closed_handling(self):
         source = RoomMemberSource(
@@ -256,11 +273,14 @@ class TestProductionWiring(unittest.TestCase):
         self.assertEqual(transport.sent, [])
 
     def test_consumed_member_event_warms_production_cache_without_fetch(self):
-        transport = _FakeHomeserverTransport(joined=(AI_A,))
+        transport = _FakeHomeserverTransport(joined=(AI_A, "@human:" + SERVER))
         server = self._server(transport, (AI_A,))
         body = {"events": [
             {"event_id": "$member", "type": "m.room.member", "room_id": "!room:" + SERVER,
              "sender": "@admin:" + SERVER, "state_key": AI_A,
+             "content": {"membership": "join"}},
+            {"event_id": "$human-member", "type": "m.room.member", "room_id": "!room:" + SERVER,
+             "sender": "@admin:" + SERVER, "state_key": "@human:" + SERVER,
              "content": {"membership": "join"}},
             {"event_id": "$human", "type": "m.room.message", "room_id": "!room:" + SERVER,
              "sender": "@human:" + SERVER, "content": {"msgtype": "m.text", "body": "hello"}},
@@ -268,7 +288,7 @@ class TestProductionWiring(unittest.TestCase):
         server.as_txn_store.store_transaction("member-cache", json.dumps(body))
         server.as_consumer.run_once()
         self.assertEqual([item.sender_id for item in transport.sent], [AI_A])
-        self.assertEqual(transport.member_requests, [])
+        self.assertEqual(len(transport.member_requests), 1)
 
 
 class _JoinedMembersHS:

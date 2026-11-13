@@ -1497,6 +1497,8 @@ class GatewayServer(http.server.ThreadingHTTPServer):
                     sender_fetcher=getattr(transport, "event_sender", None),
                     room_members=self.room_member_source.members,
                     room_member_observer=self.room_member_source.observe_member_event,
+                    group_max_responders=config.group_max_responders,
+                    persona_user_ids=personas,
                     # Engine persists each persona separately; consumer completion
                     # must not share the first persona key on partial failures.
                     dedupe=None if hooks else PersistentSpeechDedupe(self.as_txn_store),

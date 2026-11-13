@@ -8,7 +8,7 @@
 - m.login.application_service 注册（Bearer as_token + inhibit_login）与进程内缓存；
   200 响应的 user_id 必须与请求一致（缺失/不符 → appservice.namespace）；
 - M_USER_IN_USE 视为已存在（幂等）；
-- M_FORBIDDEN（未加入房间）→ 自动 join 后重试一次；
+- M_FORBIDDEN 仅在调用方已确认 DM 时自动 join 后重试一次；
 - 身份/房间映射（PR #99 阻塞项 1）：persona_id → @ai_<persona>:<server>；
   conversation_id → 房间别名 directory/room 解析 + TTL 缓存（命中/过期/0=不缓存，
   #107）；别名不存在 → conversation.not_found；非法字符集 → 客户端侧拒绝（零请求）；
@@ -221,7 +221,7 @@ class AppServiceTransportTest(unittest.TestCase):
             ],
         )
         transport = self.make_transport()
-        event = transport.send_text(room_id=ROOM, sender_id=AI, text="hello")
+        event = transport.send_text(room_id=ROOM, sender_id=AI, text="hello", allow_auto_join=True)
 
         self.assertEqual(event.event_id, "$after-join")
         joins = self.hs.matching("POST", "/_matrix/client/v3/join/")
@@ -234,6 +234,30 @@ class AppServiceTransportTest(unittest.TestCase):
         sends = self.hs.matching("PUT", "/_matrix/client/v3/rooms/")
         self.assertEqual(len(sends), 2)
         self.assertEqual(sends[0]["body"], sends[1]["body"])
+
+    def test_forbidden_unknown_room_does_not_join(self):
+        self.hs.route(
+            "PUT", "/_matrix/client/v3/rooms/",
+            [(403, {"errcode": "M_FORBIDDEN", "error": "not in room"})],
+        )
+        transport = self.make_transport()
+        with self.assertRaises(DeliveryError) as ctx:
+            transport.send_text(room_id=ROOM, sender_id=AI, text="hello")
+        self.assertEqual(ctx.exception.code, "M_FORBIDDEN")
+        self.assertEqual(len(self.hs.matching("POST", "/_matrix/client/v3/join/")), 0)
+
+    def test_forbidden_auto_join_retries_only_once(self):
+        self.hs.route(
+            "PUT", "/_matrix/client/v3/rooms/",
+            [(403, {"errcode": "M_FORBIDDEN", "error": "not in room"}),
+             (403, {"errcode": "M_FORBIDDEN", "error": "still not in room"})],
+        )
+        transport = self.make_transport()
+        with self.assertRaises(DeliveryError) as ctx:
+            transport.send_text(room_id=ROOM, sender_id=AI, text="hello", allow_auto_join=True)
+        self.assertEqual(ctx.exception.code, "M_FORBIDDEN")
+        self.assertEqual(len(self.hs.matching("POST", "/_matrix/client/v3/join/")), 1)
+        self.assertEqual(len(self.hs.matching("PUT", "/_matrix/client/v3/rooms/")), 2)
 
     def test_other_errors_are_not_retried(self):
         self.hs.route(
