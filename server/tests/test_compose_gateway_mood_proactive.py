@@ -398,6 +398,41 @@ class MoodProactiveEnvStaticTest(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             self.assertRegex(text, r"reset on gateway restart|网关重启后清零")
             self.assertRegex(text, r"set it back to false|改回 false")
+        # The groups-specific HMAC check fires only with groups ON and a
+        # memory DB (config.py: groups_enabled and memory_db_path); every
+        # mention of it names both conditions.
+        self.assertIn("`GATEWAY_GROUPS_ENABLED=true` 且配了记忆库、却没有显式密钥", doc)
+        self.assertIn("`GATEWAY_GROUPS_ENABLED=true` 且配了记忆库时，群功能的专用检查", doc)
+        for name, text in (("appservice.md", doc), ("server/README.md", readme),
+                           ("z423-synapse.md", z423)):
+            for marker in ("群功能的专用检查", "配了记忆库却没有显式密钥"):
+                for match in re.finditer(re.escape(marker), text):
+                    with self.subTest(doc=name, marker=marker, at=match.start()):
+                        self.assertIn("GATEWAY_GROUPS_ENABLED=true",
+                                      text[max(0, match.start() - 60):match.start()])
+
+    def test_forget_stale_keys_comment_in_all_env_examples(self):
+        """All three .env.example files (repo root, server/compose, gateway --
+        the last owned by B line) explain next to GATEWAY_GROUP_FORGET_STALE_KEYS
+        that it is a one-off cleanup switch to set back to false after one
+        restart, and what it deletes. Checks the comment block directly
+        above the KEY= line (contiguous '#' lines)."""
+        for path in ENV_EXAMPLES:
+            with self.subTest(path=str(path.relative_to(REPO_ROOT))):
+                lines = path.read_text(encoding="utf-8").splitlines()
+                index = [i for i, line in enumerate(lines)
+                         if line.startswith("GATEWAY_GROUP_FORGET_STALE_KEYS=")]
+                self.assertEqual(len(index), 1)
+                block = []
+                for line in reversed(lines[:index[0]]):
+                    if not line.startswith("#"):
+                        break
+                    block.insert(0, line.lstrip("# ").rstrip())
+                comment = "".join(block)  # CJK text wraps without spaces
+                self.assertIn("GATEWAY_GROUP_FORGET_STALE_KEYS", comment)
+                self.assertIn("一次性", comment)
+                self.assertIn("重启一次后改回 false", comment)
+                self.assertIn("永久删除旧 key_id 的群台账", comment)
 
     def test_no_hmac_secret_value_written_anywhere(self):
         """The HMAC secret is only ever a placeholder / empty in tracked text."""

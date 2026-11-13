@@ -308,13 +308,13 @@ B 线 PR2（角色引擎回复）读的变量，compose 原样透传给 `gateway
 > ⚠️ **开启 `GATEWAY_GROUPS_ENABLED` 必须配置持久的 HMAC 密钥。** compose 部署里它就是
 > `server/compose/.env` 的 `BOTVILLE_GATEWAY_HMAC_SECRET`（init.sh 首次生成后保留）：
 > **不能清空，也不能重新生成**。已接受的群依赖它，**轮换这个密钥会让已接受的群失效**。
-> 配了记忆库却没有显式密钥时网关拒绝启动。它是密钥，只放本地 `.env`，不要贴到文档、聊天或日志。
+> `GATEWAY_GROUPS_ENABLED=true` 且配了记忆库、却没有显式密钥（未设或占位值）时网关拒绝启动。它是密钥，只放本地 `.env`，不要贴到文档、聊天或日志。
 
 - 还需要记忆库（`GATEWAY_MEMORY_DB_PATH`）；没配时网关记 WARNING，群功能保持关闭。
   注意这只在已配显式 HMAC 密钥或 dev 模式下成立：**生产环境（非 dev）全局缺 HMAC 时，会先被
   全局规则拦下**，网关以 `GATEWAY_HMAC_SECRET is unset ...` 拒绝启动，走不到这条 WARNING；
-  配了记忆库时，群功能的专用检查（`GATEWAY_GROUPS_ENABLED requires an explicit persistent
-  GATEWAY_HMAC_SECRET`）排在全局规则之前，同样拒绝启动。
+  `GATEWAY_GROUPS_ENABLED=true` 且配了记忆库时，群功能的专用检查（`GATEWAY_GROUPS_ENABLED requires
+  an explicit persistent GATEWAY_HMAC_SECRET`）排在全局规则之前，同样拒绝启动（dev 模式也一样）。
   人设里该 persona 也要 `groups.enabled`（部署开关 + persona 开关缺一不可）。
 - `GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA`：每个 persona 的群数上限，1–200，默认 20。
 - `GATEWAY_INVITE_LEDGER_TTL_SECONDS`：邀请台账过期秒数，60–2592000，默认 86400；过期的邀请
