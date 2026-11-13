@@ -33,14 +33,24 @@ line whose previous line ends in `|`.
 Splitting is quote-aware: a `|` (or `;`, `&`, `)`) inside '...' or "..." is
 not a pipe (`grep -E 'a|b'`, `grep 'x| head' f`), while one inside `$(...)` /
 backticks still is, even within double quotes (`out="$(a | grep -q y)"`).
+A `'` between a letter/digit and a letter (don't, it's, B2's) is read as a
+prose apostrophe, not a quote, so a comment or doc line such as
+`# don't do: tar | grep -q x, it's racy` still has its real pipe checked.
 Words are split with shlex.
 
-Known limitations (conservative: they only ever cut more segments, never fewer):
-  - quotes are tracked per line. A line whose quotes do not balance (prose
-    with an apostrophe in docs, a string continued on the next line) falls
-    back to splitting on every `|`, so a `|` inside such a quote IS cut into
-    a new segment; that segment is then split on whitespace with quotes
+Known limitations (they cut in BOTH directions -- see the tests):
+  - quotes are tracked per line. A line whose quotes do not balance (a
+    string continued on the next line, a stray apostrophe that is not
+    between letters such as `users'`) falls back to splitting on every `|`:
+    a `|` inside a real quote IS then cut into a new segment (more segments,
+    may over-report), and that segment is split on whitespace with quotes
     removed (shlex cannot parse it);
+  - a BALANCED pair of apostrophes that are not between letters (`users'`
+    ... `'til`, `'90s`) is taken for a quote, so a real pipe between them is
+    NOT cut (fewer segments: a known miss, pinned by
+    test_known_misses_balanced_prose_apostrophes);
+  - a shell word quoted from inside (`-e's/x/y/'`) looks like an apostrophe
+    and falls back as above;
   - heredoc bodies are scanned like any other line.
 
 Docs are scanned too (whole lines, comments included: readers copy them). If
@@ -150,7 +160,9 @@ def _shell_cuts(text, stop_at_terminator):
             i += 1
             continue
         # Unquoted (top level, or inside $( ) / backticks).
-        if c in "'\"":
+        if c == "'" and i > 0 and text[i - 1].isalnum() and text[i + 1:i + 2].isalpha():
+            pass  # prose apostrophe (don't, it's): not a shell quote
+        elif c in "'\"":
             stack.append(c)
         elif text.startswith("$(", i) or c == "(":
             stack.append("(")
@@ -482,14 +494,17 @@ class NoEarlyExitPipesTest(unittest.TestCase):
         """shlex cannot parse a segment with an unclosed quote: the line is
         split on every `|` and words on whitespace with quotes removed. Known
         limitation: a `|` inside such a quote is cut into a new segment (more
-        segments, never fewer)."""
-        self.assertIsNone(_shell_cuts("echo it's | grep -q x", False))
-        self.assertEqual(split_pipes("echo it's | grep -q x"), ["echo it's ", " grep -q x"])
+        segments here; see test_known_misses_balanced_prose_apostrophes for
+        the opposite case)."""
+        self.assertIsNone(_shell_cuts("echo users' | grep -q x", False))
+        self.assertEqual(split_pipes("echo users' | grep -q x"), ["echo users' ", " grep -q x"])
+        # A quoted '|' on an unbalanced line is cut too (over-report side).
+        self.assertEqual(split_pipes("grep 'a|b' f users'"), ["grep 'a", "b' f users'"])
         self.assertEqual(_words(" 'grep -q x"), ["grep", "-q", "x"])
         self.assertEqual(_words(' "head -n1'), ["head", "-n1"])
         self.assertEqual(_words(" g\"rep -q x"), ["grep", "-q", "x"])
         fallback_bad = (
-            "echo it's | grep -q x",            # apostrophe in prose
+            "echo users' | grep -q x",          # stray apostrophe in prose
             "printf 'a | grep -q x",            # unclosed quote, cut anyway
             'a | "grep -q x',                   # unclosed quote around the name
             "a | 'head -n1",
@@ -500,11 +515,48 @@ class NoEarlyExitPipesTest(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertTrue(early_exit_in(line), line)
         fallback_good = (
-            "echo it's | grep -c x",
+            "echo users' | grep -c x",
             "printf 'a | wc -l",
             'a | "sort -u',
         )
         for line in fallback_good:
+            with self.subTest(line=line):
+                self.assertFalse(early_exit_in(line), line)
+
+    def test_prose_apostrophes_do_not_hide_real_pipes(self):
+        """#225 nit: a pair of apostrophes around a real pipe used to be read
+        as one quoted string, hiding the pipe. Letter'letter is prose."""
+        bad = (
+            "# don't do: tar | grep -q x, it's racy",
+            "don't do: tar -tzf x | grep -qx f, it's racy",
+            "it's tempting to tar | head -1 but don't",
+            "B2's note: a | grep -q y isn't safe",
+            "we'd pipe a | grep -m1 b; they'll fail",
+            "don't: grep -c 'a|b' f | head -1, it's racy",
+        )
+        for line in bad:
+            with self.subTest(line=line):
+                self.assertTrue(early_exit_in(line), line)
+        good = (
+            "# don't do: tar | grep -c x, it's fine",
+            "it's fine: grep 'x| head' f, isn't it",
+            "don't worry: grep -E 'a|b' f",
+        )
+        for line in good:
+            with self.subTest(line=line):
+                self.assertFalse(early_exit_in(line), line)
+        self.assertEqual(split_pipes("don't a | b it's"), ["don't a ", " b it's"])
+
+    def test_known_misses_balanced_prose_apostrophes(self):
+        """KNOWN MISS (documented in the module docstring): apostrophes that
+        are not between letters and happen to pair up look like a quote, so
+        the real pipe between them is not checked. Kept as an explicit
+        assertion so that a fix (or a regression in the other direction)
+        shows up here; flip to assertTrue if the heuristic learns them."""
+        for line in (
+            "the users' tar | grep -q x 'til done",
+            "in the '90s a | head -1 was fine in the '00s",
+        ):
             with self.subTest(line=line):
                 self.assertFalse(early_exit_in(line), line)
 
