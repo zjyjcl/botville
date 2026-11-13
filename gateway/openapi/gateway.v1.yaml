@@ -122,6 +122,7 @@ paths:
         （含 shared counterpart scope）的 text/value 为 null、redacted=true。群组范围文本只在 owner 当前仍是该 room 的 joined 成员时返回；
         成员查询失败也按非成员处理，返回元数据且 `text`（及适用时 `value`）为 null、`redacted=true`。
         按 `updated_at desc, id desc` 返回；cursor 不透明，limit 默认 20、最大 100。
+        跨层 owner 列表不是单锁下的一致快照；分页可能观察到并发变更，此为接受的行为。
         响应一律 `Cache-Control: no-store`。每 caller 60 次/分钟。
       security: [{matrixOpenIdToken: []}, {matrixUserToken: []}]
       parameters:
@@ -166,7 +167,8 @@ paths:
         owner 写入覆盖 extracted 同 key，并清除该 key 的 suppression。profile 的 `shared` 仍属于
         DM counterpart scope，不使用群成员门禁。owner_can_read_dm=false 不阻止写入，但创建、更新及
         重放响应的 text/value 为 null、redacted=true，不回显事实值。可选 `Idempotency-Key` 使用有界、进程内 24 小时
-        （全局最多 2000 条）内存缓存；缓存键为 `(caller, Idempotency-Key)`，每 owner 最多 200 条，
+        （全局最多 2000 条）内存缓存；缓存键为 `(caller, HMAC-SHA256(Idempotency-Key))`
+        （复用 owner ID 的 HMAC 密钥，加 `idempotency` 用途前缀，不保存原始 key），每 owner 最多 200 条，
         超限按 LRU 淘汰该 owner 自己最旧条目。网关重启后丢失，重启后同 key 重放按新请求处理。
         缓存有效时同 key 同请求重放返回当前同一事实；目标已经删除则 404
         `memory.not_found`；同 key 异请求为 409 `idempotency.conflict`。响应 `Cache-Control: no-store`。
@@ -2179,7 +2181,8 @@ components:
         per-caller token（每条形如 `caller_id:token:owner_id`，多条用分号 `;` 或换行分隔，
         空条目忽略；每条按 `:` 切分必须恰好 3 段，各段 trim 后非空；任何字段均不得含
         `:`、`;` 或换行，因此 owner_id 不能为完整 Matrix user ID）。结构非法一律拒绝启动，
-        错误信息不含 token。token 按 UTF-8 编码须至少 32 字节；短 token 或重复 token
+        重复 caller_id 或 caller token 与站点 token（GATEWAY_AUTH_TOKEN）相同也拒绝启动，
+        dev 模式不例外；错误信息不含 token。token 按 UTF-8 编码须至少 32 字节；短 token 或重复 token
         在非 dev 模式拒绝启动，dev 模式仅警告。服务端先对请求 token 与存储 token 各做 `HMAC-SHA256(进程随机键)`
         统一长度，再 `hmac.compare_digest` 全量比较（不提前返回）。`owner_id` 由 token 推出，
         **用于 `/personas` owner 列表及 `/context/assemble` 的 persona 区**：

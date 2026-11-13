@@ -207,25 +207,22 @@ class TestConfigCallerTokenValidation(unittest.TestCase):
             )
         self.assertIn("reuses the token", "\n".join(logs.output))
 
-    def test_duplicate_caller_id_rejected_even_in_dev(self):
-        with self.assertRaises(ConfigError):
-            _base_cfg(
-                caller_tokens=_tokens(
-                    ("callerA", TOKEN_A, "ownerA"),
-                    ("callerA", TOKEN_B, "ownerB"),
-                )
-            )
+    def test_duplicate_caller_id_rejected_in_all_modes(self):
+        for dev in (False, True):
+            with self.subTest(dev=dev), self.assertRaises(ConfigError) as cm:
+                _base_cfg(dev_mode=dev, auth_token=TOKEN_LEGACY, caller_tokens=_tokens(
+                    ("callerA", TOKEN_A, "ownerA"), ("callerA", TOKEN_B, "ownerB")))
+            self.assertIn("duplicate caller_id", str(cm.exception))
+            for token in (TOKEN_A, TOKEN_B):
+                self.assertNotIn(token, str(cm.exception))
 
-    def test_caller_token_equal_to_legacy_rejected_even_in_dev(self):
-        """§1.2.2：同一值不能既是 caller token 又是站点级 token（dev 也拒绝）。"""
-        with self.assertRaises(ConfigError) as cm:
-            _base_cfg(
-                dev_mode=True,
-                auth_token=TOKEN_A,
-                caller_tokens=_tokens(("callerA", TOKEN_A, "ownerA")),
-            )
-        self.assertIn("same token value as GATEWAY_AUTH_TOKEN", str(cm.exception))
-        self.assertNotIn(TOKEN_A, str(cm.exception))
+    def test_caller_token_equal_to_legacy_rejected_in_all_modes(self):
+        for dev in (False, True):
+            with self.subTest(dev=dev), self.assertRaises(ConfigError) as cm:
+                _base_cfg(dev_mode=dev, auth_token=TOKEN_A,
+                          caller_tokens=_tokens(("callerA", TOKEN_A, "ownerA")))
+            self.assertIn("same token value as GATEWAY_AUTH_TOKEN", str(cm.exception))
+            self.assertNotIn(TOKEN_A, str(cm.exception))
 
     def test_legacy_disabled_does_not_require_auth_token(self):
         """legacy 关闭时不要求 GATEWAY_AUTH_TOKEN（非 dev 也不拒绝）。"""

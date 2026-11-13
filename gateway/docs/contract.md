@@ -189,8 +189,9 @@ App                          网关                        模块网页（WKWebV
   token 绕过 per-caller 所有权。**配置了 `GATEWAY_CALLER_TOKENS` 而 `GATEWAY_LEGACY_TOKEN_ENABLED`
   仍为 `true` 时，启动打一条 WARNING**（提示旧 token 仍可绕过 per-caller 边界）；该 WARNING
   已在本实现落地（`caller_identity.log_startup_warnings`，随 PR-D）。
+- **重复 `caller_id`**：拒绝启动，dev 模式也不例外；错误信息不含 token。
 - **caller token 与 legacy token 冲突**：某个 caller token **等于** `GATEWAY_AUTH_TOKEN`
-  → **拒绝启动**（否则无法判定该请求的身份边界；两套语义不可重载同一值）。
+  → **拒绝启动**（dev 模式也不例外；错误信息不含 token；否则无法判定该请求的身份边界）。
 - **legacy 关闭且 caller token 为空**：`GATEWAY_LEGACY_TOKEN_ENABLED=false` 而
   `GATEWAY_CALLER_TOKENS` 为空时，**所有需要鉴权的请求一律 `401 auth.invalid_token`**
   （部署不提供任何可用凭据），启动打一条 **WARNING**（不拒绝启动：可能是刻意的封闭部署）。
@@ -943,7 +944,8 @@ PR3c 的 HTTP 主人端点已启用。
   `PUT /memories/facts`。它们只接收 matrix OpenID 或 Matrix user token，拒绝站点 bearer；
   响应为 `Cache-Control: no-store`。读取限 60/min、写入限 20/min。可选
   `Idempotency-Key` 的 set-fact 使用有界、进程内 24 小时（全局最多 2000 条）内存缓存；
-  缓存键为 `(caller, Idempotency-Key)`，每 owner 最多 200 条，超限按 LRU 淘汰该 owner 自己最旧条目。
+  缓存键为 `(caller, HMAC-SHA256(Idempotency-Key))`（复用 owner ID 的 HMAC 密钥，
+  加 `idempotency` 用途前缀，不保存原始 key），每 owner 最多 200 条，超限按 LRU 淘汰该 owner 自己最旧条目。
   网关重启后丢失，重启后同 key 重放按新请求处理。同 key
   同请求重放返回该**当前仍存在**的事实，已删除目标重放返回 `404 memory.not_found`，不同请求
   返回 `409 idempotency.conflict`。profile 的 shared fact 仍是 DM counterpart scope；成员门禁
@@ -960,7 +962,8 @@ PR3c 的 HTTP 主人端点已启用。
 
   **PR3c 端点、审计与 Q1–Q7 定论**：E1 `GET /memories` 接受必填 `persona_id`、重复
   `layer=recent|summary|profile`、`scope_kind`、`counterpart`、`room_id`、`pinned`、cursor、limit；
-  以 `updated_at desc, id desc` 分页（默认 20，最大 100）。E2 读取单项，E3 删除，E4/E5 幂等
+  以 `updated_at desc, id desc` 分页（默认 20，最大 100）。跨层 owner 列表不是单锁下的一致快照；
+  分页可能观察到并发变更，此为接受的行为。E2 读取单项，E3 删除，E4/E5 幂等
   pin/unpin，E6 写事实；summary 不可 pin，单 persona pin 上限 200。ID 为 `mr_`/`ms_`/`mf_` 加
   `HMAC(layer + row id)` 前 16 hex，不暴露 vector。模块关闭一律 `404 memory.disabled`；找不到或
   属于其他 persona 为 `404 memory.not_found`。删除 recent 会删除 row/vector、墓碑 event_id 或

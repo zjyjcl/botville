@@ -89,6 +89,24 @@ class PersonaHTTP:
 
 
 class PersonasListTests(unittest.TestCase):
+    def test_homeserver_failure_is_not_logged_as_auth_failure(self):
+        with PersonaHTTP() as app:
+            paths = ('/v1/capabilities', '/v1/personas',
+                     '/v1/personas/@ai_a:example.invalid', '/v1/moments')
+            for path in paths:
+                with self.subTest(path=path), self.assertLogs(level='INFO') as logs:
+                    # A successful caller check guarantees a real log record even
+                    # when the following unavailable verifier is correctly silent.
+                    app.request(auth='Bearer caller', path='/v1/capabilities')
+                    status, body = app.request(auth='Bearer offline', path=path)
+                self.assertEqual((status, body['code']), (500, 'internal.error'))
+                self.assertFalse(any('auth failed' in line for line in logs.output))
+            for path in paths[:-1]:
+                with self.subTest(path=path), self.assertLogs(
+                        'botville_gateway.caller_identity', level='INFO') as logs:
+                    self.assertEqual(app.request(auth='Bearer invalid', path=path)[0], 401)
+                self.assertEqual(sum('auth failed' in line for line in logs.output), 1)
+
     def test_user_bearer_does_not_log_speculative_caller_failure(self):
         log = logging.getLogger('botville_gateway.caller_identity')
         records = []

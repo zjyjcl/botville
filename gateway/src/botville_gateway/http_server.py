@@ -451,10 +451,10 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         if user_outcome == VERIFY_OK:
             self._user_id = user_id
             return True
-        # Both permitted authentication routes failed.  The authenticator's
-        # first, speculative check was deliberately silent so a valid Matrix
-        # bearer is not logged as a failed caller token.
-        self.server.authenticator._log("failed", None)
+        # Only a definitive rejection is an authentication failure; an
+        # unavailable homeserver has not determined whether the token is valid.
+        if not header or user_outcome in (VERIFY_MISSING, VERIFY_INVALID):
+            self.server.authenticator._log("failed", None)
         if not header:
             self._send_problem(401, "auth.missing", "Authorization header required")
         elif user_outcome in (VERIFY_MISSING, VERIFY_INVALID):
@@ -1598,13 +1598,12 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         if store is not None:
             store.stop_purge_scheduler()
         memory_worker = getattr(self, "memory_worker", None)
-        if memory_worker is not None:
-            memory_worker.stop()
+        memory_worker_stopped = memory_worker is None or memory_worker.stop()
         memory_purger = getattr(self, "memory_purger", None)
         if memory_purger is not None:
             memory_purger.stop()
         memory_store = getattr(self, "memory_store", None)
-        if memory_store is not None:
+        if memory_store is not None and memory_worker_stopped:
             memory_store.close()
         super().server_close()
 
