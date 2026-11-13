@@ -101,17 +101,30 @@ class GroupInvites:
                 raise RoomError(404, 'room.not_found')
             if 'mode' in body and row['state'] not in ('accepted', 'encrypted_disabled'):
                 raise RoomError(409, 'room.state_conflict')
-            if body.get('action') == 'leave':
-                # Fail closed until the cleanup persistence boundary is resolved.
-                raise RoomError(503, 'room.unavailable')
+            leaving = body.get('action') == 'leave'
             with self.store._lock, self.store._db:
                 self.store._db.execute(
-                    'UPDATE group_rooms SET mode=?,updated_at=? WHERE persona_id=? AND room_key=? AND key_id=?',
-                    (body['mode'], time.time(), persona, room_ref, self.store.group_key_id()))
+                    'UPDATE group_rooms SET mode=?,state=?,updated_at=? WHERE persona_id=? AND room_key=? AND key_id=?',
+                    (body.get('mode', row['mode']), 'left' if leaving else row['state'],
+                     time.time(), persona, room_ref, self.store.group_key_id()))
                 row = self.store._db.execute(
                     'SELECT * FROM group_rooms WHERE persona_id=? AND room_key=? AND key_id=?',
                     (persona, room_ref, self.store.group_key_id())).fetchone()
-            return room_item(row)
+            result = room_item(row)
+            if leaving:
+                # Commit the speech veto before any homeserver request.
+                result['leave_pending'] = True
+                try:
+                    rooms = self.transport.joined_rooms(persona)
+                    room = next((room for room in rooms
+                                 if self._key('room', room) == room_ref), None)
+                    result['leave_pending'] = (False if room is None else
+                        not self.transport.leave_with_cleanup(room, persona))
+                except (DeliveryError, OSError, ValueError):
+                    # No raw route is available when membership lookup fails.
+                    # Keep left; the owner can repeat this idempotent request.
+                    pass
+            return result
 
     def is_muted(self, persona, room):
         if self.store is None:
@@ -199,6 +212,14 @@ class GroupInvites:
             return
         pid, room, inviter = persona.user_id, ctx.room_id, ctx.sender
         with self._lock:
+            if self.is_left(pid, room):
+                # Decline fresh invitations without restoring participation.
+                self._result('left_ignored')
+                try:
+                    self._leave(room, pid)
+                except Exception:
+                    self._result('leave_failed')
+                return
             key = self._key('invite', pid, ctx.event_id)
             now = time.time()
             with self.store._lock, self.store._db:

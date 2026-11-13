@@ -949,8 +949,8 @@ ephemeral 不在 AS 注册里开启，忽略。
   schema 10 原有表原位补列；旧 claim 无法判断是否完成，兼容保留为 done。
 - 收到本服已配置 persona 的 m.room.member，state_key 指向该 persona 且 membership 为 leave/ban，
   无论 sender 是本人或踢人者，accepted/encrypted_disabled（以及 rejected_encrypted）均转为 left。
-  ban 统一使用 left，表示不再具有群发送恢复许可。发送 M_FORBIDDEN 时先检查 left，直接上抛，
-  不 join、不重试，即使 allow_auto_join 开启也一样。新 event_id 的再邀请重新走完整判定链。
+  ban 统一使用 left，表示不再具有群发送恢复许可。发送前检查 left，直接拒绝，
+  不 join、不重试，即使 allow_auto_join 开启也一样。left 也阻止新 event_id 的自动邀请加入。
 - 收到 `m.room.encryption` state 事件，accepted 房间标记 encrypted_disabled，不自动 leave；
   引擎在模型调用前跳过，AS 传输发送前再次检查（覆盖 HTTP 发言与模型调用期间的状态变化）。
   关闭开关后仍保留这项拦截。B2.8c 已实现 HTTP `403 conversation.e2ee` 与 policy/evaluate 前置检查。
@@ -1058,7 +1058,7 @@ join 后再次以该 AI GET `/_matrix/client/v3/rooms/{room}/state/m.room.encryp
 不以 `ai_` 开头且不是 AS sender，domain 与配置 server_name 大小写不敏感匹配。缺少 server_name 或查询失败视为非 DM。
 引擎已确认 DM 可跳过重复 DM 分类，但不能跳过邀请门禁、已有成员检查和加密检查。join 失败上抛，复核失败退出后上抛原 `M_FORBIDDEN`；仅通过检查才重试发送一次。
 退出前先写 pending-cleanup，leave 最多立即尝试 3 次，短退避 0.05/0.1 秒；成功删除，失败保留队列。leave 返回 `M_FORBIDDEN`（AI 已不在房间：已离开/被踢/被封禁）视为完成并移出队列，避免过期条目永久阻塞后续邀请门禁 join；其他错误照常重试。
-同库清理队列以 persona/room 的 SHA-256 为键，另存执行 leave 必需的原始 persona/room（明文敏感数据，沿用事务库新建 0600、WAL 权限保护，不保存密钥）。
+同库清理队列以 persona/room 的 SHA-256 为键，另存执行 leave 必需的原始 persona/room（明文敏感数据，沿用事务库新建 0600、WAL 权限保护，不保存密钥）。该原始 ID 例外也覆盖 owner 发起的 leave；成功后删除。
 哈希不可逆，故仅存哈希无法重启后执行 leave；日志不含这些原值、正文或异常详情。每次失败累加次数，按 min(5×2^(n−1), 3600) 秒退避。
 后台每 5 秒处理最多 20 项，与网关启动/停止，独立于消费者开关；单次 leave 超时 5 秒，stop 等待最多 5 秒，未完成队列重启后续办。
 非 `M_FORBIDDEN` 不 join；本行为纳入 0.6.0。
@@ -1400,11 +1400,21 @@ persona id、无 owner persona 统一 404 `persona.not_found`，隐藏存在性�
 - mention_only 保持既有群触发语义。muted 即使被 @ 或被回复也不调模型、不发送；检查在 policy
   之前，不消耗回复限额，仍按现有规则写 group scope 记忆（含其他 AI 的 untrusted 发言）。
   该模式控制内置引擎触发，不新增外部运行时 POST /messages 的 policy 禁令。
-- leave 以 persona masquerade 查询 Matrix `GET /_matrix/client/v3/joined_rooms`，逐个计算 HMAC
-  匹配 room_ref，然后用 `_leave_for_cleanup` 退群；不保存新的原始房间路由到 group_rooms。
-  不在 joined_rooms 时仍置 left 并成功返回。退群不可撤销，本 API 没有 rejoin；left 后发送遇
-  M_FORBIDDEN 不自动 rejoin。新的 Matrix 邀请仍按 B2.8b 完整邀请策略处理。
-  返回更新后的 GroupRoom；数据库或 Matrix 查询不可用返回 503 `room.unavailable`，不得误判为未加入。
+- leave 先立即提交 left，再以 persona masquerade 查询 Matrix `GET /_matrix/client/v3/joined_rooms`，
+  逐个计算当前密钥的 room_key 匹配 room_ref。无论查询或退出是否成功，left 都禁止引擎调模型、
+  发送和自动 rejoin（包括新的自动邀请处理）；本 API 不支持撤销退出。
+  找到房间后，先 `cleanup_enqueue(persona, room)`，再 `_leave_for_cleanup`，立即最多尝试 3 次；
+  成功（含 M_FORBIDDEN）清队列，失败保留，由后台按 #226 退避重试，重启后续办。
+  #226 清理队列另存原始 persona/room（明文敏感数据）的例外现在也覆盖 owner leave；
+  group_rooms 仍不新增原始 room_id，日志不含原始 ID、正文或密钥。
+  找不到房间视为已确认退出。joined_rooms 查询失败也保留 left 并返回待确认；此时没有原始
+  room_id，无法入队，成员资格可能残留，依赖 left 保证不发言，owner 可再次 PATCH leave 重试。
+  响应 200，返回更新后的 GroupRoom，并在 action=leave 时必带 `leave_pending: bool`：
+  false 表示已确认退出；true 表示已标记退出、homeserver 退出尚待确认，有队列时后台自动重试。
+  此字段是本次 PATCH 的确认结果，不是持久队列状态；列表及仅修改 mode 的响应不携带它。
+  App 对 left 一律显示“已退出”；已入队时可补充“已退出群聊；后台仍在确认，无需操作”。
+  查询失败属于上述无法入队的例外，不能保证后台自动恢复。数据库不可用仍返回 503 room.unavailable。
+
 
 `PATCH /personas/{persona_id}` 的当前实现只接受 `{"groups":{...}}`，沿用 personas loader
 校验：enabled 必须 bool，invite_policy 只能 owner/local_humans，未知字段拒绝。groups 整体替换，
@@ -1939,7 +1949,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
-| 0.6.0 | 2026-11-13 | [B2.8d] 新增 owner GET /personas/{id}/rooms 与 PATCH /personas/{id}/rooms/{room_ref}；owner 详情和 UpdatePersonaRequest 增加 groups；mention_only/muted 模式与退群；新增 room.not_found / room.state_conflict；group.replies_per_hour.exceeded 原因码正式纳入。汇总 B2.8 行为：严格双人 DM、群仅被提及/回复才发言、AI 不触发 AI、群节流与熔断、加密群 403 conversation.e2ee、HMAC 密钥轮换隔离及退出后禁止发送自动 rejoin。 |
+| 0.6.0 | 2026-11-13 | [B2.8d] 新增 owner GET /personas/{id}/rooms 与 PATCH /personas/{id}/rooms/{room_ref}；owner 详情和 UpdatePersonaRequest 增加 groups；mention_only/muted 模式与退群、leave_pending 确认状态及 owner leave 持久清理；新增 room.not_found / room.state_conflict；group.replies_per_hour.exceeded 原因码正式纳入。汇总 B2.8 行为：严格双人 DM、群仅被提及/回复才发言、AI 不触发 AI、群节流与熔断、加密群 403 conversation.e2ee、HMAC 密钥轮换隔离及退出后禁止发送自动 rejoin。 |
 | 0.5.0 | 2026-11-13 | [B2.8c #228] accepted 群冷却与滚动小时回复限额、群 ai_loop / anti_spam 底线（群内连续计数在人类发言时归零；默认 30/h 为滚动一小时硬底线，人类发言不重置）；schema 10→11 的 HMAC key_id 与轮换隔离/可选忘记旧行、上限只计当前键、发送层独立加密拦截；严格本服 room id、accepted 房间忽略不合格再邀请、拒绝 leave 的 M_FORBIDDEN 视为完成，以及 Synapse /sync invite 过滤说明修正。无 API 字段变化、契约仍 0.5.0。 |
 | 0.5.0 | 2026-11-13 | [#226 评审 nit] `/sync` 权威确认改为仅邀请的一次性请求（set_presence=offline、无 since、不消费 to-device）；leave 遇 `M_FORBIDDEN` 视为已离开并移出清理队列；格式异常的成员事件只跳过该事件；邀请台账 TTL（`GATEWAY_INVITE_LEDGER_TTL_SECONDS`，默认 1 天）。无 API 字段变化。 |
 | 0.5.0 | 2026-11-13 | [M_FORBIDDEN 安全加固] 自动 join 需邀请台账命中或 /sync 权威确认，前后排除加密；已有成员不 join/leave；leave 有限重试与持久清理队列，无新增开关或 API 字段。 |

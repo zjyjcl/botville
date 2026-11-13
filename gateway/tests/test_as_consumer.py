@@ -280,7 +280,8 @@ class TestQ5Routing(_TmpDb):
         for raw in ("0", "21", "bad"):
             with self.assertRaises(ConfigError) as caught:
                 load_config({"GATEWAY_DEV_MODE": "true", "GATEWAY_GROUP_MAX_RESPONDERS": raw})
-            self.assertNotIn(raw, str(caught.exception))
+            self.assertEqual(str(caught.exception),
+                "GATEWAY_GROUP_MAX_RESPONDERS must be an integer within 1–20")
 
     def test_room_broadcast_has_no_persona_target(self):
         seen = []

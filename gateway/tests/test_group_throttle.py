@@ -359,8 +359,8 @@ class GroupConfigTests(unittest.TestCase):
             for value in (str(low-1), str(high+1), 'private-secret', '1.2', 'true'):
                 with self.subTest(name=name, value=value), self.assertRaises(ConfigError) as caught:
                     load_config({'GATEWAY_DEV_MODE': 'true', env: value})
-                self.assertNotIn(repr(value), str(caught.exception))
-                self.assertNotIn('private-secret', str(caught.exception))
+                self.assertEqual(str(caught.exception),
+                    f'{env} must be an integer within {low}–{high}')
             with self.assertRaises(ConfigError):
                 Config(**{name: True})
 

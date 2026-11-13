@@ -38,6 +38,116 @@ def seed(app, state='accepted', room=ROOM):
 
 
 class RoomsAPITests(unittest.TestCase):
+    def leave_transport(self, app, store=None):
+        from botville_gateway.matrix_appservice import AppServiceMatrixTransport
+        transport = AppServiceMatrixTransport(homeserver_url='http://localhost',
+            as_token='test-token', server_name=SERVER, safety_store=store,
+            left_group=app.server.group_invites.is_left, sleep=lambda _: None)
+        if store is None:
+            self.addCleanup(transport.safety_store._conn.close)
+        transport.joined_rooms = Mock(return_value=[ROOM])
+        transport.leave = Mock()
+        app.server.group_invites.transport = transport
+        return transport
+
+    def test_leave_outcomes_and_retry(self):
+        from botville_gateway.matrix import DeliveryError
+        for outcome in ('failed', 'success', 'forbidden', 'absent', 'lookup_failed'):
+            with self.subTest(outcome=outcome), MemoryHTTPServer() as app:
+                ref = seed(app)
+                transport = self.leave_transport(app)
+                if outcome == 'failed':
+                    transport.leave.side_effect = DeliveryError('matrix.unavailable', 'Unavailable')
+                elif outcome == 'forbidden':
+                    transport.leave.side_effect = DeliveryError('M_FORBIDDEN', 'Forbidden')
+                elif outcome == 'absent':
+                    transport.joined_rooms.return_value = ['!another:' + SERVER]
+                elif outcome == 'lookup_failed':
+                    transport.joined_rooms.side_effect = DeliveryError('matrix.unavailable', 'Unavailable')
+                # State is already left even while lookup/leave are in progress.
+                original_lookup = transport.joined_rooms.side_effect
+                def lookup(persona):
+                    self.assertTrue(app.server.group_invites.is_left(persona, ROOM))
+                    if original_lookup:
+                        raise original_lookup
+                    return transport.joined_rooms.return_value
+                transport.joined_rooms.side_effect = lookup
+                status, _, item = app.request('PATCH', PATH + '/rooms/' + ref,
+                    body={'action': 'leave'})
+                self.assertEqual((status, item['state']), (200, 'left'))
+                self.assertEqual(item['leave_pending'], outcome in ('failed', 'lookup_failed'))
+                queue = transport.safety_store.cleanup_due(float('inf'))
+                self.assertEqual(len(queue), int(outcome == 'failed'))
+                if outcome == 'failed':
+                    self.assertEqual((queue[0]['persona'], queue[0]['room']), (PERSONA, ROOM))
+                    transport.leave.side_effect = None
+                    with patch('botville_gateway.matrix_appservice.time.time', return_value=queue[0]['next_at'] + 1):
+                        transport.retry_cleanup()
+                    self.assertEqual(transport.safety_store.cleanup_due(float('inf')), [])
+                elif outcome in ('absent', 'lookup_failed'):
+                    transport.leave.assert_not_called()
+                # Repeating leave is allowed on left and can confirm recovery.
+                transport.joined_rooms.side_effect = None
+                transport.joined_rooms.return_value = []
+                self.assertFalse(app.request('PATCH', PATH + '/rooms/' + ref,
+                    body={'action': 'leave'})[2]['leave_pending'])
+
+    def test_leave_cleanup_survives_storage_and_transport_restart(self):
+        from botville_gateway.as_txn_store import AsTransactionStore, connect
+        from botville_gateway.matrix import DeliveryError
+        with MemoryHTTPServer() as app:
+            ref = seed(app)
+            path = str(Path(app.tmp) / 'owner-leave.sqlite')
+            store = AsTransactionStore(connect(path))
+            transport = self.leave_transport(app, store)
+            transport.leave.side_effect = DeliveryError('matrix.unavailable', 'Unavailable')
+            status, _, item = app.request('PATCH', PATH + '/rooms/' + ref, body={'action': 'leave'})
+            self.assertEqual(status, 200)
+            self.assertTrue(item['leave_pending'])
+            before = store.cleanup_due(float('inf'))
+            transport.stop_cleanup()
+            store._conn.close()
+            reopened = AsTransactionStore(connect(path))
+            try:
+                transport = self.leave_transport(app, reopened)
+                self.assertEqual(reopened.cleanup_due(float('inf')), before)
+                with patch('botville_gateway.matrix_appservice.time.time', return_value=before[0]['next_at'] + 1):
+                    transport.retry_cleanup()
+                transport.leave.assert_called_once_with(ROOM, PERSONA)
+                self.assertEqual(reopened.cleanup_due(float('inf')), [])
+            finally:
+                transport.stop_cleanup()
+                reopened._conn.close()
+
+    def test_left_blocks_model_send_and_invite_rejoin(self):
+        from botville_gateway.matrix import DeliveryError
+        with MemoryHTTPServer() as app:
+            ref = seed(app)
+            transport = self.leave_transport(app)
+            self.assertEqual(app.request('PATCH', PATH + '/rooms/' + ref, body={'action': 'leave'})[0], 200)
+            client, service = Mock(), Mock()
+            hooks = EngineHooks(personas=app.server.memory_personas, client=client,
+                service=service, memory_store=app.server.memory_store,
+                group_invites=app.server.group_invites)
+            context = ConsumerContext('human_text', '$left-event', ROOM, OWNER, 'trusted',
+                text='@ai_memory hello', persona_user_id=PERSONA, target_user_ids=(PERSONA,),
+                room_ai_user_ids=(PERSONA,), room_members_confirmed=True)
+            hooks.on_human_text(context)
+            client.complete.assert_not_called()
+            service.evaluate_policy.assert_not_called()
+            service.send_ai_message.assert_not_called()
+            transport._request = Mock(side_effect=DeliveryError('M_FORBIDDEN', 'Forbidden'))
+            transport.join = Mock()
+            with self.assertRaises(DeliveryError) as caught:
+                transport.send_text(room_id=ROOM, sender_id=PERSONA, text='no speech', allow_auto_join=True)
+            self.assertEqual(caught.exception.code, 'M_FORBIDDEN')
+            transport._request.assert_not_called()
+            transport.join.assert_not_called()
+            app.server.group_invites.on_invite_to_ai(dataclasses.replace(context,
+                event_id='$new-invite'))
+            transport.join.assert_not_called()
+            self.assertTrue(app.server.group_invites.is_left(PERSONA, ROOM))
+
     def test_identity_matrix(self):
         with MemoryHTTPServer() as app:
             ref = seed(app)

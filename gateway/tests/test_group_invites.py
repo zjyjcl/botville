@@ -52,7 +52,7 @@ class GroupTests(unittest.TestCase):
     def invite(self, **kwargs):
         self.groups.on_invite_to_ai(self.ctx(**kwargs))
 
-    def test_membership_departure_and_reinvite(self):
+    def test_membership_departure_blocks_send_and_reinvite(self):
         hooks = EngineHooks(personas={AI: self.persona}, client=Mock(),
                             service=Mock(), group_invites=self.groups)
         consumer = AsTransactionConsumer(Mock(), hooks=hooks, server_name='local.test')
@@ -60,7 +60,7 @@ class GroupTests(unittest.TestCase):
                 ('leave', OWNER, False), ('ban', OWNER, False),
                 ('leave', AI, True), ('ban', OWNER, True))):
             with self.subTest(membership=membership, sender=sender, encrypted=encrypted):
-                self.invite(event_id=f'$before{index}')
+                self.groups._record(AI, ROOM, OWNER, 'accepted')
                 if encrypted:
                     self.groups.disable_encrypted(ROOM)
                 consumer._dispatch_event({'type': 'm.room.member', 'event_id': '$depart',
@@ -77,11 +77,13 @@ class GroupTests(unittest.TestCase):
                 tr._request = Mock(side_effect=error)
                 with self.assertRaises(DeliveryError) as caught:
                     tr.send_text(room_id=ROOM, sender_id=AI, text='body', allow_auto_join=True)
-                self.assertIs(caught.exception, error)
+                self.assertEqual(caught.exception.code, 'M_FORBIDDEN')
                 tr.join.assert_not_called()
-                self.assertEqual(tr._request.call_count, 1)
+                tr._request.assert_not_called()
+                self.transport.join.reset_mock()
                 self.invite(event_id=f'$after{index}')
-                self.assertTrue(self.groups.is_accepted(AI, ROOM))
+                self.transport.join.assert_not_called()
+                self.assertTrue(self.groups.is_left(AI, ROOM))
 
     def test_encrypted_decline_self_leave_is_left(self):
         self.invite(invite_encrypted=True)
@@ -439,7 +441,8 @@ class ConfigTests(unittest.TestCase):
         for value in ('0', '201', '-1', 'sensitive', '1.5', 'true'):
             with self.subTest(value=value), self.assertRaises(ConfigError) as caught:
                 load_config({'GATEWAY_DEV_MODE': 'true', 'GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA': value})
-            self.assertNotIn(repr(value), str(caught.exception))
+            self.assertEqual(str(caught.exception),
+                'GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA must be an integer within 1–200')
         for value in ('1', '200'):
             self.assertEqual(load_config({'GATEWAY_DEV_MODE': 'true',
                 'GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA': value}).group_max_rooms_per_persona, int(value))
@@ -453,7 +456,8 @@ class ConfigTests(unittest.TestCase):
         for value in ('0', '59', '2592001', '-1', 'sensitive', '1.5'):
             with self.subTest(value=value), self.assertRaises(ConfigError) as caught:
                 load_config({'GATEWAY_DEV_MODE': 'true', 'GATEWAY_INVITE_LEDGER_TTL_SECONDS': value})
-            self.assertNotIn(repr(value), str(caught.exception))
+            self.assertEqual(str(caught.exception),
+                'GATEWAY_INVITE_LEDGER_TTL_SECONDS must be an integer within 60–2592000')
 
     def test_invalid_bool_and_persistent_secret(self):
         for extra in ({'GATEWAY_GROUPS_ENABLED': 'sensitive'},

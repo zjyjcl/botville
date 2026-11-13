@@ -32,9 +32,13 @@ class MoodConfigTests(unittest.TestCase):
         for value in ('0', '10081', 'invalid-value'):
             with self.subTest(value=value), self.assertRaises(ConfigError) as raised:
                 load_config({'GATEWAY_DEV_MODE': 'true', 'GATEWAY_MOOD_HALF_LIFE_MINUTES': value})
-            self.assertNotIn(value, str(raised.exception))
-            self.assertNotIn(value, ''.join(traceback.format_exception(
-                type(raised.exception), raised.exception, raised.exception.__traceback__)))
+            self.assertEqual(str(raised.exception),
+                'GATEWAY_MOOD_HALF_LIFE_MINUTES must be an integer within 1–10080')
+            self.assertIsNone(raised.exception.__cause__)
+            self.assertTrue(raised.exception.__suppress_context__)
+            if value == 'invalid-value':
+                self.assertNotIn(value, ''.join(traceback.format_exception(
+                    type(raised.exception), raised.exception, raised.exception.__traceback__)))
         self.assertEqual(1, load_config({'GATEWAY_DEV_MODE': 'true', 'GATEWAY_MOOD_HALF_LIFE_MINUTES': '1'}).mood_half_life_minutes)
         self.assertEqual(10080, load_config({'GATEWAY_DEV_MODE': 'true', 'GATEWAY_MOOD_HALF_LIFE_MINUTES': '10080'}).mood_half_life_minutes)
         with self.assertRaises(ConfigError):
