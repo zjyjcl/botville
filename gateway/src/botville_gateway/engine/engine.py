@@ -128,6 +128,9 @@ class EngineHooks(ConsumerHooks):
             self._group_invites.on_membership(ctx)
         if self._group_invites is not None and ctx.encryption_state and ctx.room_id:
             self._group_invites.disable_encrypted(ctx.room_id)
+            note = getattr(self._group_invites.transport, "note_room_encrypted", None)
+            if note is not None:
+                note(ctx.room_id)
 
     @property
     def persona_ids(self) -> Tuple[str, ...]:

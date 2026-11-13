@@ -489,6 +489,7 @@ class Config:
     platform_proactive_per_day: int = DEFAULT_PROACTIVE_PER_DAY
     # Group invitations are opt-in at deployment and persona level.
     groups_enabled: bool = False
+    group_forget_stale_keys: bool = False
     group_max_rooms_per_persona: int = 20
     group_cooldown_seconds: int = 30
     group_max_replies_per_hour: int = 20
@@ -599,6 +600,8 @@ class Config:
     mood_half_life_minutes: int = DEFAULT_MOOD_HALF_LIFE_MINUTES
 
     def __post_init__(self) -> None:
+        if not isinstance(self.group_forget_stale_keys, bool):
+            raise ConfigError("GATEWAY_GROUP_FORGET_STALE_KEYS must be a boolean")
         if not isinstance(self.groups_enabled, bool):
             raise ConfigError("GATEWAY_GROUPS_ENABLED must be a boolean")
         if (type(self.group_max_rooms_per_persona) is not int
@@ -1270,6 +1273,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
             source, "PLATFORM_PROACTIVE_PER_DAY", DEFAULT_PROACTIVE_PER_DAY
         ),
         groups_enabled=_env_bool(source, "GATEWAY_GROUPS_ENABLED", False),
+        group_forget_stale_keys=_env_bool(source, "GATEWAY_GROUP_FORGET_STALE_KEYS", False),
         group_cooldown_seconds=_env_proactive_int(source, "GATEWAY_GROUP_COOLDOWN_SECONDS", 30),
         group_max_replies_per_hour=_env_proactive_int(source, "GATEWAY_GROUP_MAX_REPLIES_PER_HOUR", 20),
         group_ai_loop_max_per_hour=_env_proactive_int(source, "GATEWAY_GROUP_AI_LOOP_MAX_PER_HOUR", 30),

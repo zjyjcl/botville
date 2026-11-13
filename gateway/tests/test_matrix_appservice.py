@@ -204,6 +204,75 @@ class AppServiceTransportTest(unittest.TestCase):
         self.assertEqual(len(self.hs.matching("POST", "/_matrix/client/v3/register")), 1)
         self.assertEqual(len(self.hs.matching("PUT", "/_matrix/client/v3/rooms/")), 2)
 
+    def test_encryption_guard_blocks_and_caches_clear_state_without_room_ids(self):
+        key = ("GET", "/_matrix/client/v3/rooms/")
+        self.hs.routes[key] = [(200, {"algorithm": "m.megolm.v1.aes-sha2"})]
+        guarded = self.make_transport(encryption_guard=True)
+        with self.assertRaises(DeliveryError) as caught:
+            guarded.send_text(room_id=ROOM, sender_id=AI, text="hello")
+        self.assertEqual(caught.exception.code, "conversation.e2ee")
+        self.assertEqual(self.hs.matching("PUT", "/_matrix/client/v3/rooms/"), [])
+        self.assertNotIn(ROOM, repr(guarded._encryption_cache))
+
+        self.hs.routes[key] = [(404, {"errcode": "M_NOT_FOUND"})]
+        self.hs.route("POST", "/_matrix/client/v3/register", [(200, {"user_id": AI})])
+        clear = self.make_transport(encryption_guard=True)
+        clear.send_text(room_id=ROOM, sender_id=AI, text="one")
+        clear.send_text(room_id=ROOM, sender_id=AI, text="two")
+        self.assertEqual(len(self.hs.matching("GET", "/_matrix/client/v3/rooms/")), 2)
+        clear.note_room_encrypted(ROOM)
+        with self.assertRaises(DeliveryError) as caught:
+            clear.send_text(room_id=ROOM, sender_id=AI, text="three")
+        self.assertEqual(caught.exception.code, "conversation.e2ee")
+
+    def test_quarantine_prevents_forbidden_rejoin_except_explicit_auto_join(self):
+        self.hs.route("PUT", "/_matrix/client/v3/rooms/", [
+            (403, {"errcode": "M_FORBIDDEN"}),
+            (403, {"errcode": "M_FORBIDDEN"}),
+            (200, {"event_id": "$allowed"}),
+        ])
+        transport = self.make_transport(quarantine_group=lambda sender, room: True)
+        with self.assertRaises(DeliveryError):
+            transport.send_text(room_id=ROOM, sender_id=AI, text="blocked")
+        self.assertEqual(self.hs.matching("POST", "/_matrix/client/v3/join/"), [])
+        event = transport.send_text(room_id=ROOM, sender_id=AI, text="allowed", allow_auto_join=True)
+        self.assertEqual(event.event_id, "$allowed")
+
+    def test_encryption_guard_error_expiry_capacity_and_state_event_race(self):
+        transport = self.make_transport(encryption_guard=True)
+        forbidden = DeliveryError("M_FORBIDDEN", "not joined")
+        with mock.patch.object(transport, "_request", side_effect=forbidden) as request:
+            transport._guard_room_encryption(ROOM, AI)
+        self.assertEqual(request.call_count, 1)
+        for failure in (DeliveryError("M_UNKNOWN", "internal"), OSError("network")):
+            with mock.patch.object(transport, "_request", side_effect=failure):
+                with self.assertRaises(DeliveryError) as caught:
+                    transport._guard_room_encryption("!other:localhost", AI)
+            self.assertEqual(caught.exception.code, "conversation.e2ee")
+            self.assertIsNone(caught.exception.__cause__)
+        key = transport._encryption_cache_key(ROOM)
+        transport._cache_encryption(key, False, 1.0)
+        with mock.patch("botville_gateway.matrix_appservice._monotonic", return_value=31.0), \
+                mock.patch.object(transport, "_request", return_value={}) as request:
+            with self.assertRaises(DeliveryError) as caught:
+                transport._guard_room_encryption(ROOM, AI)
+        self.assertEqual(caught.exception.code, "conversation.e2ee")
+        self.assertEqual(request.call_count, 1)
+        for number in range(4096):
+            transport._cache_encryption("clear-{}".format(number), False, 999.0)
+        transport._cache_encryption("permanent", True, float("inf"))
+        self.assertEqual(len(transport._encryption_cache), 4096)
+        self.assertTrue(transport._encryption_cache["permanent"][0])
+        def state_event_then_404(*args, **kwargs):
+            transport.note_room_encrypted("!race:localhost")
+            error = DeliveryError("M_NOT_FOUND", "absent")
+            error.http_status = 404
+            raise error
+        with mock.patch.object(transport, "_request", side_effect=state_event_then_404):
+            with self.assertRaises(DeliveryError) as caught:
+                transport._guard_room_encryption("!race:localhost", AI)
+        self.assertEqual(caught.exception.code, "conversation.e2ee")
+
     def test_user_in_use_is_treated_as_existing(self):
         self.hs.route(
             "POST",
@@ -396,7 +465,7 @@ class AppServiceTransportTest(unittest.TestCase):
             "event_fields": ["type"],
             "room": {"rooms": [ROOM], "include_leave": False,
                      "timeline": {"limit": 0, "not_types": ["*"]},
-                     "state": {"not_types": ["*"]},
+                     "state": {"types": ["m.room.create"]},
                      "ephemeral": {"not_types": ["*"]},
                      "account_data": {"not_types": ["*"]}},
             "presence": {"not_types": ["*"]}, "account_data": {"not_types": ["*"]},

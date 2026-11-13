@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 MEMORY_PURGE_INTERVAL_MIN_SECONDS = 60
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 OWNER_PIN_LIMIT = 200
 _log = logging.getLogger(__name__)
 
@@ -142,6 +142,7 @@ _MIGRATIONS = {
         """CREATE TABLE IF NOT EXISTS group_invites (
             invite_key TEXT PRIMARY KEY, processed_at REAL NOT NULL)""",
     ),
+    11: (),
 }
 
 
@@ -222,6 +223,11 @@ class MemoryStore:
                 self._db.execute('CREATE TABLE memory_schema(id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL)')
             self._db.execute('INSERT OR IGNORE INTO memory_schema(id,version) VALUES(1,?)', (version,))
             for next_version in range(version + 1, SCHEMA_VERSION + 1):
+                if next_version == 11:
+                    columns = {row[1] for row in self._db.execute('PRAGMA table_info(group_rooms)')}
+                    if 'key_id' not in columns:
+                        self._db.execute("ALTER TABLE group_rooms ADD COLUMN key_id TEXT NOT NULL DEFAULT ''")
+                        self._db.execute('UPDATE group_rooms SET key_id=?', (self.group_key_id(),))
                 if next_version == 5:
                     for table in ('memory_items', 'memory_facts', 'memory_summaries'):
                         columns = {row[1] for row in self._db.execute('PRAGMA table_info(' + table + ')')}
@@ -302,6 +308,12 @@ class MemoryStore:
                     self._db.execute('UPDATE ' + table + ' SET public_id=? WHERE id=?',
                                      (self._public_id(layer, row['id']), row['id']))
 
+    def group_key_id(self) -> str:
+        secret = self._hmac_secret
+        if isinstance(secret, str):
+            secret = secret.encode('utf-8')
+        return hmac.new(secret, b'groups:key-id', hashlib.sha256).hexdigest()[:16] if secret else ''
+
     def set_hmac_secret(self, secret: Any) -> None:
         """Install the deployment HMAC and backfill IDs before owner HTTP use."""
         if not isinstance(secret, (str, bytes)) or not secret:
@@ -313,6 +325,9 @@ class MemoryStore:
                 raise RuntimeError('memory owner HMAC secret changed')
             self._hmac_secret = secret
             self._backfill_public_ids()
+            # Rows migrated before a secret was installed carry an empty key id.
+            with self._db:
+                self._db.execute("UPDATE group_rooms SET key_id=? WHERE key_id=''", (self.group_key_id(),))
 
     def close(self) -> None:
         with self._lock:
