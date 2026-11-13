@@ -47,7 +47,7 @@ from zoneinfo import ZoneInfo
 
 from .config import Config, parse_hhmm
 from .limits import EffectiveLimits, LAYER_PEER, LimitStore, LAYER_PLATFORM
-from .store import EventKind, UsageStore
+from .store import EventKind, UsageStore, text_digest
 from .timeutil import iso_utc, seconds_until, utcnow
 
 SOURCE_PLATFORM = "platform_default"
@@ -62,6 +62,7 @@ CODE_RATE_LIMIT = "messages.window.exceeded"
 CODE_TOKEN_LIMIT = "tokens.window.exceeded"
 CODE_SILENT_HOURS = "silent_hours.active"
 CODE_MIN_INTERVAL = "min_interval.too_soon"
+CODE_GROUP_REPLIES = "group.replies_per_hour.exceeded"
 CODE_PROACTIVE_LIMIT = "proactive.per_day.exceeded"
 CODE_TOWN_TOKEN_LIMIT = "town.tokens_per_day.exceeded"
 # B2.2
@@ -326,6 +327,8 @@ class PolicyEngine:
         now_fn=utcnow,
         reservations: Optional[ReservationBook] = None,
     ) -> None:
+        self.group_invites = None
+        self._group_sends = OrderedDict()
         self._config = config
         self._store = store
         self._limit_store = limit_store
@@ -431,6 +434,14 @@ class PolicyEngine:
                     )
                 )
 
+        group = bool(conversation_id and self.group_invites is not None
+                     and self.group_invites.is_throttled(persona_id, conversation_id))
+        if group:
+            for check in self._group_views(persona_id, conversation_id, now):
+                checks.append(check)
+                if not check.allowed:
+                    reasons.append(PolicyReason(check.code, "Group send limit reached.", check.layer))
+
         # 4) 主动发言 / 日（仅 kind=proactive 参与）
         if kind == "proactive":
             proactive = self._proactive_view(persona_id, now, effective)
@@ -494,6 +505,7 @@ class PolicyEngine:
                 now=now,
                 effective=effective,
                 commit_state=commit_state,
+                group=group,
             )
             if anti_spam is not None:
                 checks.append(anti_spam)
@@ -516,6 +528,7 @@ class PolicyEngine:
                 conversation_id=conversation_id,
                 now=now,
                 effective=effective,
+                group=group,
             )
             if ai_loop is not None:
                 checks.append(ai_loop)
@@ -556,6 +569,60 @@ class PolicyEngine:
             silent=silent,
             allow_deferred=allow_deferred,
         )
+
+    @staticmethod
+    def _group_floor(effective, key, floor):
+        # Group-only 0 = unset. Inspect all layers so a zero cannot hide a
+        # stricter positive owner/peer value selected out by the legacy merge.
+        winner = (floor, LAYER_PLATFORM, SOURCE_PLATFORM)
+        block, field = key.split(".")
+        for layer in effective.layers if effective is not None else ():
+            value = (layer.rules.get(block) or {}).get(field, 0)
+            if value > 0 and value < winner[0]:
+                winner = (value, layer.layer, layer.scope_id)
+        return winner
+
+    def _group_key(self, persona, room):
+        # No raw identifiers in the new bounded counter keys.
+        return (text_digest("group-persona:" + persona, self._config.hmac_secret),
+                text_digest("group-room:" + room, self._config.hmac_secret))
+
+    def record_group_send(self, persona, room, at):
+        # Called only by service's successful, deduplicated commit under its lock.
+        if self.group_invites is None or not self.group_invites.is_throttled(persona, room):
+            return
+        key = self._group_key(persona, room)
+        with self._state_lock:
+            times = [t for t in self._group_sends.get(key, ()) if t > at - timedelta(hours=1)]
+            self._group_sends[key] = (times + [at])[-200:]
+            self._group_sends.move_to_end(key)
+            while len(self._group_sends) > 4096:
+                self._group_sends.popitem(last=False)
+
+    def _group_views(self, persona, room, now):
+        since = now - timedelta(hours=1)
+        with self._state_lock:
+            times = [t for t in self._group_sends.get(self._group_key(persona, room), ()) if t > since]
+        if self._reservations is not None:
+            times.extend(r.at for r in self._reservations.for_persona(persona)
+                         if r.conversation_id == room)
+        times.sort()
+        cooldown = self._config.group_cooldown_seconds
+        if cooldown:
+            elapsed = (now - times[-1]).total_seconds() if times else cooldown
+            allowed = elapsed >= cooldown
+            yield PolicyCheck(key="group.min_interval", layer=LAYER_PLATFORM,
+                allowed=allowed, limit=cooldown, used=elapsed,
+                remaining=max(0, cooldown - elapsed),
+                reset_at=iso_utc(_ceil_to_second(times[-1] + timedelta(seconds=cooldown))) if times else None,
+                code=None if allowed else CODE_MIN_INTERVAL, source_id=SOURCE_PLATFORM)
+        limit = self._config.group_max_replies_per_hour
+        used = len(times)
+        allowed = used < limit
+        yield PolicyCheck(key="group.replies_per_hour", layer=LAYER_PLATFORM,
+            allowed=allowed, limit=limit, used=used, remaining=max(0, limit - used),
+            reset_at=iso_utc(_ceil_to_second(times[max(0, used - limit)] + timedelta(hours=1))) if times else None,
+            code=None if allowed else CODE_GROUP_REPLIES, source_id=SOURCE_PLATFORM)
 
     # ------------------------------------------------------- decision assembly
     def _resolve(
@@ -1107,6 +1174,7 @@ class PolicyEngine:
         now: datetime,
         effective: Optional[EffectiveLimits],
         commit_state: bool = False,
+        group: bool = False,
     ) -> Optional[PolicyCheck]:
         """防刷屏：同 persona、同会话连续 AI 消息数 + 冷却（B2.2 §6.3）。
 
@@ -1121,9 +1189,9 @@ class PolicyEngine:
         `_count_since`，只按内存中已有状态推算「若现在发送会怎样」（#117 N4）。
         """
 
-        if effective is None:
-            return None
-        max_item = self._limits_for(effective, "anti_spam.max_consecutive_ai_messages")
+        max_item = self._group_floor(effective, "anti_spam.max_consecutive_ai_messages",
+            self._config.group_max_consecutive_ai_messages) if group else self._limits_for(
+                effective, "anti_spam.max_consecutive_ai_messages")
         cooldown_item = self._limits_for(effective, "anti_spam.cooldown_seconds")
         if max_item is None:
             return None
@@ -1237,6 +1305,7 @@ class PolicyEngine:
         conversation_id: str,
         now: datetime,
         effective: Optional[EffectiveLimits],
+        group: bool = False,
     ) -> Optional[PolicyCheck]:
         """互聊熔断：同会话任意 AI 在 1 小时滑动窗口内的消息数（B2.2 §6.3, N8）。
 
@@ -1258,16 +1327,16 @@ class PolicyEngine:
           永不返回过去或当前时刻（避免「到点重试仍被拦」的活锁）。
         预留**不受**人类消息重置：过滤预留用窗口起点，而不是人类消息时刻。
         """
-        if effective is None:
-            return None
-        item = self._limits_for(effective, "ai_loop.max_ai_messages_per_hour")
+        item = self._group_floor(effective, "ai_loop.max_ai_messages_per_hour",
+            self._config.group_ai_loop_max_per_hour) if group else self._limits_for(
+                effective, "ai_loop.max_ai_messages_per_hour")
         if item is None:
             return None
         max_per_hour, layer, source_id = item
         window_seconds = 3600
 
         # 计数起点 = 最后一条人类消息时刻（无人类消息则取窗口起点）。
-        human_at = self._last_human_at(conversation_id, now)
+        human_at = None if group else self._last_human_at(conversation_id, now)
         window_start = now - timedelta(seconds=window_seconds)
         if human_at is not None and human_at > window_start:
             count_since = human_at

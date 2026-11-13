@@ -156,6 +156,8 @@ DEFAULT_MEMORY_RETENTION_DAYS = 90
 DEFAULT_MEMORY_PURGE_INTERVAL_SECONDS = 86_400
 MEMORY_VECTOR_BACKENDS = frozenset({"none", "python", "sqlite-vec"})
 DEFAULT_MOOD_HALF_LIFE_MINUTES = 240
+# KEEP IN SYNC: deploy-side RANGES in server/tests/test_compose_gateway_mood_proactive.py
+# (GATEWAY_MOOD_HALF_LIFE_MINUTES); change both together.
 MOOD_HALF_LIFE_MINUTES_MIN = 1
 MOOD_HALF_LIFE_MINUTES_MAX = 10_080
 
@@ -328,6 +330,8 @@ def _env_group_max_responders(env: Mapping[str, str]) -> int:
         value = int(raw.strip())
     except (TypeError, ValueError):
         raise ConfigError("GATEWAY_GROUP_MAX_RESPONDERS must be an integer in range") from None
+    # KEEP IN SYNC: deploy-side RANGES in server/tests/test_compose_gateway_mood_proactive.py
+    # (GATEWAY_GROUP_MAX_RESPONDERS); change both together.
     if not 1 <= value <= 20:
         raise ConfigError("GATEWAY_GROUP_MAX_RESPONDERS must be in range")
     return value
@@ -489,7 +493,12 @@ class Config:
     platform_proactive_per_day: int = DEFAULT_PROACTIVE_PER_DAY
     # Group invitations are opt-in at deployment and persona level.
     groups_enabled: bool = False
+    group_forget_stale_keys: bool = False
     group_max_rooms_per_persona: int = 20
+    group_cooldown_seconds: int = 30
+    group_max_replies_per_hour: int = 20
+    group_ai_loop_max_per_hour: int = 30
+    group_max_consecutive_ai_messages: int = 3
     # #226 nit: invite ledger entries expire after this many seconds.
     invite_ledger_ttl_seconds: int = DEFAULT_INVITE_LEDGER_TTL_SECONDS
     # Maximum local personas that may answer a single human group message.
@@ -595,11 +604,28 @@ class Config:
     mood_half_life_minutes: int = DEFAULT_MOOD_HALF_LIFE_MINUTES
 
     def __post_init__(self) -> None:
+        # KEEP IN SYNC: GATEWAY_GROUP_FORGET_STALE_KEYS is not yet in deploy-side RANGES/BOOLS
+        # (server/tests/test_compose_gateway_mood_proactive.py); A line still needs to add them.
+        if not isinstance(self.group_forget_stale_keys, bool):
+            raise ConfigError("GATEWAY_GROUP_FORGET_STALE_KEYS must be a boolean")
         if not isinstance(self.groups_enabled, bool):
             raise ConfigError("GATEWAY_GROUPS_ENABLED must be a boolean")
+        # KEEP IN SYNC: deploy-side RANGES in server/tests/test_compose_gateway_mood_proactive.py
+        # (GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA); change both together.
         if (type(self.group_max_rooms_per_persona) is not int
                 or not 1 <= self.group_max_rooms_per_persona <= 200):
             raise ConfigError("GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA must be within 1–200")
+        # KEEP IN SYNC: the four B2.8c group ranges below are not yet in deploy-side RANGES/BOOLS
+        # (server/tests/test_compose_gateway_mood_proactive.py); A line still needs to add them.
+        for name, low, high in (
+            ("group_cooldown_seconds", 0, 3600),
+            ("group_max_replies_per_hour", 1, 200),
+            ("group_ai_loop_max_per_hour", 1, 1000),
+            ("group_max_consecutive_ai_messages", 1, 50),
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or not low <= value <= high:
+                raise ConfigError(f"GATEWAY_{name.upper()} must be within {low}–{high}")
         if (type(self.invite_ledger_ttl_seconds) is not int
                 or not INVITE_LEDGER_TTL_MIN_SECONDS <= self.invite_ledger_ttl_seconds
                 <= INVITE_LEDGER_TTL_MAX_SECONDS):
@@ -624,8 +650,13 @@ class Config:
             raise ConfigError("platform_token_budget must be >= 0")
         if self.platform_proactive_per_day < 0:
             raise ConfigError("platform_proactive_per_day must be >= 0")
+        # KEEP IN SYNC: deploy-side RANGES in server/tests/test_compose_gateway_mood_proactive.py
+        # (GATEWAY_GROUP_MAX_RESPONDERS); change both together.
         if not isinstance(self.group_max_responders, int) or isinstance(self.group_max_responders, bool) or not 1 <= self.group_max_responders <= 20:
             raise ConfigError("GATEWAY_GROUP_MAX_RESPONDERS must be between 1 and 20")
+        # KEEP IN SYNC: deploy-side RANGES in server/tests/test_compose_gateway_mood_proactive.py
+        # (GATEWAY_PROACTIVE_TICK_SECONDS, GATEWAY_PROACTIVE_MIN_IDLE_MINUTES,
+        # GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES, GATEWAY_PROACTIVE_PER_TARGET_PER_DAY); change both together.
         proactive_ranges = (
             (self.proactive_tick_seconds, 30, 86_400, "proactive_tick_seconds"),
             (self.proactive_min_idle_minutes, 0, 43_200, "proactive_min_idle_minutes"),
@@ -1257,6 +1288,11 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
             source, "PLATFORM_PROACTIVE_PER_DAY", DEFAULT_PROACTIVE_PER_DAY
         ),
         groups_enabled=_env_bool(source, "GATEWAY_GROUPS_ENABLED", False),
+        group_forget_stale_keys=_env_bool(source, "GATEWAY_GROUP_FORGET_STALE_KEYS", False),
+        group_cooldown_seconds=_env_proactive_int(source, "GATEWAY_GROUP_COOLDOWN_SECONDS", 30),
+        group_max_replies_per_hour=_env_proactive_int(source, "GATEWAY_GROUP_MAX_REPLIES_PER_HOUR", 20),
+        group_ai_loop_max_per_hour=_env_proactive_int(source, "GATEWAY_GROUP_AI_LOOP_MAX_PER_HOUR", 30),
+        group_max_consecutive_ai_messages=_env_proactive_int(source, "GATEWAY_GROUP_MAX_CONSECUTIVE_AI_MESSAGES", 3),
         group_max_rooms_per_persona=_env_proactive_int(source, "GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA", 20),
         invite_ledger_ttl_seconds=_env_proactive_int(
             source, "GATEWAY_INVITE_LEDGER_TTL_SECONDS", DEFAULT_INVITE_LEDGER_TTL_SECONDS),

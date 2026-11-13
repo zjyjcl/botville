@@ -33,7 +33,7 @@ class GroupTests(unittest.TestCase):
         self.path = os.path.join(self.temp.name, 'memory.db')
         self.store = MemoryStore(self.path, hmac_secret=SECRET)
         self.addCleanup(self.store.close)
-        self.transport = Mock()
+        self.transport = Mock(spec=["join", "leave", "room_is_encrypted"])
         self.transport.room_is_encrypted.return_value = False
         self.persona = Persona(AI, 'instructions', owner_user_id=OWNER,
                                groups={'enabled': True, 'invite_policy': 'owner'})
@@ -225,7 +225,9 @@ class GroupTests(unittest.TestCase):
 
     def test_opaque_room_without_domain(self):
         self.invite(room_id='!opaque')
-        self.assertTrue(self.groups.is_accepted(AI, '!opaque'))
+        self.assertFalse(self.groups.is_accepted(AI, '!opaque'))
+        self.transport.join.assert_not_called()
+        self.assertEqual(self.groups.stats.snapshot()['cross_server'], 1)
 
     def test_twenty_room_limit(self):
         for i in range(21):
@@ -319,7 +321,7 @@ class GroupTests(unittest.TestCase):
         self.store._db.executescript('DROP TABLE group_rooms; DROP TABLE group_invites; UPDATE memory_schema SET version=9;')
         other = MemoryStore(self.path, hmac_secret=SECRET)
         self.addCleanup(other.close)
-        self.assertEqual(other._db.execute('SELECT version FROM memory_schema').fetchone()[0], 10)
+        self.assertEqual(other._db.execute('SELECT version FROM memory_schema').fetchone()[0], SCHEMA_VERSION)
         self.assertEqual(other._db.execute('SELECT count(*) FROM group_rooms').fetchone()[0], 0)
 
 
@@ -507,6 +509,8 @@ class AssemblyTests(unittest.TestCase):
                 server.as_consumer._dispatch_event({'type': 'm.room.encryption', 'event_id': '$e',
                     'room_id': ROOM, 'sender': OWNER, 'state_key': '', 'content': {}})
                 self.assertTrue(tr.disabled_group(AI, ROOM))
+                self.assertTrue(tr.encryption_guard)
+                self.assertTrue(tr._encryption_cache[tr._encryption_cache_key(ROOM)][0])
                 tr._request = Mock()
                 with self.assertRaises(DeliveryError):
                     tr.send_text(room_id=ROOM, sender_id=AI, text='body')

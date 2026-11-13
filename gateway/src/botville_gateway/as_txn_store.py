@@ -113,6 +113,8 @@ CREATE TABLE IF NOT EXISTS as_speech_dedupe (
 # 邀请台账 TTL（秒）：超过即视为过期，不再作为 join 快路径，转 `/sync` 权威确认。
 # **唯一定义处**：config.py 从这里 import 默认值与范围。
 DEFAULT_INVITE_LEDGER_TTL_SECONDS = 86400
+# KEEP IN SYNC: deploy-side RANGES in server/tests/test_compose_gateway_mood_proactive.py
+# (GATEWAY_INVITE_LEDGER_TTL_SECONDS); change both together.
 INVITE_LEDGER_TTL_MIN_SECONDS = 60
 INVITE_LEDGER_TTL_MAX_SECONDS = 30 * 86400
 

@@ -168,6 +168,7 @@ class GatewayService:
         now_fn=utcnow,
         reservations: Optional[ReservationBook] = None,
     ) -> None:
+        self._group_invites = None
         self._config = config
         self._transport = transport
         self._store = store if store is not None else UsageStore(
@@ -733,6 +734,17 @@ class GatewayService:
         )
 
     # ----------------------------------------------------------- policy only
+    def set_group_invites(self, groups) -> None:
+        self._group_invites = groups
+        self._engine.group_invites = groups
+
+    def _check_group_encryption(self, persona_id, conversation_id) -> None:
+        if (conversation_id and self._group_invites is not None
+                and self._group_invites.is_disabled(persona_id, conversation_id)):
+            error = ValidationError("conversation.e2ee", "AI participation is disabled in encrypted conversations")
+            error.http_status = 403
+            raise error
+
     def evaluate_policy(self, payload: Dict[str, Any], *, internal_memory: bool = False) -> Dict[str, Any]:
         # B5: 拒绝未知字段（additionalProperties: false）
         unknown = set(payload.keys()) - _EVALUATE_FIELDS
@@ -749,6 +761,7 @@ class GatewayService:
             raise ValidationError(
                 "request.invalid", "'conversation_id' must be a string", "conversation_id"
             )
+        self._check_group_encryption(persona_id, conversation_id)
         peer_id = payload.get("peer_id")
         if peer_id is not None and not isinstance(peer_id, str):
             raise ValidationError("request.invalid", "'peer_id' must be a string", "peer_id")
@@ -843,6 +856,7 @@ class GatewayService:
             raise ValidationError("request.invalid", "conversation_id is required", "conversation_id")
 
         validated = self._validate_send(payload)
+        self._check_group_encryption(validated["sender"], conversation_id)
         if proactive_reservation is not None and (
             not isinstance(proactive_reservation, Reservation)
             or proactive_reservation.kind != "proactive"
@@ -1335,6 +1349,8 @@ class GatewayService:
                     secret=self._store.secret,
                 )
             )
+        if not deduped:
+            self._engine.record_group_send(sender, conversation_id, reservation.at)
         # 释放预留（在 append 之后，保持「占名额 ⟺ 事件入账」不变量，见上方注释）。
         self._reservations.release(reservation)
         # B6 (#117)：delivered 后清 blocked 去重记录，下次进入 blocked 状态可重新写一条。

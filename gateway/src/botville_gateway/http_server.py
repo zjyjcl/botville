@@ -1161,6 +1161,10 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             )
             return
         except GatewayDeliveryError as exc:
+            if exc.code == "conversation.e2ee":
+                self._send_problem(403, "conversation.e2ee", "AI participation disabled",
+                    detail="AI participation is disabled in encrypted conversations")
+                return
             if self.server.config.access_log:  # type: ignore[attr-defined]
                 self.log_error("delivery failed: %s: %s", exc.code, exc.detail)
             # appservice 传输在客户端侧就能判定的请求错误映射为 4xx（契约
@@ -1465,11 +1469,15 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         self.group_invites = GroupInvites(
             self.memory_store, transport, self.memory_personas,
             enabled=config.groups_enabled, server_name=config.matrix_server_name,
-            max_rooms=config.group_max_rooms_per_persona)
+            max_rooms=config.group_max_rooms_per_persona,
+            forget_stale_keys=config.group_forget_stale_keys)
+        service.set_group_invites(self.group_invites)
         if hasattr(transport, "accepted_group"):
             transport.accepted_group = self.group_invites.is_accepted
             transport.disabled_group = self.group_invites.is_disabled
             transport.left_group = self.group_invites.is_left
+            transport.quarantine_group = self.group_invites.quarantine_group
+            transport.encryption_guard = config.groups_enabled
         self.personas_timestamp = iso_utc(service.started_at)
         if config.personas_file:
             try:

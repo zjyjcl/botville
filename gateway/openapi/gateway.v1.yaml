@@ -3475,6 +3475,7 @@ components:
             原因码。开放字符串（未知值按通用 blocked 处理），推荐取值：
             `messages.window.exceeded`、`tokens.window.exceeded`、
             `min_interval.too_soon`、`silent_hours.active`、
+            `group.replies_per_hour.exceeded`（B2.8c 已启用的 accepted 群每 persona 滚动小时回复上限）、
             `proactive.per_day.exceeded`、`town.tokens_per_day.exceeded`、
             `message.length`、`relation.chat_denied`、`conversation.e2ee`，
             以及 B2.2 熔断相关：

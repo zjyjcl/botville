@@ -60,7 +60,10 @@ AI 发言（`POST /conversations/{id}/messages`）或预检（`POST /policy/eval
 （`e2ee` → `disabled`，`none` → `enabled`）。
 
 客户端侧限制与已知局限见[苹果端加密策略](../../app-apple/docs/encryption-policy.md)。
-当前网关参考实现尚未校验房间加密状态；后续接入须按真实房间状态执行上述限制。
+参考实现已对 `group_rooms` 中已知的 encrypted_disabled / rejected_encrypted 群房间
+执行上述 `403 conversation.e2ee`：messages 与 policy/evaluate 在调用 transport、预留限额或入队前拒绝，
+transport 检出的同码错误也映射为 403。该约束不受群开关影响；引擎不调模型、不发言。
+状态来自邀请检查及 `m.room.encryption` 事件；未被观察到的房间状态仍不能凭空判定。
 
 > **D 线注意**：通知数据模型（D1.1）与授权回调签名（D2.1）会扩展 `/cards` 与
 > `/cards/{card_id}/actions/{action_id}`。v1 已预留 `source.module`、`source.capability_id`、
@@ -906,21 +909,37 @@ ephemeral 不在 AS 注册里开启，忽略。
   不另外猜测 DM 或为 policy 拒绝增加 DM 例外。
 - 开启后的判定顺序：persona 开关 → sender 为本服 trusted 人类（非 AI、非 AS sender）→
   owner 策略要求 sender 等于 `owner_user_id`，local_humans 允许任意本服人类 →
-  `unsigned.invite_room_state` 不含 `m.room.encryption` → room_id 如带 domain 必须为本服 →
+  `unsigned.invite_room_state` 不含 `m.room.encryption` → room_id 必须为 `!localpart:domain`，且
+  domain 与本服 server_name 不区分大小写相等 →
   群数与邀请限频。v1 不接受跨服邀请者或跨服房间。
 - `GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA` 为 int，默认 20，范围 1–200，越界拒绝启动且不回显。
 - `GATEWAY_INVITE_LEDGER_TTL_SECONDS` 为 int，默认 86400，范围 60–2592000，越界拒绝启动且不回显（邀请台账过期时间，见 §1.7.8 自动 join）。
-  accepted 与仍保留成员资格的 encrypted_disabled 均占名额。限频为每 persona 滚动 60 秒最多
+  仅当前 HMAC key_id 的 accepted 与仍保留成员资格的 encrypted_disabled 占名额。限频为每 persona 滚动 60 秒最多
   10 个新邀请（拒绝也计入），进程内最多 4096 个桶、每桶最多 10 个时间戳，过期清理；重放不占额。
 - 通过后 AS masquerade join，再以 persona GET `/rooms/{room}/state/m.room.encryption/`；
   **只有 HTTP 404** 确认未加密，其他错误 fail-closed。加密则立即 leave 并持久化 rejected_encrypted；
-  明文才写 accepted。不通过则 masquerade leave，不发卡片；INFO 与 stats 只含固定 reason code
+  明文才写 accepted。不通过则 masquerade leave（`M_FORBIDDEN` 也视为已离开并标 done），不发卡片；
+  若该 room 已 accepted，任何不合格再邀请均只标 done、计 `ignored_for_accepted`，保持 accepted 且不 leave；
+  INFO 与 stats 只含固定 reason code
   （groups_disabled/inviter_not_allowed/encrypted/cross_server/room_limit/rate_limited 等），不含 ID、正文或秘密。
 - memory schema 9 → 10，幂等新增 `group_rooms`：persona_id、room_key、state、mode、inviter、
-  joined_at、updated_at。room_key/inviter 为复用 owner HMAC 密钥、独立 groups 用途前缀的 HMAC；
+  joined_at、updated_at；schema 10 → 11 新增 `key_id TEXT NOT NULL DEFAULT ''`，迁移时回填当前指纹。
+  room_key/inviter 为复用 owner HMAC 密钥、独立 groups 用途前缀的 HMAC；key_id 为
+  `HMAC(secret, "groups:key-id")` 前 16 个十六进制字符，不能反推或泄露密钥。新写入均使用当前 key_id；
   state 为 accepted/rejected_encrypted/left/encrypted_disabled；mode 默认 mention_only，muted 预留。
   当前所有操作自带真实 room_id，因此表内**不额外保存 room_id 原值**；persona_id 为内部关联键，不打印。
   `is_accepted(persona, room_id)` 为传输层注入的许可回调。
+- HMAC 轮换使旧 room_key 失配：旧 accepted 视为未接受，因而不节流、也不免 DM 复核；旧
+  encrypted_disabled/left 同样不匹配。发送层独立的加密拦截不依赖 HMAC：群功能开启时发送前以发送者
+  masquerade GET 加密 state，200 或探测错误 fail-closed 为 `conversation.e2ee`，404 继续，
+  `M_FORBIDDEN` 交给既有恢复流程；已加密状态无 TTL、未加密缓存 30 秒、最多 4096 项，满时优先
+  淘汰未加密项；淘汰后会重新查询，收到加密 state 事件立即标记已加密。
+- 只要 persona 还有 `key_id != 当前指纹` 的行，进入“轮换隔离”：当前密钥下未知且非 accepted 的群在
+  `M_FORBIDDEN` 后不得自动 join，即便邀请台账存在；`allow_auto_join=true` 的已确认 DM 不受影响。
+  `GATEWAY_GROUP_FORGET_STALE_KEYS` 为 bool，默认 false；true 时启动删除所有旧 key_id 行并以不含
+  标识符的 INFO 记录删除数，解除隔离。此操作永久丢失旧 left/encrypted_disabled，故被踢/退出的群在新合格邀请
+  后可再次接受。schema 10 首次升级到 11 时，旧行按该次启动的当前密钥回填 key_id；运维必须先以原密钥
+  完成迁移，再轮换密钥，才能保留可靠的轮换检测。
 - `group_invites` 用 `(persona,event_id)` 的 HMAC 持久化去重，不随记忆保留期清理。
   网络动作前提交 pending、processed_at（本次尝试时间）和 attempt_owner；完成 join/leave 与房间记录后标记 done。
   done 重放跳过；pending 在 5 分钟后或处理实例重启后可重试，重试不占新邀请限频额度。
@@ -933,8 +952,35 @@ ephemeral 不在 AS 注册里开启，忽略。
   不 join、不重试，即使 allow_auto_join 开启也一样。新 event_id 的再邀请重新走完整判定链。
 - 收到 `m.room.encryption` state 事件，accepted 房间标记 encrypted_disabled，不自动 leave；
   引擎在模型调用前跳过，AS 传输发送前再次检查（覆盖 HTTP 发言与模型调用期间的状态变化）。
-  关闭开关后仍保留这项拦截。HTTP `403 conversation.e2ee` 的状态码映射与 policy/evaluate 留给 B2.8c；
-  当前发送走已有 delivery error 通道，不会实际发送。
+  关闭开关后仍保留这项拦截。B2.8c 已实现 HTTP `403 conversation.e2ee` 与 policy/evaluate 前置检查。
+
+**群节流与多 AI 熔断（B2.8c，契约仍为 0.5.0）**
+
+只适用于该 persona 在 `group_rooms` 中 state=accepted，且部署 `GATEWAY_GROUPS_ENABLED`
+与 persona `groups.enabled` 均开启的房间；其他房间行为不变。
+
+| 变量 | 默认 | 范围与含义 |
+|---|---|---|
+| `GATEWAY_GROUP_COOLDOWN_SECONDS` | `30` | 每 (persona, room) 冷却秒数，整数 0–3600；0 关闭 |
+| `GATEWAY_GROUP_MAX_REPLIES_PER_HOUR` | `20` | 每 (persona, room) 滚动 3600 秒回复上限，整数 1–200 |
+| `GATEWAY_GROUP_AI_LOOP_MAX_PER_HOUR` | `30` | 同房间任意 AI 滚动小时底线，整数 1–1000 |
+| `GATEWAY_GROUP_MAX_CONSECUTIVE_AI_MESSAGES` | `3` | 同 persona 在同房间连续发言底线，整数 1–50 |
+
+四项配置非法或越界均拒绝启动，错误不回显值。群冷却作为 `group.min_interval` 检查，
+原因码复用 `min_interval.too_soon`；与三层最小间隔检查并存，任一未通过即 block。
+群小时上限检查 `group.replies_per_hour`，推荐原因码 `group.replies_per_hour.exceeded`，
+均进入 checks[] / reasons[]，不新增 schema 字段、不升级版本。
+
+成功投递后通过现有 commit 路径入账，幂等重放不重复计数；在途预留暂占额度，失败回滚。
+群节流键为部署密钥 HMAC，最多 4096 个 (persona, room) 桶，每桶最多 200 个时间戳，
+进程内 LRU 有界存储，重启清空；容量淘汰可能使旧桶少算，部署应容纳活跃群规模。
+小时窗口为 `(now-3600s, now]`，到出窗时恢复。群内 anti_spam 同 persona 连续计数
+在人类发言时归零（默认上限 3 条）；ai_loop 默认 30/h 为滚动一小时硬底线，人类发言不重置。
+三层底线及既有冷却语义见 §6.3。
+
+验收使用假时钟、假模型及假 transport，经 consumer → engine → policy 模拟 5 AI、1 人类、
+每 20 秒消息持续一小时；AI 文本回灌无链式回复，每人类事件最多 MAX_RESPONDERS 位回复者，
+每 persona 满足冷却/小时额度、房间总回复不超过 ai_loop 底线。另以 5 AI HTTP 连发验证熔断。
 
 **⑦ 防循环与人类入站（修正 §6.3 旧局限）**
 
@@ -1004,7 +1050,7 @@ DM 不受此上限影响。`m.mentions.room=true`（`@room`）本身不产生目
 消费者记录本服 persona 的 invite，join/leave/ban 清除邀请；事件哈希去重防止事务重试恢复旧邀请，清理待办未完成时拒绝再次自动 join；邀请表位于 AS 事务 SQLite，键为 SHA-256(persona, room)，不保存原始标识。
 未配置持久库时使用最多 1000 项的进程内邀请缓存，缺失/淘汰转 `/sync` 权威确认；内存事件去重墓碑上限 1000，满后拒绝记录新邀请直至重启，避免淘汰墓碑后重放恢复旧邀请。
 邀请台账条目带写入时间，超过 `GATEWAY_INVITE_LEDGER_TTL_SECONDS`（默认 86400，范围 60–2592000，越界拒绝启动且不回显）即过期删除，不再作为快路径，转 `/sync` 权威确认；#226 时期无时间列的旧条目迁移后视为已过期。格式异常的 `m.room.member` 事件（content 非对象、membership 或 state_key 非字符串）只跳过该事件并计数，不影响事务内其他事件、不写台账。
-权威确认是一次性请求，使用 `GET /_matrix/client/v3/sync?user_id=...&timeout=0&set_presence=offline&full_state=false&filter=<内联 JSON>`；不带 since、不保存 `next_batch`，因此 to-device 消息不会被确认消费（HS 只在后续请求出示该 token 时删除），也不改变 AI 在线状态。filter 仅保留该房间邀请：`{"event_fields":["type"],"room":{"rooms":[room],"include_leave":false,"timeline":{"limit":0,"not_types":["*"]},"state":{"not_types":["*"]},"ephemeral":{"not_types":["*"]},"account_data":{"not_types":["*"]}},"presence":{"not_types":["*"]},"account_data":{"not_types":["*"]}}`。
+权威确认是一次性请求，使用 `GET /_matrix/client/v3/sync?user_id=...&timeout=0&set_presence=offline&full_state=false&filter=<内联 JSON>`；不带 since、不保存 `next_batch`，因此 to-device 消息不会被确认消费（HS 只在后续请求出示该 token 时删除），也不改变 AI 在线状态。实测（Synapse v1.141，与 CI 同一镜像 digest）：filter 的 `rooms:[room]` **不约束 invite 段**（返回全部待处理邀请），代码只读取 `rooms.invite[room]`，即在客户端按房间筛选；`rooms` 约束 join 段，但 state 过滤排除全部类型时 Synapse 会整体省略已加入房间，因此 state 只保留 `m.room.create`（必然存在，经 `event_fields` 只剩 type），保证“已加入”仍可检出。filter 为：`{"event_fields":["type"],"room":{"rooms":[room],"include_leave":false,"timeline":{"limit":0,"not_types":["*"]},"state":{"types":["m.room.create"]},"ephemeral":{"not_types":["*"]},"account_data":{"not_types":["*"]}},"presence":{"not_types":["*"]},"account_data":{"not_types":["*"]}}`。
 请求超时 5 秒，不跟随重定向；任何错误或结构异常均 fail-closed，上抛原 `M_FORBIDDEN`。`rooms.join` 含该房间时不 join/leave，直接上抛原错误；否则须在 `rooms.invite` 中确认该房间，并检查 `invite_state.events`。邀请 stripped state 含 `m.room.encryption` 时拒绝 join。
 join 后再次以该 AI GET `/_matrix/client/v3/rooms/{room}/state/m.room.encryption/`：仅 HTTP 404 视为未加密，其余响应/错误均按加密处理，不发送并退出。
 默认路径（包括 HTTP 发送与主动发言）还须复核完整 joined 成员恰好为 {发送者，一个本服人类}；人类 localpart
@@ -1851,6 +1897,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.5.0 | 2026-11-13 | [B2.8c #228] accepted 群冷却与滚动小时回复限额、群 ai_loop / anti_spam 底线（群内连续计数在人类发言时归零；默认 30/h 为滚动一小时硬底线，人类发言不重置）；schema 10→11 的 HMAC key_id 与轮换隔离/可选忘记旧行、上限只计当前键、发送层独立加密拦截；严格本服 room id、accepted 房间忽略不合格再邀请、拒绝 leave 的 M_FORBIDDEN 视为完成，以及 Synapse /sync invite 过滤说明修正。无 API 字段变化、契约仍 0.5.0。 |
 | 0.5.0 | 2026-11-13 | [#226 评审 nit] `/sync` 权威确认改为仅邀请的一次性请求（set_presence=offline、无 since、不消费 to-device）；leave 遇 `M_FORBIDDEN` 视为已离开并移出清理队列；格式异常的成员事件只跳过该事件；邀请台账 TTL（`GATEWAY_INVITE_LEDGER_TTL_SECONDS`，默认 1 天）。无 API 字段变化。 |
 | 0.5.0 | 2026-11-13 | [M_FORBIDDEN 安全加固] 自动 join 需邀请台账命中或 /sync 权威确认，前后排除加密；已有成员不 join/leave；leave 有限重试与持久清理队列，无新增开关或 API 字段。 |
 | 0.5.0 | 2026-11-13 | [PR4c quasi-breaking] 新增默认关闭的主动发言部署/人设配置、DM-only 候选、持久化队列与 stable txnId 重放语义；`ProactiveSettings.enabled` 默认值由 true 改为 false。该默认值改变未显式设置旧部署的行为，按准破坏性变更公告。 |
@@ -1966,6 +2013,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
   `messages.window.exceeded`）。
 - **B2.1 已实现**的检查项：`messages.window`（code: `messages.window.exceeded`）、
   `tokens.window`（code: `tokens.window.exceeded`）、`min_interval`（code: `min_interval.too_soon`）、
+  `group.min_interval`（code: `min_interval.too_soon`）、`group.replies_per_hour`（code: `group.replies_per_hour.exceeded`）、
   `silent_hours`（code: `silent_hours.active`）（每项都取三层中最严者，`source_layer` 落在
   `PolicyCheck.layer` 上）。`proactive.per_day`（code: `proactive.per_day.exceeded`）/
   `town.tokens_per_day`（code: `town.tokens_per_day.exceeded`）的生效值已在 `GET /limits` 中计算，
@@ -2019,6 +2067,15 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 ### 6.3 熔断语义（B2.2）
 
 本节描述防刷屏（`anti_spam`）与互聊熔断（`ai_loop`）的语义。
+
+**B2.8c 群底线例外**：对上述双开关开启的 accepted 群，ai_loop 默认 30/h，
+anti_spam 默认同 persona 连续 3 条；配置范围见 B2.8c 表。有效值为各层正值与群底线的最小值，
+现有 0/未设按无限参与该群计算（仅这两个群规则；API anti_spam 仍不接受 0，不修改验证范围）。
+非群规则、非群房间及 `PLATFORM_*` 的既有语义不变。
+群 ai_loop 默认 30/h 为滚动一小时硬底线，统计同房间任意 AI，**人类发言不重置**，防止持续 @ 绕过房间小时底线；
+其余房间仍按下文的人类重置语义。群 anti_spam 仍按同 persona，**连续计数在人类发言时归零**，沿用既有冷却及在途预留语义。
+群限额与非群限额都使用同一 service 实发路径，外部运行时 messages / policy/evaluate 同样执行。
+下文 API 零值与人类重置规则除本段明确的群例外外保持原义。
 
 - **平台层可配置（N7）**：`anti_spam` / `ai_loop` 与 §6.1 的其它限额一样参与
   **三层取最严**，平台层的值由部署配置给出：

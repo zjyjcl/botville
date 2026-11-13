@@ -545,17 +545,54 @@ HTTP 消息与主动发言复核为非 DM 后立即尝试退出，不重试发�
 开启 memory 后，同群其他 AI 文本写入 group 记忆，trust=untrusted，以 role=assistant 和 sender
 保留 AI 来源，召回只进入不可信数据区；自身回声不重复记录。memory 关闭时 AI 入站不追加 ring buffer。
 
-### 群邀请（B2.8b）
+### 群邀请与节流（B2.8b / B2.8c）
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `GATEWAY_GROUPS_ENABLED` | `false` | 部署群邀请开关；还需 persona groups.enabled、memory DB 与持久 HMAC 密钥。无 DB 时 WARNING 并关闭 |
+| `GATEWAY_GROUP_FORGET_STALE_KEYS` | `false` | 启动时永久删除旧 HMAC key_id 的群台账，解除轮换隔离；会丢失旧 left/encrypted_disabled 记录 |
 | `GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA` | `20` | 每 persona 群数上限，整数 1–200，非法值拒绝启动 |
 | `GATEWAY_INVITE_LEDGER_TTL_SECONDS` | `86400` | 邀请台账过期秒数，整数 60–2592000；过期邀请不作快路径，改由 `/sync` 权威确认，非法值拒绝启动 |
+| `GATEWAY_GROUP_COOLDOWN_SECONDS` | `30` | 每 (persona, room) 冷却秒数，整数 0–3600；0 关闭 |
+| `GATEWAY_GROUP_MAX_REPLIES_PER_HOUR` | `20` | 每 (persona, room) 滚动 3600 秒回复上限，整数 1–200 |
+| `GATEWAY_GROUP_AI_LOOP_MAX_PER_HOUR` | `30` | 同房间任意 AI 滚动小时底线，整数 1–1000 |
+| `GATEWAY_GROUP_MAX_CONSECUTIVE_AI_MESSAGES` | `3` | 同 persona 在同房间连续发言底线，整数 1–50 |
 
 persona 可配置 `"groups": {"enabled": true, "invite_policy": "owner"}`；
 默认关闭，策略仅支持 owner/local_humans。关闭部署开关保持邀请 no-op，DM 继续按 B2.8a 发送时复核。
-开启后只接受符合策略的本服明文群，拒绝使用 leave；每 persona 限 10 次/60 秒。
+开启后只接受符合策略的本服明文群：room id 必须为 `!localpart:domain`，且 domain 与
+`server_name` 不区分大小写相等；拒绝使用 leave（leave 返回 `M_FORBIDDEN` 也视为已完成）；
+每 persona 限 10 次/60 秒。已接受房间若再次收到任何不合格邀请，标记该邀请完成并计入
+`ignored_for_accepted`，保持 accepted 且不 leave；合格再邀请仍走原判定。
 邀请 HMAC claim 持久化，先记账后执行，崩溃时可能遗漏尝试但重放不会重复 join/leave。
-已接受群中途加密后停止模型回复和实际发送，不自动退出；HTTP 403 映射留待 B2.8c。
+已接受群中途加密后停止模型回复和实际发送，不自动退出。
+已知 encrypted_disabled / rejected_encrypted 房间的 messages 与 policy/evaluate 返回
+`403 conversation.e2ee`，不入队、不消耗限额；关闭开关仍禁止加密群发言。
+
+群台账的 room/inviter/invite 键与 `key_id` 都由 HMAC 派生；`key_id` 是
+`HMAC(secret, "groups:key-id")` 的前 16 个十六进制字符，不包含密钥。轮换 HMAC 后旧行不匹配：
+旧 accepted 变为未接受，不再节流或免除 DM 复核；旧 encrypted_disabled/left 也不再匹配，
+且房间上限只统计当前 key_id 的 accepted/encrypted_disabled 行。发送路径的加密状态探测不依赖
+此 HMAC：开启群功能时，发送前以发送者 masquerade 检查 `m.room.encryption`；200 或除
+`M_FORBIDDEN` 外的探测失败均返回 `conversation.e2ee`，404 继续发送，`M_FORBIDDEN` 交给原 PUT
+恢复流程；已加密结果无 TTL、未加密最多 30 秒；缓存最多 4096 项，满时优先淘汰
+未加密项，已被淘汰的房间下次重新查询，并由加密 state 事件立即生效。
+
+只要某 persona 仍有旧 key_id 行，轮换隔离会阻止其在当前密钥下未知房间的自动 join（包括已有
+邀请台账的主动/HTTP 发言）；已确认 DM 的 `allow_auto_join=true` 不受影响。设置
+`GATEWAY_GROUP_FORGET_STALE_KEYS=true` 后，启动时会永久删除旧 key_id 行并解除隔离；代价是旧
+left/encrypted_disabled 记录丢失，被踢/退出的群取得新的合格邀请后可以再次接受。
+从 schema 10 首次升级到 11 时，旧行会按**该次启动的当前密钥**回填 key_id；因此应先使用原密钥完成
+迁移，再轮换密钥，才能保留可靠的轮换检测。
+
+节流仅适用于部署及 persona 开关均开启且 group_rooms.state=accepted 的房间；
+且 accepted 必须属于当前 HMAC key_id；轮换后旧 accepted 不再节流，也不免除 DM 复核。
+其余房间维持原行为。上述整数配置非法或越界拒绝启动，错误不回显输入值。
+群冷却与现有三层最小间隔同时检查（`min_interval.too_soon`）；小时上限使用
+`group.replies_per_hour.exceeded`。群熔断与三层正值取最严，0/未设视为无限；
+群 ai_loop 默认 30/h 为滚动一小时硬底线，人类发言不重置。anti_spam 仍按同 persona
+连续数（默认上限 3 条），在人类发言时归零，也沿用既有冷却重置语义。外部运行时同样受约束。
+仅成功投递且非幂等重放入账；在途预留暂占名额，失败释放。新计数键为 HMAC，
+进程内最多 4096 个 (persona, room) 桶，每桶 200 个时间戳，LRU 淘汰，重启清空；
+ai_loop / anti_spam 沿用有界 UsageStore，容量与保留期须覆盖计数窗口（见契约 §6.3）。
 详见 [契约群邀请规则](docs/contract.md)。

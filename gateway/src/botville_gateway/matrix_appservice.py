@@ -32,6 +32,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -67,6 +68,8 @@ LOCAL_ID_RE = re.compile(r"^[a-z0-9._=-]{1,64}$")
 
 
 MEMBER_LOOKUP_TIMEOUT_SECONDS = 5.0
+ENCRYPTION_GUARD_CACHE_SIZE = 4096
+ENCRYPTION_GUARD_CLEAR_TTL_SECONDS = 30.0
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -104,6 +107,8 @@ class AppServiceMatrixTransport:
         accepted_group: Optional[Callable[[str, str], bool]] = None,
         disabled_group: Optional[Callable[[str, str], bool]] = None,
         left_group: Optional[Callable[[str, str], bool]] = None,
+        quarantine_group: Optional[Callable[[str, str], bool]] = None,
+        encryption_guard: bool = False,
     ) -> None:
         if room_cache_ttl_seconds < 0:
             raise ValueError(
@@ -111,8 +116,12 @@ class AppServiceMatrixTransport:
                 "alias->room cache), got {!r}".format(room_cache_ttl_seconds)
             )
         self.left_group = left_group
+        self.quarantine_group = quarantine_group
         self.accepted_group = accepted_group
         self.disabled_group = disabled_group
+        self.encryption_guard = encryption_guard
+        # hash(room) -> (is_encrypted, expiry).  Never retain a raw room id.
+        self._encryption_cache: Dict[str, Tuple[bool, float]] = {}
         self.safety_store = safety_store if safety_store is not None else AsTransactionStore(connect(":memory:"))
         self._sleep = sleep
         self._recovery_lock = threading.Lock()
@@ -374,6 +383,60 @@ class AppServiceMatrixTransport:
         if self.disabled_group is not None and self.disabled_group(sender, room):
             raise DeliveryError("conversation.e2ee", "Encrypted room participation is disabled")
 
+    @staticmethod
+    def _encryption_cache_key(room: str) -> str:
+        return hashlib.sha256(room.encode("utf-8")).hexdigest()
+
+    def _cache_encryption(self, key: str, encrypted: bool, expiry: float) -> None:
+        with self._lock:
+            old = self._encryption_cache.get(key)
+            if old is not None and old[0] and not encrypted:
+                return
+            if len(self._encryption_cache) >= ENCRYPTION_GUARD_CACHE_SIZE and key not in self._encryption_cache:
+                clear = next((candidate for candidate, value in self._encryption_cache.items()
+                              if not value[0]), None)
+                self._encryption_cache.pop(clear if clear is not None else next(iter(self._encryption_cache)))
+            self._encryption_cache[key] = (encrypted, expiry)
+
+    def note_room_encrypted(self, room: str) -> None:
+        """Remember an observed encryption state without retaining room identity."""
+        self._cache_encryption(self._encryption_cache_key(room), True, float("inf"))
+
+    def _raise_if_cached_encrypted(self, room: str) -> bool:
+        with self._lock:
+            cached = self._encryption_cache.get(self._encryption_cache_key(room))
+        if cached is not None and cached[0]:
+            raise DeliveryError("conversation.e2ee", "Encrypted room participation is disabled")
+        return cached is not None and cached[1] > _monotonic()
+
+    def _guard_room_encryption(self, room: str, sender: str) -> None:
+        if not self.encryption_guard:
+            return
+        key = self._encryption_cache_key(room)
+        now = _monotonic()
+        if self._raise_if_cached_encrypted(room):
+            return
+        try:
+            self._request("GET", "/_matrix/client/v3/rooms/{}/state/m.room.encryption/".format(
+                urllib.parse.quote(room, safe="")), query={"user_id": sender},
+                timeout=MEMBER_LOOKUP_TIMEOUT_SECONDS)
+        except DeliveryError as exc:
+            if getattr(exc, "http_status", None) == 404:
+                self._cache_encryption(key, False, now + ENCRYPTION_GUARD_CLEAR_TTL_SECONDS)
+                with self._lock:
+                    if self._encryption_cache.get(key, (False, 0))[0]:
+                        raise DeliveryError("conversation.e2ee", "Encrypted room participation is disabled")
+                return
+            # A forbidden lookup only says that the sender is absent.  Preserve
+            # the existing PUT/M_FORBIDDEN invitation-recovery path.
+            if exc.code == "M_FORBIDDEN":
+                return
+            raise DeliveryError("conversation.e2ee", "Unable to verify room encryption") from None
+        except Exception:
+            raise DeliveryError("conversation.e2ee", "Unable to verify room encryption") from None
+        self.note_room_encrypted(room)
+        raise DeliveryError("conversation.e2ee", "Encrypted room participation is disabled")
+
     def _joined_room_is_dm(self, room: str, sender: str) -> bool:
         try:
             members = set(self.joined_members(room, (sender,)))
@@ -405,6 +468,7 @@ class AppServiceMatrixTransport:
         room = self.resolve_room(room_id)
         self._check_group_send(room, sender)
         self.ensure_user(sender)
+        self._guard_room_encryption(room, sender)
 
         content: Dict[str, Any] = {"msgtype": "m.text", "body": text}
         if content_type == "markdown":
@@ -422,12 +486,19 @@ class AppServiceMatrixTransport:
         )
         self._check_group_send(room, sender)
         try:
+            if self.encryption_guard:
+                self._raise_if_cached_encrypted(room)
             resp = self._request("PUT", path, body=content, query={"user_id": sender})
         except DeliveryError as exc:
             if exc.code != "M_FORBIDDEN":
                 raise
             if self.left_group is not None and self.left_group(sender, room):
                 # B2.8b: left/kicked/banned group rooms never auto-rejoin.
+                raise
+            if (not allow_auto_join and self.quarantine_group is not None
+                    and self.quarantine_group(sender, room)):
+                # A rotated HMAC cannot identify old room rows.  Keep unknown
+                # rooms closed until an already-confirmed DM explicitly opts in.
                 raise
             with self._recovery_lock:
                 try:
@@ -455,6 +526,8 @@ class AppServiceMatrixTransport:
                     self._rollback_join(room, sender)
                     raise exc
                 self._check_group_send(room, sender)
+                if self.encryption_guard:
+                    self._raise_if_cached_encrypted(room)
                 resp = self._request("PUT", path, body=content, query={"user_id": sender})
 
         event_id = resp.get("event_id")
@@ -479,16 +552,20 @@ class AppServiceMatrixTransport:
         # `since` is sent and `next_batch` is never stored, so to-device
         # messages are delivered but not acknowledged (the homeserver only
         # deletes them once a later request presents the returned token).
-        # The filter narrows the response to this room's invite and drops
-        # timeline, state, ephemeral, account data and presence; the joined
-        # section is kept only so an existing membership is still detected.
+        # Verified on Synapse (v1.141, same image digest as CI): `rooms` does
+        # NOT restrict the invite section (every pending invite is returned),
+        # so the invite is selected client-side by room id below. `rooms`
+        # does restrict the joined section, but a state filter excluding all
+        # types makes Synapse omit the joined room entirely, so the state
+        # filter keeps only `m.room.create` (always present, stripped to its
+        # type by `event_fields`) to keep an existing membership detectable.
         sync_filter = {
             "event_fields": ["type"],
             "room": {
                 "rooms": [room],
                 "include_leave": False,
                 "timeline": {"limit": 0, "not_types": ["*"]},
-                "state": {"not_types": ["*"]},
+                "state": {"types": ["m.room.create"]},
                 "ephemeral": {"not_types": ["*"]},
                 "account_data": {"not_types": ["*"]},
             },
