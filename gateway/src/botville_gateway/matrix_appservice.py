@@ -41,7 +41,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Set, Tuple
 
 from .matrix import DeliveryError, SentEvent, resolve_txn_id
 
@@ -98,12 +98,16 @@ class AppServiceMatrixTransport:
         timeout: float = 30.0,
         health_timeout: float = 2.0,
         health_cache_seconds: float = 5.0,
+        accepted_group: Optional[Callable[[str, str], bool]] = None,
+        disabled_group: Optional[Callable[[str, str], bool]] = None,
     ) -> None:
         if room_cache_ttl_seconds < 0:
             raise ValueError(
                 "room_cache_ttl_seconds must be >= 0 (0 disables the "
                 "alias->room cache), got {!r}".format(room_cache_ttl_seconds)
             )
+        self.accepted_group = accepted_group
+        self.disabled_group = disabled_group
         self._base = homeserver_url.rstrip("/")
         self._as_token = as_token
         self._server_name = server_name
@@ -164,7 +168,9 @@ class AppServiceMatrixTransport:
             errcode = parsed.get("errcode") or f"http.{exc.code}"
             # detail 只含 HS 的错误摘要与路径；不含 URL query（无敏感值）与 token。
             detail = parsed.get("error") or f"HTTP {exc.code} from {method} {path}"
-            raise DeliveryError(errcode, str(detail)) from exc
+            error = DeliveryError(errcode, str(detail))
+            error.http_status = exc.code
+            raise error from exc
         except urllib.error.URLError as exc:
             raise DeliveryError(
                 "matrix.unreachable", f"{method} {path}: {exc.reason}"
@@ -340,6 +346,22 @@ class AppServiceMatrixTransport:
             body={}, query={"user_id": user_id},
         )
 
+    def room_is_encrypted(self, room_id: str, user_id: str) -> bool:
+        """Only an actual HTTP 404 confirms absence; all other failures close."""
+        self._check_sender(user_id)
+        try:
+            self._request("GET", "/_matrix/client/v3/rooms/{}/state/m.room.encryption/".format(
+                urllib.parse.quote(room_id, safe="")), query={"user_id": user_id})
+        except DeliveryError as exc:
+            return getattr(exc, "http_status", None) != 404
+        except Exception:
+            return True
+        return True
+
+    def _check_group_send(self, room: str, sender: str) -> None:
+        if self.disabled_group is not None and self.disabled_group(sender, room):
+            raise DeliveryError("conversation.e2ee", "Encrypted room participation is disabled")
+
     def _joined_room_is_dm(self, room: str, sender: str) -> bool:
         try:
             members = set(self.joined_members(room, (sender,)))
@@ -369,6 +391,7 @@ class AppServiceMatrixTransport:
     ) -> SentEvent:
         sender = self.resolve_sender(sender_id)
         room = self.resolve_room(room_id)
+        self._check_group_send(room, sender)
         self.ensure_user(sender)
 
         content: Dict[str, Any] = {"msgtype": "m.text", "body": text}
@@ -385,21 +408,22 @@ class AppServiceMatrixTransport:
         path = "/_matrix/client/v3/rooms/{}/send/m.room.message/{}".format(
             urllib.parse.quote(room, safe=""), urllib.parse.quote(txn, safe="")
         )
+        self._check_group_send(room, sender)
         try:
             resp = self._request("PUT", path, body=content, query={"user_id": sender})
         except DeliveryError as exc:
             if exc.code != "M_FORBIDDEN":
                 raise
             self.join(room, sender)
-            # B2.8b may allow accepted group_rooms here. Until then, only a
-            # confirmed DM may continue sending after automatic join.
-            if not allow_auto_join and not self._joined_room_is_dm(room, sender):
+            accepted = self.accepted_group is not None and self.accepted_group(sender, room)
+            if not accepted and not allow_auto_join and not self._joined_room_is_dm(room, sender):
                 try:
                     self.leave(room, sender)
                 except (DeliveryError, OSError):
                     # Never log IDs, message text, or HS exception details.
                     logging.getLogger(__name__).warning("Auto-join rollback leave failed")
                 raise
+            self._check_group_send(room, sender)
             resp = self._request("PUT", path, body=content, query={"user_id": sender})
 
         event_id = resp.get("event_id")

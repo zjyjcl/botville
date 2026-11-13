@@ -100,7 +100,9 @@ class EngineHooks(ConsumerHooks):
         memory_embedding: Optional[object] = None,
         memory_vectors: Optional[object] = None,
         mood_service: Optional[object] = None,
+        group_invites: Optional[object] = None,
     ) -> None:
+        self._group_invites = group_invites
         self._personas = personas
         self._client = client
         self._service = service
@@ -116,6 +118,14 @@ class EngineHooks(ConsumerHooks):
         self.stats.set("memory_db_alerts", 0)
         self._buffers: OrderedDict[str, _RoomBuffer] = OrderedDict()
         self._buf_lock = threading.Lock()
+
+    def on_invite_to_ai(self, ctx: ConsumerContext) -> None:
+        if self._group_invites is not None:
+            self._group_invites.on_invite_to_ai(ctx)
+
+    def on_other(self, ctx: ConsumerContext) -> None:
+        if self._group_invites is not None and ctx.encryption_state and ctx.room_id:
+            self._group_invites.disable_encrypted(ctx.room_id)
 
     @property
     def persona_ids(self) -> Tuple[str, ...]:
@@ -221,6 +231,9 @@ class EngineHooks(ConsumerHooks):
         """一个 persona 对一条消息的完整回复流程。"""
         # PR3a may install the hooks solely to persist layer-1 memory while no
         # model is configured.  Preserve PR2's record/count-only behaviour.
+        if self._group_invites is not None and self._group_invites.is_disabled(persona.user_id, room_id):
+            self.stats.inc("group_encrypted_skipped")
+            return
         if not self._client.config.configured:
             return
         idem_key = speech_idempotency_key(persona.user_id, event_id)

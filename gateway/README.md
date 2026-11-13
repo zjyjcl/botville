@@ -544,3 +544,17 @@ AS 发送遇 `M_FORBIDDEN` 默认 join 后复核：仅 DM 继续发送，否则�
 HTTP 消息与主动发言复核为非 DM 后立即尝试退出，不重试发送。
 开启 memory 后，同群其他 AI 文本写入 group 记忆，trust=untrusted，以 role=assistant 和 sender
 保留 AI 来源，召回只进入不可信数据区；自身回声不重复记录。memory 关闭时 AI 入站不追加 ring buffer。
+
+### 群邀请（B2.8b）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `GATEWAY_GROUPS_ENABLED` | `false` | 部署群邀请开关；还需 persona groups.enabled、memory DB 与持久 HMAC 密钥。无 DB 时 WARNING 并关闭 |
+| `GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA` | `20` | 每 persona 群数上限，整数 1–200，非法值拒绝启动 |
+
+persona 可配置 `"groups": {"enabled": true, "invite_policy": "owner"}`；
+默认关闭，策略仅支持 owner/local_humans。关闭部署开关保持邀请 no-op，DM 继续按 B2.8a 发送时复核。
+开启后只接受符合策略的本服明文群，拒绝使用 leave；每 persona 限 10 次/60 秒。
+邀请 HMAC claim 持久化，先记账后执行，崩溃时可能遗漏尝试但重放不会重复 join/leave。
+已接受群中途加密后停止模型回复和实际发送，不自动退出；HTTP 403 映射留待 B2.8c。
+详见 [契约群邀请规则](docs/contract.md)。

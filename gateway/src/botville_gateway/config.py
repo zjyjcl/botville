@@ -482,6 +482,9 @@ class Config:
     platform_token_budget: int = DEFAULT_TOKEN_BUDGET
     # B2.1：平台层主动发言/日上限（0 = 不限）
     platform_proactive_per_day: int = DEFAULT_PROACTIVE_PER_DAY
+    # Group invitations are opt-in at deployment and persona level.
+    groups_enabled: bool = False
+    group_max_rooms_per_persona: int = 20
     # Maximum local personas that may answer a single human group message.
     group_max_responders: int = DEFAULT_GROUP_MAX_RESPONDERS
     # N7（契约 §6.3）：平台层 anti_spam / ai_loop。三个数值项 0 = 平台不设该项
@@ -585,6 +588,11 @@ class Config:
     mood_half_life_minutes: int = DEFAULT_MOOD_HALF_LIFE_MINUTES
 
     def __post_init__(self) -> None:
+        if not isinstance(self.groups_enabled, bool):
+            raise ConfigError("GATEWAY_GROUPS_ENABLED must be a boolean")
+        if (type(self.group_max_rooms_per_persona) is not int
+                or not 1 <= self.group_max_rooms_per_persona <= 200):
+            raise ConfigError("GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA must be within 1–200")
         # 构造时校验，避免明显错误的配置拖到第一次请求才炸。
         parse_hhmm(self.silent_hours_start)
         parse_hhmm(self.silent_hours_end)
@@ -845,6 +853,8 @@ class Config:
         # frozen dataclass 的 __post_init__ 不能直接赋值；用 object.__setattr__。
         secret = self.hmac_secret
         if secret is None or secret in _INSECURE_SECRET_BYTES:
+            if self.groups_enabled and self.memory_db_path:
+                raise ConfigError("GATEWAY_GROUPS_ENABLED requires an explicit persistent GATEWAY_HMAC_SECRET")
             if self.proactive_enabled:
                 # A generated dev secret changes after restart, which defeats
                 # Matrix txnId replay protection for queued proactive sends.
@@ -1234,6 +1244,8 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         platform_proactive_per_day=_env_int(
             source, "PLATFORM_PROACTIVE_PER_DAY", DEFAULT_PROACTIVE_PER_DAY
         ),
+        groups_enabled=_env_bool(source, "GATEWAY_GROUPS_ENABLED", False),
+        group_max_rooms_per_persona=_env_proactive_int(source, "GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA", 20),
         group_max_responders=_env_group_max_responders(source),
         # N7：三个数值项 0 = 平台不设该项；非 0 的区间由 Config 校验（fail-closed）。
         platform_max_consecutive_ai_messages=_env_int(

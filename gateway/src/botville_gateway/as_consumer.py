@@ -311,6 +311,8 @@ class ConsumerContext:
     # group for routing and memory purposes.
     room_is_dm: bool = False
     mentioned_user_ids: Tuple[str, ...] = ()
+    invite_encrypted: bool = False
+    encryption_state: bool = False
 
 
 class ConsumerHooks:
@@ -773,6 +775,7 @@ class AsTransactionConsumer:
                 sender=sender,
                 trust=trust,
                 persona_user_id=target,
+                invite_encrypted=fields.get("invite_encrypted", False),
                 idempotency_key=(
                     speech_idempotency_key(target, event_id)
                     if target and event_id
@@ -781,7 +784,7 @@ class AsTransactionConsumer:
                 should_reply=False,
             )
             self._stats.inc("invites")
-            # 关系策略尚未接入：on_invite_to_ai 是 no-op stub（不自动接受邀请）。
+            # Deployment opt-in is enforced by the invite hook.
             self._run_hook(self._hooks.on_invite_to_ai, ctx)
             return
 
@@ -805,8 +808,14 @@ class AsTransactionConsumer:
             room_id=room_id,
             sender=sender,
             trust=trust,
+            encryption_state=fields.get("encryption_state", False),
         )
-        self._run_hook(self._hooks.on_other, ctx)
+        if ctx.encryption_state:
+            # A failed durable disable must retry the transaction, not discard
+            # the only notification that this room became encrypted.
+            self._hooks.on_other(ctx)
+        else:
+            self._run_hook(self._hooks.on_other, ctx)
 
     def _classify_event(self, event: Any) -> Optional[Tuple[str, Dict[str, Any]]]:
         """把一条 Matrix 事件分类；格式不对返回 None（调用方计数并跳过）。
@@ -859,8 +868,16 @@ class AsTransactionConsumer:
                 state_key = event.get("state_key")
                 if self._is_local_ai(state_key):
                     fields["target_user_id"] = state_key
+                    unsigned = event.get("unsigned")
+                    stripped = unsigned.get("invite_room_state", []) if isinstance(unsigned, dict) else []
+                    fields["invite_encrypted"] = (
+                        not isinstance(stripped, list) or any(
+                            isinstance(item, dict) and item.get("type") == "m.room.encryption"
+                            for item in stripped))
                     return EVENT_INVITE_TO_AI, fields
             return EVENT_OTHER_STATE, fields
+        if event_type == "m.room.encryption" and event.get("state_key") == "":
+            fields["encryption_state"] = True
         if event_type.startswith("m.room."):
             return EVENT_OTHER_STATE, fields
         return EVENT_OTHER, fields

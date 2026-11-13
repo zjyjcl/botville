@@ -886,14 +886,47 @@ worker 的 stop 有界 join；超时仍存活时不关闭存储并写不含敏�
 | 事件 | 分类 | PR1 行为 |
 |---|---|---|
 | `m.room.message` 且 `msgtype ∈ {m.text, m.notice}` | `message_text` | 防循环判定 → `on_human_text` / `on_ai_text` |
-| `m.room.member` 且 `membership=invite`，`state_key` 为本服 `@ai_*` | `invite_to_ai` | `on_invite_to_ai`（**no-op stub**；关系策略未接入） |
+| `m.room.member` 且 `membership=invite`，`state_key` 为本服 `@ai_*` | `invite_to_ai` | `on_invite_to_ai`（B2.8b 默认关闭；开启后按下述群邀请判定） |
 | `m.room.redaction` | `redaction` | `on_redaction`（PR3 删除记忆；PR1 no-op） |
 | `m.reaction` / `m.room.message` + `rel_type=m.annotation` | `reaction` | `on_other`（只计数） |
 | `m.room.message` + `rel_type=m.replace` | `edit` | `on_other`（只计数） |
-| 其他 `m.room.*` state 事件 | `other_state` | `on_other`（只计数） |
+| 其他 `m.room.*` state 事件 | `other_state` | `on_other`（加密 state 停用已接受群；其余只计数） |
 | 其余 | `other` | `on_other`（只计数） |
 
 ephemeral 不在 AS 注册里开启，忽略。
+
+**群邀请（B2.8b，契约仍为 0.5.0）**
+
+- `GATEWAY_GROUPS_ENABLED` 为 bool，默认 false；persona 文件可选
+  `groups: {enabled: false, invite_policy: "owner"}`。未知字段、类型或策略值拒绝启动，错误不回显值。
+  `invite_policy` 只支持 `owner` 与 `local_humans`。依赖 memory DB；部署开启而无 DB 时 WARNING 并关闭。
+  开启且有 DB 时要求显式持久 `GATEWAY_HMAC_SECRET`，防止 dev 临时密钥破坏重启去重。
+- 部署关闭时邀请保持 **no-op，不 join、不 leave**（包括 persona 开关为开的情况）：
+  stripped state 无法确认严格 DM，DM 仍由 B2.8a 发送时 join 后复核。部署开启时 persona 关闭则 decline；
+  不另外猜测 DM 或为 policy 拒绝增加 DM 例外。
+- 开启后的判定顺序：persona 开关 → sender 为本服 trusted 人类（非 AI、非 AS sender）→
+  owner 策略要求 sender 等于 `owner_user_id`，local_humans 允许任意本服人类 →
+  `unsigned.invite_room_state` 不含 `m.room.encryption` → room_id 如带 domain 必须为本服 →
+  群数与邀请限频。v1 不接受跨服邀请者或跨服房间。
+- `GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA` 为 int，默认 20，范围 1–200，越界拒绝启动且不回显。
+  accepted 与仍保留成员资格的 encrypted_disabled 均占名额。限频为每 persona 滚动 60 秒最多
+  10 个新邀请（拒绝也计入），进程内最多 4096 个桶、每桶最多 10 个时间戳，过期清理；重放不占额。
+- 通过后 AS masquerade join，再以 persona GET `/rooms/{room}/state/m.room.encryption/`；
+  **只有 HTTP 404** 确认未加密，其他错误 fail-closed。加密则立即 leave 并持久化 rejected_encrypted；
+  明文才写 accepted。不通过则 masquerade leave，不发卡片；INFO 与 stats 只含固定 reason code
+  （groups_disabled/inviter_not_allowed/encrypted/cross_server/room_limit/rate_limited 等），不含 ID、正文或秘密。
+- memory schema 9 → 10，幂等新增 `group_rooms`：persona_id、room_key、state、mode、inviter、
+  joined_at、updated_at。room_key/inviter 为复用 owner HMAC 密钥、独立 groups 用途前缀的 HMAC；
+  state 为 accepted/rejected_encrypted/left/encrypted_disabled；mode 默认 mention_only，muted 预留。
+  当前所有操作自带真实 room_id，因此表内**不额外保存 room_id 原值**；persona_id 为内部关联键，不打印。
+  `is_accepted(persona, room_id)` 为传输层注入的许可回调。
+- `group_invites` 用 `(persona,event_id)` 的 HMAC 持久化去重，不随记忆保留期清理。
+  网络动作前提交 claim，重启或重放不会重复 join/leave；这是 at-most-once 尝试：
+  claim 后崩溃/网络失败可能留下未完成邀请，需新邀请事件重新处理，不宣称网络与 SQLite 原子提交。
+- 收到 `m.room.encryption` state 事件，accepted 房间标记 encrypted_disabled，不自动 leave；
+  引擎在模型调用前跳过，AS 传输发送前再次检查（覆盖 HTTP 发言与模型调用期间的状态变化）。
+  关闭开关后仍保留这项拦截。HTTP `403 conversation.e2ee` 的状态码映射与 policy/evaluate 留给 B2.8c；
+  当前发送走已有 delivery error 通道，不会实际发送。
 
 **⑦ 防循环与人类入站（修正 §6.3 旧局限）**
 
@@ -964,7 +997,7 @@ DM 不受此上限影响。`m.mentions.room=true`（`@room`）本身不产生目
 不以 `ai_` 开头且不是 AS sender，domain 与配置的 `server_name` 大小写不敏感匹配；未配置 server_name
 或成员查询失败均视为非 DM。join 失败直接上抛；非 DM 尝试 leave 后上抛原 `M_FORBIDDEN`，
 leave 失败仅记无敏感信息 WARNING；非 `M_FORBIDDEN` 不 join。成功复核后仅重试一次；
-B2.8b 可在明确的许可钩子加入已接受的 `group_rooms`。
+B2.8b 通过注入回调允许 `group_rooms.state=accepted` 的房间 join 后重试，无需 DM 复核；其他房间保持上述 B2.8a 行为。
 
 **⑩ 四层记忆（B2.6：PR3a / PR3b / PR3c 已实现）**
 
@@ -1802,6 +1835,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 |---|---|---|
 | 0.5.0 | 2026-11-13 | [PR4c quasi-breaking] 新增默认关闭的主动发言部署/人设配置、DM-only 候选、持久化队列与 stable txnId 重放语义；`ProactiveSettings.enabled` 默认值由 true 改为 false。该默认值改变未显式设置旧部署的行为，按准破坏性变更公告。 |
 | 0.5.0 | 2026-11-13 | [#221 proactive 修正] 启用但无法启动 worker 记录 WARNING；owner 无 DM 日志每目标限频且缓存有界；过期且成员不匹配的队列转 abandoned，终态保留 30 天；跨午夜静默时段与严格 DM 协同验证。 |
+| 0.5.0 | 2026-11-13 | [B2.8b] 默认关闭的本服群邀请自动接受、owner/local_humans 策略、持久去重与群数上限；加密邀请拒绝、中途加密停用、accepted 群自动 rejoin。无版本升级。 |
 | 0.5.0 | 2026-11-13 | [B2.8a 行为修正，无 API 字段变化] 一个 AI + 多个人类的房间现在只在被 @ 或被回复时回复；严格两人本服 DM、成员失败按群、群回复者上限、忽略 @room 广播、群 AI 文本记忆 untrusted、join 后复核：仅 DM 继续发送，否则立即退出并报错。 |
 | 0.4.0 | 2026-11-13 | [PR4b] 新增 owner-only `GET/PATCH /personas/{id}/state` 与 memory.db persona_state；新增 `GATEWAY_MOOD_ENABLED` / `GATEWAY_MOOD_HALF_LIFE_MINUTES`、确定性窗口规则及读时半衰期衰减。PersonaMood 删除 `neutral`、`anxious`，最终为 calm/happy/sad/excited/tired；详情增加 mood，列表项不变；`mood_public` 默认 true，非 owner 仅在 mood 开启且 `mood_public` 为真时见标签。模块关闭时通过 owner 校验后 404 `mood.disabled`；`/state` 写限流返回 429，mood 存储不可用返回 503 `mood.unavailable`。 |
 | 0.3.0 | 2026-11-13 | [PR4d additive] owner 文件签名 bio（500 码点），列表扩展与分级 GET 详情；本服非 owner 最小视图，跨服/无 owner/未知或非法 id 统一 404 persona.not_found。mood 可缺省/null 枚举，当前 null；自身和他人 bio 均不注入 system。 |
