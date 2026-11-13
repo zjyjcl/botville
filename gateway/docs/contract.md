@@ -60,7 +60,10 @@ AI 发言（`POST /conversations/{id}/messages`）或预检（`POST /policy/eval
 （`e2ee` → `disabled`，`none` → `enabled`）。
 
 客户端侧限制与已知局限见[苹果端加密策略](../../app-apple/docs/encryption-policy.md)。
-当前网关参考实现尚未校验房间加密状态；后续接入须按真实房间状态执行上述限制。
+参考实现已对 `group_rooms` 中已知的 encrypted_disabled / rejected_encrypted 群房间
+执行上述 `403 conversation.e2ee`：messages 与 policy/evaluate 在调用 transport、预留限额或入队前拒绝，
+transport 检出的同码错误也映射为 403。该约束不受群开关影响；引擎不调模型、不发言。
+状态来自邀请检查及 `m.room.encryption` 事件；未被观察到的房间状态仍不能凭空判定。
 
 > **D 线注意**：通知数据模型（D1.1）与授权回调签名（D2.1）会扩展 `/cards` 与
 > `/cards/{card_id}/actions/{action_id}`。v1 已预留 `source.module`、`source.capability_id`、
@@ -933,8 +936,33 @@ ephemeral 不在 AS 注册里开启，忽略。
   不 join、不重试，即使 allow_auto_join 开启也一样。新 event_id 的再邀请重新走完整判定链。
 - 收到 `m.room.encryption` state 事件，accepted 房间标记 encrypted_disabled，不自动 leave；
   引擎在模型调用前跳过，AS 传输发送前再次检查（覆盖 HTTP 发言与模型调用期间的状态变化）。
-  关闭开关后仍保留这项拦截。HTTP `403 conversation.e2ee` 的状态码映射与 policy/evaluate 留给 B2.8c；
-  当前发送走已有 delivery error 通道，不会实际发送。
+  关闭开关后仍保留这项拦截。B2.8c 已实现 HTTP `403 conversation.e2ee` 与 policy/evaluate 前置检查。
+
+**群节流与多 AI 熔断（B2.8c，契约仍为 0.5.0）**
+
+只适用于该 persona 在 `group_rooms` 中 state=accepted，且部署 `GATEWAY_GROUPS_ENABLED`
+与 persona `groups.enabled` 均开启的房间；其他房间行为不变。
+
+| 变量 | 默认 | 范围与含义 |
+|---|---|---|
+| `GATEWAY_GROUP_COOLDOWN_SECONDS` | `30` | 每 (persona, room) 冷却秒数，整数 0–3600；0 关闭 |
+| `GATEWAY_GROUP_MAX_REPLIES_PER_HOUR` | `20` | 每 (persona, room) 滚动 3600 秒回复上限，整数 1–200 |
+| `GATEWAY_GROUP_AI_LOOP_MAX_PER_HOUR` | `30` | 同房间任意 AI 滚动小时底线，整数 1–1000 |
+| `GATEWAY_GROUP_MAX_CONSECUTIVE_AI_MESSAGES` | `3` | 同 persona 在同房间连续发言底线，整数 1–50 |
+
+四项配置非法或越界均拒绝启动，错误不回显值。群冷却作为 `group.min_interval` 检查，
+原因码复用 `min_interval.too_soon`；与三层最小间隔检查并存，任一未通过即 block。
+群小时上限检查 `group.replies_per_hour`，推荐原因码 `group.replies_per_hour.exceeded`，
+均进入 checks[] / reasons[]，不新增 schema 字段、不升级版本。
+
+成功投递后通过现有 commit 路径入账，幂等重放不重复计数；在途预留暂占额度，失败回滚。
+群节流键为部署密钥 HMAC，最多 4096 个 (persona, room) 桶，每桶最多 200 个时间戳，
+进程内 LRU 有界存储，重启清空；容量淘汰可能使旧桶少算，部署应容纳活跃群规模。
+小时窗口为 `(now-3600s, now]`，到出窗时恢复。群 ai_loop 的完整小时口径及三层底线见 §6.3。
+
+验收使用假时钟、假模型及假 transport，经 consumer → engine → policy 模拟 5 AI、1 人类、
+每 20 秒消息持续一小时；AI 文本回灌无链式回复，每人类事件最多 MAX_RESPONDERS 位回复者，
+每 persona 满足冷却/小时额度、房间总回复不超过 ai_loop 底线。另以 5 AI HTTP 连发验证熔断。
 
 **⑦ 防循环与人类入站（修正 §6.3 旧局限）**
 
@@ -1851,6 +1879,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.5.0 | 2026-11-13 | [B2.8c] accepted 群冷却与滚动小时回复限额、群 ai_loop / anti_spam 底线、5 AI 假时钟验收及已知加密群 403 conversation.e2ee；无 schema 结构变化，无版本升级。 |
 | 0.5.0 | 2026-11-13 | [#226 评审 nit] `/sync` 权威确认改为仅邀请的一次性请求（set_presence=offline、无 since、不消费 to-device）；leave 遇 `M_FORBIDDEN` 视为已离开并移出清理队列；格式异常的成员事件只跳过该事件；邀请台账 TTL（`GATEWAY_INVITE_LEDGER_TTL_SECONDS`，默认 1 天）。无 API 字段变化。 |
 | 0.5.0 | 2026-11-13 | [M_FORBIDDEN 安全加固] 自动 join 需邀请台账命中或 /sync 权威确认，前后排除加密；已有成员不 join/leave；leave 有限重试与持久清理队列，无新增开关或 API 字段。 |
 | 0.5.0 | 2026-11-13 | [PR4c quasi-breaking] 新增默认关闭的主动发言部署/人设配置、DM-only 候选、持久化队列与 stable txnId 重放语义；`ProactiveSettings.enabled` 默认值由 true 改为 false。该默认值改变未显式设置旧部署的行为，按准破坏性变更公告。 |
@@ -1966,6 +1995,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
   `messages.window.exceeded`）。
 - **B2.1 已实现**的检查项：`messages.window`（code: `messages.window.exceeded`）、
   `tokens.window`（code: `tokens.window.exceeded`）、`min_interval`（code: `min_interval.too_soon`）、
+  `group.min_interval`（code: `min_interval.too_soon`）、`group.replies_per_hour`（code: `group.replies_per_hour.exceeded`）、
   `silent_hours`（code: `silent_hours.active`）（每项都取三层中最严者，`source_layer` 落在
   `PolicyCheck.layer` 上）。`proactive.per_day`（code: `proactive.per_day.exceeded`）/
   `town.tokens_per_day`（code: `town.tokens_per_day.exceeded`）的生效值已在 `GET /limits` 中计算，
@@ -2019,6 +2049,15 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 ### 6.3 熔断语义（B2.2）
 
 本节描述防刷屏（`anti_spam`）与互聊熔断（`ai_loop`）的语义。
+
+**B2.8c 群底线例外**：对上述双开关开启的 accepted 群，ai_loop 默认 30/h，
+anti_spam 默认同 persona 连续 3 条；配置范围见 B2.8c 表。有效值为各层正值与群底线的最小值，
+现有 0/未设按无限参与该群计算（仅这两个群规则；API anti_spam 仍不接受 0，不修改验证范围）。
+非群规则、非群房间及 `PLATFORM_*` 的既有语义不变。
+群 ai_loop 使用完整滚动小时的任意 AI 计数，**人类消息不重置**，防止持续 @ 绕过房间小时底线；
+其余房间仍按下文的人类重置语义。群 anti_spam 仍按同 persona，沿用冷却、人类重置及在途预留。
+群限额与非群限额都使用同一 service 实发路径，外部运行时 messages / policy/evaluate 同样执行。
+下文 API 零值与人类重置规则除本段明确的群例外外保持原义。
 
 - **平台层可配置（N7）**：`anti_spam` / `ai_loop` 与 §6.1 的其它限额一样参与
   **三层取最严**，平台层的值由部署配置给出：

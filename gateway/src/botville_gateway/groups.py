@@ -60,6 +60,11 @@ class GroupInvites:
     def is_accepted(self, persona, room):
         return self._state(persona, room) == 'accepted'
 
+    def is_throttled(self, persona, room):
+        entry = self.personas.get(persona)
+        return bool(self.enabled and entry and entry.groups.get('enabled', False)
+                    and self.is_accepted(persona, room))
+
     def is_disabled(self, persona, room):
         return self._state(persona, room) in ('encrypted_disabled', 'rejected_encrypted')
 

@@ -545,17 +545,33 @@ HTTP 消息与主动发言复核为非 DM 后立即尝试退出，不重试发�
 开启 memory 后，同群其他 AI 文本写入 group 记忆，trust=untrusted，以 role=assistant 和 sender
 保留 AI 来源，召回只进入不可信数据区；自身回声不重复记录。memory 关闭时 AI 入站不追加 ring buffer。
 
-### 群邀请（B2.8b）
+### 群邀请与节流（B2.8b / B2.8c）
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `GATEWAY_GROUPS_ENABLED` | `false` | 部署群邀请开关；还需 persona groups.enabled、memory DB 与持久 HMAC 密钥。无 DB 时 WARNING 并关闭 |
 | `GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA` | `20` | 每 persona 群数上限，整数 1–200，非法值拒绝启动 |
 | `GATEWAY_INVITE_LEDGER_TTL_SECONDS` | `86400` | 邀请台账过期秒数，整数 60–2592000；过期邀请不作快路径，改由 `/sync` 权威确认，非法值拒绝启动 |
+| `GATEWAY_GROUP_COOLDOWN_SECONDS` | `30` | 每 (persona, room) 冷却秒数，整数 0–3600；0 关闭 |
+| `GATEWAY_GROUP_MAX_REPLIES_PER_HOUR` | `20` | 每 (persona, room) 滚动 3600 秒回复上限，整数 1–200 |
+| `GATEWAY_GROUP_AI_LOOP_MAX_PER_HOUR` | `30` | 同房间任意 AI 滚动小时底线，整数 1–1000 |
+| `GATEWAY_GROUP_MAX_CONSECUTIVE_AI_MESSAGES` | `3` | 同 persona 在同房间连续发言底线，整数 1–50 |
 
 persona 可配置 `"groups": {"enabled": true, "invite_policy": "owner"}`；
 默认关闭，策略仅支持 owner/local_humans。关闭部署开关保持邀请 no-op，DM 继续按 B2.8a 发送时复核。
 开启后只接受符合策略的本服明文群，拒绝使用 leave；每 persona 限 10 次/60 秒。
 邀请 HMAC claim 持久化，先记账后执行，崩溃时可能遗漏尝试但重放不会重复 join/leave。
-已接受群中途加密后停止模型回复和实际发送，不自动退出；HTTP 403 映射留待 B2.8c。
+已接受群中途加密后停止模型回复和实际发送，不自动退出。
+已知 encrypted_disabled / rejected_encrypted 房间的 messages 与 policy/evaluate 返回
+`403 conversation.e2ee`，不入队、不消耗限额；关闭开关仍禁止加密群发言。
+
+节流仅适用于部署及 persona 开关均开启且 group_rooms.state=accepted 的房间；
+其余房间维持原行为。上述整数配置非法或越界拒绝启动，错误不回显输入值。
+群冷却与现有三层最小间隔同时检查（`min_interval.too_soon`）；小时上限使用
+`group.replies_per_hour.exceeded`。群熔断与三层正值取最严，0/未设视为无限；
+群 ai_loop 按完整滚动小时计数，不因人类消息重置。anti_spam 仍按同 persona 连续数，
+人类消息及既有冷却可重置。外部运行时同样受约束。
+仅成功投递且非幂等重放入账；在途预留暂占名额，失败释放。新计数键为 HMAC，
+进程内最多 4096 个 (persona, room) 桶，每桶 200 个时间戳，LRU 淘汰，重启清空；
+ai_loop / anti_spam 沿用有界 UsageStore，容量与保留期须覆盖计数窗口（见契约 §6.3）。
 详见 [契约群邀请规则](docs/contract.md)。
