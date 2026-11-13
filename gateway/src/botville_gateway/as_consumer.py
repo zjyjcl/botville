@@ -674,6 +674,20 @@ class AsTransactionConsumer:
             self._stats.inc("invalid_event_ids")
             return
         self._stats.inc(f"event.{category}")
+        if event.get("type") == "m.room.member":
+            persona = event.get("state_key")
+            room = fields.get("room_id")
+            if isinstance(persona, str) and self._is_local_ai(persona) and isinstance(room, str) and room.startswith("!"):
+                unsigned = event.get("unsigned")
+                stripped = unsigned.get("invite_room_state", []) if isinstance(unsigned, dict) else []
+                encrypted = not isinstance(stripped, list) or any(
+                    isinstance(state, dict) and state.get("type") == "m.room.encryption"
+                    for state in (stripped if isinstance(stripped, list) else [])
+                )
+                # Storage failures must retry the transaction, not silently retain
+                # a stale invitation after leave/ban.
+                self._store.invitation_update(persona, room, event["content"].get("membership"), encrypted, event_id)
+
         if event.get("type") == "m.room.member" and self._room_member_observer is not None:
             try:
                 self._room_member_observer(event)

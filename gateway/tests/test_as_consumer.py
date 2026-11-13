@@ -319,6 +319,51 @@ class TestQ5Routing(_TmpDb):
         self.assertFalse(seen[0].room_is_dm)
         self.assertEqual(seen[0].target_user_ids, ())
 
+    def test_two_ai_one_human_and_lone_ai_are_group_memory(self):
+        from botville_gateway.engine.engine import EngineHooks
+        from botville_gateway.engine.personas import Persona
+        for index, (members, mentioned, targets) in enumerate((
+            ([self.AI_A, self.AI_B, "@human:" + SERVER_NAME], False, ()),
+            ([self.AI_A, self.AI_B, "@human:" + SERVER_NAME], True, (self.AI_A,)),
+            ([self.AI_A], False, ()),
+        )):
+            with self.subTest(index=index):
+                seen = []
+                class Hooks(ConsumerHooks):
+                    def on_human_text(self, ctx): seen.append(ctx)
+                event = {"type": "m.room.message", "event_id": "$group-shape" + str(index),
+                         "room_id": "!r:" + SERVER_NAME, "sender": "@human:" + SERVER_NAME,
+                         "content": {"msgtype": "m.text", "body": "hi",
+                                     "m.mentions": {"user_ids": [self.AI_A] if mentioned else []}}}
+                self.store.store_transaction("shape" + str(index), json.dumps({"events": [event]}))
+                self._make_consumer(hooks=Hooks(), persona_user_ids=(self.AI_A, self.AI_B),
+                                    room_members=lambda _: members).run_once()
+                self.assertFalse(seen[0].room_is_dm)
+                self.assertEqual(seen[0].target_user_ids, targets)
+                self.assertEqual(EngineHooks._memory_scope(Persona(self.AI_A, "test"), seen[0])[0], "group")
+
+    def test_invitation_observation_encryption_membership_and_replay(self):
+        room = "!invitation:" + SERVER_NAME
+        consumer = self._make_consumer()
+        def event(membership, persona=self.AI_A, encrypted=False):
+            return {"type": "m.room.member", "event_id": "$" + membership + persona,
+                    "room_id": room, "sender": "@human:" + SERVER_NAME,
+                    "state_key": persona, "content": {"membership": membership},
+                    "unsigned": {"invite_room_state": [{"type": "m.room.encryption"}] if encrypted else []}}
+        invite = event("invite", encrypted=True)
+        consumer._dispatch_event(invite)
+        self.assertIs(self.store.invitation(self.AI_A, room), True)
+        for membership in ("join", "leave", "ban"):
+            self.store.invitation_update(self.AI_A, room, "invite")
+            consumer._dispatch_event(event(membership))
+            self.assertIsNone(self.store.invitation(self.AI_A, room))
+        consumer._dispatch_event(invite)
+        self.assertIsNone(self.store.invitation(self.AI_A, room))
+        consumer._dispatch_event(event("invite", persona="@ai_foreign:elsewhere"))
+        self.assertIsNone(self.store.invitation("@ai_foreign:elsewhere", room))
+        columns = self.store._conn.execute("SELECT * FROM as_invitations").description
+        self.assertEqual([column[0] for column in columns], ["key", "encrypted"])
+
     def test_multi_human_room_ordinary_text_does_not_reply(self):
         seen = []
         class Hooks(ConsumerHooks):
