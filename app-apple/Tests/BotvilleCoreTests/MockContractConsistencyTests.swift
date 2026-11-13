@@ -25,6 +25,19 @@ final class MockContractConsistencyTests: XCTestCase {
         }
     }
 
+    func testManifestVersionsMatchCurrentContractAndRuntimeManifest() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        for path in ["gateway/openapi/examples/capability-manifest.json",
+                     "app-apple/Sources/BotvilleCore/Resources/mock-capability-manifest.json"] {
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(
+                with: Data(contentsOf: root.appendingPathComponent(path))) as? [String: Any])
+            XCTAssertEqual(object["contract_version"] as? String, "0.5.0")
+            XCTAssertEqual(object["manifest_version"] as? String, "1.3.0")
+        }
+    }
+
     @MainActor
     func testViewLogsActionCreatesSessionAndLoadsOfflineLogPage() async throws {
         let client = MockGatewayClient()

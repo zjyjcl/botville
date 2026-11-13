@@ -12,7 +12,7 @@ final class GatewayCompatibilityTests: XCTestCase {
             GatewayCapabilityManifest.self,
             from: Data(
                 """
-                {"manifest_version":"1.0.0","contract_version":"0.1.0","generated_at":"2026-11-04T12:00:00.125Z","capabilities":[
+                {"manifest_version":"1.0.0","contract_version":"0.5.0","generated_at":"2026-11-04T12:00:00.125Z","capabilities":[
                   {"id":"malformed","module":"future","version":"1","title":"Bad","summary":"","status":"enabled","entry":{},"scopes":[]},
                   {"id":"web.future","module":"future","version":"1","title":"Good","summary":"","status":"enabled","entry":{"type":"web","web_url":"https://example.test/"},"scopes":[]}
                 ]}
@@ -64,7 +64,7 @@ final class GatewayCompatibilityTests: XCTestCase {
             GatewayCapabilityManifest.self,
             from: Data(
                 """
-                {"manifest_version":"1.0.0","contract_version":"0.1.0","generated_at":"2026-11-04T12:00:00Z","capabilities":[]}
+                {"manifest_version":"1.0.0","contract_version":"0.5.0","generated_at":"2026-11-04T12:00:00Z","capabilities":[]}
                 """.utf8))
         XCTAssertEqual(valid.generatedAt.timeIntervalSince1970, 1_793_793_600)
 
@@ -73,7 +73,7 @@ final class GatewayCompatibilityTests: XCTestCase {
                 GatewayCapabilityManifest.self,
                 from: Data(
                     """
-                    {"manifest_version":"1.0.0","contract_version":"0.1.0","generated_at":"not-a-date","capabilities":[]}
+                    {"manifest_version":"1.0.0","contract_version":"0.5.0","generated_at":"not-a-date","capabilities":[]}
                     """.utf8)))
     }
 }

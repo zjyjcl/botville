@@ -6,6 +6,59 @@ import Foundation
 import XCTest
 
 final class PersonaStateTests: XCTestCase {
+    func testProactiveSettingsDecodesCompleteConfiguration() throws {
+        let data = Data(#"{"enabled":true,"max_per_day":6,"require_reply":false,"quiet_hours":{"enabled":false,"start":"23:00","end":"07:30","timezone":"Asia/Shanghai"}}"#.utf8)
+        let settings = try GatewayCoding.decoder.decode(ProactiveSettings.self, from: data)
+        XCTAssertTrue(settings.enabled)
+        XCTAssertEqual(settings.maxPerDay, 6)
+        XCTAssertEqual(settings.requireReply, false)
+        XCTAssertEqual(settings.quietHours?.enabled, false)
+        XCTAssertEqual(settings.quietHours?.start, "23:00")
+        XCTAssertEqual(settings.quietHours?.end, "07:30")
+        XCTAssertEqual(settings.quietHours?.timezone, "Asia/Shanghai")
+        let encoded = try JSONEncoder().encode(settings)
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: encoded) as? NSDictionary,
+                       try JSONSerialization.jsonObject(with: data) as? NSDictionary)
+    }
+
+    func testProactiveMissingEnabledDefaultsOffAndIgnoresUnknownFields() throws {
+        let data = Data(#"{"max_per_day":0,"require_reply":true,"future_mode":"unknown","quiet_hours":{"start":"23:00","end":"07:30","timezone":"Asia/Shanghai","future":{}}}"#.utf8)
+        let settings = try GatewayCoding.decoder.decode(ProactiveSettings.self, from: data)
+        XCTAssertFalse(settings.enabled)
+        XCTAssertEqual(settings.maxPerDay, 0)
+        XCTAssertEqual(settings.requireReply, true)
+        XCTAssertEqual(settings.quietHours?.enabled, true)
+        let empty = try GatewayCoding.decoder.decode(ProactiveSettings.self, from: Data("{}".utf8))
+        XCTAssertFalse(empty.enabled)
+        XCTAssertNil(empty.maxPerDay)
+        XCTAssertNil(empty.requireReply)
+        XCTAssertNil(empty.quietHours)
+    }
+
+    func testPersonaProactiveIsOptionalAndDoesNotChangeUnknownMoodHandling() throws {
+        let base: [String: Any] = [
+            "id": "persona_demo", "owner_id": "@owner:example.invalid", "display_name": "Demo",
+            "kind": "custom", "status": "active", "revision": 1, "visibility": "private",
+            "created_at": "2026-11-13T00:00:00Z", "updated_at": "2026-11-13T00:00:00Z",
+        ]
+        for proactive: Any? in [nil, NSNull(), [:], ["enabled": true, "unknown": "future"]] {
+            for mood: Any? in [nil, NSNull(), "future", "happy"] {
+                var object = base
+                object["proactive"] = proactive
+                object["mood"] = mood
+                object["future_field"] = ["ignored": true]
+                let persona = try GatewayCoding.decoder.decode(MemoryPersona.self,
+                    from: JSONSerialization.data(withJSONObject: object))
+                XCTAssertEqual(persona.mood, mood as? String == "happy" ? .happy : nil)
+                if let config = proactive as? [String: Any] {
+                    XCTAssertEqual(try XCTUnwrap(persona.proactive).enabled, config["enabled"] as? Bool ?? false)
+                } else {
+                    XCTAssertNil(persona.proactive)
+                }
+            }
+        }
+    }
+
     func testStateDecodesKnownUnknownAndNullMoodLabels() throws {
         for (label, expected): (Any, PersonaMood?) in [
             ("calm", .calm), ("happy", .happy), ("sad", .sad), ("excited", .excited),

@@ -397,7 +397,7 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
 
     private static func isOpenIDPath(_ segments: [String], method: String) -> Bool {
         guard let first = segments.first else { return false }
-        // Contract 0.4.0 authenticates GET collection/detail and owner state reads/writes.
+        // Contract 0.5.0 authenticates GET collection/detail and owner state reads/writes.
         return first == "moments" || first == "memories"
             || (first == "personas" && method.caseInsensitiveCompare("GET") == .orderedSame
                 && (segments.count == 1 || (segments.count == 2 && !segments[1].isEmpty)))
@@ -594,7 +594,7 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
     }
 
     public func personas() async throws -> [MemoryPersona] {
-        // Contract 0.4.0 list summary; detailed state is loaded separately.
+        // Contract 0.5.0 list summary; detailed state is loaded separately.
         try GatewayCoding.decoder.decode(MemoryPersonaPage.self,
             from: Self.resource("mock-persona-page")).items
     }

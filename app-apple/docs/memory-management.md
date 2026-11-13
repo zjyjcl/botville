@@ -23,7 +23,7 @@ E6 写事实只有客户端接口与测试，本轮没有编辑页面。
 部署覆盖规则继续生效。群聊、真人、成员不完整或身份不明确时不猜测 AI。
 
 名字与头像来自 Matrix 成员资料；头像通过已登录 SDK 的认证媒体通道读取，
-失败或无头像显示名字首字母/占位。网关契约 0.4.0 的 `bio` 映射到 `AIProfile.signature`，
+失败或无头像显示名字首字母/占位。网关契约 0.5.0 的 `bio` 映射到 `AIProfile.signature`，
 在名字下方用次要色展示，支持多行；null、缺失或去空白后为空时隐藏，不用聊天正文推断。
 详情成功后采用网关的名字和签名，保留 Matrix 头像。公开视图的 mood 为
 calm、happy、sad、excited、tired 时，在名字下显示带 SF Symbol 的次要心情标签，
@@ -39,12 +39,12 @@ calm、happy、sad、excited、tired 时，在名字下显示带 SF Symbol 的�
 主人 `PersonaMemoryView` 固定显示「私聊内容是否可见由服务端开关决定」。
 #211 已将 `owner_can_read_dm` 的 schema 默认值改为 `false`，已在 main
 `a7d5a7f` 的 `gateway/openapi/gateway.v1.yaml` 核对；App 缺失字段仍默认隐藏。
-manifest 的 contract_version 为 0.4.0；manifest_version 保持 1.3.0，与网关运行时
+manifest 的 contract_version 为 0.5.0；manifest_version 保持 1.3.0，与网关运行时
 清单及其测试（`test_memory_qa_p1`）一致。
 
 ## 集成边界
 
-#215 已合入。列表和详情按 main 的 0.4.0 契约对齐：
+#215、#221 已合入（普通 merge main `23f1e23`）。列表和详情按 main 的 0.5.0 契约对齐：
 `PersonaSummary` 为包含 nullable bio 的十字段摘要，Matrix user ID 作为 id，
 列表使用平铺的 `next_cursor` / `has_more`。App mock 的 persona-page、persona-state
 与 capability manifest 均逐字节采用当前契约示例；真实请求不注入示例。
@@ -73,6 +73,17 @@ GET 集合、恰好一个非空 id 的详情路径，以及恰好一个非空 id
 Idempotency-Key，因此 500 不重试。
 
 契约示例随 main 的 YAML 同步验证；不得为通过检查修改运行时行为。
+`test_example_contract_version_matches_runtime_contract` 保留硬断言，merge 冲突未恢复 skipUnless。
+#221 的 JSON examples 仅更新 `health.json`，App 没有 health mock，因此不新增资源。
+现有 manifest/card/persona-page/persona-state 均由 `MockContractConsistencyTests` 逐字节校验。
+
+契约 0.5.0 的 `proactive` 仅由 `Persona`、`CreatePersonaRequest`、`UpdatePersonaRequest`
+引用；`PersonaSummary`、`PersonaOwnerDetail`、`PersonaPublicView`、`PersonaState` 均不包含它。
+App 共用的 `MemoryPersona` 可选解码完整 Persona 的 `ProactiveSettings`；proactive 缺失或
+null 为 nil，缺 enabled 为 false。max_per_day、require_reply、quiet_hours 保留可选性，
+由服务端应用省略字段的默认值；静默时段 start/end/timezone 按 SilentHours 必需，enabled
+缺失按 true。未知字段忽略；既有 mood 的未知值和 null 仍为缺失，不回退默认心情。
+App 尚无创建/更新人设请求模型，本轮只补配置模型、解码与测试，没有主动发言 UI 或发送接线。
 
 AI 资料页仅将 join 计入活跃成员；invite 不作 AI 对方，也不增加活跃人数。
 详情请求的跨服判断按大小写不敏感的完整 server_name 比较，端口保留且域名仍精确；
