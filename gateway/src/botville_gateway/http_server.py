@@ -501,12 +501,14 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         parts = rest.split("/")
         if len(parts) == 2 and parts[1] == "state" and self.command in ("GET", "HEAD", "PATCH"):
             handle_mood(self, parts[0])
-        elif len(parts) == 2 and parts[1] == "rooms" and self.command in ("GET", "HEAD"):
-            from .group_rooms_http import handle
-            handle(self, parts[0])
-        elif len(parts) == 3 and parts[1] == "rooms" and self.command == "PATCH":
-            from .group_rooms_http import handle
-            handle(self, parts[0], parts[2])
+        elif len(parts) in (2, 3) and parts[1] == "rooms":
+            from .group_rooms_http import handle, owner_persona
+            collection = len(parts) == 2
+            allowed = ("GET", "HEAD") if collection else ("PATCH",)
+            if self.command in allowed:
+                handle(self, parts[0], None if collection else parts[2])
+            elif owner_persona(self, parts[0]) is not None:
+                self._method_not_allowed(allow=", ".join(allowed))
         elif len(parts) == 1 and self.command == "PATCH":
             from .personas_update import handle
             handle(self, parts[0])
@@ -942,13 +944,14 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             self._internal_error(exc)
 
     # 不支持的方法：仍返回 problem+json，而不是 stdlib 的 501 HTML。
-    def _method_not_allowed(self) -> None:
+    def _method_not_allowed(self, *, allow: Optional[str] = None) -> None:
         self._request_id()
         self._send_problem(
             405,
             "request.invalid",
             "Method Not Allowed",
             detail=f"{self.command} is not supported on this endpoint",
+            extra_headers={"Allow": allow} if allow else None,
         )
 
     def do_PUT(self) -> None:
@@ -1135,6 +1138,18 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 status, exc.code, title,
                 detail=exc.detail, errors=errors,
             )
+            return
+        except GatewayDeliveryError as exc:
+            if exc.code == "conversation.not_found":
+                self._send_problem(404, "conversation.not_found", "Conversation not found",
+                    detail="Conversation could not be resolved")
+            elif exc.code == "conversation.invalid":
+                detail = "Conversation identifier is invalid"
+                self._send_problem(400, "request.invalid", "Request validation failed",
+                    detail=detail, errors=[{"field": "conversation_id",
+                        "code": "conversation.invalid", "message": detail}])
+            else:
+                self._internal_error(exc)
             return
         self._send_json(200, result)
 

@@ -566,6 +566,8 @@ persona 可配置 `"groups": {"enabled": true, "invite_policy": "owner"}`；
 `ignored_for_accepted`，保持 accepted 且不 leave；合格再邀请仍走原判定。
 邀请 HMAC claim 持久化，先记账后执行，崩溃时可能遗漏尝试但重放不会重复 join/leave。
 已接受群中途加密后停止模型回复和实际发送，不自动退出。
+群功能（部署或 persona）关闭时，内置引擎在群中即使被 @/回复也不发言，成员未确认按群处理；DM 不受影响，不自动退群。
+外部运行时 POST /messages 不受此限制。有 memory DB 时 rooms GET 仍列出现有房间；PATCH 仅允许 muted/leave，mention_only 返回 409 room.state_conflict。
 已知 encrypted_disabled / rejected_encrypted 房间的 messages 与 policy/evaluate 返回
 `403 conversation.e2ee`，不入队、不消耗限额；关闭开关仍禁止加密群发言。
 

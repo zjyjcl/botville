@@ -958,7 +958,9 @@ ephemeral 不在 AS 注册里开启，忽略。
 **群节流与多 AI 熔断（B2.8c，行为汇总于契约 0.6.0）**
 
 只适用于该 persona 在 `group_rooms` 中 state=accepted，且部署 `GATEWAY_GROUPS_ENABLED`
-与 persona `groups.enabled` 均开启的房间；其他房间行为不变。
+与 persona `groups.enabled` 均开启的房间。
+群功能（部署或 persona）关闭时，内置引擎在群房间完全不发言（包括被 @/回复），DM 不受影响，不自动退群。
+只有成员已确认且 room_is_dm 的房间视为 DM；成员未确认按群处理。外部运行时 POST /messages 不受此限制。
 
 | 变量 | 默认 | 范围与含义 |
 |---|---|---|
@@ -1314,6 +1316,8 @@ token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，�
 | PUT/DELETE | `/moments/{moment_id}/likes/me` | 点赞与取消点赞 | App / A2.2 |
 | GET | `/moments/{moment_id}/likes` | 点赞列表 | App / A2.2 |
 
+`POST /policy/evaluate` 会话解析失败返回 404 `conversation.not_found`；非法会话标识返回 400 `request.invalid`（errors 的 field 为 `conversation_id`、code 为 `conversation.invalid`），错误不回显原始 id 或别名；其他投递异常仍返回 500 `internal.error`。
+
 `GET /personas` 返回摘要视图，仅含 `id`（Matrix user_id，与记忆 persona_id 一致）、`owner_id`（owner_user_id）、`display_name`（为空回退 localpart）、`bio`（缺省 null）、`kind=custom`、`status=active`、`revision=1`、`created_at`、`updated_at`、`visibility=private`。时间取启动时文件 mtime（UTC RFC3339 Z），不可得则取网关启动时间，是文件型人设的近似时间。配置及其他扩展字段均省略，无 owner 的人设永不列出。
 
 `GET /personas/{persona_id}`（实际路径 `/v1/personas/{id}`）复用 §1.2.2 调用方鉴权与 /capabilities 的用户鉴权 helper。owner 返回列表十字段摘要加 `mood` 与 `groups`（列表项本身不增加该字段）；已认证本服（server name 大小写不敏感，可含端口）非 owner 仅返回 `id, display_name, bio, status, mood`。`mood` 是 `calm` / `happy` / `sad` / `excited` / `tired` 或 null。服务端只会输出这五个值；客户端必须容忍未知值（按缺省处理）。mood 模块关闭时均为 null；非 owner 还要求 `mood_public=true`。不得暴露 owner_id、model_binding、密钥、visibility 或时间戳。
@@ -1387,12 +1391,14 @@ AI 运行时                        网关                        Matrix
 未认证 401；legacy/无 owner 身份 403 `persona.not_owned`；非 owner、跨服、未知或非法
 persona id、无 owner persona 统一 404 `persona.not_found`，隐藏存在性。响应不缓存。
 
+rooms 集合仅支持 GET/HEAD，单项仅支持 PATCH；其他方法在相同 owner 鉴权后返回 405 `request.invalid`，带 `Allow` 头（集合 `GET, HEAD`，单项 `PATCH`）；非 owner 仍隐藏为 404 `persona.not_found`。
+
 - `GET /personas/{persona_id}/rooms`：默认仅 accepted/encrypted_disabled；`include=all` 也列
   left/rejected_encrypted。`limit` 为 1–200，默认 50。按 `(updated_at, room_ref)` 升序 keyset
   分页，使用返回的 `next_cursor`；末页为 null、has_more=false。重复/未知参数、非法 limit/cursor
   返回 400 `request.invalid`。分页不提供跨请求快照，期间更新后客户端应刷新并按 room_ref 去重。
-  响应 `{items, next_cursor, has_more, groups_enabled}`；部署关闭或没有 memory DB 时为空页且
-  groups_enabled=false。该字段表示部署可用性，persona 的邀请开关另见 groups.enabled。
+  响应 `{items, next_cursor, has_more, groups_enabled}`；有 memory DB 时，即使部署或 persona 群功能关闭也按现有规则列出当前 key_id 的行。
+  无 memory DB 时返回空页、groups_enabled=false。该字段仅表示部署开启且有 memory DB，persona 开关不改变它。
 - GroupRoom 仅含 `room_ref, state, mode, joined_at, updated_at`，时间为 UTC RFC3339；从未接受
   的邀请 joined_at=null。不返回 inviter 或 Matrix room_id。room_ref 是不可逆 HMAC room_key，
   在相同密钥下稳定；不是 Matrix room_id，也不能传给 Matrix API。仅列当前 key_id 行；轮换密钥后
@@ -1400,7 +1406,11 @@ persona id、无 owner persona 统一 404 `persona.not_found`，隐藏存在性�
 - `PATCH /personas/{persona_id}/rooms/{room_ref}` 接受 `{"mode":"mention_only"|"muted"}`
   和/或 `{"action":"leave"}`，至少一项。未知字段/非法类型/枚举为 400。不存在、非当前密钥、
   不属于 persona 的引用统一 404 `room.not_found`；只有 accepted/encrypted_disabled 可以设置
-  mode，否则 409 `room.state_conflict`。组合请求先校验当前状态，再执行模式更新和 leave。
+  mode，否则 409 `room.state_conflict`。群功能（部署或 persona）关闭时仅接受 muted、leave 或两者组合；
+  任何含 mention_only 的请求返回 409 `room.state_conflict`，不修改行。
+  校验顺序为 400 参数、404 房间、409 状态/开关冲突，再执行；无 store 时仍为 404。
+- 群功能（部署或 persona）关闭时，内置引擎在群房间完全不发言（包括被 @/回复），DM 不受影响，不自动退群。
+  只有成员已确认且 room_is_dm 的房间视为 DM；成员未确认按群处理。外部运行时 POST /messages 不受此限制。
 - mention_only 保持既有群触发语义。muted 即使被 @ 或被回复也不调模型、不发送；检查在 policy
   之前，不消耗回复限额，仍按现有规则写 group scope 记忆（含其他 AI 的 untrusted 发言）。
   该模式控制内置引擎触发，不新增外部运行时 POST /messages 的 policy 禁令。
@@ -1449,7 +1459,7 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 ```json
 {
   "manifest_version": "1.3.0",
-  "contract_version": "0.5.0",
+  "contract_version": "0.6.0",
   "generated_at": "2026-11-13T00:00:00Z",
   "cache_ttl_seconds": 300,
   "defaults": { "unknown_capability": "hidden", "card_fallback": "text" },
@@ -1545,7 +1555,7 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 }
 ```
 
-清单版本为 `1.3.0`，`contract_version` 取网关配置（当前 `0.5.0`），缓存建议为 300 秒。
+清单版本为 `1.3.0`，`contract_version` 取网关配置（当前 `0.6.0`），缓存建议为 300 秒。
 无论记忆模块是否启用，均返回完整基础清单：`chat.direct`、`memory.search`、
 `notify.approvals`、`town.enter`，并保留各自状态、入口及 defaults；按 `module` / `status`
 查询时只返回匹配条目。基础元数据随代码打包，不在运行时读取 OpenAPI 示例文件。
@@ -1953,6 +1963,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.6.0 | 2026-11-13 | [B2.8d2 评审清理] evaluate 解析失败 404/400 替代 500；rooms 错误方法鉴权后 405 + Allow；record_group_send 复用已解析 id；示例 title 与 0.5.0 残留表述修正；群功能关闭时引擎群回复 fail-closed、PATCH 仅 muted/leave、有 DB 的 GET 仍列出现有房间；无字段变化、不升版本。 |
 | 0.6.0 | 2026-11-13 | [B2.8d] 新增 owner GET /personas/{id}/rooms 与 PATCH /personas/{id}/rooms/{room_ref}；owner 详情和 UpdatePersonaRequest 增加 groups；mention_only/muted 模式与退群、leave_pending 确认状态及 owner leave 持久清理；新增 room.not_found / room.state_conflict；group.replies_per_hour.exceeded 原因码正式纳入。汇总 B2.8 行为：严格双人 DM、群仅被提及/回复才发言、AI 不触发 AI、群节流与熔断、加密群 403 conversation.e2ee、HMAC 密钥轮换隔离及退出后禁止发送自动 rejoin；群节流/熔断计数以规范 persona 与规范 room 为键，别名与裸 id 不能绕过，key_id 回填先于 forget。 |
 | 0.5.0 | 2026-11-13 | [B2.8c #228] accepted 群冷却与滚动小时回复限额、群 ai_loop / anti_spam 底线（群内连续计数在人类发言时归零；默认 30/h 为滚动一小时硬底线，人类发言不重置）；schema 10→11 的 HMAC key_id 与轮换隔离/可选忘记旧行、上限只计当前键、发送层独立加密拦截；严格本服 room id、accepted 房间忽略不合格再邀请、拒绝 leave 的 M_FORBIDDEN 视为完成，以及 Synapse /sync invite 过滤说明修正。无 API 字段变化、契约仍 0.5.0。 |
 | 0.5.0 | 2026-11-13 | [#226 评审 nit] `/sync` 权威确认改为仅邀请的一次性请求（set_presence=offline、无 since、不消费 to-device）；leave 遇 `M_FORBIDDEN` 视为已离开并移出清理队列；格式异常的成员事件只跳过该事件；邀请台账 TTL（`GATEWAY_INVITE_LEDGER_TTL_SECONDS`，默认 1 天）。无 API 字段变化。 |

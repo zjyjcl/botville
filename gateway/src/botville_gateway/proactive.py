@@ -275,6 +275,8 @@ class ProactiveWorker:
             if body is None:
                 body = self.client.complete(system_text=system, messages=messages, persona=persona,
                                             max_tokens=persona.max_reply_chars)[:persona.max_reply_chars]
+            # DM-only, including queued retries: verify complete membership
+            # immediately before sending, so this path never targets groups.
             if self._stop.is_set() or not self._dm(persona.user_id, target, room):
                 return 0
             self._write("UPDATE proactive_queue SET state='sending',body=?,tokens=? WHERE key=?", (body, estimate, key))

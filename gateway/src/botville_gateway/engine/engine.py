@@ -236,6 +236,12 @@ class EngineHooks(ConsumerHooks):
         """一个 persona 对一条消息的完整回复流程。"""
         # PR3a may install the hooks solely to persist layer-1 memory while no
         # model is configured.  Preserve PR2's record/count-only behaviour.
+        # Only confirmed DMs bypass the switch; missing context fails closed.
+        if (self._group_invites is not None
+                and not (ctx and ctx.room_members_confirmed and ctx.room_is_dm)
+                and not self._group_invites.groups_active(persona.user_id)):
+            self.stats.inc("group_disabled_skipped")
+            return
         if self._group_invites is not None and self._group_invites.is_disabled(persona.user_id, room_id):
             self.stats.inc("group_encrypted_skipped")
             return
