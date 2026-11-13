@@ -58,6 +58,16 @@ make down            # 停止（不传 -v，不删任何卷）。清卷：docker
 App 会向聊天对方显示披露**。**设了 `GATEWAY_EMBEDDING_MODEL`，私聊正文就会
 发给 embedding 服务商**（地址留空 = 聊天模型同一家）；`GATEWAY_EMBEDDING_API_KEY` 是密钥，只放本地 `.env`。
 
+情绪与主动发言（B 线 PR4b / PR4c）：`GATEWAY_MOOD_ENABLED`（默认 `false`）、
+`GATEWAY_MOOD_HALF_LIFE_MINUTES`（240）、`GATEWAY_PROACTIVE_ENABLED`（`false`）、
+`GATEWAY_PROACTIVE_RECENT_CONTACTS_ENABLED`（`false`）、`GATEWAY_PROACTIVE_TICK_SECONDS`（300）、
+`GATEWAY_PROACTIVE_MIN_IDLE_MINUTES`（180）、`GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES`（240）、
+`GATEWAY_PROACTIVE_PER_TARGET_PER_DAY`（1）原样透传，init.sh 不生成。**开启
+`GATEWAY_PROACTIVE_ENABLED` 前必须先启用记忆库（`GATEWAY_MEMORY_DB_PATH`），并且要有持久的
+`GATEWAY_HMAC_SECRET`**（compose 里即 `.env` 的 `BOTVILLE_GATEWAY_HMAC_SECRET`，init.sh 生成后
+保留；它是密钥，别清空、别重新生成，也别贴出来）。情绪同样依赖记忆库。详见
+[docs/deploy/appservice.md](../docs/deploy/appservice.md#角色引擎模型与人设)「情绪与主动发言」。
+
 
 continuwuity 默认关闭上游 announcements 检查（避免 SIGTERM 卡到 SIGKILL）：见 [docs/ops/continuwuity-announcements.md](../docs/ops/continuwuity-announcements.md)。
 
