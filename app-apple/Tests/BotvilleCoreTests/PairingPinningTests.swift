@@ -483,8 +483,8 @@ private final class TLSFixture {
         if let san { contents += "subjectAltName = \(san)\n" }
         if let eku { contents += "extendedKeyUsage = \(eku)\n" }
         try contents.write(to: extensions, atomically: true, encoding: .utf8)
-        // Keep the serial file inside this fixture. Without -CAserial, the system
-        // openssl writes .srl to the working directory shared by parallel workers.
+        // Explicitly pin the serial file's location inside this fixture. Without
+        // -CAserial, openssl writes .srl to the shared working directory.
         let serial = directory.appendingPathComponent("ca-cert.srl")
         try run(openssl, ["x509", "-req", "-in", request.path, "-CA", caCertificate.path, "-CAkey", caKey.path, "-CAcreateserial", "-CAserial", serial.path, "-out", certificate.path, "-days", String(days), "-extfile", extensions.path, "-extensions", "leaf"])
     }

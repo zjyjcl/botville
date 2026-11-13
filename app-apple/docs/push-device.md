@@ -27,8 +27,8 @@ NSE 的角标策略仍是**保留 APNs/default payload 已给出的系统值**�
 
 ## 前台 App 内横幅与系统通知边界
 
-- **前台可见性以 App 内 UI 为准**：`MatrixService` 每次房间列表 / sync 更新后比较 joined 房间的未读数与最新活动。首次本地快照、新出现的房间先建立基线；后续未读增加或活动变新才发候选，避免启动、排序变化和 sync 重放弹出历史消息。正文、房间名、发送者显示名只取本机 SDK 已同步状态，不解析 APNs/NSE 正文，不新增事件或 profile 请求。
-- `ForegroundInAppBannerStore` 在主线程维护一张卡片，约 3 秒自动消失。同房连发更新为最新内容并重新计时，不堆叠；同一事件重复不会续命。用 room ID + event ID 去重；当前 SDK 的 `latestEvent()` 不提供 event ID，因此实际使用 room ID + latestActivity 时间戳（同房同毫秒事件可能合并）。候选和去重记录只在内存保存，退出清除，不写正文或凭据日志。
+- **前台候选来自 SDK 逐事件通知回调**：`MatrixService` 激活会话时通过 `registerNotificationHandler` 注册 `ForegroundSyncNotifications`，每条按 Matrix 通知规则触发的消息事件（文本、加密、贴纸）各生成一个候选，带本条真实 event ID、时间戳和裁剪后的正文。首个成功 sync 前的事件视为历史，不出卡；房间列表 / `latestEvent()` 只负责列表显示和排序，不再派生横幅，也不比较未读数或建立基线。正文、房间名、发送者显示名只取本机 SDK 已同步的事件和房间信息，不解析 APNs/NSE 正文，不新增事件或 profile 请求，不写 raw JSON。
+- `ForegroundInAppBannerStore` 在主线程维护一张卡片，约 3 秒自动消失。同房连发更新为最新内容并重新计时，不堆叠；同一事件重复不会续命。候选身份固定为 room ID + event ID（`eventID` 为必填），同房同毫秒的不同事件各自出卡；时间戳不参与去重。回前台时只按系统已投递通知的 room ID + event ID 抑制。候选和去重记录只在内存保存，退出清除，不写正文或凭据日志。
 - 卡片位于整个 tab 容器的最外层 top overlay（高于 `NavigationSplitView`），使用 `safeAreaPadding(.top)` 并避让顶部导航操作。显示 initials 头像占位、房间名（私聊优先本地发送者显示名）与正文。点按复用 `.room(roomID)` → `apply(route)`，切到「会话」并打开房间；其他 tab 也能显示和点按。
 - 自己的消息、当前**实际可见**的房间、输入框 focused 或正在 composing 时不弹；手机已返回列表时，即使保留房间选择也允许弹。非 active 状态不显示，进入后台立即清除当前卡片；被抑制事件直接消费，不在离开输入框后补弹。未读列表和角标沿用原逻辑。
 - 加密房间固定显示「加密消息」，即使本机已解密；无法解密事件同样如此。空白或暂不可展示正文显示「…」，本地消息解析失败显示「无法加载」，加密状态优先于失败提示；成员、房名等状态事件及撤回不作为新消息。标题最多 120 个 Character，正文最多 240 个 Character，超出以「…」截断。
