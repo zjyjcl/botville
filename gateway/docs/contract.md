@@ -1180,13 +1180,18 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 - 新模块只要在网关注册 capability，App **不改代码**就能显示入口与卡片（C2.5 验收点）；
 - 同一套清单驱动网页版（D4.1）与内置浏览器。
 
+`GET /v1/capabilities` 接受站点/调用方 bearer（`bearerAuth`）、Matrix OpenID
+（`matrixOpenIdToken`）或 Matrix 用户 Bearer（`matrixUserToken`），任一校验通过即可；
+两种身份校验均未通过时返回 401 problem，缺凭据为 `auth.missing`，其余为 `auth.invalid_token`。
+用户身份复用 `/moments` 的 verifier；该路由在两种校验结束前不发送失败响应。
+
 ### 3.2 清单结构
 
 ```json
 {
-  "manifest_version": "1.2.0",
-  "contract_version": "0.1.0",
-  "generated_at": "2026-11-03T12:00:00Z",
+  "manifest_version": "1.3.0",
+  "contract_version": "0.2.0",
+  "generated_at": "2026-11-13T00:00:00Z",
   "cache_ttl_seconds": 300,
   "defaults": { "unknown_capability": "hidden", "card_fallback": "text" },
   "capabilities": [ { ... }, { ... } ]
@@ -1281,9 +1286,14 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 }
 ```
 
-当记忆模块启用时，清单额外发布 `memory.manage`：`module: memory`、
-`scopes: ["memory.read", "memory.write"]`、`entry.type: native` 指向 App 原生记忆管理页，且
-`owner_can_read_dm` 反映 `GATEWAY_MEMORY_OWNER_CAN_READ_DM`（默认 false）；模块关闭时不得发布该 capability。`memory.search` 仍只是示例能力。
+清单版本为 `1.3.0`，`contract_version` 取网关配置（当前 `0.2.0`），缓存建议为 300 秒。
+无论记忆模块是否启用，均返回完整基础清单：`chat.direct`、`memory.search`、
+`notify.approvals`、`town.enter`，并保留各自状态、入口及 defaults；按 `module` / `status`
+查询时只返回匹配条目。基础元数据随代码打包，不在运行时读取 OpenAPI 示例文件。
+
+当记忆模块启用（`memory_store` 非空）时，在基础清单之外额外发布 `memory.manage`：`module: memory`、
+`scopes: ["memory.read", "memory.write"]`、`entry.type: native`、`entry.deep_link: botville://memories` 指向 App 原生记忆管理页，且
+`owner_can_read_dm` 反映 `GATEWAY_MEMORY_OWNER_CAN_READ_DM`（默认 false）；模块关闭时不得发布该 capability。`memory.search` 保留基础清单元数据，不代表本次实现了检索网页。
 
 ### 3.7 命名约定
 
@@ -1686,6 +1696,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 |---|---|---|
 | 0.2.0 | 2026-11-13 | [B 线 PR3d DM 可读开关] 0.2.0 草案内补充部署开关，默认 false；按 §5.3 将默认可读改为默认脱敏视为准破坏并在此公告，随本次 0.2.0 minor 契约交付。E1/E2/E6（含重放）DM 正文/事实值脱敏，保留写入及 pin/unpin/delete；capability 反映配置，披露仅在开启时展示；群成员门禁独立生效。E6 幂等缓存重启后丢失。 |
 | 0.2.0 | 2026-11-13 | [B 线 PR3c memory-owner，**新增端点（minor），不改既有字段/状态码**] 新增 owner memory 浏览、删除、固定与显式事实端点，以及 `memory.manage` capability、审计与群组成员脱敏约束。 |
+| 0.2.0 | 2026-11-13 | [PR3d QA P1，修复 #209 回归] capabilities 返回完整基础清单并按启用状态追加 memory.manage，manifest_version 1.3.0，支持站点 bearer 与用户身份，原生入口统一 botville://memories；保留期按 updated_at 清理不可 pin 的过期摘要及对应向量，均计入清理数，公开 ID 不复用。 |
 | 0.1.0 | 2026-11-13 | [B 线 #207 nits，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 抽取事实标为 derived 并与主人事实分别隔离召回；空闲门忽略尚未到期的 defer 事务；永久错误按 scope 退避而非全局阻塞；摘要输入按 6000 tokens 最早分块滚动；纯 Python 向量仅扫 scope 最新 500 条、sqlite-vec 覆盖全 scope；回复 query embedding 先预留预算；memory usage 归属 persona/会话；补独立 embedding 提供方 DM/群聊文本披露，以及可信本地人类指令式档案值永不执行的边界。 |
 | 0.1.0 | 2026-11-13 | [B 线 PR3b memory-idle，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 实现空闲批处理滚动摘要、可信本服人类事实抽取、embedding 与 scope 隔离向量召回；memory-idle-worker 在端口绑定后启动，真人回复优先，内部 memory token 用量照常计入预算而不暴露新 /v1 枚举。新增 summaries/vectors 加法迁移、撤回 dirty 重算及 sqlite-vec 回退；/v1 服务端 token floor 现将 CJK 按约 1 token/字估算（字段/状态无变化）。 |
 | 0.1.0 | 2026-11-13 | [B 线 #205 nits，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 主人删除永久墓碑、记忆读取失败延后、DB 指数退避与告警计数、本服真人 counterpart 校验、旧库权限收紧、召回 SQL 上限、CJK token 估算及并发单行 schema 迁移；明确助手记忆尽力写入与 spk 占位撤回限制。 |

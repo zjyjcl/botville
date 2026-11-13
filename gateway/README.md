@@ -47,7 +47,19 @@ gateway/src/botville_gateway/
 ├── policy.py            三层限速（消息/token/间隔）+ 按日预算 + 静默 → PolicyDecision
 ├── service.py           send_ai_message() 编排、幂等、/limits 与 /usage 查询
 ├── store.py             内存 UsageEvent 日志（append-only、容量有界、不存正文）
-├── http_server.py       stdlib HTTP + build_transport 工厂（/health、/policy、/messages、/limits、/usage、/_matrix/app/v1/*）
+├── http_server.py       stdlib HTTP + build_transport 工厂（/health、/policy、/messages、/limits、/usage、/memories、/capabilities、/_matrix/app/v1/*）
+├── capability_manifest.py 完整基础能力清单与记忆管理元数据（随代码打包）
+├── memory/              可选四层记忆（默认关闭）
+│   ├── store.py         SQLite 存储、迁移、保留期清理与公开 ID
+│   ├── recall.py        scope 隔离与预算内上下文召回
+│   ├── profile.py       档案事实规则
+│   ├── api.py           内部记忆管理 API
+│   ├── owner.py         owner 浏览、删除、固定与事实管理
+│   ├── owner_http.py    /memories 边界、脱敏、审计与能力清单组装
+│   ├── worker.py        空闲整理任务
+│   ├── summary.py       滚动摘要与召回适配
+│   ├── embedding.py     向量嵌入客户端
+│   └── vector.py        向量存储与检索（默认标准库实现）
 ├── moments/             动态模块（存储 / 可见性 / HTTP / 迁移，A2.2）
 ├── timeutil.py          UTC `Z` 结尾的 RFC 3339 格式化
 ├── trust.py             §7.1 trust 判定规则（B2.3）

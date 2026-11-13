@@ -435,6 +435,31 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         self._send_problem(401, "auth.invalid_token", "Invalid bearer token")
         return False
 
+    def _auth_capabilities_ok(self) -> bool:
+        """Accept site/caller or end-user identity without sending an early 401."""
+        header = self.headers.get("Authorization")
+        outcome, identity = self.server.authenticator.authenticate(header)
+        if outcome in (AUTH_OK, AUTH_PASS_THROUGH):
+            self._caller = identity
+            return True
+        user_outcome, user_id = self.server.user_verifier.verify(header)
+        if user_outcome == VERIFY_OK:
+            self._user_id = user_id
+            return True
+        if not header:
+            self._send_problem(401, "auth.missing", "Authorization header required")
+        elif user_outcome in (VERIFY_MISSING, VERIFY_INVALID):
+            self._send_problem(401, "auth.invalid_token", "Invalid bearer token")
+        else:
+            # Same as /moments: homeserver unavailable is retryable, not an invalid token.
+            self._send_problem(
+                500,
+                "internal.error",
+                "Homeserver unavailable",
+                detail="user identity could not be verified; retry later",
+            )
+        return False
+
     def _caller_identity(self) -> CallerIdentity:
         """当前请求的调用方身份；未经鉴权（如 /health）时为空身份。"""
         identity = getattr(self, "_caller", None)
@@ -788,11 +813,13 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             if _is_moments_path(path):
                 self._handle_moments()
                 return
+            if path == "/v1/capabilities":
+                if self._auth_capabilities_ok():
+                    self._send_json(200, capabilities(self.server, query))
+                return
             if not self._auth_ok():
                 return
-            if path == "/v1/capabilities":
-                self._send_json(200, capabilities(self.server, query))
-            elif path == "/v1/limits":
+            if path == "/v1/limits":
                 self._handle_get_limits(query)
             elif path == "/v1/usage":
                 self._handle_get_usage(query)

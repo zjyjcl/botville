@@ -290,9 +290,15 @@ paths:
     get:
       tags: [Capabilities]
       operationId: listCapabilities
+      security:
+        - bearerAuth: []
+        - matrixOpenIdToken: []
+        - matrixUserToken: []
       summary: 获取功能清单
       description: |
-        返回当前网关切片的 capability manifest。App 必须以此渲染模块入口，不得硬编码模块列表。
+        返回完整基础清单，记忆模块启用时额外发布 memory.manage，manifest_version 为 1.3.0。
+        接受站点/调用方 bearer 或 MatrixOpenID / Matrix 用户 Bearer 身份，任一通过即可。
+        memory.manage 的原生入口为 botville://memories。App 必须以清单渲染模块入口，不得硬编码模块列表。
         `app_version` 用于服务端过滤不满足 `min_app_version` 的能力；App 仍需忽略未知能力 ID
         与未知字段。清单可缓存（参考 `cache_ttl_seconds`），版本变化通过 `manifest_version` 感知。
       parameters:
@@ -4169,7 +4175,7 @@ components:
         manifest_version:
           type: string
           pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
-          example: 1.2.0
+          example: 1.3.0
         contract_version:
           type: string
           description: 生成该清单的网关契约版本。

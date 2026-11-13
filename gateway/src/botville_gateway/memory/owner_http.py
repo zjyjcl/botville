@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict, deque
+from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -14,6 +15,7 @@ import threading
 import time
 from urllib.parse import parse_qs
 
+from ..capability_manifest import DEFAULTS, BASE_CAPABILITIES, MEMORY_MANAGE
 from ..engine.personas import _is_local_owner
 from ..errors import ValidationError
 from .profile import FACT_KEYS
@@ -61,19 +63,17 @@ class MemoryHTTPState:
 
 def capabilities(server, query):
     params = parse_qs(query)
-    entries = []
+    entries = deepcopy(BASE_CAPABILITIES)
     if server.memory_store is not None:
-        entries.append(dict(id='memory.manage', module='memory', version='0.2.0',
-                            title='记忆管理', summary='查看、删除和固定该 AI 的聊天记忆',
-                            status='enabled', scopes=['memory.read', 'memory.write'],
-                            entry=dict(type='native', deep_link='botville://memory'),
-                            owner_can_read_dm=server.config.memory_owner_can_read_dm))
+        manage = deepcopy(MEMORY_MANAGE)
+        manage['owner_can_read_dm'] = server.config.memory_owner_can_read_dm
+        entries.append(manage)
     for name in ('module', 'status'):
         if name in params:
             entries = [entry for entry in entries if entry[name] == params[name][-1]]
-    return dict(manifest_version='0.2.0', contract_version=server.config.contract_version,
+    return dict(manifest_version='1.3.0', contract_version=server.config.contract_version,
                 generated_at=datetime.now(timezone.utc).isoformat(),
-                cache_ttl_seconds=0, capabilities=entries)
+                cache_ttl_seconds=300, defaults=deepcopy(DEFAULTS), capabilities=entries)
 
 
 def _owner(server, persona_id, caller):
