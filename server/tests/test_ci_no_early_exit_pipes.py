@@ -49,8 +49,11 @@ Known limitations (they cut in BOTH directions -- see the tests):
     ... `'til`, `'90s`) is taken for a quote, so a real pipe between them is
     NOT cut (fewer segments: a known miss, pinned by
     test_known_misses_balanced_prose_apostrophes);
-  - a shell word quoted from inside (`-e's/x/y/'`) looks like an apostrophe
-    and falls back as above;
+  - a shell single quote glued between letters is read as an apostrophe:
+    `echo foo'bar| grep -q x'baz` is ONE quoted word to the shell, but the
+    `|` is treated as a pipe and reported (over-report, pinned by
+    test_known_over_report_glued_single_quotes); `-e's/x/y/'` likewise
+    unbalances the line and falls back as above;
   - heredoc bodies are scanned like any other line.
 
 Docs are scanned too (whole lines, comments included: readers copy them). If
@@ -559,6 +562,16 @@ class NoEarlyExitPipesTest(unittest.TestCase):
         ):
             with self.subTest(line=line):
                 self.assertFalse(early_exit_in(line), line)
+
+    def test_known_over_report_glued_single_quotes(self):
+        """KNOWN OVER-REPORT (module docstring): a real shell single quote
+        between letters (foo'bar|x'baz) is taken for an apostrophe, so the
+        quoted `|` counts as a pipe. Rare in shell; rewrite such a line (e.g.
+        "foo"'bar|x'"baz") or add it to ALLOWED with a reason."""
+        self.assertTrue(early_exit_in("echo foo'bar| grep -q x'baz"))
+        self.assertEqual(split_pipes("echo foo'bar|x'baz"), ["echo foo'bar", "x'baz"])
+        # Not glued to letters on both sides: a real quote, not split.
+        self.assertFalse(early_exit_in("echo foo 'bar| grep -q x' baz"))
 
     def test_split_pipes_is_quote_aware(self):
         self.assertEqual(split_pipes("grep -E 'a|b' f"), ["grep -E 'a|b' f"])

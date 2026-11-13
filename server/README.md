@@ -54,6 +54,11 @@ make down            # 停止（不传 -v，不删任何卷）。清卷：docker
 （86400，60–2592000）原样透传，init.sh 不生成。⚠️ **开启群功能必须有持久的 HMAC 密钥**：
 compose 部署里就是 `.env` 的 `BOTVILLE_GATEWAY_HMAC_SECRET`，**不能清空，也不能重新生成；
 轮换它会让已接受的群失效**（它是密钥，别贴出来）。还需记忆库和 persona 的 `groups.enabled`。
+群节流（B 线 B2.8c）：`GATEWAY_GROUP_COOLDOWN_SECONDS`（30，0–3600）、`GATEWAY_GROUP_MAX_REPLIES_PER_HOUR`
+（20，1–200）、`GATEWAY_GROUP_AI_LOOP_MAX_PER_HOUR`（30，1–1000）、`GATEWAY_GROUP_MAX_CONSECUTIVE_AI_MESSAGES`
+（3，1–50）原样透传；**节流计数重启后清零**。`GATEWAY_GROUP_FORGET_STALE_KEYS`（默认 `false`）是
+**轮换密钥后的一次性清理开关**：打开后每次启动都会永久删除旧 key_id 的群台账（解除轮换隔离，
+旧 left / encrypted_disabled 记录丢失），**重启一次后改回 `false`**。
 
 记忆（B 线 PR3a）：`GATEWAY_MEMORY_DB_PATH` 默认空 = 关闭；启用时写
 `/var/lib/botville-gateway/memory.db`（gateway-data 卷顶层，`make backup` /
