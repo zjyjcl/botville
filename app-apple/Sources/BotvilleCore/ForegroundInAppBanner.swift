@@ -4,17 +4,17 @@
 import Combine
 import Foundation
 
-/// A display-safe notification assembled from the locally synced Matrix state.
-/// It intentionally carries no APNs or credential material.
+/// A display-safe notification assembled from one SDK sync notification event.
+/// The Matrix event ID is its identity. It carries no APNs or credential material.
 public struct ForegroundBannerCandidate: Equatable, Sendable {
     public let roomID: String
-    public let eventID: String?
+    public let eventID: String
     public let latestActivity: Date
     public let title: String
     public let preview: String
     public let isOwn: Bool
 
-    public init(roomID: String, eventID: String? = nil, latestActivity: Date,
+    public init(roomID: String, eventID: String, latestActivity: Date,
                 title: String, preview: String, isOwn: Bool = false) {
         self.roomID = roomID
         self.eventID = eventID
@@ -26,9 +26,8 @@ public struct ForegroundBannerCandidate: Equatable, Sendable {
 
     public var route: PushNotificationRoute { .room(roomID) }
 
-    fileprivate var deduplicationKey: String {
-        roomID + "|" + (eventID ?? String(latestActivity.timeIntervalSince1970))
-    }
+    /// Same-millisecond events stay distinct; time is never part of identity.
+    fileprivate var deduplicationKey: String { roomID + "|" + eventID }
 }
 
 /// Presentation policy shared by the sync bridge and the SwiftUI overlay.
@@ -149,13 +148,6 @@ public final class ForegroundInAppBannerStore: ObservableObject {
     }
 }
 
-/// A room-list snapshot and its optional displayable latest event. The event is
-/// optional because the list can refresh before the SDK has a renderable preview.
-struct ForegroundBannerSnapshot {
-    let room: MatrixRoom
-    let candidate: ForegroundBannerCandidate?
-}
-
 /// Navigation owns visibility, independent of retained RoomView lifecycles.
 /// Room-attached sheets retain the room context (and same-room suppression).
 public enum ForegroundBannerVisibility {
@@ -170,8 +162,9 @@ public enum ForegroundBannerVisibility {
     }
 }
 
-/// A background edge never invalidates the online baseline. Foreground messages
-/// remain eligible even if a network-driven replacement sync is still draining.
+/// Tracks the background edge only. Foreground messages remain eligible even if
+/// a network-driven replacement sync is still draining; on resume only events
+/// already delivered as system notifications are suppressed, by room + event ID.
 struct ForegroundBannerResumeState {
     private var isActive = true
     var isForeground: Bool { isActive }
@@ -192,8 +185,8 @@ struct ForegroundBannerResumeState {
     }
 }
 
-/// The commit closure includes both UI publication and detector mutation.
-/// Keeping them behind one gate prevents rejected snapshots arming the baseline.
+/// A replaced or cancelled online refresh must not publish its room snapshot.
+/// Local refreshes (no online generation) always publish.
 enum RoomRefreshCommitGate {
     @discardableResult
     static func commit(onlineGeneration: UUID?, currentGeneration: UUID,
@@ -203,58 +196,6 @@ enum RoomRefreshCommitGate {
         }
         body()
         return true
-    }
-}
-
-/// Only a committed online snapshot can establish the notification baseline.
-/// Cached rooms remain available to the UI without arming history replay.
-struct ForegroundBannerDetector {
-    private struct Baseline: Equatable {
-        let unreadCount: UInt64
-        let latestActivity: Date?
-        let candidateKey: String?
-    }
-
-    private var baselines = [String: Baseline]()
-    private var hasBaseline = false
-
-    mutating func beginCatchUp() {
-        hasBaseline = false
-    }
-
-    mutating func candidates(in snapshots: [ForegroundBannerSnapshot],
-                             isOnlineSync: Bool) -> [ForegroundBannerCandidate] {
-        // Local refreshes must neither arm nor advance the online baseline.
-        guard isOnlineSync else { return [] }
-        var next = [String: Baseline]()
-        var result = [ForegroundBannerCandidate]()
-        for snapshot in snapshots {
-            let room = snapshot.room
-            guard room.membership == .joined else { continue }
-            let candidate = snapshot.candidate
-            let baseline = Baseline(unreadCount: room.unreadCount,
-                                    latestActivity: room.latestActivity,
-                                    candidateKey: candidate.map { $0.deduplicationKey })
-            defer { next[room.id] = baseline }
-            guard hasBaseline, let previous = baselines[room.id] else { continue }
-            let isNewer = (room.latestActivity ?? .distantPast) > (previous.latestActivity ?? .distantPast)
-            let hasUnreadIncrease = room.unreadCount > previous.unreadCount
-            guard isNewer || hasUnreadIncrease,
-                  let candidate,
-                  !candidate.isOwn,
-                  candidate.deduplicationKey != previous.candidateKey else { continue }
-            result.append(candidate)
-        }
-        baselines = next
-        hasBaseline = true
-        return result.sorted { lhs, rhs in
-            lhs.latestActivity == rhs.latestActivity ? lhs.roomID < rhs.roomID : lhs.latestActivity < rhs.latestActivity
-        }
-    }
-
-    mutating func reset() {
-        baselines.removeAll()
-        hasBaseline = false
     }
 }
 

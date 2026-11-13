@@ -72,10 +72,9 @@ final class ForegroundSyncNotificationBridge: SyncNotificationListener, @uncheck
             return
         }
 #endif
-        guard let candidate = Self.candidate(notification: notification, roomID: roomId, userID: userID),
-              let eventID = candidate.eventID else { return }
+        guard let candidate = Self.candidate(notification: notification, roomID: roomId, userID: userID) else { return }
         lock.withLock {
-            let key = roomId + "|" + eventID
+            let key = roomId + "|" + candidate.eventID
             guard seen.insert(key).inserted else {
 #if DEBUG
                 recordSuppression(.alreadyHandled, roomID: roomId)

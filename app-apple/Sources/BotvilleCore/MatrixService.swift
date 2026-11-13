@@ -999,7 +999,7 @@ public final class MatrixService: ObservableObject {
                                       participants: participants))
         }
         guard session == sessionGeneration, refresh == roomRefreshGeneration, isLoggedIn, !isLoggingOut else { return }
-        // A cancelled/replaced sync must not commit or arm the banner baseline.
+        // A cancelled/replaced sync must not publish its room snapshot.
         let committed = RoomRefreshCommitGate.commit(onlineGeneration: onlineSyncGeneration,
                                      currentGeneration: syncGeneration,
                                      isCancelled: Task.isCancelled) {
@@ -1036,56 +1036,6 @@ public final class MatrixService: ObservableObject {
         if let activeRoomID, !rooms.contains(where: { $0.id == activeRoomID && $0.membership == .joined }) {
             closeRoom(activeRoomID)
         }
-    }
-
-    /// `latestEvent()` reads the SDK's locally synced room state. Its current
-    /// API has no event ID, so candidate identity falls back to room + timestamp.
-    /// No notification payload parsing, profile fetch, or error-body logging.
-    static func foregroundBannerCandidate(for room: MatrixRoom, latest: LatestEventValue,
-                                          currentUserID: String?) -> ForegroundBannerCandidate? {
-        guard room.membership == .joined,
-              case let .remote(timestamp, sender, isOwn, profile, content) = latest else { return nil }
-        let preview: String
-        switch content {
-        case .msgLike(let message):
-            if case .redacted = message.kind { return nil }
-            if room.encryption == .encrypted {
-                // Match NSE privacy semantics even if this device has decrypted it.
-                preview = "加密消息"
-            } else {
-                switch message.kind {
-                case .unableToDecrypt: preview = "加密消息"
-                case .message(let message):
-                    preview = nonemptyBannerText(message.body) ?? PushNotificationText.placeholder.body
-                case .sticker(let body, _, _):
-                    preview = nonemptyBannerText(body) ?? PushNotificationText.placeholder.body
-                default: preview = PushNotificationText.placeholder.body
-                }
-            }
-        case .failedToParseMessageLike:
-            preview = room.encryption == .encrypted ? "加密消息" : PushNotificationText.unavailable.body
-        default:
-            // Membership, profile and other state changes are not new messages.
-            return nil
-        }
-        let displayName: String?
-        if case .ready(let name, _, _, _, _) = profile { displayName = name.flatMap(nonemptyBannerText) }
-        else { displayName = nil }
-        let roomName = nonemptyBannerText(room.name) ?? room.id
-        let title = room.isDirect ? (displayName ?? roomName) : roomName
-        return ForegroundBannerCandidate(
-            roomID: room.id, latestActivity: Date(timeIntervalSince1970: Double(timestamp) / 1_000),
-            title: truncatedBannerText(title, limit: 120), preview: truncatedBannerText(preview, limit: 240),
-            isOwn: isOwn || sender == currentUserID)
-    }
-
-    private static func nonemptyBannerText(_ text: String) -> String? {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private static func truncatedBannerText(_ text: String, limit: Int) -> String {
-        text.count > limit ? String(text.prefix(limit - 1)) + "…" : text
     }
 
     /// The consent is bound to the exact draft; editing recipients invalidates it.
