@@ -285,11 +285,30 @@ final class MatrixServiceLifecycleTests: XCTestCase {
             let client = FakeClient()
             let service = makeService(sessionStore: store, directory: temporary, client: client)
 
+            let blocked = expectation(description: "sync continuation installed")
+            client.blockNextSync = true
+            client.onSyncBlocked = { blocked.fulfill() }
+            defer { client.releaseBlockedSync() }
             await service.restoreSession()
+            await fulfillment(of: [blocked], timeout: 0.5)
+
+            let detached = expectation(description: "session no longer visible")
+            let completed = expectation(description: "auth error cleanup completed")
+            let visibility = service.$isLoggedIn.dropFirst().filter { !$0 }.sink { _ in detached.fulfill() }
+            let completion = service.$sessionError.compactMap { $0 }.sink { _ in completed.fulfill() }
+            defer { visibility.cancel(); completion.cancel() }
             client.emitAuthError(isSoftLogout: testCase.isSoftLogout)
-            try await waitUntil {
-                testCase.retainsStore ? service.requiresPasswordReauthentication : !service.isLoggedIn
-            }
+            await fulfillment(of: [detached], timeout: 0.5)
+
+            // isLoggedIn becomes false before the cancelled sync has drained.
+            // Keep that window open deterministically, then await the error
+            // published after cleanup instead of treating visibility as completion.
+            XCTAssertTrue(client.isSyncBlocked)
+            XCTAssertEqual(try store.load(), saved)
+            client.releaseBlockedSync()
+            await fulfillment(of: [completed], timeout: 0.5)
+            XCTAssertFalse(service.isLoggedIn)
+            XCTAssertEqual(service.requiresPasswordReauthentication, testCase.isSoftLogout)
 
             if testCase.retainsStore {
                 XCTAssertEqual(try store.load(), saved)

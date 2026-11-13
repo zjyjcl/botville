@@ -189,9 +189,12 @@ final class PairingPinningTests: XCTestCase {
     }
 
     func testTLSFixtureCleansPrivateKeyDirectoryWhenOpenSSLFails() throws {
-        let before = fixtureDirectories()
-        XCTAssertThrowsError(try TLSFixture(san: "IP:127.0.0.1", openssl: "/usr/bin/false"))
-        XCTAssertEqual(fixtureDirectories(), before)
+        // Observe only this test's fixtures: other test processes may create
+        // or remove their own certificates while OpenSSL is running.
+        let parent = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        XCTAssertThrowsError(try TLSFixture(san: "IP:127.0.0.1", openssl: "/usr/bin/false", parentDirectory: parent))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: parent.path), [])
     }
     func testRejectedTLSRequestMapsToCertificateMismatch() async throws {
         let directory = try makeTemporaryDirectory()
@@ -388,8 +391,9 @@ private final class TLSFixture {
     let issuerCertificate: URL?
     let fingerprint: Data
 
-    init(san: String?, eku: String? = "serverAuth", days: Int = 1, validity: Validity = .current, commonName: String = "127.0.0.1", issuer: Issuer = .selfSigned, openssl: String = "/usr/bin/openssl") throws {
-        directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent(".build/pairing-fixture-\(UUID().uuidString)")
+    init(san: String?, eku: String? = "serverAuth", days: Int = 1, validity: Validity = .current, commonName: String = "127.0.0.1", issuer: Issuer = .selfSigned, openssl: String = "/usr/bin/openssl", parentDirectory: URL? = nil) throws {
+        let parent = parentDirectory ?? URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent(".build")
+        directory = parent.appendingPathComponent("pairing-fixture-\(UUID().uuidString)")
         key = directory.appendingPathComponent("key.pem")
         certificate = directory.appendingPathComponent("cert.pem")
         issuerCertificate = issuer == .certificateAuthority ? directory.appendingPathComponent("ca-cert.pem") : nil
@@ -469,12 +473,6 @@ private final class TLSFixture {
         try contents.write(to: extensions, atomically: true, encoding: .utf8)
         try run(openssl, ["x509", "-req", "-in", request.path, "-CA", caCertificate.path, "-CAkey", caKey.path, "-CAcreateserial", "-out", certificate.path, "-days", String(days), "-extfile", extensions.path, "-extensions", "leaf"])
     }
-}
-
-private func fixtureDirectories() -> Set<String> {
-    let build = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent(".build")
-    let names = (try? FileManager.default.contentsOfDirectory(atPath: build.path)) ?? []
-    return Set(names.filter { $0.hasPrefix("pairing-fixture-") })
 }
 
 private func XCTAssertThrowsErrorAsync<T>(_ expression: @autoclosure () async throws -> T, _ handler: (Error) -> Void = { _ in }) async {
