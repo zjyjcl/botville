@@ -111,8 +111,9 @@ continuwuity 仍用 `memory`（尚无文件注册）。运维注意见
 
 | 方法 | 路径 | 契约 operationId | 说明 |
 |---|---|---|---|
-| GET | `/v1/personas` | `listPersonas` | 0.3.0：owner 摘要列表，含 bio（缺省 null） |
-| GET | `/v1/personas/{id}` | `getPersona` | 0.3.0：owner 摘要 / 本服非 owner 最小视图，含 bio；mood 当前 null |
+| GET | `/v1/personas` | `listPersonas` | 0.4.0：owner 摘要列表，含 bio（缺省 null），不含 mood |
+| GET | `/v1/personas/{id}` | `getPersona` | 0.4.0：owner 详情 / 本服非 owner 最小视图，含 bio 与 mood；列表项不加 mood |
+| GET/PATCH | `/v1/personas/{id}/state` | `getPersonaState` / `updatePersonaState` | 0.4.0：仅 owner 的 mood 与 mood_public，关闭时 404 `mood.disabled`，响应 no-store |
 | GET | `/health` | `getHealth` | 免鉴权；返回 Health 形态 |
 | POST | `/v1/policy/evaluate` | `evaluatePolicy` | 预检，不投递、不占额度 |
 | POST | `/v1/conversations/{id}/messages` | `sendMessage` | 完整裁决 + 投递 |
@@ -338,6 +339,8 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_EMBEDDING_API_KEY` | `GATEWAY_MODEL_API_KEY` | 可选 embedding 密钥；空时复用聊天模型密钥；不进日志、`/health`、错误体或 `repr` |
 | `GATEWAY_EMBEDDING_DIM` | `0` | `0` 接受首个响应维度并固定；正整数要求响应维度匹配；负数拒绝启动 |
 | `GATEWAY_MEMORY_VECTOR_BACKEND` | `python` | `none`、`python` 或 `sqlite-vec`；后者无法加载时静默回退 Python，仅 embedding 已配置时有效 |
+| `GATEWAY_MOOD_ENABLED` | `false` | 严格布尔。开启需 memory DB；未配置 DB 时记录 WARNING 并保持关闭，不拒绝启动 |
+| `GATEWAY_MOOD_HALF_LIFE_MINUTES` | `240` | 正整数 1–10080；越界或非法拒绝启动，错误不回显输入值。非 calm mood 在严格超过一个半衰期后读为 calm |
 | `GATEWAY_PERSONAS_FILE` | 空 | 只读人设 JSON（B2.4，契约 §1.7.8 ②）。空 = 无人设 → 内置引擎**永不发言**（消费者仍记录/计数）。启动期校验 schema / 本服 `@ai_*` / `credential_ref` 形状 / `max_reply_chars` 范围，非法**拒绝启动**（错误信息不回显文件内容）。示例见 [`examples/personas.example.json`](examples/personas.example.json)；**真实人设不进仓库** |
 | `GATEWAY_MODEL_BASE_URL` | 空 | OpenAI 兼容模型基址（B2.4，契约 §1.7.8 ⑫）。空 = **未配置模型**：引擎不发言、`/health` 不 degraded。非空时必须是 `http://` / `https://` URL。请求形如 `POST {BASE_URL}/chat/completions` |
 | `GATEWAY_MODEL_NAME` | 空 | 模型名。配置了 `GATEWAY_MODEL_BASE_URL` 时**必填**，否则拒绝启动。人设可用 `model` 字段覆盖 |

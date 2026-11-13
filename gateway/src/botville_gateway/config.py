@@ -149,6 +149,9 @@ DEFAULT_MODEL_TIMEOUT_SECONDS = 30
 DEFAULT_MEMORY_RETENTION_DAYS = 90
 DEFAULT_MEMORY_PURGE_INTERVAL_SECONDS = 86_400
 MEMORY_VECTOR_BACKENDS = frozenset({"none", "python", "sqlite-vec"})
+DEFAULT_MOOD_HALF_LIFE_MINUTES = 240
+MOOD_HALF_LIFE_MINUTES_MIN = 1
+MOOD_HALF_LIFE_MINUTES_MAX = 10_080
 
 # 部署路径前缀（GATEWAY_HTTP_PATH_PREFIX）的禁用片段：这些要么改变路径语义
 # （`//`、`..`），要么在拼 URL / 反代重写时会被提前截断或解码（`?` `#` `%`），
@@ -307,6 +310,20 @@ def _env_int_range(env: Mapping[str, str], name: str, default: int, *, minimum: 
     value = _env_int(env, name, default, minimum=minimum)
     if value > maximum:
         raise ConfigError(f"{name} must be <= {maximum}, got {value}")
+    return value
+
+
+def _env_mood_half_life(env: Mapping[str, str]) -> int:
+    """Read the mood decay period without reflecting a deployment value."""
+    raw = env.get("GATEWAY_MOOD_HALF_LIFE_MINUTES")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_MOOD_HALF_LIFE_MINUTES
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        raise ConfigError("GATEWAY_MOOD_HALF_LIFE_MINUTES must be an integer in range") from None
+    if not MOOD_HALF_LIFE_MINUTES_MIN <= value <= MOOD_HALF_LIFE_MINUTES_MAX:
+        raise ConfigError("GATEWAY_MOOD_HALF_LIFE_MINUTES must be in range")
     return value
 
 
@@ -546,6 +563,9 @@ class Config:
     embedding_api_key: Optional[str] = field(default=None, repr=False)
     embedding_dim: int = 0
     memory_vector_backend: str = "python"
+    # PR4b mood is persistent-memory backed and disabled by default.
+    mood_enabled: bool = False
+    mood_half_life_minutes: int = DEFAULT_MOOD_HALF_LIFE_MINUTES
 
     def __post_init__(self) -> None:
         # 构造时校验，避免明显错误的配置拖到第一次请求才炸。
@@ -716,6 +736,10 @@ class Config:
             raise ConfigError(
                 "GATEWAY_MEMORY_VECTOR_BACKEND must be one of none, python, sqlite-vec"
             )
+        if (not isinstance(self.mood_half_life_minutes, int)
+                or isinstance(self.mood_half_life_minutes, bool)
+                or not MOOD_HALF_LIFE_MINUTES_MIN <= self.mood_half_life_minutes <= MOOD_HALF_LIFE_MINUTES_MAX):
+            raise ConfigError("mood_half_life_minutes must be in range")
         # AS 回调：hs_token 强度校验（与 as_token 同规则；None/空串 = 未配置，合法）。
         # 未配置时网关照常启动，但 /_matrix/app/v1/* 一律 403。空串归一为 None，
         # 与 load_config 对 GATEWAY_HS_TOKEN="" 的处理一致（不触发下面的强度检查）。
@@ -1367,4 +1391,6 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         memory_vector_backend=_env_str(
             source, "GATEWAY_MEMORY_VECTOR_BACKEND", "python"
         ).lower(),
+        mood_enabled=_env_bool(source, "GATEWAY_MOOD_ENABLED", False),
+        mood_half_life_minutes=_env_mood_half_life(source),
     )

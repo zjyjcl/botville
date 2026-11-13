@@ -663,7 +663,7 @@ def check_examples(document, report):
     check_assemble_nonce_binding(report)
     # PR4d examples exercise the actual GET union, including a strict public allowlist.
     detail = resolve_pointer(document, "#/paths/~1personas~1{persona_id}/get/responses/200/content/application~1json/schema")
-    for name in ("PersonaSummary", "PersonaPublicView"):
+    for name in ("PersonaOwnerDetail", "PersonaPublicView"):
         schema = document["components"]["schemas"][name]
         payload = schema["example"]
         errors = validate(payload, schema, document) + validate(payload, detail, document)

@@ -50,6 +50,8 @@ from .as_txn_store import (
     build_as_txn_store,
 )
 from .memory.store import MemoryPurger, MemoryStore
+from .memory.mood import MoodService
+from .memory.mood_http import handle as handle_mood
 from .memory.owner_http import handle as handle_memory, MemoryHTTPState, capabilities
 from .engine import (
     EngineHooks,
@@ -493,6 +495,16 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             return
         self._send_json(200, page)
 
+    def _route_persona(self, path: str) -> None:
+        rest = path[len("/v1/personas/"):]
+        parts = rest.split("/")
+        if len(parts) == 2 and parts[1] == "state" and self.command in ("GET", "HEAD", "PATCH"):
+            handle_mood(self, parts[0])
+        elif len(parts) == 1 and self.command in ("GET", "HEAD"):
+            self._handle_persona_detail(rest)
+        else:
+            self._send_problem(404, "not_found", "Not Found")
+
     def _handle_persona_detail(self, encoded_id: str) -> None:
         if not self._auth_capabilities_ok(persona_detail=True):
             return
@@ -867,7 +879,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 self._handle_personas_list(query)
                 return
             if path.startswith("/v1/personas/"):
-                self._handle_persona_detail(path[len("/v1/personas/"):])
+                self._route_persona(path)
                 return
             if not self._auth_ok():
                 return
@@ -900,6 +912,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 return
             if _is_moments_path(path):
                 self._handle_moments()
+                return
+            if path.startswith("/v1/personas/"):
+                self._route_persona(path)
                 return
             if not self._auth_ok():
                 return
@@ -940,6 +955,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             if _is_moments_path(path):
                 self._handle_moments()
                 return
+            if path.startswith("/v1/personas/"):
+                self._route_persona(path)
+                return
             if not self._auth_ok():
                 return
             if path != "/v1/limits":
@@ -973,9 +991,11 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             if path == "/v1/memories" or path.startswith("/v1/memories/"):
                 handle_memory(self)
                 return
-            if path == "/v1/personas" or path.startswith("/v1/personas/"):
-                if self._auth_ok():
-                    self._send_problem(404, "not_found", "Not Found")
+            if path.startswith("/v1/personas/"):
+                self._route_persona(path)
+                return
+            if path == "/v1/personas":
+                self._send_problem(404, "not_found", "Not Found")
                 return
             if _is_moments_path(path):
                 # 先校验用户身份；鉴权失败已在 _auth_user_ok 里发响应。
@@ -1012,6 +1032,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         if _is_matrix_app_path(path):
             self._request_id()
             self._handle_as_matrix_path(path)
+            return
+        if path.startswith("/v1/personas/"):
+            self._route_persona(path)
             return
         self._method_not_allowed()
 
@@ -1404,6 +1427,12 @@ class GatewayServer(http.server.ThreadingHTTPServer):
             self.memory_purger = MemoryPurger(
                 self.memory_store, config.memory_purge_interval_seconds
             )
+        self.mood_service = None
+        if config.mood_enabled:
+            if self.memory_store is None:
+                logging.getLogger(__name__).warning("Mood disabled: memory database is not configured")
+            else:
+                self.mood_service = MoodService(self.memory_store, config.mood_half_life_minutes)
         self.memory_worker = None
         self.memory_idle = None
         self.memory_embedding = None
@@ -1602,6 +1631,7 @@ class GatewayServer(http.server.ThreadingHTTPServer):
             client=ModelClient(model_config),
             service=service,
             dedupe=PersistentSpeechDedupe(self.as_txn_store),
+            mood_service=self.mood_service,
             memory_store=self.memory_store,
             memory_embedding=self.memory_embedding,
             memory_vectors=self.memory_vectors,

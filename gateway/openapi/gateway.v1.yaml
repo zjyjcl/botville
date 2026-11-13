@@ -329,7 +329,7 @@ paths:
           description: 调用方 App 版本，用于按 min_app_version 过滤。
           schema:
             type: string
-            example: 0.4.0
+            example: 0.3.0
       responses:
         '200':
           description: 功能清单。
@@ -500,7 +500,7 @@ paths:
         按 id 升序；cursor 是最后返回 id 的无填充 base64url keyset 游标；
         畸形 cursor 或非法 limit（整数 1–100，默认 20）返回 400 request.invalid。
         最后一页 next_cursor=null。未配置文件时返回空页，与记忆模块开关无关。
-        单项 GET 已实现；写入与 state 操作尚未实现，保持 404；不发布 role.personas capability。
+        单项 GET 与 `/personas/{persona_id}/state` 已实现；列表不增加 mood，且不发布 role.personas capability。
       security: [{matrixOpenIdToken: []}, {matrixUserToken: []}, {bearerAuth: []}]
       parameters:
         - name: owner_id
@@ -581,8 +581,9 @@ paths:
       operationId: getPersona
       summary: 获取角色
       description: |
-        0.3.0 已实现：owner 返回与列表项完全一致的 PersonaSummary（含 bio）。
-        已认证本服非 owner 仅返回 id、display_name、bio、status、mood（当前 null）。
+        0.4.0：owner 返回 PersonaOwnerDetail（列表的十字段摘要加 mood）；列表项不增加 mood。
+        已认证本服非 owner 仅返回 id、display_name、bio、status、mood。mood 仅在 mood 模块开启且
+        `mood_public=true` 时为衰减后的标签，否则为 null。
         跨服身份、未知或非法 id、无 owner 人设统一返回 404 persona.not_found，不泄露存在性。
         legacy 或无 owner 身份返回 403 persona.not_owned；未认证按既有约定返回 401。
         bio 仅由 owner 在 personas 文件维护，最多 500 Unicode 码点，模型不得生成或修改。
@@ -596,7 +597,7 @@ paths:
             application/json:
               schema:
                 anyOf:
-                  - $ref: '#/components/schemas/PersonaSummary'
+                  - $ref: '#/components/schemas/PersonaOwnerDetail'
                   - $ref: '#/components/schemas/PersonaPublicView'
         '401':
           $ref: '#/components/responses/Unauthorized'
@@ -677,12 +678,17 @@ paths:
       tags: [Personas]
       operationId: getPersonaState
       summary: 获取角色状态
-      description: 返回心情、需求与今日主动发言预算，用于 App 的角色页（C2.4）与多 AI 群调度。
+      description: |
+        仅角色 owner；使用与 `/personas` 相同的 caller token、Matrix OpenID 或用户 Bearer 鉴权。
+        响应 `Cache-Control: no-store`。mood 模块关闭时，在 owner 校验后返回 404 `mood.disabled`。
+        其它未实现的 `/personas/{persona_id}/*` 子路径一律为 404 `not_found`。
+      security: [{matrixOpenIdToken: []}, {matrixUserToken: []}, {bearerAuth: []}]
       parameters:
         - $ref: '#/components/parameters/PersonaId'
       responses:
         '200':
           description: 角色状态。
+          headers: {Cache-Control: {$ref: '#/components/headers/CacheControl'}}
           content:
             application/json:
               schema:
@@ -693,6 +699,10 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -700,7 +710,11 @@ paths:
       tags: [Personas]
       operationId: updatePersonaState
       summary: 更新角色状态
-      description: 更新心情或需求水平（事件驱动）。网关会对超出范围的值返回 422。
+      description: |
+        仅角色 owner。可更新 `mood`（source 写为 owner）和/或 `mood_public`；至少提供一项。
+        未知字段、空对象、类型错误或不在请求侧封闭枚举中的 mood 返回 422。沿用 owner memory
+        写入限流与无正文审计模式；响应 `Cache-Control: no-store`。
+      security: [{matrixOpenIdToken: []}, {matrixUserToken: []}, {bearerAuth: []}]
       parameters:
         - $ref: '#/components/parameters/PersonaId'
       requestBody:
@@ -712,6 +726,7 @@ paths:
       responses:
         '200':
           description: 更新后的角色状态。
+          headers: {Cache-Control: {$ref: '#/components/headers/CacheControl'}}
           content:
             application/json:
               schema:
@@ -726,6 +741,10 @@ paths:
           $ref: '#/components/responses/NotFound'
         '422':
           $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -2730,9 +2749,39 @@ components:
         visibility: {type: string, enum: [private]}
 
     PersonaMood:
-      description: 可选枚举标签，允许 null 或缺省；PR4b 实现前详情一律返回 null，不返回情绪对象。枚举为暂定集合，PR4b 可能扩展，客户端遇到未知值须按缺省处理（与 PersonaState.mood.label 对齐）。
+      description: 可选公开情绪标签。响应侧为开放枚举；客户端遇到未知值须按 null/缺省处理。
       type: [string, "null"]
-      enum: [neutral, happy, sad, excited, calm, anxious, null]
+      enum: [calm, happy, sad, excited, tired, null]
+
+    PersonaOwnerDetail:
+      description: owner 的详情视图；列表 `PersonaSummary` 保持不含 mood。
+      type: object
+      additionalProperties: false
+      required: [id, owner_id, display_name, bio, kind, status, revision, created_at, updated_at, visibility, mood]
+      example:
+        id: '@ai_demo:example.invalid'
+        owner_id: '@owner:example.invalid'
+        display_name: Demo
+        bio: '你好，世界。'
+        kind: custom
+        status: active
+        revision: 1
+        created_at: '2026-11-13T00:00:00Z'
+        updated_at: '2026-11-13T00:00:00Z'
+        visibility: private
+        mood: calm
+      properties:
+        id: {type: string}
+        owner_id: {type: string}
+        display_name: {type: string}
+        bio: {type: [string, "null"], maxLength: 500}
+        kind: {type: string, enum: [custom]}
+        status: {type: string, enum: [active]}
+        revision: {type: integer, enum: [1]}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        visibility: {type: string, enum: [private]}
+        mood: {$ref: '#/components/schemas/PersonaMood'}
 
     PersonaPublicView:
       example:
@@ -2834,92 +2883,34 @@ components:
           description: 可选。与当前 revision 不一致时返回 409。
       additionalProperties: false
 
-    MoodInput:
-      type: object
-      properties:
-        label:
-          type: string
-          maxLength: 32
-        valence:
-          type: number
-          minimum: -1
-          maximum: 1
-        arousal:
-          type: number
-          minimum: 0
-          maximum: 1
-      additionalProperties: false
-
     PersonaState:
       type: object
-      required: [persona_id, mood, needs, updated_at]
+      additionalProperties: false
+      required: [persona_id, mood, mood_public, updated_at]
       properties:
         persona_id:
           type: string
         mood:
           type: object
-          required: [label, valence, arousal, updated_at]
+          required: [label, source, set_at]
+          additionalProperties: false
           properties:
-            label:
-              type: string
-            valence:
-              type: number
-              minimum: -1
-              maximum: 1
-            arousal:
-              type: number
-              minimum: 0
-              maximum: 1
-            updated_at:
-              type: string
-              format: date-time
-        needs:
-          type: array
-          items:
-            type: object
-            required: [key, level]
-            properties:
-              key:
-                type: string
-                example: social
-              level:
-                type: number
-                minimum: 0
-                maximum: 1
-        proactive:
-          type: object
-          properties:
-            remaining_today:
-              type: integer
-              minimum: 0
-            reset_at:
-              type: string
-              format: date-time
+            label: {type: string, enum: [calm, happy, sad, excited, tired]}
+            source: {type: string, enum: [rule, owner]}
+            set_at: {type: [string, "null"], format: date-time}
+        mood_public: {type: boolean, default: true}
         updated_at:
-          type: string
+          type: [string, "null"]
           format: date-time
 
     UpdatePersonaStateRequest:
       type: object
+      minProperties: 1
       properties:
         mood:
-          $ref: '#/components/schemas/MoodInput'
-        needs:
-          type: array
-          items:
-            type: object
-            required: [key, level]
-            properties:
-              key:
-                type: string
-              level:
-                type: number
-                minimum: 0
-                maximum: 1
-        reason:
           type: string
-          maxLength: 200
-          description: 事件来源说明，写入审计。
+          enum: [calm, happy, sad, excited, tired]
+        mood_public: {type: boolean}
       additionalProperties: false
 
     # ----- 会话 -----
@@ -4293,7 +4284,7 @@ components:
         contract_version:
           type: string
           description: 生成该清单的网关契约版本。
-          example: 0.3.0
+          example: 0.4.0
         generated_at:
           type: string
           format: date-time
@@ -5063,7 +5054,7 @@ components:
         contract_version:
           type: string
           description: 本响应遵循的契约版本。
-          example: 0.3.0
+          example: 0.4.0
         started_at:
           type: string
           format: date-time
