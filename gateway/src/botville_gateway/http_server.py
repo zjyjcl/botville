@@ -840,14 +840,16 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             if _is_moments_path(path):
                 self._handle_moments()
                 return
+            if path == "/v1/capabilities":
+                if self._auth_capabilities_ok():
+                    self._send_json(200, capabilities(self.server, query))
+                return
             if path == "/v1/personas":
                 self._handle_personas_list(query)
                 return
             if not self._auth_ok():
                 return
-            if path == "/v1/capabilities":
-                self._send_json(200, capabilities(self.server, query))
-            elif path == "/v1/limits":
+            if path == "/v1/limits":
                 self._handle_get_limits(query)
             elif path == "/v1/usage":
                 self._handle_get_usage(query)

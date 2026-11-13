@@ -27,7 +27,11 @@ An end-to-end core path runs (Compose deployment → gateway → app), while qui
 | [app-apple/](app-apple/README.md) | 🔧 α 原型 / alpha prototype：密码登录、房间与消息、断线恢复（本地 Synapse 验证）；[扫码配对契约](docs/contracts/pairing-qr.md)（含 #132 `fp` SPKI pin），App 端 PairingTLS 已实现（SDK 内部请求无法固定：已知边界，见 [pairing-qr.md §3.3.3](docs/contracts/pairing-qr.md)），兑换暂走 mock、服务端兑换端点未实现；前台时 App 内自绘横幅（in-app banner），后台/被杀时走 NSE 推送扩展（按事件 ID 拉取正文、会话跳转与未读角标）。真机 APNs 送达、完整 UI 验收与 TestFlight 未完成。Login/rooms/messaging verified against a local Synapse; QR pairing with SPKI pinning (SDK-internal requests can't be pinned — known boundary, see [pairing-qr.md §3.3.3](docs/contracts/pairing-qr.md); mock redeem, server endpoint not yet implemented); in-app banner when foregrounded, NSE push extension when backgrounded/killed; real-device APNs, full UI acceptance and TestFlight pending. |
 | [town/](town/README.md) | 📋 规划 / planning（M4）：仅有 README，无代码。README only, no code yet. |
 
-尚未实现或未验收（举例）/ Not yet implemented or accepted (examples)：安装向导（A3.1）、TestFlight 分发（C3.2）、网关记忆/心情/角色引擎（B2.4–B2.8）、动态跨服（A2.2 剩余；同服已落地）、通知投递与授权回调（D2.1+）、桥接（D2.3）、小镇全部（M4）。Install wizard, TestFlight, gateway memory/mood/persona engine, cross-server moments (single-server moments already works), notification delivery & approval callbacks, bridges, and the whole town module.
+- 网关记忆（B2.6）：已落地，默认关闭；包含四层记忆与 owner 管理 HTTP API，尚不代表生产验收完成。
+- 角色引擎（B2.4）：简单接入对话引擎已有实现（API、人设与 Matrix 事件消费），完整产品验收仍待完成。
+- mood（情绪，B2.5）：尚未实现完整的情绪、需求驱动与主动发言机制。
+
+尚未实现或未验收（举例）/ Not yet implemented or accepted (examples)：安装向导（A3.1）、TestFlight 分发（C3.2）、动态跨服（A2.2 剩余；同服已落地）、通知投递与授权回调（D2.1+）、桥接（D2.3）、小镇全部（M4）。Install wizard, TestFlight, cross-server moments, notification delivery & approval callbacks, bridges, and the whole town module. Future work includes mood-driven behavior; memory and the basic persona engine are implemented but not production-accepted.
 
 ## 模块 / Modules
 
