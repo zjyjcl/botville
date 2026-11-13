@@ -356,6 +356,18 @@ class AppServiceMatrixTransport:
         )
         return resp.get("room_id") or room_id
 
+    def joined_rooms(self, user_id: str):
+        """Read memberships as the persona; raw routing IDs stay in memory."""
+        self._check_sender(user_id)
+        response = self._request(
+            "GET", "/_matrix/client/v3/joined_rooms", query={"user_id": user_id},
+            timeout=MEMBER_LOOKUP_TIMEOUT_SECONDS)
+        rooms = response.get("joined_rooms") if isinstance(response, dict) else None
+        if not isinstance(rooms, list) or any(not isinstance(room, str) or not room.startswith("!")
+                                               for room in rooms):
+            raise DeliveryError("matrix.unavailable", "Invalid membership response")
+        return rooms
+
     def leave(self, room_id: str, user_id: str) -> None:
         """Leave a room using the sender's AS masquerade identity."""
         self._check_sender(user_id)

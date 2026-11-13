@@ -88,6 +88,40 @@ class GroupInvites:
     def is_accepted(self, persona, room):
         return self._state(persona, room) == 'accepted'
 
+    def update_room(self, persona, room_ref, body):
+        from .group_rooms_http import RoomError, room_item
+        if self.store is None:
+            raise RoomError(404, 'room.not_found')
+        with self._lock:
+            with self.store._lock:
+                row = self.store._db.execute(
+                    'SELECT * FROM group_rooms WHERE persona_id=? AND room_key=? AND key_id=?',
+                    (persona, room_ref, self.store.group_key_id())).fetchone()
+            if row is None:
+                raise RoomError(404, 'room.not_found')
+            if 'mode' in body and row['state'] not in ('accepted', 'encrypted_disabled'):
+                raise RoomError(409, 'room.state_conflict')
+            if body.get('action') == 'leave':
+                # Fail closed until the cleanup persistence boundary is resolved.
+                raise RoomError(503, 'room.unavailable')
+            with self.store._lock, self.store._db:
+                self.store._db.execute(
+                    'UPDATE group_rooms SET mode=?,updated_at=? WHERE persona_id=? AND room_key=? AND key_id=?',
+                    (body['mode'], time.time(), persona, room_ref, self.store.group_key_id()))
+                row = self.store._db.execute(
+                    'SELECT * FROM group_rooms WHERE persona_id=? AND room_key=? AND key_id=?',
+                    (persona, room_ref, self.store.group_key_id())).fetchone()
+            return room_item(row)
+
+    def is_muted(self, persona, room):
+        if self.store is None:
+            return False
+        with self.store._lock:
+            row = self.store._db.execute(
+                "SELECT mode FROM group_rooms WHERE persona_id=? AND room_key=? AND key_id=?",
+                (persona, self._key('room', room), self.store.group_key_id())).fetchone()
+        return bool(row and row[0] == 'muted')
+
     def is_throttled(self, persona, room):
         entry = self.personas.get(persona)
         return bool(self.enabled and entry and entry.groups.get('enabled', False)

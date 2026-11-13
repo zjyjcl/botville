@@ -1,7 +1,7 @@
 {
   "status": "ok",
   "version": "0.1.0",
-  "contract_version": "0.5.0",
+  "contract_version": "0.6.0",
   "started_at": "2026-11-03T00:00:00Z",
   "uptime_seconds": 86400,
   "checks": [
