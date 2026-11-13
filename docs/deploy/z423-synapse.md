@@ -289,7 +289,7 @@ make backup
 | --- | --- |
 | `synapse-db.dump` | `pg_dump -Fc` 数据库快照（postgres 保持运行中导出） |
 | `synapse-data.tar.gz` | `media_store`、`signing.key`（短暂停 synapse 保证与数据库一致） |
-| `gateway-data.tar.gz` | （可选）compose 卷 `gateway-data` 的**整卷** `tar`（卷根目录下的全部文件，不限 `.db`）。打包期间暂停正在运行的 gateway 容器；打包前仅对**卷顶层** `*.db` 做 `PRAGMA wal_checkpoint(TRUNCATE)`（sqlite3 CLI，没有则用镜像里的 python3），不递归子目录。**卷不存在则跳过，不写此文件**（没用过 `GATEWAY=1` 的栈没有该卷）。旧备份没有此文件时，恢复不碰该卷 |
+| `gateway-data.tar.gz` | （可选）compose 卷 `gateway-data` 的**整卷** `tar`（卷根目录下的全部文件，不限 `.db`）。打包期间暂停正在运行的 gateway 容器；打包前对卷内**所有** `*.db`（含子目录）做 `PRAGMA wal_checkpoint(TRUNCATE)`（sqlite3 CLI，没有则用镜像里的 python3）。恢复后卷内所有 SQLite 文件（`*.db` 及 `-wal`/`-shm`）显式 `chmod 600`。**卷不存在则跳过，不写此文件**（没用过 `GATEWAY=1` 的栈没有该卷）。旧备份没有此文件时，恢复不碰该卷 |
 | `homeserver.yaml` | 渲染后的 Synapse 配置副本 |
 | `env` | `.env` 副本，**含全部密钥**（网关密钥若写在这份 `.env` 里会随它备份；`gateway-data` 卷只含业务数据，不另存密钥） |
 | `manifest.txt` | 备份时间、镜像、每个文件的 sha256（有 `gateway-data.tar.gz` 时也列入） |
@@ -348,8 +348,11 @@ curl -s http://127.0.0.1:8020/health   # 端口 = .env 的 BOTVILLE_GATEWAY_PORT
 `GATEWAY_MODEL_API_KEY` / `GATEWAY_MODEL_TIMEOUT_SECONDS` / `GATEWAY_PERSONAS_FILE` /
 `GATEWAY_CONSUMER_ENABLED` 和记忆变量 `GATEWAY_MEMORY_DB_PATH`（空 = 关闭；启用写
 `/var/lib/botville-gateway/memory.db`，0600，在 gateway-data 卷里随备份走）/
-`GATEWAY_MEMORY_RETENTION_DAYS` / `GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS` 从 `.env`
-透传给网关（init.sh 不生成，开关默认关）；
+`GATEWAY_MEMORY_RETENTION_DAYS` / `GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS`，以及 PR3b 的
+`GATEWAY_MEMORY_SUMMARY_MODEL` / `GATEWAY_EMBEDDING_BASE_URL` / `GATEWAY_EMBEDDING_MODEL` /
+`GATEWAY_EMBEDDING_API_KEY`（密钥）/ `GATEWAY_EMBEDDING_DIM` / `GATEWAY_MEMORY_VECTOR_BACKEND`
+从 `.env` 透传给网关（init.sh 不生成，开关默认关；设了 embedding 模型后私聊正文会发给
+embedding 服务商，地址留空即聊天模型同一家）；
 人设目录 `server/compose/gateway-personas/` 只读挂到 `/etc/botville-gateway`（真实人设
 gitignore）。只有开关打开、配了模型并且配了人设，AI 才会开口。API key 只放本地
 `.env`，不要贴 `docker compose config` 的输出（用 `--quiet`）。详见
@@ -363,7 +366,7 @@ HS→网关 ping；`@ai_*` 所在房间的消息被推送并落进 `as_transacti
 网关挂载 compose 卷 `gateway-data`（实际名 `<项目名>_gateway-data`）到
 `/var/lib/botville-gateway`，`GATEWAY_MOMENTS_DB_PATH=/var/lib/botville-gateway/moments.db`，
 启动时自动执行镜像内的 moments 迁移；AS 事务库 `as_transactions.db` 也在卷顶层，
-随卷一起备份（备份前对顶层 `*.db` 做 WAL checkpoint）和恢复。删除语义：
+随卷一起备份（备份前对卷内所有 `*.db` 做 WAL checkpoint）和恢复（SQLite 文件恢复为 0600）。删除语义：
 
 - `make down` **不传** `-v`，不删除任何卷（包括 `gateway-data`）。
 - `docker compose ... --profile gateway down -v`（只要带上 gateway profile，与网关
@@ -389,8 +392,8 @@ make restore-gateway RESTORE_DIR=backups/<时间戳>      # 备份里没有 gate
 
 产物同样落在 `./backups/<UTC时间戳>/`（`gateway-data.tar.gz` + `manifest.txt`，目录 700、
 文件 600），**不含 `.env`**——网关密钥只在 `.env` 里，请另行保管 `.env`；卷内只有业务
-数据。两套脚本共用 `server/scripts/lib.sh` 的同一份归档/恢复逻辑（暂停网关容器、顶层
-`*.db` 的 WAL checkpoint、整卷 tar、manifest sha256 校验）。联邦栈（botville-fed）没有
+数据。两套脚本共用 `server/scripts/lib.sh` 的同一份归档/恢复逻辑（暂停网关容器、卷内
+所有 `*.db` 的 WAL checkpoint、整卷 tar、manifest sha256 校验、恢复后 SQLite 文件 0600）。联邦栈（botville-fed）没有
 网关服务、也没有 `gateway-data` 卷，不涉及。
 保留天数沿用现有备份目录清理惯例（下文 crontab 的 14 天，同一个 `backups/` 目录），
 本卷不另设保留期。

@@ -51,7 +51,9 @@ make down            # 停止（不传 -v，不删任何卷）。清卷：docker
 `/var/lib/botville-gateway/memory.db`（gateway-data 卷顶层，`make backup` /
 `make restore` 自动覆盖）。网关以 0600 创建这个文件，里面有聊天内容，备份同样要私密。
 `GATEWAY_MEMORY_RETENTION_DAYS`（默认 90）、`GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS`
-（默认 86400）同样透传。
+（默认 86400）同样透传。PR3b 的 `GATEWAY_MEMORY_SUMMARY_MODEL` / `GATEWAY_EMBEDDING_*` /
+`GATEWAY_MEMORY_VECTOR_BACKEND` 也透传（embedding 默认关）。**设了 `GATEWAY_EMBEDDING_MODEL`，私聊正文就会
+发给 embedding 服务商**（地址留空 = 聊天模型同一家）；`GATEWAY_EMBEDDING_API_KEY` 是密钥，只放本地 `.env`。
 
 
 continuwuity 默认关闭上游 announcements 检查（避免 SIGTERM 卡到 SIGKILL）：见 [docs/ops/continuwuity-announcements.md](../docs/ops/continuwuity-announcements.md)。

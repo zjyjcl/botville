@@ -6,8 +6,8 @@ lib.sh helpers they use together with backup-synapse.sh/restore-synapse.sh.
 tuwunel and continuwuity have no homeserver backup script, so these two
 scripts are how their gateway-data gets backed up. Semantics match #188:
 gateway-data.tar.gz; skip when the volume is absent; a backup without the
-artifact leaves an existing volume untouched; WAL checkpoint only for
-top-level *.db; a running gateway container is stopped around the archive.
+artifact leaves an existing volume untouched; WAL checkpoint for every
+*.db in the volume (subdirectories too); a running gateway container is stopped around the archive.
 
 No Docker: a fake `docker` (logs calls; `volume inspect` and `ps` are
 scriptable via env) and a fake COMPOSE prefix. Standard library only.
@@ -174,14 +174,14 @@ class BackupGatewayDataTest(GatewayDataScriptsCase):
         self.assertIn(" gateway -c ", run[0])
         self.assertEqual((self.tmp / "backups" / ".last-backup").read_text().strip(), str(self.out))
 
-    def test_checkpoint_is_top_level_only(self):
+    def test_checkpoint_covers_subdirectories(self):
+        """#206 nit: every *.db in the volume (any depth) is checkpointed."""
         proc = self.run_script("backup-gateway-data.sh")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         run = "\n".join(self.lines(self.compose_log))
-        self.assertIn("for db in /gateway-data/*.db", run)
+        self.assertIn('find /gateway-data -type f -name "*.db" | while IFS= read -r db; do', run)
         self.assertIn("wal_checkpoint(TRUNCATE)", run)
-        self.assertNotIn("find /gateway-data", run)
-        self.assertNotIn("**", run)
+        self.assertNotIn("for db in /gateway-data/*.db", run)
 
     def test_running_gateway_is_stopped_and_started(self):
         proc = self.run_script("backup-gateway-data.sh", ps="abc123")
@@ -315,6 +315,88 @@ class GatewayUidConsistencyTest(unittest.TestCase):
         self.assertRegex(dockerfile, r"(?m)^USER 10001:10001$")
         self.assertIn("--uid 10001", dockerfile)
 
+
+
+class GatewayArchiveRestoreScriptsRunTest(unittest.TestCase):
+    """Run lib.sh's real in-container scripts against a sandbox directory
+    (paths /gateway-data and /backup rewritten; owner = the test user):
+    the WAL checkpoint reaches *.db in subdirectories, and restore forces
+    every SQLite file to 0600 (#206 nits)."""
+
+    def script(self, name):
+        proc = subprocess.run(
+            ["bash", "-c", 'source "$1" && printf "%s" "${!2}"', "x",
+             str(SCRIPTS / "lib.sh"), name],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True)
+        return proc.stdout
+
+    def sandboxed(self, text, data, backup):
+        uid_gid = "{}:{}".format(os.getuid(), os.getgid())
+        text = text.replace('chown -R "$GATEWAY_UID:$GATEWAY_UID"', "chown -R " + uid_gid)
+        archive = "/backup/gateway-data.tar.gz"
+        self.assertIn(archive, text)
+        text = text.replace(archive, "@ARCHIVE@").replace("/gateway-data", str(data))
+        self.assertNotIn("/backup", text)
+        return text.replace("@ARCHIVE@", str(backup / "gateway-data.tar.gz"))
+
+    def run_sh(self, text):
+        env = dict(os.environ, HOST_UID=str(os.getuid()), HOST_GID=str(os.getgid()))
+        return subprocess.run(["sh", "-c", text], env=env, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=60)
+
+    def test_archive_checkpoints_nested_db_and_restore_chmods_600(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            data, backup, live = tmp / "data", tmp / "backup", tmp / "live"
+            for d in (data / "sub", backup, live):
+                d.mkdir(parents=True)
+            # A WAL-mode db with rows still only in the -wal file: copy the
+            # files while a connection is open (as if the process had stopped).
+            conn = sqlite3.connect(str(live / "nested.db"))
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA wal_autocheckpoint=0")
+            conn.execute("CREATE TABLE t (v TEXT)")
+            conn.executemany("INSERT INTO t VALUES (?)", [("row",)] * 50)
+            conn.commit()
+            for suffix in ("", "-wal"):
+                shutil.copy(str(live / ("nested.db" + suffix)), str(data / "sub" / ("nested.db" + suffix)))
+            conn.close()
+            (data / "top.db").write_bytes((data / "sub" / "nested.db").read_bytes())
+            self.assertGreater((data / "sub" / "nested.db-wal").stat().st_size, 0)
+
+            proc = self.run_sh(self.sandboxed(self.script("GATEWAY_ARCHIVE_SH"), data, backup))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            wal = data / "sub" / "nested.db-wal"
+            self.assertTrue(not wal.exists() or wal.stat().st_size == 0,
+                            "nested db was not checkpointed")
+            archive = backup / "gateway-data.tar.gz"
+            self.assertEqual(stat.S_IMODE(archive.stat().st_mode), 0o600)
+
+            # Loosen modes, then restore: SQLite files come back 0600, other
+            # files keep their mode.
+            for f in data.rglob("*"):
+                if f.is_file():
+                    f.chmod(0o644)
+            (data / "notes.txt").write_text("x", encoding="utf-8")
+            (data / "notes.txt").chmod(0o644)
+            subprocess.run(["tar", "-czf", str(archive), "-C", str(data), "."],
+                           stdin=subprocess.DEVNULL, check=True)
+            shutil.rmtree(str(data))
+            data.mkdir()
+            (data / "stale.db").write_text("old", encoding="utf-8")
+            proc = self.run_sh(self.sandboxed(self.script("GATEWAY_RESTORE_SH"), data, backup))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertFalse((data / "stale.db").exists())
+            for rel in ("top.db", "sub/nested.db"):
+                self.assertEqual(stat.S_IMODE((data / rel).stat().st_mode), 0o600, rel)
+            for side in data.rglob("*.db-*"):
+                self.assertEqual(stat.S_IMODE(side.stat().st_mode), 0o600, side.name)
+            self.assertEqual(stat.S_IMODE((data / "notes.txt").stat().st_mode), 0o644)
+            # The checkpointed rows are in the main file alone.
+            check = sqlite3.connect(str(data / "sub" / "nested.db"))
+            self.assertEqual(check.execute("SELECT count(*) FROM t").fetchone()[0], 50)
+            check.close()
 
 if __name__ == "__main__":
     unittest.main()

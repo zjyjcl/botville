@@ -9,8 +9,8 @@
 #
 #   gateway-data.tar.gz  full-volume tar of <project>_gateway-data; a running
 #                        gateway container is stopped around the archive and
-#                        top-level /gateway-data/*.db get a WAL checkpoint
-#                        (not recursive) first
+#                        every *.db in the volume (subdirectories too) gets
+#                        a WAL checkpoint first
 #   manifest.txt         backup time, project, sha256 + size
 #
 # If the volume does not exist (the gateway profile never ran), nothing is

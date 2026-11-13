@@ -6,7 +6,8 @@
   random user is created only on a confirmed password mismatch, never when
   whoami/login merely fail.
 - nothing secret is printed: AS/HS tokens, the registration token, the
-  fixture password/token (stored or derived), nor GATEWAY_MODEL_API_KEY.
+  fixture password/token (stored or derived), nor GATEWAY_MODEL_API_KEY /
+  GATEWAY_EMBEDDING_API_KEY from the env file.
 """
 
 import contextlib
@@ -30,6 +31,7 @@ SECRETS = {
     "APPSERVICE_HS_TOKEN": "sentinel-hs-token-0123456789abcdef0123456789",
     "BOTVILLE_REGISTRATION_TOKEN": "sentinel-registration-token-0123456789",
     "GATEWAY_MODEL_API_KEY": "sentinel-model-key-must-not-print-0123456789",
+    "GATEWAY_EMBEDDING_API_KEY": "sentinel-embedding-key-must-not-print-0123456789",
 }
 USER_TOKEN = "sentinel-user-access-token-0123456789"
 PASSWORD = "sentinel-fixture-password-0123456789"

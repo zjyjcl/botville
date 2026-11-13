@@ -15,8 +15,8 @@
 #                        exists; omitted otherwise so a stack without the
 #                        gateway profile still backs up cleanly. A running
 #                        gateway container is stopped around the archive;
-#                        PRAGMA wal_checkpoint(TRUNCATE) runs on top-level
-#                        /gateway-data/*.db only (not recursive) before tar.
+#                        PRAGMA wal_checkpoint(TRUNCATE) runs on every
+#                        *.db in the volume (subdirectories too) before tar.
 #                        Same helper as backup-gateway-data.sh (lib.sh).
 #   homeserver.yaml      copy of server/compose/generated/synapse/homeserver.yaml
 #   env                  copy of server/compose/.env -- CONTAINS SECRETS
@@ -118,7 +118,7 @@ compose run --rm --no-deps --entrypoint sh \
 #    archive the whole volume through a one-off container on the synapse
 #    image (already pulled for this backup; no extra image) with the shared
 #    lib.sh helper, which also stops/starts a running gateway container and
-#    does the top-level *.db WAL checkpoint (see archive_gateway_data).
+#    does the *.db WAL checkpoint (whole volume; see archive_gateway_data).
 artifacts=(synapse-db.dump synapse-data.tar.gz homeserver.yaml env)
 gateway_vol="$(gateway_data_volume)"
 if docker_volume_exists "${gateway_vol}"; then
