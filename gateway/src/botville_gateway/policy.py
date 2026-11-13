@@ -617,8 +617,10 @@ class PolicyEngine:
                 text_digest("group-room:" + room, self._config.hmac_secret))
 
     def record_group_send(self, persona, room, at):
-        # Called only by service's successful, deduplicated commit under its lock.
-        persona, room = self.normalize_group_target(persona, room)
+        """Record a successful send; caller must pass normalized (persona, room).
+
+        Called only by service's successful, deduplicated commit under its lock.
+        """
         if self.group_invites is None or not self.group_invites.is_throttled(persona, room):
             return
         key = self._group_key(persona, room)

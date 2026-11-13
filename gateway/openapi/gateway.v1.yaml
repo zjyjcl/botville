@@ -17,7 +17,7 @@ info:
     负责消息传输；本契约只覆盖网关自己的控制面（角色、会话登记、发言裁决、三层限额、
     用量账单、功能清单与通用卡片），不重复定义 Matrix 协议。
 
-    当前为 **0.5.0 草案**（M0），供 C 线（App）与 D 线（通知 / 开放 API）评审。
+    当前为 **0.6.0 草案**（M0），供 C 线（App）与 D 线（通知 / 开放 API）评审。
     版本规则见 `gateway/docs/contract.md#版本规则`：`/v1` 路径、只增不删、破坏性变更升主版本。
 
     所有示例、令牌与密钥均为占位符（`<change-me>`），本契约不含任何真实凭据。
@@ -752,13 +752,13 @@ paths:
           content:
             application/problem+json:
               schema: {$ref: '#/components/schemas/Problem'}
-              example: {type: 'urn:botville:error:room.not_found', title: Room not found, status: 404, code: room.not_found, request_id: example-request}
+              example: {type: 'urn:botville:error:room.not_found', title: Room request rejected, status: 404, code: room.not_found, request_id: example-request}
         '409':
           description: 当前房间状态不允许设置 mode。
           content:
             application/problem+json:
               schema: {$ref: '#/components/schemas/Problem'}
-              example: {type: 'urn:botville:error:room.state_conflict', title: Room state conflict, status: 409, code: room.state_conflict, request_id: example-request}
+              example: {type: 'urn:botville:error:room.state_conflict', title: Room request rejected, status: 409, code: room.state_conflict, request_id: example-request}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
 
   /personas/{persona_id}/state:
@@ -1191,6 +1191,7 @@ paths:
       description: |
         在不投递的情况下评估一次发言是否会被允许，供 AI 在花 token 之前决定「要不要说」。
         返回完整的 `PolicyDecision`（命中层级、剩余额度、重置时间、原因）。
+        会话解析失败返回 404 conversation.not_found；非法会话标识返回 400 request.invalid（errors 字段 conversation_id，code conversation.invalid），错误不回显原始标识。
         预检结果不占用额度，也不保证稍后发送一定成功（额度可能被并发消耗）。
 
         目标会话 `encryption=e2ee` 或 `ai_participation=disabled` 时返回 `403` `conversation.e2ee`
@@ -1241,7 +1242,20 @@ paths:
                     code: conversation.e2ee
                     request_id: req_demo_e2ee_policy
         '404':
-          $ref: '#/components/responses/NotFound'
+          description: 会话无法解析。
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+              examples:
+                conversation_not_found:
+                  value:
+                    type: urn:botville:error:conversation.not_found
+                    title: Conversation not found
+                    status: 404
+                    detail: Conversation could not be resolved
+                    instance: /v1/policy/evaluate
+                    code: conversation.not_found
+                    request_id: req_demo_policy_not_found
         '422':
           $ref: '#/components/responses/UnprocessableEntity'
         '500':
