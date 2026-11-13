@@ -7,6 +7,13 @@ import XCTest
 
 @MainActor
 final class UnreadBannerProbeTests: XCTestCase {
+    func testDuplicateRoomIDsKeepLastUnreadValue() {
+        let rooms = [MatrixRoom(id: "!duplicate:test", name: "first", unreadCount: 8),
+                     MatrixRoom(id: "!other:test", name: "other", unreadCount: 3),
+                     MatrixRoom(id: "!duplicate:test", name: "last", unreadCount: 0)]
+        XCTAssertEqual(UnreadBannerProbeLog.unreadSnapshot(rooms), ["!duplicate:test": 0, "!other:test": 3])
+    }
+
     func testFingerprintIsExactlyEightLowercaseSHA256HexCharacters() {
         XCTAssertEqual(UnreadBannerProbeLog.fingerprint("abc"), "ba7816bf")
         XCTAssertNotNil(UnreadBannerProbeLog.fingerprint("!room:test").range(of: "^[0-9a-f]{8}$", options: .regularExpression))

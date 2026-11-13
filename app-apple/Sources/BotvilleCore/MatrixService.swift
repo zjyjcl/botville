@@ -902,7 +902,7 @@ public final class MatrixService: ObservableObject {
         var updated: [MatrixRoom] = []
 #if DEBUG
         // Snapshot once so diagnostic reads do not turn a room refresh into O(n²).
-        let previousUnreadByRoom = Dictionary(uniqueKeysWithValues: rooms.map { ($0.id, $0.unreadCount) })
+        let previousUnreadByRoom = UnreadBannerProbeLog.unreadSnapshot(rooms)
 #endif
         for room in client.rooms() {
             let membership: MatrixRoomMembership
@@ -1185,7 +1185,8 @@ public final class MatrixService: ObservableObject {
         currentRevisions: [String: UUID],
         observedEncryptedRooms: Set<String>
     ) -> [MatrixRoom] {
-        let currentByID = Dictionary(uniqueKeysWithValues: current.map { ($0.id, $0) })
+        // Duplicate SDK snapshots keep the last published room, matching refresh order.
+        let currentByID = Dictionary(current.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
         return refreshed.map { room in
             let security = currentRevisions[room.id] != revisionsAtStart[room.id]
                 ? currentByID[room.id] ?? room

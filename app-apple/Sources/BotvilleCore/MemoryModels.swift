@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import Foundation
+import Combine
 
 public struct Memory: Codable, Sendable, Equatable, Identifiable {
     public let id: String
@@ -25,8 +26,6 @@ public struct Memory: Codable, Sendable, Equatable, Identifiable {
     public var actions: MemoryPresentationPolicy.Actions {
         MemoryPresentationPolicy.actions(layer: layer, redacted: redacted, pinned: pinned)
     }
-    /// Whether toggling the current pin state is allowed (including unpin).
-    public var canPin: Bool { actions.canTogglePin }
     enum CodingKeys: String, CodingKey {
         case id, layer, scope, visibility, trust, source, pinned, text, key, value, dirty, redacted
         case personaID = "persona_id"
@@ -97,9 +96,19 @@ public struct MemoryFactWrite: Codable, Sendable, Equatable {
 public struct MemoryPersona: Codable, Sendable, Equatable, Identifiable {
     public let id: String
     public let displayName: String
+    public let ownerID: String
+    public let kind: String
+    public let status: String
+    public let revision: Int
+    public let createdAt: Date
+    public let updatedAt: Date
+    public let visibility: String
     enum CodingKeys: String, CodingKey {
-        case id
+        case id, kind, status, revision, visibility
         case displayName = "display_name"
+        case ownerID = "owner_id"
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
     }
 }
 struct MemoryPersonaPage: Decodable {
@@ -110,5 +119,33 @@ struct MemoryPersonaPage: Decodable {
         case items
         case nextCursor = "next_cursor"
         case hasMore = "has_more"
+    }
+}
+
+/// Shared with the native list so empty and permission-error states are testable.
+@MainActor
+public final class PersonaListModel: ObservableObject {
+    @Published public private(set) var personas: [MemoryPersona] = []
+    @Published public private(set) var isLoading = false
+    @Published public private(set) var errorMessage: String?
+    public let client: any GatewayClient
+    public var isEmpty: Bool { !isLoading && errorMessage == nil && personas.isEmpty }
+
+    public init(client: any GatewayClient) { self.client = client }
+
+    public func load() async {
+        guard !isLoading else { return }
+        isLoading = true
+        errorMessage = nil
+        defer { isLoading = false }
+        do { personas = try await client.personas() } catch {
+            personas = []
+            if let error = error as? GatewayClientError {
+                errorMessage = error == .problem(status: 403, code: "persona.not_owned")
+                    ? "当前身份无权查看我的 AI，请重新登录后重试。"
+                    : error.errorDescription
+            }
+            if errorMessage == nil { errorMessage = "暂时无法加载 AI，请稍后重试。" }
+        }
     }
 }

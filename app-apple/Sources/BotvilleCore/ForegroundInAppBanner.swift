@@ -264,6 +264,11 @@ import os
 /// Allowlisted diagnostics only. No message, user, token, or event ID input.
 @MainActor
 enum UnreadBannerProbeLog {
+    /// Duplicate room IDs keep the last snapshot value in SDK/list order.
+    static func unreadSnapshot(_ rooms: [MatrixRoom]) -> [String: UInt64] {
+        Dictionary(rooms.map { ($0.id, $0.unreadCount) }, uniquingKeysWith: { _, latest in latest })
+    }
+
     enum UnreadSource: String, CaseIterable {
         case readReceiptLocalZero, sdkUnreadZero, sdkInfoUnavailable, refreshCommitZero
     }

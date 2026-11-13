@@ -292,7 +292,7 @@ struct DynamicUIView: View {
             }
             .sheet(isPresented: $showMyAI) {
                 NavigationStack {
-                    MyAIListView(client: model.client, manifest: model.manifest)
+                    MyAIListView(client: model.client)
                         .toolbar {
                             ToolbarItem(placement: .cancellationAction) {
                                 Button("完成") { showMyAI = false }

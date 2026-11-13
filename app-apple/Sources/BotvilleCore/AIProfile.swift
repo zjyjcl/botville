@@ -40,7 +40,7 @@ public struct AIProfileMember: Equatable, Sendable {
 
 public enum AIProfileEligibility {
     /// Returns the counterpart only for a direct room whose complete
-    /// active-member list contains the signed-in joined user and one active AI
+    /// joined-member list contains the signed-in user and one joined AI
     /// account. Any extra, duplicate, or incomplete snapshot fails closed.
     public static func aiCounterpartID(
         isDirect: Bool,
@@ -49,6 +49,8 @@ public enum AIProfileEligibility {
         snapshotComplete: Bool = true,
         policy: AIParticipantPolicy
     ) -> String? {
+        // Invites are not active participants; only joined members count.
+        let members = members.filter(\.isJoined)
         guard isDirect, snapshotComplete, let localUserID, members.count == 2,
               members.allSatisfy(\.isActive) else { return nil }
         let memberIDs = members.map(\.userID)
@@ -74,7 +76,7 @@ enum AIProfileLoader {
             roomMembers.append(contentsOf: chunk)
         }
         guard UInt32(roomMembers.count) == expectedMemberCount else { return nil }
-        let activeMembers = roomMembers.filter { $0.membership == .join || $0.membership == .invite }
+        let activeMembers = roomMembers.filter { $0.membership == .join }
         let members = activeMembers.map {
             AIProfileMember(userID: $0.userId, isJoined: $0.membership == .join)
         }
