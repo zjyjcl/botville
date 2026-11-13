@@ -548,7 +548,7 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 | POST | `/_matrix/app/v1/ping` | 连通性探测，返回 `{}` |
 
 **只有协议层**：网关在返回 `200` 之前把**原始事务请求体**持久化到 SQLite，
-但**不**把事件交给角色引擎、记忆或主动发言逻辑。消费侧留在后续 PR（见 §1.7.6）。
+但**不**把事件交给角色引擎、记忆或主动发言逻辑。消费侧已由独立后台消费者实现（见 §1.7.6）。
 
 #### 1.7.2 认证
 
@@ -784,8 +784,10 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 `proactive.enabled=true`，两者缺一均不发主动消息（部署开关开启时 worker 仍可运行以便后续人设配置生效）。可选
 `GATEWAY_PROACTIVE_RECENT_CONTACTS_ENABLED=false` 开启后，目标除 `owner_user_id` 外，可包括
 最近 **7×24 小时内（边界包含）**与该 persona 有确定性 DM 交互记录的本服人类账户。v1 的记录来源
-是同一 memory DB 的 `memory_items.created_at`（本地接收/记录时间，不回读 AS 事务正文）；目标永远
-排除群组、`@ai_*`、其他 persona 和跨服用户；不会创建 DM，找不到已有一对一房间则跳过并记不含
+是同一 memory DB 中 `scope_kind=dm` 的 `memory_items.created_at`（本地接收/记录时间，不回读 AS 事务正文）；
+新记录按 B2.8a 严格 DM 定义写入，旧记录仍须重查完整成员，发送前再次核验 persona 与目标均已 joined。
+发送保持 `allow_auto_join=false`，已加入房间的正常发送不受该默认值影响。目标永远
+排除群组、`@ai_*`、网关 AS 账户、其他 persona 和跨服用户；不会创建 DM，找不到已有一对一房间则跳过并记不含
 正文或标识符的 INFO。
 
 环境变量：`GATEWAY_PROACTIVE_TICK_SECONDS=300`（30–86400）、
@@ -805,11 +807,14 @@ mood 不参与候选选择或发/不发决策，只作为 untrusted prompt 上�
 
 `quiet_hours.timezone` 同时定义 persona `max_per_day` 和每目标日上限的日界；未给 quiet_hours 时回退
 部署静默时区。`require_reply=true`（默认）时，一次主动发言后必须等该目标发来新的 DM 人类消息；否则
-该 persona 不再向该目标主动发言。未知、过期或因 memory 保留清理而没有可用 DM 记录的目标都跳过，
+在队列保留窗口内该 persona 不再向该目标主动发言。未知、过期或因 memory 保留清理而没有可用 DM 记录的目标都跳过，
 不会推断、回读或创建房间。
 
 主动 worker 仅在 memory DB、模型和具备 `joined_members` 的 Matrix transport 都已就绪时启动；它以独立
-SQLite 连接访问同一 memory DB，且一个部署只支持一个 scheduler。每 tick 的顺序固定为：候选选择 → policy `kind=proactive` 预检和预算预留 → 非 allow 时释放/跳过且
+SQLite 连接访问同一 memory DB，且一个部署只支持一个 scheduler。部署启用但缺少上述任一前提时，
+记录固定 WARNING `Proactive inactive: requires memory DB, model and membership transport`，不含敏感值。
+owner 无已确认 DM 的固定 INFO 按 `(persona,target)` 进程内首次及每 24 小时最多一次；
+缓存最多 4096 项，过期回收，满时抑制新键日志。每 tick 的顺序固定为：候选选择 → policy `kind=proactive` 预检和预算预留 → 非 allow 时释放/跳过且
 不调模型 → 调模型 → `send_ai_message` → Matrix 成功后标 done。token window 与
 `proactive_per_day` 同时计入。系统区只含人设指令和固定主动说明；v1 不读取任何记忆文本进 prompt，
 只给固定问候；可选 mood 位于 derived/untrusted 区。mood provider 仅可附加
@@ -817,7 +822,12 @@ SQLite 连接访问同一 memory DB，且一个部署只支持一个 scheduler�
 
 队列保存在 memory SQLite 的 `proactive_queue`，迁移幂等；`time_slot = floor(UTC epoch /
 GATEWAY_PROACTIVE_TICK_SECONDS)`，队列键是 `sha256(JSON[persona_id,target_user_id,time_slot])`。写入
-queued/sending 后，发送成功才 done；`sending` 保留已生成正文以供重放，`done` 清除正文；队列键交给
+queued/sending 后，发送成功才 done；每 tick 在候选筛选前维护队列：未完成行的 `created_at`
+年龄严格超过 `max(24 小时, 3 × tick)`，且完整成员列表已不匹配原两人 DM 时，标记 `abandoned`、
+清除正文，不再重试或阻塞该目标后续新槽。成员查询异常则保留，不据此废弃；仍匹配的旧 DM 保留稳定 txnId 重试。
+`done/abandoned` 行按 `COALESCE(sent_at, created_at)` 年龄严格超过 30 天清理；因此 require_reply
+及队列历史约束仅覆盖保留窗口。上述期限为代码常量，不新增环境变量。
+`sending` 保留已生成正文以供重放，`done` 清除正文；队列键交给
 既有 HMAC txnId 推导。崩溃在“已发送、未标 done”时会重放相同 txnId，由 homeserver 去重，不重复发言。
 worker 的 stop 有界 join；超时仍存活时不关闭存储并写不含敏感数据的 WARNING，线程退出后才可关闭。
 
@@ -1125,7 +1135,7 @@ token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，�
 `max_tokens=2048` 限制生成；输入及预留在调用前原子记账，失败时因远端用量未知仍保留保守扣账。
 运行中的请求完成后才关闭 worker；新事务到达后不再发起下一次整理调用。
 
-**⑪ 主动发言（不入本 PR）**
+**⑪ 主动发言（0.5.0 已实现，默认关闭）**
 
 独立调度线程，**不在消费路径**；沿用现有限额（每日默认 6、静默时段、三层限额）。
 
@@ -1150,7 +1160,7 @@ token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，�
 **⑬ 契约范围**
 
 除⑩ PR3c 已明确新增的 `/v1/memories*`、capability 和 OpenAPI 外，本节其余消费与引擎行为
-不改变 `/v1`；C 线按 0.4.0 契约接入。
+不改变 `/v1`；主动发言已在 0.5.0 落地，C 线按当前契约 0.5.0 接入，示例 manifest 由 C 线同步。
 
 ---
 
@@ -1282,7 +1292,7 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 ```json
 {
   "manifest_version": "1.3.0",
-  "contract_version": "0.4.0",
+  "contract_version": "0.5.0",
   "generated_at": "2026-11-13T00:00:00Z",
   "cache_ttl_seconds": 300,
   "defaults": { "unknown_capability": "hidden", "card_fallback": "text" },
@@ -1378,7 +1388,7 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 }
 ```
 
-清单版本为 `1.3.0`，`contract_version` 取网关配置（当前 `0.4.0`），缓存建议为 300 秒。
+清单版本为 `1.3.0`，`contract_version` 取网关配置（当前 `0.5.0`），缓存建议为 300 秒。
 无论记忆模块是否启用，均返回完整基础清单：`chat.direct`、`memory.search`、
 `notify.approvals`、`town.enter`，并保留各自状态、入口及 defaults；按 `module` / `status`
 查询时只返回匹配条目。基础元数据随代码打包，不在运行时读取 OpenAPI 示例文件。
@@ -1787,6 +1797,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 | 版本 | 日期 | 变更 |
 |---|---|---|
 | 0.5.0 | 2026-11-13 | [PR4c quasi-breaking] 新增默认关闭的主动发言部署/人设配置、DM-only 候选、持久化队列与 stable txnId 重放语义；`ProactiveSettings.enabled` 默认值由 true 改为 false。该默认值改变未显式设置旧部署的行为，按准破坏性变更公告。 |
+| 0.5.0 | 2026-11-13 | [#221 proactive 修正] 启用但无法启动 worker 记录 WARNING；owner 无 DM 日志每目标限频且缓存有界；过期且成员不匹配的队列转 abandoned，终态保留 30 天；跨午夜静默时段与严格 DM 协同验证。 |
 | 0.5.0 | 2026-11-13 | [B2.8a 行为修正，无 API 字段变化] 一个 AI + 多个人类的房间现在只在被 @ 或被回复时回复；严格两人本服 DM、成员失败按群、群回复者上限、忽略 @room 广播、群 AI 文本记忆 untrusted、自动 join 仅 DM。 |
 | 0.4.0 | 2026-11-13 | [PR4b] 新增 owner-only `GET/PATCH /personas/{id}/state` 与 memory.db persona_state；新增 `GATEWAY_MOOD_ENABLED` / `GATEWAY_MOOD_HALF_LIFE_MINUTES`、确定性窗口规则及读时半衰期衰减。PersonaMood 删除 `neutral`、`anxious`，最终为 calm/happy/sad/excited/tired；详情增加 mood，列表项不变；`mood_public` 默认 true，非 owner 仅在 mood 开启且 `mood_public` 为真时见标签。模块关闭时通过 owner 校验后 404 `mood.disabled`；`/state` 写限流返回 429，mood 存储不可用返回 503 `mood.unavailable`。 |
 | 0.3.0 | 2026-11-13 | [PR4d additive] owner 文件签名 bio（500 码点），列表扩展与分级 GET 详情；本服非 owner 最小视图，跨服/无 owner/未知或非法 id 统一 404 persona.not_found。mood 可缺省/null 枚举，当前 null；自身和他人 bio 均不注入 system。 |
@@ -1900,7 +1911,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
   `silent_hours`（code: `silent_hours.active`）（每项都取三层中最严者，`source_layer` 落在
   `PolicyCheck.layer` 上）。`proactive.per_day`（code: `proactive.per_day.exceeded`）/
   `town.tokens_per_day`（code: `town.tokens_per_day.exceeded`）的生效值已在 `GET /limits` 中计算，
-  执行留待 B2.5（主动发言调度）；小镇预算执行留待 B4.2。
+  主动预算已随 0.5.0 主动发言调度执行；小镇预算执行留待 B4.2。
 - **B2.2 契约已定、实现见 PR2** 的检查项：`anti_spam.consecutive`（同 persona 连续
   AI 消息达到 `max_consecutive_ai_messages`，code: `anti_spam.consecutive`）、`anti_spam.cooldown`
   （防刷屏冷却未结束，code: `anti_spam.cooldown`）、`ai_loop.per_hour`（同会话任意 AI 互聊
@@ -2443,7 +2454,7 @@ npx --yes @redocly/cli lint gateway/openapi/gateway.v1.yaml
 ### 8.3 已知未决事项（评审请关注）
 
 B 类清单的 12 项已于 **2026-11-10 由棉棉霸拍板**，逐项定论见 [§8.4](#84-b-线产品定论2026-11-10-已拍板)。
-本节保留原条目的上下文，改为「已拍板 + 待实现于哪个里程碑」。
+本节保留原条目的上下文，注明已实现范围与剩余里程碑。
 
 1. 面向终端用户的令牌签发/轮换与细粒度 scope 仍不在 v1；调用方身份契约见
    [§1.2.2](#122-调用方身份124)，实现见 #124。**终端用户（Matrix 用户）身份**已定为
@@ -2452,7 +2463,8 @@ B 类清单的 12 项已于 **2026-11-10 由棉棉霸拍板**，逐项定论见 
 2. **已拍板（2026-11-10，清单 B1）**：主动发言 `queued` 之后**不新开专用通道、客户端不轮询
    网关**；投递成功后复用 `Card type=notification` + D 线推送通知。客户端用**同一
    `Idempotency-Key`** 重放可拿到同一 `queue_id`（与 §1.5 一致）。卡片文案与跳转归 D/C。
-   待实现于 B2.5（#21），推送依赖 D 线（#4）。
+   主动调度已在 0.5.0 实现，当前直接投递 Matrix，不创建通知卡片，也不向客户端暴露内部队列。
+   上述通知卡片与 queue_id 是后续通知集成设计，仍依赖 D 线（#4），不代表当前 proactive 行为。
 3. **已拍板（2026-11-10，清单 B2）**：关系策略（B2.8 / #24）的审批以**独立的 minor 新增
    `/relations/*`** 承载，**不塞进 `PATCH /conversations`**。**动作接口细节（具体路径、
    请求/响应）仍未定义**，本轮不为它写任何动作接口；落地时按「只增不删」的 minor 扩展走。
@@ -2477,7 +2489,7 @@ B 类清单的 12 项已于 **2026-11-10 由棉棉霸拍板**，逐项定论见 
 
 | 编号 | 定论 | 落地里程碑 / issue | 契约影响 |
 |---|---|---|---|
-| B1 | 主动发言 `queued` 之后复用 `Card type=notification` + D 线推送，不新开专用通道、客户端不轮询网关；同一 `Idempotency-Key` 重放拿到同一 `queue_id`。卡片文案/跳转归 D/C | B2.5（#21）；推送依赖 D 线（#4） | 无字段/状态码变化 |
+| B1 | 主动发言 `queued` 之后复用 `Card type=notification` + D 线推送，不新开专用通道、客户端不轮询网关；同一 `Idempotency-Key` 重放拿到同一 `queue_id`。卡片文案/跳转归 D/C | 主动调度已在 0.5.0 实现；通知集成依赖 D 线（#4），当前不创建卡片 | 无字段/状态码变化 |
 | B2 | 关系审批由 B2.8 以独立的 minor 新增 `/relations/*` 承载，不塞进 `PATCH /conversations`；动作接口细节未定义，本轮不写。终端用户身份定为 Matrix OpenID token（见 §1.2.3） | B2.8（#24）；身份实现见 #124 / PR-D | 无字段/状态码变化 |
 | B3 | v1 不加 `/conversations/{id}/turn`；多 AI 群调度作为网关内部状态，发言仍走 `POST /policy/evaluate` + `POST /messages`，受 `anti_spam` / `ai_loop` 与 proactive 预算约束 | B2.8（#24） | 无字段/状态码变化 |
 | B4 | 小镇接口维持不纳入 v1，M4 再按「只增不删」扩展；`town.tokens_per_day` 已在限额模型里 | M4 / B4.2（#28） | 无字段/状态码变化 |

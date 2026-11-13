@@ -2610,6 +2610,11 @@ components:
         顺序为候选→policy kind=proactive 预检及预留→allow 后模型→既有发送路径→成功标记。
         队列以 `(persona_id,target_user_id,floor(UTC epoch/tick_seconds))` 的 SHA-256 键持久化；
         proactive_queue 位于 memory DB，幂等建表，queued→sending→done；只有发送成功才 done。
+        未完成行 created_at 年龄超过 max(24 小时, 3 × tick) 且完整成员不再匹配两人 DM 时
+        转 abandoned 并清除正文，不重试、不阻塞后续新槽；成员查询异常保留。
+        done/abandoned 按 COALESCE(sent_at, created_at) 年龄超过 30 天清理，历史约束仅覆盖保留窗口。
+        启用但缺 memory DB、模型或 joined_members 时记固定 WARNING。
+        owner 无 DM 的 INFO 每目标每 24 小时最多一次，进程内缓存最多 4096 项。
         sending 保存待重放正文，done 清除正文。同键经既有 HMAC txnId 路径重放，使“已发送未标记”
         的重启重试由 homeserver 去重。计入 token window 与 proactive_per_day；非 allow 不调模型。
         system 仅人设与固定说明，mood 可选且仅以 mood: label 放入 untrusted 数据区。
@@ -2749,7 +2754,7 @@ components:
         visibility: {type: string, enum: [private]}
 
     PersonaMood:
-      description: 可选公开情绪标签，可为 null。服务端只会输出这五个值（calm/happy/sad/excited/tired）；客户端必须容忍未知值（按缺省处理）。
+      description: 可选公开情绪标签，可为 null。enum 用于服务端输出校验，不放宽为任意字符串。服务端只会输出这五个值（calm/happy/sad/excited/tired）；客户端必须容忍未知值（按缺省处理）。
       type: [string, "null"]
       enum: [calm, happy, sad, excited, tired, null]
 

@@ -15,12 +15,18 @@ import threading
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from .as_consumer import DEFAULT_AS_SENDER_LOCALPART
 from .engine.personas import _is_local_owner
 from .isolation import SYSTEM_ZONE_DECLARATION, build_untrusted_segment
 from .policy import estimate_tokens, silent_hours_active
 
 _LOG = logging.getLogger(__name__)
 STOP_TIMEOUT_SECONDS = 35
+OWNER_LOG_INTERVAL_SECONDS = 24 * 60 * 60
+OWNER_LOG_MAX_ENTRIES = 4096
+PENDING_MIN_AGE_SECONDS = 24 * 60 * 60
+PENDING_AGE_TICKS = 3
+TERMINAL_RETENTION_SECONDS = 30 * 24 * 60 * 60
 LABELS = frozenset(('calm', 'happy', 'sad', 'excited', 'tired'))
 INSTRUCTION = '主动向对方简短、自然地问候；不要编造事实，不要要求对方必须回复。'
 
@@ -37,16 +43,65 @@ class ProactiveWorker:
         self._thread = None
         self._round_lock = threading.Lock()
         self._closed = False
-        with store._lock, store._db:
-            store._db.execute('''CREATE TABLE IF NOT EXISTS proactive_queue (
-                key TEXT PRIMARY KEY, persona_id TEXT NOT NULL, target_user_id TEXT NOT NULL,
-                room_id TEXT NOT NULL, slot INTEGER NOT NULL,
-                state TEXT NOT NULL CHECK(state IN ('queued','sending','done')),
-                body TEXT, tokens INTEGER NOT NULL DEFAULT 0,
-                created_at REAL NOT NULL, sent_at REAL,
-                UNIQUE(persona_id,target_user_id,slot))''')
-            store._db.execute('''CREATE INDEX IF NOT EXISTS proactive_queue_target
-                ON proactive_queue(persona_id,target_user_id,state)''')
+        self._owner_log_times = {}
+        self._migrate_queue()
+
+    def _migrate_queue(self):
+        # SQLite CHECK constraints require a table rebuild. A savepoint makes
+        # DDL and data copy atomic, including when no outer transaction exists.
+        with self.store._lock:
+            db = self.store._db
+            db.execute('SAVEPOINT proactive_migration')
+            try:
+                old = db.execute("SELECT sql FROM sqlite_master WHERE name='proactive_queue'").fetchone()
+                migrate = old is not None and "'abandoned'" not in old[0]
+                if migrate:
+                    db.execute('ALTER TABLE proactive_queue RENAME TO proactive_queue_legacy')
+                db.execute('''CREATE TABLE IF NOT EXISTS proactive_queue (
+                    key TEXT PRIMARY KEY, persona_id TEXT NOT NULL, target_user_id TEXT NOT NULL,
+                    room_id TEXT NOT NULL, slot INTEGER NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('queued','sending','done','abandoned')),
+                    body TEXT, tokens INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL, sent_at REAL,
+                    UNIQUE(persona_id,target_user_id,slot))''')
+                if migrate:
+                    db.execute('INSERT INTO proactive_queue SELECT * FROM proactive_queue_legacy')
+                    db.execute('DROP TABLE proactive_queue_legacy')
+                db.execute('''CREATE INDEX IF NOT EXISTS proactive_queue_target
+                    ON proactive_queue(persona_id,target_user_id,state)''')
+                db.execute('RELEASE proactive_migration')
+            except Exception:
+                db.execute('ROLLBACK TO proactive_migration')
+                db.execute('RELEASE proactive_migration')
+                raise
+
+    def _maintain_queue(self, now):
+        cutoff = now.timestamp() - max(PENDING_MIN_AGE_SECONDS,
+                                      PENDING_AGE_TICKS * self.config.proactive_tick_seconds)
+        for row in self._rows('''SELECT * FROM proactive_queue
+                WHERE state IN ('queued','sending') AND created_at < ?''', (cutoff,)):
+            try:
+                valid = self._dm(row['persona_id'], row['target_user_id'], row['room_id'])
+            except Exception:
+                # Unavailable membership is not confirmation that the DM changed.
+                continue
+            if not valid:
+                self._write("UPDATE proactive_queue SET state='abandoned',body=NULL WHERE key=?",
+                            (row['key'],))
+        self._write('''DELETE FROM proactive_queue WHERE state IN ('done','abandoned')
+            AND COALESCE(sent_at,created_at) < ?''',
+            (now.timestamp() - TERMINAL_RETENTION_SECONDS,))
+
+    def _log_missing_owner(self, persona, now):
+        timestamp = now.timestamp()
+        # Expire entries before admitting new keys; when full suppress new keys
+        # rather than evicting one and logging it repeatedly under churn.
+        self._owner_log_times = {key: at for key, at in self._owner_log_times.items()
+                                 if timestamp - at < OWNER_LOG_INTERVAL_SECONDS}
+        key = (persona.user_id, persona.owner_user_id)
+        if key not in self._owner_log_times and len(self._owner_log_times) < OWNER_LOG_MAX_ENTRIES:
+            self._owner_log_times[key] = timestamp
+            _LOG.info('Proactive owner skipped: no confirmed existing DM')
 
     def start(self):
         if self.config.proactive_enabled and self._thread is None:
@@ -96,7 +151,9 @@ class ProactiveWorker:
         seen = set()
         for row in rows:
             target = row['counterpart']
-            if target in seen or target in self.personas or not _is_local_owner(target, self.config.matrix_server_name):
+            if (target in seen or target in self.personas
+                    or not _is_local_owner(target, self.config.matrix_server_name)
+                    or target[1:].partition(':')[0] == DEFAULT_AS_SENDER_LOCALPART):
                 continue
             if target != persona.owner_user_id:
                 if not self.config.proactive_recent_contacts_enabled or not row['human_at']:
@@ -109,7 +166,7 @@ class ProactiveWorker:
             seen.add(target)
             yield row
         if persona.owner_user_id and persona.owner_user_id not in seen:
-            _LOG.info('Proactive owner skipped: no confirmed existing DM')
+            self._log_missing_owner(persona, now)
 
     def _eligible(self, persona, contact, now, key):
         settings = persona.proactive
@@ -153,6 +210,7 @@ class ProactiveWorker:
         sent = 0
         try:
             now = self.clock()
+            self._maintain_queue(now)
             for persona in self.personas.values():
                 if not persona.proactive.get('enabled', False):
                     continue
@@ -175,7 +233,7 @@ class ProactiveWorker:
     def _process(self, persona, contact, now):
         target, room = contact['counterpart'], contact['room_id']
         pending = self._rows('''SELECT * FROM proactive_queue WHERE persona_id=?
-            AND target_user_id=? AND state!='done' ORDER BY slot LIMIT 1''', (persona.user_id, target))
+            AND target_user_id=? AND state IN ('queued','sending') ORDER BY slot LIMIT 1''', (persona.user_id, target))
         slot = int(now.timestamp()) // self.config.proactive_tick_seconds
         key = hashlib.sha256(json.dumps([persona.user_id, target, slot], separators=(',', ':')).encode()).hexdigest()
         if pending:

@@ -1537,7 +1537,7 @@ class GatewayServer(http.server.ThreadingHTTPServer):
                     mood_label_provider=(self._proactive_mood_label
                                          if self.mood_service is not None else None))
             else:
-                logging.getLogger(__name__).info(
+                logging.getLogger(__name__).warning(
                     'Proactive inactive: requires memory DB, model and membership transport')
         log_startup_warnings(config)
         super().__init__((config.host, config.port), GatewayHandler)
