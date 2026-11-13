@@ -41,7 +41,7 @@ GET 保持现有有限退避重试；三个新 PATCH 均不携带 Idempotency-Ke
 
 ## 依赖 #235（B2.8d2）
 
-依赖 #235（B2.8d2）的网关行为；#235 合入前旧网关在关闭时 GET 返回空页、PATCH mention_only 可能成功，App 行为仍安全：本地关闭判定后不提供也不发送 mention_only，仍可管理网关实际返回的房间。部署升级后关闭时会恢复显示现有房间，无需修改 App。开启时仍按 #232 允许 accepted/encrypted_disabled 在两种模式间切换。
+依赖 #235（B2.8d2）的网关行为，#235 已合入 main。未升级到 #235 的旧网关在关闭时 GET 返回空页、PATCH mention_only 可能成功，App 行为仍安全：本地关闭判定后不提供也不发送 mention_only，仍可管理网关实际返回的房间。部署升级后关闭时会恢复显示现有房间，无需修改 App。开启时仍按 #232 允许 accepted/encrypted_disabled 在两种模式间切换。
 
 #235 的 C 线同步清单逐项对应：
 
