@@ -56,6 +56,7 @@ PROBLEM_MEDIA_TYPE = "application/problem+json"
 # example file -> JSON pointer to the schema it must satisfy.
 # Pointers target the contract itself, so a schema change breaks examples too.
 EXAMPLE_TARGETS = {
+    "persona-page.json": "#/paths/~1personas/get/responses/200/content/application~1json/schema",
     "health.json": "#/paths/~1health/get/responses/200/content/application~1json/schema",
     "capability-manifest.json": "#/paths/~1capabilities/get/responses/200/content/application~1json/schema",
     "persona.json": "#/paths/~1personas~1{persona_id}/get/responses/200/content/application~1json/schema",
