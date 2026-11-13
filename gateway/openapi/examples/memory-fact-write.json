@@ -1,0 +1,7 @@
+{
+  "persona_id": "persona_demo",
+  "counterpart": "@human:example.invalid",
+  "key": "likes",
+  "value": "示例值",
+  "visibility": "dm_only"
+}

@@ -1,0 +1,1 @@
+{"type":"urn:botville:error:memory.pin_limit","title":"Pin limit reached","status":409,"detail":"The persona pin limit was reached.","instance":"/v1/memories/mr_0123456789abcdef/pin","code":"memory.pin_limit","request_id":"req_memory_limit","retry_after_seconds":0}

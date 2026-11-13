@@ -1,0 +1,1 @@
+{"type":"urn:botville:error:memory.not_found","title":"Memory not found","status":404,"detail":"Memory was not found.","instance":"/v1/memories/mr_0123456789abcdef","code":"memory.not_found","request_id":"req_memory_not_found","retry_after_seconds":0}

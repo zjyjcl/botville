@@ -21,7 +21,7 @@ from botville_gateway.engine.engine import estimate_tokens
 from botville_gateway.memory.api import OwnerMemoryAPI
 from botville_gateway.memory.__main__ import main
 from botville_gateway.memory.recall import assemble_recall, RECALL_ITEMS_LIMIT, RECALL_FACTS_LIMIT
-from botville_gateway.memory.store import MemoryStore
+from botville_gateway.memory.store import MemoryStore, SCHEMA_VERSION
 from test_memory_integration import AI, HUMAN, SERVER, config, context
 from botville_gateway.engine import EngineHooks, ModelClient, ModelConfig, Persona
 from botville_gateway.matrix import InMemoryMatrixTransport
@@ -114,7 +114,7 @@ class StoreNits(unittest.TestCase):
             try:
                 for name in (path, path+'-wal', path+'-shm'):
                     self.assertEqual(os.stat(name).st_mode & 0o777, 0o600)
-                self.assertEqual([tuple(r) for r in second._db.execute('SELECT * FROM memory_schema')], [(1, 4)])
+                self.assertEqual([tuple(r) for r in second._db.execute('SELECT * FROM memory_schema')], [(1, SCHEMA_VERSION)])
                 with self.assertRaises(sqlite3.IntegrityError):
                     second._db.execute('INSERT INTO memory_schema VALUES(2,2)')
                 second._db.rollback()

@@ -1,6 +1,6 @@
 {
   "manifest_version": "1.2.0",
-  "contract_version": "0.1.0",
+  "contract_version": "0.2.0",
   "generated_at": "2026-11-03T12:00:00Z",
   "cache_ttl_seconds": 300,
   "defaults": {
@@ -45,6 +45,18 @@
         }
       },
       "updated_at": "2026-11-01T08:00:00Z"
+    },
+    {
+      "id": "memory.manage",
+      "module": "memory",
+      "version": "0.2.0",
+      "title": "记忆管理",
+      "summary": "查看和管理此 AI 的聊天记忆。",
+      "status": "enabled",
+      "entry": { "type": "native", "deep_link": "botville://memory" },
+      "scopes": ["memory.read", "memory.write"],
+      "owner_can_read_dm": true,
+      "updated_at": "2026-11-13T00:00:00Z"
     },
     {
       "id": "notify.approvals",

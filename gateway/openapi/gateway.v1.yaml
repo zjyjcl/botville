@@ -9,7 +9,7 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: botville AI Gateway API
-  version: 0.1.0
+  version: 0.2.0
   summary: AI 网关契约初稿：对话与消息、角色、功能清单、卡片、用量与限额。
   description: |
     botville 自部署 AI 网关的开放 HTTP API。网关位于 Matrix homeserver 与 AI 运行时之间：
@@ -84,6 +84,20 @@ tags:
     description: |
       动态（朋友圈式短内容）：发布、可见性范围、评论与点赞（A2.2 / issue #7）。
       可见性在读取时计算，越权访问与不存在统一返回 404 `moment.not_found`。
+  - name: Memory
+    description: |
+      角色主人查看、删除、固定与显式设置的记忆（B2.6 PR3c，contract §1.7.8 ⑩）。
+      **该 AI 的主人可以查看和删除它与你的聊天记忆**（`/capabilities` 中 `memory.manage` 的
+      `owner_can_read_dm`，默认 true）。仅 persona 的 `owner_user_id` 可调用；身份为
+      matrixOpenIdToken 或 matrixUserToken，不接受 bearerAuth。
+      群组记忆正文仅在 owner 当前是该 room 成员时返回；否则（含成员查询失败）只返回元数据，
+      `text: null`、`redacted: true`，删除与取消固定仍可用。
+      审计表 `memory_audit` 位于 memory.db（0600），随记忆保留期清理；不存正文、事实值或明文
+      counterpart，counterpart 仅存 HMAC（`counterpart_hmac`）。
+      错误码：404 `memory.disabled` / `memory.not_found`，422 `memory.key_not_allowed` /
+      `memory.counterpart_invalid` / `memory.not_pinnable`，409 `memory.pin_limit`，
+      503 `memory.unavailable`，403 `persona.not_owned`；读取 60 次/分钟、写入 20 次/分钟
+      （每 caller），超限 429 `rate_limited.transport`。
 
 x-botville-contract:
   stability: draft
@@ -93,6 +107,150 @@ x-botville-contract:
   idempotency: Idempotency-Key header
 
 paths:
+  # ----- 主人记忆管理（B2.6 PR3c）-----
+  # 身份与 /moments* 一致：matrixOpenIdToken 或 matrixUserToken；不接受 bearerAuth。
+  /memories:
+    get:
+      tags: [Memory]
+      operationId: listOwnerMemories
+      summary: 列出主人名下角色的记忆
+      description: |
+        仅 persona 的 owner 可读。群组范围文本只在 owner 当前仍是该 room 的 joined 成员时返回；
+        成员查询失败也按非成员处理，返回元数据且 `text`（及适用时 `value`）为 null、`redacted=true`。
+        按 `updated_at desc, id desc` 返回；cursor 不透明，limit 默认 20、最大 100。
+        响应一律 `Cache-Control: no-store`。每 caller 60 次/分钟。
+      security: [{matrixOpenIdToken: []}, {matrixUserToken: []}]
+      parameters:
+        - name: persona_id
+          in: query
+          required: true
+          schema: {type: string}
+        - name: layer
+          in: query
+          description: 可重复。
+          schema: {type: array, items: {type: string, enum: [recent, summary, profile]}}
+        - name: scope_kind
+          in: query
+          schema: {type: string, enum: [dm, group]}
+        - name: counterpart
+          in: query
+          schema: {type: string}
+        - name: room_id
+          in: query
+          schema: {type: string}
+        - name: pinned
+          in: query
+          schema: {type: boolean}
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageLimit'
+      responses:
+        '200': {description: 记忆分页。, headers: {Cache-Control: {$ref: '#/components/headers/CacheControl'}}, content: {application/json: {schema: {$ref: '#/components/schemas/MemoryPage'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /memories/facts:
+    put:
+      tags: [Memory]
+      operationId: putOwnerMemoryFact
+      summary: 设置主人事实
+      description: |
+        仅 owner。`key` 必须是服务端允许的 FACT_KEYS；counterpart 必须为本服真实人类用户。
+        owner 写入覆盖 extracted 同 key，并清除该 key 的 suppression。profile 的 `shared` 仍属于
+        DM counterpart scope，不使用群成员门禁。可选 `Idempotency-Key` 使用有界、进程内 24 小时
+        （最多 2000 key）缓存：同 key 同请求重放返回当前同一事实；目标已经删除则 404
+        `memory.not_found`；同 key 异请求为 409 `idempotency.conflict`。响应 `Cache-Control: no-store`。
+      security: [{matrixOpenIdToken: []}, {matrixUserToken: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/MemoryFactWrite'}}}}
+      responses:
+        '200': {description: 已更新。, headers: {Cache-Control: {$ref: '#/components/headers/CacheControl'}}, content: {application/json: {schema: {$ref: '#/components/schemas/Memory'}}}}
+        '201': {description: 已创建。, headers: {Cache-Control: {$ref: '#/components/headers/CacheControl'}}, content: {application/json: {schema: {$ref: '#/components/schemas/Memory'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/UnprocessableEntity'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /memories/{memory_id}:
+    parameters:
+      - name: memory_id
+        in: path
+        required: true
+        description: HMAC 派生的不透明记忆 ID（mr_、ms_ 或 mf_ 前缀）。
+        schema: {type: string, pattern: '^m[rsf]_[0-9a-f]{16}$'}
+    get:
+      tags: [Memory]
+      operationId: getOwnerMemory
+      summary: 读取单条记忆
+      description: "群组文本的成员门禁与列表相同；响应 `Cache-Control: no-store`。每 caller 60 次/分钟。"
+      security: [{matrixOpenIdToken: []}, {matrixUserToken: []}]
+      responses:
+        '200': {description: 记忆。, headers: {Cache-Control: {$ref: '#/components/headers/CacheControl'}}, content: {application/json: {schema: {$ref: '#/components/schemas/Memory'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+        '500': {$ref: '#/components/responses/InternalError'}
+    delete:
+      tags: [Memory]
+      operationId: deleteOwnerMemory
+      summary: 删除一条记忆
+      description: "recent 会遗忘并使覆盖 summary dirty；删除 summary 只重置 watermark、并非遗忘。响应 `Cache-Control: no-store`。"
+      security: [{matrixOpenIdToken: []}, {matrixUserToken: []}]
+      responses:
+        '204': {description: 已删除。, headers: {Cache-Control: {$ref: '#/components/headers/CacheControl'}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /memories/{memory_id}/pin:
+    parameters:
+      - name: memory_id
+        in: path
+        required: true
+        schema: {type: string, pattern: '^m[rsf]_[0-9a-f]{16}$'}
+    put:
+      tags: [Memory]
+      operationId: pinOwnerMemory
+      summary: 固定记忆
+      description: "幂等固定。summary 不可固定；每 persona 最多 200 条固定项。响应 `Cache-Control: no-store`。"
+      security: [{matrixOpenIdToken: []}, {matrixUserToken: []}]
+      responses:
+        '200': {description: 固定后的记忆。, headers: {Cache-Control: {$ref: '#/components/headers/CacheControl'}}, content: {application/json: {schema: {$ref: '#/components/schemas/Memory'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/UnprocessableEntity'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+        '500': {$ref: '#/components/responses/InternalError'}
+    delete:
+      tags: [Memory]
+      operationId: unpinOwnerMemory
+      summary: 取消固定记忆
+      description: "幂等取消固定。响应 `Cache-Control: no-store`。"
+      security: [{matrixOpenIdToken: []}, {matrixUserToken: []}]
+      responses:
+        '200': {description: 取消固定后的记忆。, headers: {Cache-Control: {$ref: '#/components/headers/CacheControl'}}, content: {application/json: {schema: {$ref: '#/components/schemas/Memory'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/UnprocessableEntity'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+        '500': {$ref: '#/components/responses/InternalError'}
+
   /health:
     get:
       tags: [Health]
@@ -2145,6 +2303,11 @@ components:
       schema:
         type: integer
         minimum: 0
+    CacheControl:
+      description: 记忆 owner 端点禁止中间缓存。
+      schema:
+        type: string
+        example: no-store
 
   responses:
     BadRequest:
@@ -2222,6 +2385,17 @@ components:
     InternalError:
       description: 网关内部错误。
       headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ServiceUnavailable:
+      description: 记忆存储或必要依赖暂不可用。
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
       content:
@@ -3772,6 +3946,70 @@ components:
               items:
                 $ref: '#/components/schemas/UsageEvent'
 
+    # ----- 主人记忆管理（B2.6 PR3c）-----
+    MemoryScope:
+      type: object
+      required: [kind]
+      properties:
+        kind: {type: string, enum: [dm, group]}
+        counterpart: {type: [string, 'null']}
+        room_id: {type: [string, 'null']}
+      additionalProperties: false
+    MemorySource:
+      type: object
+      required: [kind]
+      properties:
+        kind: {type: string, enum: [event, owner, extraction, summary]}
+        event_id: {type: string}
+        sender: {type: string}
+        role: {type: string, enum: [user, assistant]}
+        model: {type: string}
+      additionalProperties: false
+    Memory:
+      type: object
+      required: [id, persona_id, layer, scope, visibility, trust, source, pinned, text, redacted, created_at, updated_at, expires_at]
+      properties:
+        id: {type: string, pattern: '^m[rsf]_[0-9a-f]{16}$'}
+        persona_id: {type: string}
+        layer:
+          description: 开放枚举；未知值按只读元数据处理。
+          anyOf:
+            - enum: [recent, summary, profile]
+            - type: string
+        scope: {$ref: '#/components/schemas/MemoryScope'}
+        visibility: {type: string, enum: [scope_only, dm_only, shared]}
+        trust: {type: string, enum: [trusted, untrusted, derived, owner]}
+        source: {$ref: '#/components/schemas/MemorySource'}
+        pinned: {type: boolean}
+        text: {type: [string, 'null']}
+        key: {type: string}
+        value: {type: [string, 'null']}
+        dirty: {type: boolean}
+        redacted: {type: boolean}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        expires_at: {type: [string, 'null'], format: date-time}
+      additionalProperties: false
+    MemoryPage:
+      type: object
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/Memory'}
+        page: {$ref: '#/components/schemas/PageMeta'}
+      additionalProperties: false
+    MemoryFactWrite:
+      type: object
+      required: [persona_id, counterpart, key, value]
+      properties:
+        persona_id: {type: string}
+        counterpart: {type: string, description: 本服真实人类 Matrix user id。}
+        key: {type: string, description: 必须属于服务端 FACT_KEYS。}
+        value: {type: string, minLength: 1, maxLength: 500}
+        visibility: {type: string, enum: [dm_only, shared], default: dm_only}
+      additionalProperties: false
+
     # ----- 功能清单 -----
     CapabilityIcon:
       type: object
@@ -3911,6 +4149,10 @@ components:
         updated_at:
           type: string
           format: date-time
+        owner_can_read_dm:
+          type: boolean
+          default: true
+          description: memory.manage 的披露：AI 主人可查看与其聊天的记忆。
 
     CapabilityManifest:
       type: object

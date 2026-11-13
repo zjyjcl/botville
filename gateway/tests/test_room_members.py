@@ -132,6 +132,47 @@ class TestRoomMemberSource(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             source.members("!room:" + SERVER)
 
+    def test_is_joined_queries_as_requested_persona_and_caches_result(self):
+        joined = "@owner:" + SERVER
+        # The direct lookup path must use only the selected impersonated AI.
+        # ``calls`` records rooms in this fixture; inspect with a dedicated
+        # fetcher as well to keep this behavioral boundary explicit.
+        requests = []
+        source = RoomMemberSource(
+            fetcher=lambda room, personas: requests.append((room, tuple(personas))) or (joined,),
+            personas=(AI_A,), is_local_ai=_local_ai, monotonic=lambda: self.now,
+        )
+        self.assertTrue(source.is_joined("room", joined, AI_A))
+        self.assertTrue(source.is_joined("room", joined, AI_A))
+        self.assertEqual(requests, [("room", (AI_A,))])
+
+    def test_is_joined_negative_result_and_human_member_event_update(self):
+        owner = "@owner:" + SERVER
+        source = RoomMemberSource(
+            fetcher=lambda room, personas: (), personas=(AI_A,),
+            is_local_ai=_local_ai, monotonic=lambda: self.now,
+        )
+        self.assertFalse(source.is_joined("room", owner, AI_A))
+        source.observe_member_event({
+            "type": "m.room.member", "room_id": "room", "state_key": owner,
+            "content": {"membership": "join"},
+        })
+        self.assertTrue(source.is_joined("room", owner, AI_A))
+        source.observe_member_event({
+            "type": "m.room.member", "room_id": "room", "state_key": owner,
+            "content": {"membership": "leave"},
+        })
+        self.assertFalse(source.is_joined("room", owner, AI_A))
+
+    def test_is_joined_failures_share_negative_cache_and_fail_closed(self):
+        owner = "@owner:" + SERVER
+        self.fail = True
+        with self.assertRaises(RuntimeError):
+            self.source.is_joined("room", owner, AI_A)
+        with self.assertRaises(RuntimeError):
+            self.source.is_joined("room", owner, AI_A)
+        self.assertEqual(self.calls, ["room"])
+
 
 class _FakeHomeserverTransport(InMemoryMatrixTransport):
     """Small AS transport double exposing the joined-members CS route."""

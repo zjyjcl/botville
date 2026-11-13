@@ -1,0 +1,1 @@
+{"type":"urn:botville:error:memory.unavailable","title":"Memory unavailable","status":503,"detail":"Memory storage is temporarily unavailable.","instance":"/v1/memories","code":"memory.unavailable","request_id":"req_memory_unavailable","retry_after_seconds":30}

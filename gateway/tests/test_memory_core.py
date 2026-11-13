@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from botville_gateway.memory.api import MemoryPermissionError, OwnerMemoryAPI
 from botville_gateway.memory.profile import apply_extractions
-from botville_gateway.memory.store import MemoryPurger, MemoryStore, _MIGRATIONS
+from botville_gateway.memory.store import MemoryPurger, MemoryStore, SCHEMA_VERSION, _MIGRATIONS
 
 
 def add_item(store, event_id, pinned=False):
@@ -24,6 +24,29 @@ def add_item(store, event_id, pinned=False):
 
 
 class MemoryStoreTests(unittest.TestCase):
+    def test_public_ids_do_not_reuse_after_delete_or_reopen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'memory.db')
+            first = MemoryStore(path, hmac_secret='test-owner-id-secret')
+            add_item(first, '$first')
+            old = first.items('p')[0]['public_id']
+            first.delete_item('p', 1)
+            first.close()
+            second = MemoryStore(path, hmac_secret='test-owner-id-secret')
+            add_item(second, '$second')
+            self.assertNotEqual(old, second.items('p')[0]['public_id'])
+
+    def test_deleted_extracted_fact_is_suppressed_until_owner_write(self):
+        store = MemoryStore(':memory:', hmac_secret='test-owner-id-secret')
+        store.upsert_fact('p', '@human:example.org', 'name', 'old', source='extraction',
+                          source_event_ids=['$one'])
+        self.assertTrue(store.delete_fact('p', 'name', '@human:example.org'))
+        self.assertFalse(store.upsert_fact('p', '@human:example.org', 'name', 'new', source='extraction',
+                                           source_event_ids=['$two']))
+        self.assertTrue(store.upsert_fact('p', '@human:example.org', 'name', 'owner', source='owner'))
+        self.assertFalse(store.upsert_fact('p', '@human:example.org', 'name', 'new', source='extraction',
+                                           source_event_ids=['$three']))
+
     def test_private_reopen_and_future_version(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "memory.db")
@@ -53,7 +76,7 @@ class MemoryStoreTests(unittest.TestCase):
             store = MemoryStore(path)
             self.assertEqual(store.facts("p", "u")[0]["value"], "saved")
             self.assertEqual(store.facts("p", "u")[0]["visibility"], "dm_only")
-            self.assertEqual(store._db.execute("SELECT version FROM memory_schema").fetchone()[0], 4)
+            self.assertEqual(store._db.execute("SELECT version FROM memory_schema").fetchone()[0], SCHEMA_VERSION)
 
     def test_retention_pinned_and_tombstone_expiry(self):
         store = MemoryStore(":memory:", retention_days=1)

@@ -106,6 +106,10 @@ continuwuity 仍用 `memory`（尚无文件注册）。运维注意见
 | PUT | `/v1/limits` | `putLimits` | 写入 owner / peer 层（平台层只读） |
 | GET | `/v1/usage` | `getUsage` | 用量汇总、预算与分桶 |
 | GET | `/v1/usage/events` | `listUsageEvents` | 用量账单明细分页（不含正文） |
+| GET | `/v1/memories` | `listOwnerMemories` | owner 查看角色记忆（分页、筛选，`no-store`） |
+| GET/DELETE | `/v1/memories/{memory_id}` | `getOwnerMemory` / `deleteOwnerMemory` | 读取或删除一条记忆 |
+| PUT/DELETE | `/v1/memories/{memory_id}/pin` | `pinOwnerMemory` / `unpinOwnerMemory` | 固定或取消固定（幂等） |
+| PUT | `/v1/memories/facts` | `putOwnerMemoryFact` | owner 设置允许的长期事实 |
 | PUT | `/_matrix/app/v1/transactions/{txnId}` | *（不在 OpenAPI）* | Matrix AS 事务接收（幂等落库）。**根路径**，不带 `GATEWAY_HTTP_PATH_PREFIX`；鉴权只用 `Authorization: Bearer <GATEWAY_HS_TOKEN>` 请求头（不认 `?access_token=`）；错误体为 Matrix `{"errcode","error"}`。见 [contract.md](docs/contract.md) §1.7 |
 | POST | `/_matrix/app/v1/ping` | *（不在 OpenAPI）* | Matrix AS 连通性探测，返回 `{}`。同样**根路径**、`Authorization: Bearer <GATEWAY_HS_TOKEN>`、Matrix 错误格式。见 [contract.md](docs/contract.md) §1.7 |
 
@@ -362,7 +366,18 @@ hours 或 block/defer 时静默延期。无 embedding 不影响 health。
 
 纯 Python 向量后端每个 scope 只扫描最新 500 条记录（不是先选「最相关」500 条）；启用 sqlite-vec
 后检索覆盖该 scope 的全部向量。当前启用模型回复时，召回的 DM 内容也随上下文发送给配置的模型
-提供方。PR3c 才增加主人 HTTP 端点，需先获总管批准。Compose 透传由 A 线后续完成。
+提供方。PR3c 已增加主人 HTTP 端点；Compose 透传由 A 线后续完成。
+
+### 主人记忆管理（PR3c）
+
+记忆模块启用时，owner 可用 Matrix OpenID 或 Matrix user token 管理自己 AI 的记忆；站点 bearer
+不能调用这些端点。**该 AI 的主人可以查看和删除它与你的聊天记忆**。群组记忆正文仅在 owner
+当前仍 joined 到对应房间时返回，查询失败同样脱敏；响应一律 `Cache-Control: no-store`。删除
+extracted 事实会抑制模型为同一 counterpart/key 重写，owner 显式设置可解除该抑制。审计行不含
+记忆正文、事实值、消息体、原始 txn ID 或密钥。
+counterpart 只以 HMAC 存储；审计表在 memory.db（0600）中，随记忆保留期一同清理。
+`GET /v1/capabilities` 的 `memory.manage` 条目带布尔 `owner_can_read_dm`（默认 true），供客户端
+向聊天对象披露上述事实（App 文案由 C 线负责）。端点、错误码与限流见 contract §1.7.8 ⑩。
 
 ### 测试
 

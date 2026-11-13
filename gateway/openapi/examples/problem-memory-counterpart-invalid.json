@@ -1,0 +1,1 @@
+{"type":"urn:botville:error:memory.counterpart_invalid","title":"Counterpart invalid","status":422,"detail":"Counterpart must be a local human.","instance":"/v1/memories/facts","code":"memory.counterpart_invalid","request_id":"req_memory_counterpart","retry_after_seconds":0}
