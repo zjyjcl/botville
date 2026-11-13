@@ -41,7 +41,7 @@ from ..as_consumer import (
 )
 from ..isolation import SYSTEM_ZONE_DECLARATION, build_untrusted_segment
 from ..errors import GatewayDeliveryError
-from ..policy import DECISION_ALLOW, DECISION_DEFER, CODE_SILENT_HOURS, estimate_tokens
+from ..policy import DECISION_ALLOW, DECISION_BLOCK, DECISION_DEFER, CODE_SILENT_HOURS, estimate_tokens
 from ..service import GatewayService
 from .model_client import ModelClient
 from .personas import Persona
@@ -99,6 +99,7 @@ class EngineHooks(ConsumerHooks):
         memory_store: Optional[object] = None,
         memory_embedding: Optional[object] = None,
         memory_vectors: Optional[object] = None,
+        mood_service: Optional[object] = None,
     ) -> None:
         self._personas = personas
         self._client = client
@@ -107,6 +108,7 @@ class EngineHooks(ConsumerHooks):
         self._memory_store = memory_store
         self._memory_embedding = memory_embedding
         self._memory_vectors = memory_vectors
+        self._mood_service = mood_service
         self.stats = ConsumerStats()
         self._memory_failures = 0
         self._memory_warning_at = float('-inf')
@@ -143,6 +145,21 @@ class EngineHooks(ConsumerHooks):
     def _memory_recovered(self) -> None:
         self._memory_failures = 0
         self.stats.set("memory_db_unavailable_consecutive", 0)
+
+    def _mood(self, action: str, persona_id: str) -> Optional[str]:
+        """Mood is advisory; a database fault must never affect delivery."""
+        if self._mood_service is None:
+            return None
+        try:
+            if action == "reply":
+                return self._mood_service.record_reply(persona_id, human=True)["label"]
+            if action == "block":
+                self._mood_service.record_block(persona_id)
+            else:
+                return self._mood_service.get(persona_id)["label"]
+        except Exception as exc:
+            _LOG.warning("persona mood update failed: %s", type(exc).__name__)
+        return None
 
     def on_human_text(self, ctx: ConsumerContext) -> None:
         try:
@@ -234,6 +251,8 @@ class EngineHooks(ConsumerHooks):
             if decision["decision"] != DECISION_ALLOW:
                 if decision["decision"] == DECISION_DEFER:
                     raise self._deferred_until(decision, persona, room_id)
+                if decision["decision"] == DECISION_BLOCK:
+                    self._mood("block", persona.user_id)
                 self.stats.inc("precheck_blocked")
                 return
 
@@ -275,12 +294,21 @@ class EngineHooks(ConsumerHooks):
             history = buf.snapshot() if buf else []
             messages = _build_messages(history, text)
 
+        # Mood is derived state, never an instruction.  It is deliberately
+        # wrapped in the same untrusted zone as conversation data.
+        mood_label = self._mood("get", persona.user_id)
+        if mood_label is not None:
+            wrapped_mood, _ = build_untrusted_segment("mood: " + mood_label)
+            messages.insert(0, {"role": "user", "content": wrapped_mood})
+
         # Keep the normal full-prompt budget gate: recalled context and room
-        # history count towards the reply policy just as before.
+        # history (including derived mood) count towards the reply policy.
         decision = evaluate(messages)
         if decision["decision"] != DECISION_ALLOW:
             if decision["decision"] == DECISION_DEFER:
                 raise self._deferred_until(decision, persona, room_id)
+            if decision["decision"] == DECISION_BLOCK:
+                self._mood("block", persona.user_id)
             self.stats.inc("precheck_blocked")
             return
 
@@ -321,10 +349,15 @@ class EngineHooks(ConsumerHooks):
                     r.get("code") == CODE_SILENT_HOURS
                     for r in decision.get("reasons", [])):
                 raise self._deferred_until(decision, persona, room_id, receipt)
+            if decision.get("decision") == DECISION_BLOCK:
+                self._mood("block", persona.user_id)
             self.stats.inc("send_blocked")
             return
         if self._dedupe is not None:
             self._dedupe.mark(idem_key)
+        # A delivery receipt defines a successful reply even if optional memory
+        # archival immediately below fails.
+        self._mood("reply", persona.user_id)
         if self._memory_store is not None and ctx is not None:
             self._record_memory(
                 persona, ctx, "assistant", reply_text,

@@ -67,7 +67,7 @@ def persona_summary(server, persona):
             "visibility": "private"}
 
 
-def persona_detail(server, caller, persona_id):
+def owned_persona_candidate(server, caller, persona_id):
     # Validate decoded IDs, including encoded path separators, without logging input.
     local_user = re.fullmatch(r"@[A-Za-z0-9._=/-]+:([^\s/?#%]+)", caller)
     server_name = server.config.matrix_server_name or ""
@@ -77,8 +77,16 @@ def persona_detail(server, caller, persona_id):
     persona = server.memory_personas.get(persona_id)
     if persona is None or not persona.owner_user_id:
         raise PersonaListError(404, "persona.not_found")
+    return persona
+
+
+def persona_detail(server, caller, persona_id):
+    persona = owned_persona_candidate(server, caller, persona_id)
     summary = persona_summary(server, persona)
+    mood_service = getattr(server, "mood_service", None)
+    state = mood_service.get(persona_id) if mood_service is not None else None
+    label = state['label'] if state else None
     if persona.owner_user_id == caller:
-        return summary
+        return dict(summary, mood=label)
     return {**{key: summary[key] for key in ("id", "display_name", "bio", "status")},
-            "mood": None}
+            "mood": label if state and state["mood_public"] else None}

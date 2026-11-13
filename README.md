@@ -29,14 +29,15 @@ An end-to-end core path runs (Compose deployment → gateway → app), while qui
 
 - 网关记忆（B2.6）：已落地，默认关闭；包含四层记忆与 owner 管理 HTTP API，尚不代表生产验收完成。
 - 角色引擎（B2.4）：简单接入对话引擎已有实现（API、人设与 Matrix 事件消费），完整产品验收仍待完成。
-- mood（情绪，B2.5）：尚未实现完整的情绪、需求驱动与主动发言机制。
+- mood（情绪，PR4b）：已实现 memory.db 支持的确定性标签与 owner 状态接口；需求驱动与主动发言仍待实现。
 
 尚未实现或未验收（举例）/ Not yet implemented or accepted (examples)：安装向导（A3.1）、TestFlight 分发（C3.2）、动态跨服（A2.2 剩余；同服已落地）、通知投递与授权回调（D2.1+）、桥接（D2.3）、小镇全部（M4）。Install wizard, TestFlight, cross-server moments, notification delivery & approval callbacks, bridges, and the whole town module. Future work includes mood-driven behavior; memory and the basic persona engine are implemented but not production-accepted.
 
-| 方法 | 网关端点（契约 0.3.0） | 说明 |
+| 方法 | 网关端点（契约 0.4.0） | 说明 |
 |---|---|---|
 | GET | `/v1/personas` | owner 摘要列表，含 bio（缺省 null） |
-| GET | `/v1/personas/{id}` | owner 摘要 / 本服非 owner 最小视图，含 bio；mood 当前 null |
+| GET | `/v1/personas/{id}` | owner 详情 / 本服非 owner 最小视图，含 bio 与 mood；列表项不加 mood |
+| GET/PATCH | `/v1/personas/{id}/state` | 仅 owner 的 mood 与 mood_public；关闭时 404 `mood.disabled` |
 
 ## 模块 / Modules
 

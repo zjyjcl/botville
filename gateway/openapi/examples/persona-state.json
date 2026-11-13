@@ -1,18 +1,10 @@
 {
-  "persona_id": "persona_demo",
+  "persona_id": "@ai_demo:example.invalid",
   "mood": {
     "label": "calm",
-    "valence": 0.35,
-    "arousal": 0.2,
-    "updated_at": "2026-11-03T11:50:00Z"
+    "source": "rule",
+    "set_at": "2026-11-03T11:50:00Z"
   },
-  "needs": [
-    { "key": "social", "level": 0.42 },
-    { "key": "rest", "level": 0.18 }
-  ],
-  "proactive": {
-    "remaining_today": 4,
-    "reset_at": "2026-11-03T16:00:00Z"
-  },
+  "mood_public": true,
   "updated_at": "2026-11-03T11:50:00Z"
 }
