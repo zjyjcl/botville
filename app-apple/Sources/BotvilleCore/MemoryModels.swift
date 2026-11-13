@@ -228,6 +228,9 @@ public struct PersonaState: Decodable, Sendable, Equatable {
     public let moodPublic: Bool
     public let updatedAt: Date?
 
+    /// Owner-only decoration; private moods remain visible to their owner.
+    public var showsPrivateMoodMarker: Bool { mood != nil && !moodPublic }
+
     private enum CodingKeys: String, CodingKey {
         case personaID = "persona_id"
         case mood

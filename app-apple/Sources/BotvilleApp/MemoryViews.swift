@@ -189,6 +189,10 @@ private struct PersonaMemoryView: View {
                         HStack {
                             Label(state.mood?.label ?? "未设置", systemImage: state.mood?.symbolName ?? "face.dashed")
                                 .foregroundStyle(state.mood == nil ? .secondary : memoryAccent)
+                            if state.showsPrivateMoodMarker {
+                                Text("仅自己可见")
+                                    .font(.caption2).foregroundStyle(.secondary)
+                            }
                             Spacer()
                             Menu("手动设置心情") {
                                 ForEach(PersonaMood.allCases, id: \.self) { value in

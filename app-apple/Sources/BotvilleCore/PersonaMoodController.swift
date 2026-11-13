@@ -78,10 +78,14 @@ public final class PersonaMoodController: ObservableObject {
     }
 
     private static func message(for error: Error) -> String {
-        if let error = error as? GatewayClientError, error.httpStatus == 429 {
-            return "操作太频繁，请稍后再试"
+        guard let error = error as? GatewayClientError else { return "操作失败，请稍后重试" }
+        // Preserve the mood editor's existing validation/rate-limit copy.
+        // All other gateway errors use the shared, sanitized description.
+        switch error.httpStatus {
+        case 422: return "操作失败，请稍后重试"
+        case 429: return "操作太频繁，请稍后再试"
+        default: return error.errorDescription ?? "操作失败，请稍后重试"
         }
-        return "操作失败，请稍后重试"
     }
 }
 
