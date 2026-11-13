@@ -136,7 +136,7 @@ class PythonVectorStore:
         found.sort(key=lambda pair: pair[0], reverse=True)
         return [dict(row, text=row.get('item_text') or row.get('summary_text') or '',
                      trust=row.get('item_trust') or row.get('summary_trust') or 'untrusted',
-                     visibility=row.get('item_visibility') or ('dm_only' if row['scope_kind'] == 'dm' else 'shared'),
+                     visibility=row.get('item_visibility', 'dm_only') or ('dm_only' if row['scope_kind'] == 'dm' else 'shared'),
                      created_at=row.get('item_created_at') or row.get('summary_updated_at') or row['created_at'], score=score)
                 for score, row in found[:k]]
 
@@ -187,9 +187,10 @@ class SqliteVecStore(PythonVectorStore):
                     LEFT JOIN memory_summaries ON memory_summaries.id=memory_vectors.summary_id AND memory_summaries.dirty=0
                     WHERE ''' + ' AND '.join(conditions) + '''
                     ORDER BY distance LIMIT ?''', args).fetchall()
+            rows = [dict(row) for row in rows]
             return [dict(row, text=row['item_text'] or row['summary_text'] or '',
                          trust=row['item_trust'] or row['summary_trust'] or 'untrusted',
-                         visibility=row['item_visibility'] or ('dm_only' if row['scope_kind'] == 'dm' else 'shared'),
+                         visibility=row.get('item_visibility', 'dm_only') or ('dm_only' if row['scope_kind'] == 'dm' else 'shared'),
                          created_at=row['item_created_at'] or row['summary_updated_at'] or row['created_at'], score=1.0-row['distance']) for row in rows]
         except Exception:
             return super().search(**kwargs)
@@ -238,6 +239,7 @@ class VectorRecall:
                                      query_vec=self._query, model=self._model, dim=self._dim)
         except Exception:
             return []
-        return [dict(row, text=row.get('text', '')) for row in rows
+        return [dict(row, text=row.get('text', ''),
+                     visibility=row.get('visibility') or 'dm_only') for row in rows
                 if (row.get('persona_id') == persona_id and
                     row.get('scope_kind') == scope_kind and row.get('scope_key') == scope_key)]

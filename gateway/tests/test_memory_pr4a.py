@@ -99,6 +99,26 @@ class Pr4aMemoryTests(unittest.TestCase):
             self.assertEqual([100], [row[0] for row in store._db.execute('SELECT id FROM ' + table)])
         self.assertIsNotNone(store._db.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_memory_summaries_expiry'").fetchone())
 
+    def test_tombstone_and_audit_purge_keep_exact_cutoff(self):
+        now = datetime(2026, 1, 2, tzinfo=timezone.utc)
+        cutoff = now - timedelta(days=1)
+        store = MemoryStore(':memory:', retention_days=1)
+        self.addCleanup(store.close)
+        for label, point in (('old', cutoff - timedelta(seconds=1)),
+                             ('equal', cutoff), ('new', cutoff + timedelta(seconds=1))):
+            stamp = point.strftime('%Y-%m-%dT%H:%M:%SZ')
+            store._db.execute('INSERT INTO memory_tombstones(event_id,created_at) VALUES(?,?)',
+                              (label, stamp))
+            store._db.execute("INSERT INTO memory_audit "
+                "(occurred_at,request_id,caller,persona_id,action,result_code) "
+                "VALUES(?,?,'owner','p','list','200')", (stamp, label))
+        store._db.commit()
+        self.assertEqual(store.purge(now), 2)
+        for table, column in (('memory_tombstones', 'event_id'), ('memory_audit', 'request_id')):
+            with self.subTest(table=table):
+                self.assertEqual([row[0] for row in store._db.execute(
+                    'SELECT ' + column + ' FROM ' + table + ' ORDER BY ' + column)], ['equal', 'new'])
+
     def test_v7_upgrade_adds_expiry_index_idempotently(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, 'memory.db')

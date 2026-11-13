@@ -95,13 +95,16 @@ class MemoryIdleWorker:
             self._thread = threading.Thread(target=self._run, name='memory-idle-worker', daemon=True)
             self._thread.start()
 
-    def stop(self):
+    def stop(self) -> bool:
+        """Return whether the worker exited and its storage can be closed."""
         self._stop.set()
         if self._thread is not None:
             # Never hold process shutdown hostage to a misbehaving provider.
             self._thread.join(MEMORY_WORKER_STOP_TIMEOUT_SECONDS)
             if self._thread.is_alive():
-                _log.warning('Memory idle worker did not stop before timeout')
+                _log.warning('Memory idle worker did not stop before timeout; storage left open')
+                return False
+        return True
 
     def _run(self):
         while not self._stop.wait(1):

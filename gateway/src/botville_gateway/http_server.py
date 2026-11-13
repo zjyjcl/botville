@@ -81,7 +81,7 @@ from .matrix import InMemoryMatrixTransport, MatrixTransport
 from .room_members import RoomMemberSource
 from .moments.http_api import handle as _handle_moments_dispatch
 from .moments.service import build_moments_service
-from .personas_list import PersonaListError, persona_page
+from .personas_list import PersonaListError, persona_page, persona_detail
 from .service import GatewayService
 from .store import UsageStore
 from .timeutil import iso_utc
@@ -438,21 +438,23 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         self._send_problem(401, "auth.invalid_token", "Invalid bearer token")
         return False
 
-    def _auth_capabilities_ok(self) -> bool:
+    def _auth_capabilities_ok(self, *, persona_detail: bool = False) -> bool:
         """Accept site/caller or end-user identity without sending an early 401."""
         header = self.headers.get("Authorization")
         outcome, identity = self.server.authenticator.authenticate(header, log_failure=False)
         if outcome in (AUTH_OK, AUTH_PASS_THROUGH):
             self._caller = identity
             return True
-        user_outcome, user_id = self.server.user_verifier.verify(header)
+        verifier = (self.server.persona_detail_verifier if persona_detail
+                    else self.server.user_verifier)
+        user_outcome, user_id = verifier.verify(header)
         if user_outcome == VERIFY_OK:
             self._user_id = user_id
             return True
-        # Both permitted authentication routes failed.  The authenticator's
-        # first, speculative check was deliberately silent so a valid Matrix
-        # bearer is not logged as a failed caller token.
-        self.server.authenticator._log("failed", None)
+        # Only a definitive rejection is an authentication failure; an
+        # unavailable homeserver has not determined whether the token is valid.
+        if not header or user_outcome in (VERIFY_MISSING, VERIFY_INVALID):
+            self.server.authenticator._log("failed", None)
         if not header:
             self._send_problem(401, "auth.missing", "Authorization header required")
         elif user_outcome in (VERIFY_MISSING, VERIFY_INVALID):
@@ -490,6 +492,19 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             self._send_problem(exc.status, exc.code, "Persona request rejected")
             return
         self._send_json(200, page)
+
+    def _handle_persona_detail(self, encoded_id: str) -> None:
+        if not self._auth_capabilities_ok(persona_detail=True):
+            return
+        owner = self._persona_owner_identity()
+        if owner is None:
+            return
+        try:
+            result = persona_detail(self.server, owner, unquote(encoded_id, errors="strict"))
+        except (PersonaListError, UnicodeError):
+            self._send_problem(404, "persona.not_found", "Persona not found")
+            return
+        self._send_json(200, result)
 
     def _caller_identity(self) -> CallerIdentity:
         """当前请求的调用方身份；未经鉴权（如 /health）时为空身份。"""
@@ -850,6 +865,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 return
             if path == "/v1/personas":
                 self._handle_personas_list(query)
+                return
+            if path.startswith("/v1/personas/"):
+                self._handle_persona_detail(path[len("/v1/personas/"):])
                 return
             if not self._auth_ok():
                 return
@@ -1357,6 +1375,7 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         # #124 §1.2.3：`/moments*` 的终端用户身份校验（MatrixOpenID / Matrix Bearer）。
         # 与上面的 caller/legacy authenticator 并存但互不替代：`/moments*` 只走这里。
         self.user_verifier = UserIdentityVerifier(config)
+        self.persona_detail_verifier = UserIdentityVerifier(config, allow_foreign_identity=True)
         # A2.2（issue #7）动态服务：未配置 GATEWAY_MOMENTS_DB_PATH → None
         # （模块关闭，`/moments*` 鉴权后行为与合入前一致）。
         self.moments_service = build_moments_service(config)
@@ -1579,13 +1598,12 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         if store is not None:
             store.stop_purge_scheduler()
         memory_worker = getattr(self, "memory_worker", None)
-        if memory_worker is not None:
-            memory_worker.stop()
+        memory_worker_stopped = memory_worker is None or memory_worker.stop()
         memory_purger = getattr(self, "memory_purger", None)
         if memory_purger is not None:
             memory_purger.stop()
         memory_store = getattr(self, "memory_store", None)
-        if memory_store is not None:
+        if memory_store is not None and memory_worker_stopped:
             memory_store.close()
         super().server_close()
 

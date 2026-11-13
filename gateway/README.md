@@ -111,6 +111,8 @@ continuwuity 仍用 `memory`（尚无文件注册）。运维注意见
 
 | 方法 | 路径 | 契约 operationId | 说明 |
 |---|---|---|---|
+| GET | `/v1/personas` | `listPersonas` | 0.3.0：owner 摘要列表，含 bio（缺省 null） |
+| GET | `/v1/personas/{id}` | `getPersona` | 0.3.0：owner 摘要 / 本服非 owner 最小视图，含 bio；mood 当前 null |
 | GET | `/health` | `getHealth` | 免鉴权；返回 Health 形态 |
 | POST | `/v1/policy/evaluate` | `evaluatePolicy` | 预检，不投递、不占额度 |
 | POST | `/v1/conversations/{id}/messages` | `sendMessage` | 完整裁决 + 投递 |
