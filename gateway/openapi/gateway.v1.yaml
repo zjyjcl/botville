@@ -2692,7 +2692,7 @@ components:
         visibility: {type: string, enum: [private]}
 
     PersonaMood:
-      description: 可选枚举标签，允许 null；PR4b 实现前详情一律返回 null，不返回情绪对象。
+      description: 可选枚举标签，允许 null 或缺省；PR4b 实现前详情一律返回 null，不返回情绪对象。枚举为暂定集合，PR4b 可能扩展，客户端遇到未知值须按缺省处理（与 PersonaState.mood.label 对齐）。
       type: [string, "null"]
       enum: [neutral, happy, sad, excited, calm, anxious, null]
 

@@ -1115,7 +1115,7 @@ token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，�
 
 `GET /personas` 返回摘要视图，仅含 `id`（Matrix user_id，与记忆 persona_id 一致）、`owner_id`（owner_user_id）、`display_name`（为空回退 localpart）、`bio`（缺省 null）、`kind=custom`、`status=active`、`revision=1`、`created_at`、`updated_at`、`visibility=private`。时间取启动时文件 mtime（UTC RFC3339 Z），不可得则取网关启动时间，是文件型人设的近似时间。配置及其他扩展字段均省略，无 owner 的人设永不列出。
 
-`GET /personas/{persona_id}`（实际路径 `/v1/personas/{id}`）复用 §1.2.2 调用方鉴权与 /capabilities 的用户鉴权 helper。owner 返回与列表项完全一致的摘要（无 model_binding）；已认证本服（server name 大小写不敏感，可含端口）非 owner 仅返回 `id, display_name, bio, status, mood`。mood 是可缺省或 null 的枚举字符串（neutral / happy / sad / excited / calm / anxious），PR4b 前一律 null，不是 PersonaState.mood 对象。不得暴露 owner_id、model_binding、密钥、visibility 或时间戳。
+`GET /personas/{persona_id}`（实际路径 `/v1/personas/{id}`）复用 §1.2.2 调用方鉴权与 /capabilities 的用户鉴权 helper。owner 返回与列表项完全一致的摘要（无 model_binding）；已认证本服（server name 大小写不敏感，可含端口）非 owner 仅返回 `id, display_name, bio, status, mood`。mood 是可缺省或 null 的枚举字符串（暂定 neutral / happy / sad / excited / calm / anxious，PR4b 可能扩展；客户端遇未知值按缺省处理），PR4b 前一律 null，不是 PersonaState.mood 对象。不得暴露 owner_id、model_binding、密钥、visibility 或时间戳。
 
 跨服已验证调用方、未知/非法路径 id、无 owner 的 persona 均返回相同 `404 persona.not_found`，不泄露存在性；不因联邦配对放行。legacy/空 owner/dev 无身份与列表一致为 `403 persona.not_owned`；未认证为既有 401。详情专用用户验证器仅保留可信 homeserver 返回的跨服身份以作 404 拒绝，使用独立缓存；其他端点仍按原规则拒绝跨服用户（401）。bearer caller 的 owner_id 受现有配置格式限制，非 Matrix ID 无法访问详情（404），本 PR 不放宽 token 配置格式。
 
