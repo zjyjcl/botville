@@ -164,17 +164,22 @@ public final class PersonaGroupRoomsModel: ObservableObject {
         _ = await reload()
     }
 
+    /// `preservingRoomsOnFailure` keeps the last list visible until a fresh first
+    /// page arrives (409 conflict refresh). On failure the stale rows stay, and the
+    /// next loadMore restarts from the first page instead of an old cursor.
     @discardableResult
-    private func reload() async -> Bool {
+    private func reload(preservingRoomsOnFailure: Bool = false) async -> Bool {
         generation += 1
         let requestGeneration = generation
         isLoading = true
         isLoadingMore = false
-        rooms = []
-        nextCursor = nil
-        hasMore = false
-        seenCursors = []
-        paginationNeedsRefresh = false
+        if !preservingRoomsOnFailure {
+            rooms = []
+            nextCursor = nil
+            hasMore = false
+            seenCursors = []
+            paginationNeedsRefresh = false
+        }
         errorMessage = nil
         defer { if requestGeneration == generation { isLoading = false } }
         await settings.refresh()
@@ -185,10 +190,15 @@ public final class PersonaGroupRoomsModel: ObservableObject {
                 personaID: personaID, limit: 50,
                 cursor: nil, includeAll: includeAll)
             guard !Task.isCancelled, requestGeneration == generation else { return false }
+            if preservingRoomsOnFailure {
+                seenCursors = []
+                paginationNeedsRefresh = false
+            }
             apply(page, replacing: true)
             return errorMessage == nil
         } catch {
             guard !Task.isCancelled, requestGeneration == generation else { return false }
+            if preservingRoomsOnFailure { paginationNeedsRefresh = true }
             errorMessage = message(for: error)
             return false
         }
@@ -258,7 +268,11 @@ public final class PersonaGroupRoomsModel: ObservableObject {
             paginationNeedsRefresh = true
         } catch let error as GatewayClientError {
             guard !Task.isCancelled else { return }
-            if error.problemCode == "room.not_found" || error.problemCode == "room.state_conflict" {
+            if error.problemCode == "room.state_conflict" {
+                // Keep the old rows if the refresh fails; 409 does not invalidate references.
+                if await reload(preservingRoomsOnFailure: true) { errorMessage = "群状态已变化，已刷新" }
+            } else if error.problemCode == "room.not_found" {
+                // 404 may mean the HMAC key rotated, so every cached room_ref is suspect.
                 if await reload() { errorMessage = "群状态已变化，已刷新" }
             } else {
                 errorMessage = message(for: error)

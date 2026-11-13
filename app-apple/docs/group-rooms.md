@@ -2,7 +2,7 @@
 
 # C2.7 拉群与群管理
 
-依据 [网关契约 §2.4](../../gateway/docs/contract.md)、[OpenAPI](../../gateway/openapi/gateway.v1.yaml) 、[#232 同步清单](https://github.com/zjyjcl/botville/pull/232) 与 [#235（B2.8d2）](https://github.com/zjyjcl/botville/pull/235)。本次仅覆盖 #40 的多 AI 拉群及群管理，不涵盖 AI 关系审批、撤销等其余验收。
+依据 [网关契约 §2.4](../../gateway/docs/contract.md)、[OpenAPI](../../gateway/openapi/gateway.v1.yaml)、[#232 同步清单](https://github.com/zjyjcl/botville/pull/232) 与 [#235（B2.8d2）](https://github.com/zjyjcl/botville/pull/235)。本次仅覆盖 #40 的多 AI 拉群及群管理，不涵盖 AI 关系审批、撤销等其余验收。
 
 #232 清单 1 的既有版本断言调整已由上游 #234 处理；第二轮补充合成夹具假版本说明、OpenAPI info.version 的可变缩进解析及严格唯一性测试，不新增硬编码的真实契约版本断言。
 
@@ -30,7 +30,8 @@
 | 401 | 既有 OpenID 换令牌一次的策略；会话失效提示重新登录。重复 invalid-token 沿用服务器认证异常提示。其他状态不触发重新登录。 |
 | 403（含无 problem body） | 显示「没有权限查看」，提供重试；不切到登录页。 |
 | 404 persona.not_found | 「不存在或不可见」。 |
-| 404 room.not_found / 409 room.state_conflict | 清理旧引用及分页，从第一页刷新，并重新读取 persona 详情以更新群开关；成功提示群状态已变化，失败显示刷新错误。 |
+| 404 room.not_found | 可能是密钥轮换使旧引用失效：先清理旧引用及分页，从第一页刷新，并重新读取 persona 详情以更新群开关；成功提示群状态已变化，失败显示刷新错误（列表为空）。 |
+| 409 room.state_conflict | 从第一页刷新并重新读取 persona 详情；新页到达前保留旧列表。刷新失败时继续显示旧列表并给出刷新错误，下一次加载更多改为从第一页重新加载，不沿用冲突前的游标。 |
 | 503 room.unavailable / persona.unavailable | 服务暂时不可用，可手动重试。 |
 | 纯 503 / 无 code 或空 code 的 503 problem | 「网关请求失败，请稍后重试。」；不映射为 room.unavailable。 |
 | 409 persona.state_conflict | 回滚设置，提示刷新重试。 |
