@@ -592,8 +592,7 @@ class Config:
     mood_half_life_minutes: int = DEFAULT_MOOD_HALF_LIFE_MINUTES
 
     def __post_init__(self) -> None:
-        # KEEP IN SYNC: GATEWAY_GROUP_FORGET_STALE_KEYS is not yet in deploy-side RANGES/BOOLS
-        # (server/tests/test_compose_gateway_mood_proactive.py); A line still needs to add them.
+        # KEEP IN SYNC: deploy-side BOOLS in server/tests/test_compose_gateway_mood_proactive.py
         if not isinstance(self.group_forget_stale_keys, bool):
             raise ConfigError("GATEWAY_GROUP_FORGET_STALE_KEYS must be a boolean")
         if not isinstance(self.groups_enabled, bool):
@@ -603,8 +602,7 @@ class Config:
         if (type(self.group_max_rooms_per_persona) is not int
                 or not 1 <= self.group_max_rooms_per_persona <= 200):
             raise ConfigError("GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA must be within 1–200")
-        # KEEP IN SYNC: the four B2.8c group ranges below are not yet in deploy-side RANGES/BOOLS
-        # (server/tests/test_compose_gateway_mood_proactive.py); A line still needs to add them.
+        # KEEP IN SYNC: deploy-side RANGES in server/tests/test_compose_gateway_mood_proactive.py (the four B2.8c group ranges below)
         for name, low, high in (
             ("group_cooldown_seconds", 0, 3600),
             ("group_max_replies_per_hour", 1, 200),
