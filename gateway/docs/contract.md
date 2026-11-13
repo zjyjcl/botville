@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# AI 网关契约 v1（草案 0.2.0）
+# AI 网关契约 v1（草案 0.3.0）
 
 > 任务：B0.1 · 里程碑 M0 · 评审：C 线（App）/ D 线（通知与开放 API）
 > 机器可读规范：[`gateway/openapi/gateway.v1.yaml`](../openapi/gateway.v1.yaml)
@@ -210,14 +210,14 @@ App                          网关                        模块网页（WKWebV
   `403`**——推不出 owner 或非 owner 都只是让 persona 区为空，`outcome` 仍按 §7.2 正常判定
   （`allowed` / `blocked`）；请求本身非法时仍按 `400` / `401` / `422` 返回，这些状态码与
   persona 归属无关。这与 #123 已合的 fail-closed 行为及其测试一致，PR-D 不得改写为 `403`。
-- **`403` 只用于 `/context/assemble` 以外的 persona 写操作**：例如模块以 `author_persona_id`
+- **`403` 用于 `/context/assemble` 以外的 persona 写操作及无 owner 身份的 persona 读取**：例如模块以 `author_persona_id`
   写动态、写 persona 设置等，调用方 token 有效但该 persona 不归其 owner 所有时返回
   **`403 persona.not_owned`**（错误码统一为 `persona.not_owned`，不使用
   `auth.insufficient_scope`；见 §1.3 与 OpenAPI 的 `persona.not_owned` 定义）。
 - **不改请求字段、不改 `401` 语义**：本节不向任何请求体新增字段；无有效 token（caller token
   未配置且 legacy 关闭、或 token 不匹配）仍走 §1.3 的 `401 auth.invalid_token`。本节不新增
   任何错误码。
-- **v1 的约束范围**：调用方身份**只约束 `/context/assemble` 的 persona 区**（该区内容由
+- **v1 的约束范围**：调用方身份用于 persona 列表/详情（§2）及 `/context/assemble` 的 persona 区（该区内容由
   token 推出的 owner 决定，非 owner 即为空）。**发送路径的 `sender_persona_id` 所有权校验
   不在本期**：v1 不校验以某个 persona 发言的调用方是否拥有该 persona——站点级 token（legacy）
   仍可代表任意 `sender_persona_id` 发言，per-caller token 也不额外做发送侧归属校验。
@@ -748,13 +748,14 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 **② 人设（B2.4 已实现）**
 
 - 只读 JSON 文件 `GATEWAY_PERSONAS_FILE`（空 = 没有人设 → 引擎**永不发言**，消费者
-  仍记录/计数）。仓库只放**示例**：`gateway/examples/personas.example.json`；
+  仍记录/计数）。可选 `bio` 必须为字符串，最多 500 Unicode 码点（Python `len(str)`，非字节）；显式 null 等同省略；其他类型或超长按既有人设校验抛 PersonaConfigError 拒绝启动，错误只含位置/字段/限制，不回显正文。仅 owner 可维护 personas 文件，模型不生成或修改 bio；本 PR 无写端点。仓库只放**示例**：`gateway/examples/personas.example.json`；
   **真实人设不进仓库**，用户自有人设不开源。
 - 结构：`{"personas": [...]}`，每项字段：
 
   | 字段 | 必填 | 含义 |
   |---|---|---|
   | `user_id` | 是 | **本服** `@ai_*`（domain 等于 `GATEWAY_MATRIX_SERVER_NAME`，大小写不敏感） |
+  | `bio` | 否 | owner 维护的签名字符串，最多 500 Unicode 码点；省略则 API 返回 null，不进入 system |
   | `display_name` | 否 | 展示名（拼进系统提示） |
   | `system_prompt` | 是 | 人设指令正文，进 **system/instructions 区**（不是数据区） |
   | `personality` | 否 | 追加的性格描述（同属指令区） |
@@ -769,7 +770,7 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
   `GATEWAY_MATRIX_SERVER_NAME` → **拒绝启动**（exit 2）。错误消息只报**位置与字段名**，
   **不回显文件内容或任何字段原值**（人设文件可能含部署侧写的密钥）。
 - 房间归属由房间内 `@ai_*` 成员的成员关系推出（`room_members` 回调的返回值会被过滤，
-  只保留本服 `@ai_*`；回调缺失/出错时 fail-closed）；`GET /v1/personas` 列表已实现，其他 `/personas*` 操作尚未实现（保持 404）
+  只保留本服 `@ai_*`；回调缺失/出错时 fail-closed）；`GET /v1/personas` 列表已实现，单项 GET 也已实现；写入与 state 操作尚未实现（保持 404）
   （不在 v1 PR1–PR3B 范围）。
 
 **③ 消费者形态**
@@ -1067,7 +1068,7 @@ token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，�
 **⑬ 契约范围**
 
 除⑩ PR3c 已明确新增的 `/v1/memories*`、capability 和 OpenAPI 外，本节其余消费与引擎行为
-不改变 `/v1`；C 线按 0.2.0 契约接入。
+不改变 `/v1`；C 线按 0.3.0 契约接入。
 
 ---
 
@@ -1083,7 +1084,8 @@ token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，�
 | POST | `/capabilities/{capability_id}/session-cookies` | 一次性 code 换 HttpOnly cookie | 模块网页 |
 | GET | `/personas` | 已实现：仅 owner 的文件型人设摘要列表（见下文） | 我的 AI（C2.4） |
 | POST | `/personas` | 创建角色 | 简单接入、我的 AI |
-| GET/PATCH/DELETE | `/personas/{persona_id}` | 角色读写 | 我的 AI |
+| GET | `/personas/{persona_id}` | 已实现：owner 摘要 / 本服非 owner 展示视图（0.3.0，含 bio） | 我的 AI |
+| PATCH/DELETE | `/personas/{persona_id}` | 规划：角色写入 | 我的 AI |
 | GET/PATCH | `/personas/{persona_id}/state` | 心情/需求/主动发言预算 | 我的 AI、群调度 |
 | GET | `/conversations` | 会话列表 | App |
 | POST | `/conversations` | 登记 Matrix room | 服务端（A 线） |
@@ -1111,9 +1113,13 @@ token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，�
 | PUT/DELETE | `/moments/{moment_id}/likes/me` | 点赞与取消点赞 | App / A2.2 |
 | GET | `/moments/{moment_id}/likes` | 点赞列表 | App / A2.2 |
 
-`GET /personas` 返回摘要视图，仅含 `id`（Matrix user_id，与记忆 persona_id 一致）、`owner_id`（owner_user_id）、`display_name`（为空回退 localpart）、`kind=custom`、`status=active`、`revision=1`、`created_at`、`updated_at`、`visibility=private`。时间取启动时文件 mtime（UTC RFC3339 Z），不可得则取网关启动时间，是文件型人设的近似时间。配置及其他扩展字段均省略，无 owner 的人设永不列出。
+`GET /personas` 返回摘要视图，仅含 `id`（Matrix user_id，与记忆 persona_id 一致）、`owner_id`（owner_user_id）、`display_name`（为空回退 localpart）、`bio`（缺省 null）、`kind=custom`、`status=active`、`revision=1`、`created_at`、`updated_at`、`visibility=private`。时间取启动时文件 mtime（UTC RFC3339 Z），不可得则取网关启动时间，是文件型人设的近似时间。配置及其他扩展字段均省略，无 owner 的人设永不列出。
 
-用户 OpenID / Matrix 用户 Bearer 使用已验证 user_id，调用方凭据使用其 owner_id（注：§1.2.2 的 `owner_id` 目前不得含 `:`，无法写成 Matrix user ID，因此调用方 token 当前只会得到空页；是否放宽格式另行决定）；legacy、空 owner 与 dev 无身份放行返回 403 `persona.not_owned`。`owner_id` 只允许自身，其他合法本服人类用户返回 403；格式非法、非 `GATEWAY_MATRIX_SERVER_NAME` 域或 `@ai_*` 返回 400 `request.invalid`。kind/status 按映射值过滤，其他合法枚举返回空，非法枚举返回 400。按 id 升序，cursor 为最后返回 id 的无填充 base64url keyset 游标；畸形 cursor、非法 limit 返回 400。limit 为 1–100 整数，默认 20。响应 `{items, next_cursor, has_more}`，末页游标为 null。复用启动时人设快照，未配置文件返回空页，与记忆开关无关。仅列表已实现，POST、单项 GET/PATCH/DELETE 及 state 操作尚未实现（保持 404），不发布 `role.personas` capability。
+`GET /personas/{persona_id}`（实际路径 `/v1/personas/{id}`）复用 §1.2.2 调用方鉴权与 /capabilities 的用户鉴权 helper。owner 返回与列表项完全一致的摘要（无 model_binding）；已认证本服（server name 大小写不敏感，可含端口）非 owner 仅返回 `id, display_name, bio, status, mood`。mood 是可缺省或 null 的枚举字符串（neutral / happy / sad / excited / calm / anxious），PR4b 前一律 null，不是 PersonaState.mood 对象。不得暴露 owner_id、model_binding、密钥、visibility 或时间戳。
+
+跨服已验证调用方、未知/非法路径 id、无 owner 的 persona 均返回相同 `404 persona.not_found`，不泄露存在性；不因联邦配对放行。legacy/空 owner/dev 无身份与列表一致为 `403 persona.not_owned`；未认证为既有 401。详情专用用户验证器仅保留可信 homeserver 返回的跨服身份以作 404 拒绝，使用独立缓存；其他端点仍按原规则拒绝跨服用户（401）。bearer caller 的 owner_id 受现有配置格式限制，非 Matrix ID 无法访问详情（404），本 PR 不放宽 token 配置格式。
+
+用户 OpenID / Matrix 用户 Bearer 使用已验证 user_id，调用方凭据使用其 owner_id（注：§1.2.2 的 `owner_id` 目前不得含 `:`，无法写成 Matrix user ID，因此调用方 token 当前只会得到空页；是否放宽格式另行决定）；legacy、空 owner 与 dev 无身份放行返回 403 `persona.not_owned`。`owner_id` 只允许自身，其他合法本服人类用户返回 403；格式非法、非 `GATEWAY_MATRIX_SERVER_NAME` 域或 `@ai_*` 返回 400 `request.invalid`。kind/status 按映射值过滤，其他合法枚举返回空，非法枚举返回 400。按 id 升序，cursor 为最后返回 id 的无填充 base64url keyset 游标；畸形 cursor、非法 limit 返回 400。limit 为 1–100 整数，默认 20。响应 `{items, next_cursor, has_more}`，末页游标为 null。复用启动时人设快照，未配置文件返回空页，与记忆开关无关。列表与单项 GET 已实现，POST、PATCH/DELETE 及 state 操作尚未实现（保持 404），不发布 `role.personas` capability。
 
 ### 2.0 动态（Moments）接口说明
 
@@ -1194,7 +1200,7 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 ```json
 {
   "manifest_version": "1.3.0",
-  "contract_version": "0.2.0",
+  "contract_version": "0.3.0",
   "generated_at": "2026-11-13T00:00:00Z",
   "cache_ttl_seconds": 300,
   "defaults": { "unknown_capability": "hidden", "card_fallback": "text" },
@@ -1290,7 +1296,7 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 }
 ```
 
-清单版本为 `1.3.0`，`contract_version` 取网关配置（当前 `0.2.0`），缓存建议为 300 秒。
+清单版本为 `1.3.0`，`contract_version` 取网关配置（当前 `0.3.0`），缓存建议为 300 秒。
 无论记忆模块是否启用，均返回完整基础清单：`chat.direct`、`memory.search`、
 `notify.approvals`、`town.enter`，并保留各自状态、入口及 defaults；按 `module` / `status`
 查询时只返回匹配条目。基础元数据随代码打包，不在运行时读取 OpenAPI 示例文件。
@@ -1698,6 +1704,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.3.0 | 2026-11-13 | [PR4d additive] owner 文件签名 bio（500 码点），列表扩展与分级 GET 详情；本服非 owner 最小视图，跨服/无 owner/未知或非法 id 统一 404 persona.not_found。mood 可缺省/null 枚举，当前 null；自身和他人 bio 均不注入 system。 |
 | 0.2.0 | 2026-11-13 | [additive] 新增实现 `GET /personas` owner 摘要列表及 keyset 分页；其他人设操作尚未实现。 |
 | 0.2.0 | 2026-11-13 | [B 线 PR3d DM 可读开关] 0.2.0 草案内补充部署开关，默认 false；按 §5.3 将默认可读改为默认脱敏视为准破坏并在此公告，随本次 0.2.0 minor 契约交付。E1/E2/E6（含重放）DM 正文/事实值脱敏，保留写入及 pin/unpin/delete；capability 反映配置，披露仅在开启时展示；群成员门禁独立生效。E6 幂等缓存重启后丢失。 |
 | 0.2.0 | 2026-11-13 | [B 线 PR3c memory-owner，**新增端点（minor），不改既有字段/状态码**] 新增 owner memory 浏览、删除、固定与显式事实端点，以及 `memory.manage` capability、审计与群组成员脱敏约束。 |
@@ -2049,6 +2056,8 @@ B2.2 起 peer 层限额按 `(persona, peer_id)` 计数，即对每个对端角�
 
 ### 7.1 trust 判定规则（B2.3）
 
+PR4d：当前 engine 不注入其他 persona 的资料。未来如注入他人的 `bio`，只能进入 derived/untrusted 数据区，绝不进入 system。自身 `bio` 也不注入自己的 system，本 PR 不改变自身 prompt 行为。`bio` 只是 owner 手写展示数据，模型不得生成或修改。
+
 `Message.trust` 由**网关**在投递/入上下文前判定。下表每条规则**独立**评估，
 **所有命中规则取最低值**（偏序 `untrusted < trusted`）；`system` 不参与比较——
 它**只**由规则 1 在 2–8 全部不命中时产生，任何 `untrusted` 命中都覆盖它。
@@ -2386,7 +2395,7 @@ B 类清单的 12 项已于 **2026-11-10 由棉棉霸拍板**，逐项定论见 
 | B2 | 关系审批由 B2.8 以独立的 minor 新增 `/relations/*` 承载，不塞进 `PATCH /conversations`；动作接口细节未定义，本轮不写。终端用户身份定为 Matrix OpenID token（见 §1.2.3） | B2.8（#24）；身份实现见 #124 / PR-D | 无字段/状态码变化 |
 | B3 | v1 不加 `/conversations/{id}/turn`；多 AI 群调度作为网关内部状态，发言仍走 `POST /policy/evaluate` + `POST /messages`，受 `anti_spam` / `ai_loop` 与 proactive 预算约束 | B2.8（#24） | 无字段/状态码变化 |
 | B4 | 小镇接口维持不纳入 v1，M4 再按「只增不删」扩展；`town.tokens_per_day` 已在限额模型里 | M4 / B4.2（#28） | 无字段/状态码变化 |
-| B5 | AI 签名继续用 `Persona.bio` 作为签名展示，不新增 `signature` 字段 | B2.4 / C2.2（#35） | 无字段/状态码变化 |
+| B5 | AI 签名用 `bio`，仅 owner 经 personas 文件写入；最多 500 Unicode 码点，缺省 null。模型不生成/修改，自身不注入 system；他人 bio 仅可进 derived/untrusted 区 | B2.4 / C2.2（#35） | 0.3.0：列表含 bio，分级 GET 详情；跨服/无 owner/未知 id 均 404 |
 | B6 | AI 资料页只用当前查看者与该 AI 的**单聊** `Conversation.relation`；无单聊显示 `stranger`；不做跨群汇总。好友角标只在 `kind=ai` 且该视角 `relation.state=friend` 时出现。关系编辑/审批走 B2 的 `/relations/*`，不在 Persona PATCH 里改（见 §2.3） | C2.2（#35）、B2.8（#24） | 无字段/状态码变化 |
 | B7 | v1 不加 alias API；规范身份是 `persona_id` / Matrix user id，`@ai_*` 仅作 UI 展示，mention 仍提交规范 ID | B 线 persona 身份；C 线展示 | 无字段/状态码变化 |
 | B8 | 发帖默认**不**自动触发 AI 评论；所有者开启后才触发，且计入 `proactive.max_per_day` 与 `anti_spam` / `ai_loop`。订阅对象与回执形状未定，不写接口 | B2.5（#21）、A2.2 | 无字段/状态码变化 |

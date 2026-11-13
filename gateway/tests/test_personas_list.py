@@ -61,6 +61,7 @@ class PersonaHTTP:
               if stat_failure else contextlib.nullcontext()):
             self.server = build_server(config)
         self.server.user_verifier = Verifier()
+        self.server.persona_detail_verifier = self.server.user_verifier
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     def __enter__(self):
@@ -79,7 +80,7 @@ class PersonaHTTP:
         if auth:
             req.add_header('Authorization', auth)
         try:
-            response = urllib.request.urlopen(req, timeout=5)
+            response = urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=5)
         except urllib.error.HTTPError as exc:
             response = exc
         with response:
@@ -102,7 +103,8 @@ class PersonasListTests(unittest.TestCase):
                 self.assertNotIn(forbidden, encoded)
             for row in page['items']:
                 self.assertEqual(set(row), {'id', 'owner_id', 'display_name', 'kind', 'status',
-                                           'revision', 'created_at', 'updated_at', 'visibility'})
+                                           'revision', 'created_at', 'updated_at', 'visibility', 'bio'})
+                self.assertIsNone(row['bio'])
                 self.assertEqual((row['owner_id'], row['kind'], row['status'], row['revision'], row['visibility']),
                                  (OWNER, 'custom', 'active', 1, 'private'))
                 self.assertEqual(row['created_at'], '2023-11-14T22:13:20Z')
