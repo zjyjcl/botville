@@ -23,7 +23,7 @@ E6 写事实只有客户端接口与测试，本轮没有编辑页面。
 部署覆盖规则继续生效。群聊、真人、成员不完整或身份不明确时不猜测 AI。
 
 名字与头像来自 Matrix 成员资料；头像通过已登录 SDK 的认证媒体通道读取，
-失败或无头像显示名字首字母/占位。网关契约 0.5.0 的 `bio` 映射到 `AIProfile.signature`，
+失败或无头像显示名字首字母/占位。网关契约的 `bio` 映射到 `AIProfile.signature`，
 在名字下方用次要色展示，支持多行；null、缺失或去空白后为空时隐藏，不用聊天正文推断。
 详情成功后采用网关的名字和签名，保留 Matrix 头像。公开视图的 mood 为
 calm、happy、sad、excited、tired 时，在名字下显示带 SF Symbol 的次要心情标签，
@@ -39,12 +39,12 @@ calm、happy、sad、excited、tired 时，在名字下显示带 SF Symbol 的�
 主人 `PersonaMemoryView` 固定显示「私聊内容是否可见由服务端开关决定」。
 #211 已将 `owner_can_read_dm` 的 schema 默认值改为 `false`，已在 main
 `a7d5a7f` 的 `gateway/openapi/gateway.v1.yaml` 核对；App 缺失字段仍默认隐藏。
-manifest 的 contract_version 为 0.5.0；manifest_version 保持 1.3.0，与网关运行时
-清单及其测试（`test_memory_qa_p1`）一致。
+manifest 的 contract_version 以网关运行时契约常量为准，manifest_version 以契约示例为准；
+App 测试从这些来源读取版本，校验 OpenAPI、示例、App mock 与 MockGatewayClient 的一致性。
 
 ## 集成边界
 
-#215、#221 已合入（普通 merge main `23f1e23`）。列表和详情按 main 的 0.5.0 契约对齐：
+#215、#221 已合入（普通 merge main `23f1e23`）。列表和详情按当前契约对齐：
 `PersonaSummary` 为包含 nullable bio 的十字段摘要，Matrix user ID 作为 id，
 列表使用平铺的 `next_cursor` / `has_more`。App mock 的 persona-page、persona-state
 与 capability manifest 均逐字节采用当前契约示例；真实请求不注入示例。
@@ -68,16 +68,22 @@ GET 集合、恰好一个非空 id 的详情路径，以及恰好一个非空 id
 
 主人详情的心情块先读取 `GET /v1/personas/{id}/state`，显示当前心情、五个手动选项和
 「对他人显示心情」开关；每次选择或开关发送契约字段 `mood` 或 `mood_public` 的 PATCH。
-界面先乐观更新，失败回滚。`404 mood.disabled` 隐藏整个心情块且不提示错误；422 和其他
-失败提示「操作失败，请稍后重试」，429 提示「操作太频繁，请稍后再试」。PATCH 没有
-Idempotency-Key，因此 500 不重试。
+界面先乐观更新，失败回滚。有心情且 `mood_public == false` 时，主人页在心情徽章旁以
+次要样式显示「仅自己可见」；对方资料页不显示这个标记。
+GET/PATCH 错误复用 `GatewayClientError.errorDescription`：401 提示重新登录；403（含无
+problem body）显示「没有权限查看」；`404 mood.disabled` 隐藏整个心情块且不提示错误，
+其他 404 走现有映射（如 `persona.not_found` 为「不存在或不可见」）；
+`503 mood.unavailable` 显示「心情暂时不可用」，无 problem code 的纯 503 保留通用网关错误。
+422/429 保留心情块本地固定文案：422 为「操作失败，请稍后重试」，429 为
+「操作太频繁，请稍后再试。」。非 GatewayClientError（如网络 URLError）及无共享描述的
+错误兜底为「操作失败，请稍后重试」。PATCH 没有 Idempotency-Key，因此 500 不重试。
 
 契约示例随 main 的 YAML 同步验证；不得为通过检查修改运行时行为。
 `test_example_contract_version_matches_runtime_contract` 保留硬断言，merge 冲突未恢复 skipUnless。
 #221 的 JSON examples 仅更新 `health.json`，App 没有 health mock，因此不新增资源。
 现有 manifest/card/persona-page/persona-state 均由 `MockContractConsistencyTests` 逐字节校验。
 
-契约 0.5.0 的 `proactive` 仅由 `Persona`、`CreatePersonaRequest`、`UpdatePersonaRequest`
+契约的 `proactive` 仅由 `Persona`、`CreatePersonaRequest`、`UpdatePersonaRequest`
 引用；`PersonaSummary`、`PersonaOwnerDetail`、`PersonaPublicView`、`PersonaState` 均不包含它。
 App 共用的 `MemoryPersona` 可选解码完整 Persona 的 `ProactiveSettings`；proactive 缺失或
 null 为 nil，缺 enabled 为 false。max_per_day、require_reply、quiet_hours 保留可选性，

@@ -25,17 +25,18 @@ final class MockContractConsistencyTests: XCTestCase {
         }
     }
 
-    func testManifestVersionsMatchCurrentContractAndRuntimeManifest() throws {
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent().deletingLastPathComponent()
-            .deletingLastPathComponent().deletingLastPathComponent()
+    func testManifestVersionsMatchCurrentContractAndRuntimeManifest() async throws {
+        let versions = try ContractTestVersions()
+        XCTAssertEqual(versions.openAPIVersion, versions.contractVersion)
         for path in ["gateway/openapi/examples/capability-manifest.json",
                      "app-apple/Sources/BotvilleCore/Resources/mock-capability-manifest.json"] {
-            let object = try XCTUnwrap(JSONSerialization.jsonObject(
-                with: Data(contentsOf: root.appendingPathComponent(path))) as? [String: Any])
-            XCTAssertEqual(object["contract_version"] as? String, "0.6.0")
-            XCTAssertEqual(object["manifest_version"] as? String, "1.3.0")
+            let object = try ContractTestVersions.manifest(at: path)
+            XCTAssertEqual(object["contract_version"] as? String, versions.contractVersion)
+            XCTAssertEqual(object["manifest_version"] as? String, versions.manifestVersion)
         }
+        let runtime = try await MockGatewayClient().capabilities()
+        XCTAssertEqual(runtime.contractVersion, versions.contractVersion)
+        XCTAssertEqual(runtime.manifestVersion, versions.manifestVersion)
     }
 
     @MainActor
@@ -134,3 +135,43 @@ final class MockContractConsistencyTests: XCTestCase {
         }
     }
 #endif
+
+/// Read the checked-in contract sources without importing the gateway runtime.
+/// Missing or ambiguous declarations fail the test instead of supplying a default.
+struct ContractTestVersions {
+    static let root = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().deletingLastPathComponent()
+
+    let contractVersion: String
+    let openAPIVersion: String
+    let manifestVersion: String
+
+    init() throws {
+        let config = try String(contentsOf: Self.root.appendingPathComponent(
+            "gateway/src/botville_gateway/config.py"), encoding: .utf8)
+        contractVersion = try Self.capture(
+            #"(?m)^CONTRACT_VERSION\s*=\s*["']([^"']+)["']\s*(?:#.*)?$"#, in: config)
+        let yaml = try String(contentsOf: Self.root.appendingPathComponent(
+            "gateway/openapi/gateway.v1.yaml"), encoding: .utf8)
+        let info = try Self.capture(#"(?m)^info:[ \t]*\n((?:[ \t]+[^\n]*\n|\n)+)"#, in: yaml)
+        openAPIVersion = try Self.capture(
+            #"(?m)^  version:[ \t]*["']?([^\s"']+)["']?[ \t]*$"#, in: info)
+        manifestVersion = try XCTUnwrap(Self.manifest(
+            at: "gateway/openapi/examples/capability-manifest.json")["manifest_version"] as? String)
+    }
+
+    static func manifest(at path: String) throws -> [String: Any] {
+        try XCTUnwrap(JSONSerialization.jsonObject(
+            with: Data(contentsOf: root.appendingPathComponent(path))) as? [String: Any])
+    }
+
+    private static func capture(_ pattern: String, in source: String) throws -> String {
+        let matches = try NSRegularExpression(pattern: pattern).matches(
+            in: source, range: NSRange(source.startIndex..., in: source))
+        XCTAssertEqual(matches.count, 1, "Expected one contract declaration matching \(pattern)")
+        let match = try XCTUnwrap(matches.count == 1 ? matches.first : nil)
+        let range = try XCTUnwrap(Range(match.range(at: 1), in: source))
+        return String(source[range])
+    }
+}

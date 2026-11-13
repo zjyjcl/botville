@@ -83,7 +83,7 @@ public final class PersonaMoodController: ObservableObject {
         // All other gateway errors use the shared, sanitized description.
         switch error.httpStatus {
         case 422: return "操作失败，请稍后重试"
-        case 429: return "操作太频繁，请稍后再试"
+        case 429: return "操作太频繁，请稍后再试。"
         default: return error.errorDescription ?? "操作失败，请稍后重试"
         }
     }

@@ -178,8 +178,9 @@ final class MemoryPresentationPolicyTests: XCTestCase {
 
     func testMockManifestVersionCapabilityAndDisclosure() async throws {
         let value = try await MockGatewayClient().capabilities()
-        XCTAssertEqual(value.manifestVersion, "1.3.0")
-        XCTAssertEqual(value.contractVersion, "0.6.0")
+        let versions = try ContractTestVersions()
+        XCTAssertEqual(value.manifestVersion, versions.manifestVersion)
+        XCTAssertEqual(value.contractVersion, versions.contractVersion)
         XCTAssertTrue(MemoryPresentationPolicy.isMemoryManagementAvailable(in: value))
         XCTAssertEqual(
             value.capabilities.first(where: { $0.id == "memory.manage" })?.ownerCanReadDM, false)

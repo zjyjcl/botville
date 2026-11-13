@@ -34,7 +34,10 @@ struct AIProfileView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text(displayedProfile.displayName).font(.title2.weight(.semibold))
                         if let mood = displayedProfile.mood {
-                            PersonaMoodBadge(mood: mood)
+                            PersonaMoodBadge(presentation: PersonaMoodPresentation(counterpartMood: mood))
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(aiProfileAccent)
+                                .accessibilityLabel("当前心情：\(mood.label)")
                         }
                         if let signature = displayedProfile.signature {
                             Text(signature)
@@ -119,13 +122,17 @@ struct AIProfileView: View {
     }
 }
 
-private struct PersonaMoodBadge: View {
-    let mood: PersonaMood
+/// Shared rendering for the owner and counterpart presentation policies.
+struct PersonaMoodBadge: View {
+    let presentation: PersonaMoodPresentation
 
     var body: some View {
-        Label(mood.label, systemImage: mood.symbolName)
-            .font(.caption.weight(.medium))
-            .foregroundStyle(aiProfileAccent)
-            .accessibilityLabel("当前心情：\(mood.label)")
+        HStack {
+            Label(presentation.mood?.label ?? "未设置",
+                  systemImage: presentation.mood?.symbolName ?? "face.dashed")
+            if let marker = presentation.privateMarkerText {
+                Text(marker).font(.caption2).foregroundStyle(.secondary)
+            }
+        }
     }
 }

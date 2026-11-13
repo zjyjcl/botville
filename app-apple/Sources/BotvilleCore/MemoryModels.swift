@@ -220,6 +220,22 @@ public enum PersonaMood: String, Codable, Sendable, CaseIterable {
     }
 }
 
+/// Presentation consumed by both mood views; only owner state carries visibility.
+public struct PersonaMoodPresentation: Sendable, Equatable {
+    public let mood: PersonaMood?
+    public let privateMarkerText: String?
+
+    public init(ownerState: PersonaState) {
+        mood = ownerState.mood
+        privateMarkerText = ownerState.showsPrivateMoodMarker ? "仅自己可见" : nil
+    }
+
+    public init(counterpartMood: PersonaMood?) {
+        mood = counterpartMood
+        privateMarkerText = nil
+    }
+}
+
 /// Owner-only `/personas/{id}/state` response. The response mood is an object,
 /// whereas public persona details expose the label as a string.
 public struct PersonaState: Decodable, Sendable, Equatable {
