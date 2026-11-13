@@ -12,6 +12,9 @@ Early-exit consumers caught (any path prefix, e.g. /usr/bin/head, and
 behind a multi-call wrapper: `busybox grep`, `toybox head` are checked as
 the applet that follows):
   - head / ghead (always);
+  - any of these run by xargs (`xargs -0 -n1 grep -q`, `xargs -I {} ggrep
+    -m1 ... {}`, `busybox xargs grep -q`): xargs' own options are skipped
+    and the command it runs is checked;
   - grep / egrep / fgrep / rg and the GNU-prefixed ggrep / gegrep / gfgrep
     with -q / -m N / -mN / -l in any short-flag cluster (`-E -q`, `-Eq`,
     `-qxF`, `-m1`, `-m 1`) or --quiet / --silent / --max-count /
@@ -50,19 +53,49 @@ HEAD_LIKE = {"head", "ghead"}
 WRAPPERS = {"busybox", "toybox"}
 LONG_EARLY = ("--quiet", "--silent", "--max-count", "--files-with-matches")
 SEGMENT_END = re.compile(r"[;&)`]|\|\|")
+# xargs runs the command that follows its own options; these options take a
+# separate argument when not attached (-n 1, -I {}, --max-args 2, ...).
+XARGS = {"xargs", "gxargs"}
+XARGS_ARG_SHORT = {"-I", "-n", "-P", "-L", "-d", "-E", "-s", "-a"}
+XARGS_ARG_LONG = {"--arg-file", "--delimiter", "--max-args", "--max-procs",
+                  "--max-lines", "--max-chars", "--replace", "--eof", "--process-slot-var"}
+
+
+def _command_name(tokens):
+    """Strip env assignments / command / exec / sudo, multi-call wrappers
+    (busybox grep) and xargs with its options (xargs -0 -n1 grep -q ...);
+    return (name, remaining tokens) of the command that actually reads."""
+    while True:
+        while tokens and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=\S*|command|exec|sudo|env", tokens[0]):
+            tokens = tokens[1:]
+        if not tokens:
+            return "", []
+        name = tokens[0].strip("\"'").rsplit("/", 1)[-1]
+        if name in WRAPPERS and len(tokens) > 1:
+            tokens = tokens[1:]
+            continue
+        if name in XARGS:
+            rest = tokens[1:]
+            while rest and rest[0].startswith("-"):
+                opt = rest.pop(0)
+                if opt == "--":
+                    break
+                if opt in XARGS_ARG_SHORT or (opt.startswith("--") and "=" not in opt
+                                              and opt in XARGS_ARG_LONG):
+                    if rest:
+                        rest.pop(0)
+            if not rest:
+                return "", []
+            tokens = rest
+            continue
+        return name, tokens
 
 
 def _consumer_is_early_exit(segment):
     segment = SEGMENT_END.split(segment, 1)[0]
-    tokens = segment.strip().lstrip("!{(").split()
-    while tokens and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=\S*|command|exec|sudo", tokens[0]):
-        tokens.pop(0)
-    if not tokens:
+    name, tokens = _command_name(segment.strip().lstrip("!{(").split())
+    if not name:
         return False
-    name = tokens[0].strip("\"'").rsplit("/", 1)[-1]
-    while name in WRAPPERS and len(tokens) > 1:
-        tokens.pop(0)
-        name = tokens[0].strip("\"'").rsplit("/", 1)[-1]
     if name in HEAD_LIKE:
         return True
     if name not in GREP_LIKE:
@@ -153,6 +186,20 @@ class NoEarlyExitPipesTest(unittest.TestCase):
             "tar -tzf x | gegrep -q foo",
             "tar -tzf x | gfgrep -m 1 foo",
             "tar -tzf x | ghead -n1",
+            "find . -name '*.db' | xargs grep -q foo",
+            "find . -print0 | xargs -0 grep -q foo",
+            "find . -print0 | xargs -0 -n1 grep -qx foo",
+            "find . -print0 | xargs -0 -n 1 -P 4 egrep -q foo",
+            "find . | xargs -I {} fgrep -q foo {}",
+            "find . | xargs -I{} ggrep -m1 foo {}",
+            "find . | xargs --max-args 2 grep --quiet foo",
+            "find . | xargs --max-args=2 -r grep -l foo",
+            "find . | xargs busybox grep -q foo",
+            "find . | busybox xargs -0 grep -q foo",
+            "find . | /usr/bin/xargs -0 /usr/bin/grep -q foo",
+            "find . | xargs -- grep -q foo",
+            "find . | xargs head -n1",
+            "find . | env LC_ALL=C xargs grep -q foo",
         )
         for line in bad:
             with self.subTest(line=line):
@@ -175,6 +222,12 @@ class NoEarlyExitPipesTest(unittest.TestCase):
             "a | ggrep -v foo",
             "a | busybox tail -n 1",
             "a | busybox wc -l",
+            "find . -print0 | xargs -0 grep -c foo",
+            "find . -print0 | xargs -0 -n1 grep foo",
+            "find . | xargs -I {} chmod 600 {}",
+            "find . -print0 | xargs -0 rm -f",
+            "find . | xargs -n 1 echo -q",
+            "find . | xargs",
         )
         for line in good:
             with self.subTest(line=line):

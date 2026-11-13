@@ -24,6 +24,7 @@ make gateway-hs-smoke # 对真实 HS 冒烟：whoami + OpenID userinfo + AS 事�
                      # （需 GATEWAY=1 的 synapse/tuwunel 栈；网关只能跑一个，只用 make up 重建；
                      # 测试用户/房间跨次复用，记在 generated/gateway-hs-smoke.json）
 make config          # 只校验、不写任何文件：网关预检 + compose config --quiet（不跑 init，不打印插值后的值；没有 .env 时报错）
+                     # 注意：自己手敲 docker compose config 时一定带 --quiet，不带会把 .env 里的密钥全部展开打印
 make smoke           # 标准库冒烟测试：注册→登录→建房(v10)→发消息→回读→sync
 make backup          # 备份到 ./backups/<UTC时间戳>/（目录 700、文件 600，A1.1）
 make restore RESTORE_DIR=backups/<时间戳>   # 破坏性恢复（自动 --yes）
@@ -52,7 +53,9 @@ make down            # 停止（不传 -v，不删任何卷）。清卷：docker
 `make restore` 自动覆盖）。网关以 0600 创建这个文件，里面有聊天内容，备份同样要私密。
 `GATEWAY_MEMORY_RETENTION_DAYS`（默认 90）、`GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS`
 （默认 86400）同样透传。PR3b 的 `GATEWAY_MEMORY_SUMMARY_MODEL` / `GATEWAY_EMBEDDING_*` /
-`GATEWAY_MEMORY_VECTOR_BACKEND` 也透传（embedding 默认关）。**设了 `GATEWAY_EMBEDDING_MODEL`，私聊正文就会
+`GATEWAY_MEMORY_VECTOR_BACKEND` 也透传（embedding 默认关）。PR3d 的
+`GATEWAY_MEMORY_OWNER_CAN_READ_DM`（默认 `false`，严格布尔）打开后**主人能看到 AI 的私聊记忆，
+App 会向聊天对方显示披露**。**设了 `GATEWAY_EMBEDDING_MODEL`，私聊正文就会
 发给 embedding 服务商**（地址留空 = 聊天模型同一家）；`GATEWAY_EMBEDDING_API_KEY` 是密钥，只放本地 `.env`。
 
 

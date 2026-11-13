@@ -289,7 +289,7 @@ make backup
 | --- | --- |
 | `synapse-db.dump` | `pg_dump -Fc` 数据库快照（postgres 保持运行中导出） |
 | `synapse-data.tar.gz` | `media_store`、`signing.key`（短暂停 synapse 保证与数据库一致） |
-| `gateway-data.tar.gz` | （可选）compose 卷 `gateway-data` 的**整卷** `tar`（卷根目录下的全部文件，不限 `.db`）。打包期间暂停正在运行的 gateway 容器；打包前对卷内**所有** `*.db`（含子目录）做 `PRAGMA wal_checkpoint(TRUNCATE)`（sqlite3 CLI，没有则用镜像里的 python3）。恢复后卷内所有 SQLite 文件（`*.db` 及 `-wal`/`-shm`）显式 `chmod 600`。**卷不存在则跳过，不写此文件**（没用过 `GATEWAY=1` 的栈没有该卷）。旧备份没有此文件时，恢复不碰该卷 |
+| `gateway-data.tar.gz` | （可选）compose 卷 `gateway-data` 的**整卷** `tar`（卷根目录下的全部文件，不限 `.db`）。打包期间暂停正在运行的 gateway 容器；打包前对卷内**所有** `*.db`（含子目录）做 `PRAGMA wal_checkpoint(TRUNCATE)`（sqlite3 CLI，没有则用镜像里的 python3）。恢复后卷内所有 SQLite 文件（`*.db` 及 `-wal`/`-shm`/`-journal`）显式 `chmod 600`。**卷不存在则跳过，不写此文件**（没用过 `GATEWAY=1` 的栈没有该卷）。旧备份没有此文件时，恢复不碰该卷 |
 | `homeserver.yaml` | 渲染后的 Synapse 配置副本 |
 | `env` | `.env` 副本，**含全部密钥**（网关密钥若写在这份 `.env` 里会随它备份；`gateway-data` 卷只含业务数据，不另存密钥） |
 | `manifest.txt` | 备份时间、镜像、每个文件的 sha256（有 `gateway-data.tar.gz` 时也列入） |
@@ -350,7 +350,8 @@ curl -s http://127.0.0.1:8020/health   # 端口 = .env 的 BOTVILLE_GATEWAY_PORT
 `/var/lib/botville-gateway/memory.db`，0600，在 gateway-data 卷里随备份走）/
 `GATEWAY_MEMORY_RETENTION_DAYS` / `GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS`，以及 PR3b 的
 `GATEWAY_MEMORY_SUMMARY_MODEL` / `GATEWAY_EMBEDDING_BASE_URL` / `GATEWAY_EMBEDDING_MODEL` /
-`GATEWAY_EMBEDDING_API_KEY`（密钥）/ `GATEWAY_EMBEDDING_DIM` / `GATEWAY_MEMORY_VECTOR_BACKEND`
+`GATEWAY_EMBEDDING_API_KEY`（密钥）/ `GATEWAY_EMBEDDING_DIM` / `GATEWAY_MEMORY_VECTOR_BACKEND`、
+PR3d 的 `GATEWAY_MEMORY_OWNER_CAN_READ_DM`（默认 false；打开后主人能看 AI 的私聊记忆，App 向对方披露）
 从 `.env` 透传给网关（init.sh 不生成，开关默认关；设了 embedding 模型后私聊正文会发给
 embedding 服务商，地址留空即聊天模型同一家）；
 人设目录 `server/compose/gateway-personas/` 只读挂到 `/etc/botville-gateway`（真实人设
