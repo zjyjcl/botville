@@ -6,6 +6,7 @@ import contextlib
 from datetime import datetime, timezone
 import io
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -88,6 +89,28 @@ class PersonaHTTP:
 
 
 class PersonasListTests(unittest.TestCase):
+    def test_user_bearer_does_not_log_speculative_caller_failure(self):
+        log = logging.getLogger('botville_gateway.caller_identity')
+        records = []
+        handler = logging.Handler()
+        handler.emit = records.append
+        log.addHandler(handler)
+        old_level = log.level
+        log.setLevel(logging.INFO)
+        try:
+            with PersonaHTTP() as app:
+                for auth in ('MatrixOpenID user', 'Bearer user'):
+                    self.assertEqual(app.request(auth=auth)[0], 200)
+                    self.assertEqual(app.request(auth=auth, path='/v1/capabilities')[0], 200)
+                self.assertEqual([r for r in records if 'auth failed' in r.getMessage()], [])
+                self.assertEqual(app.request(auth='Bearer invalid')[0], 401)
+                self.assertEqual(sum('auth failed' in r.getMessage() for r in records), 1)
+                self.assertEqual(app.request(auth='Bearer invalid', path='/v1/capabilities')[0], 401)
+        finally:
+            log.removeHandler(handler)
+            log.setLevel(old_level)
+        failures = [record.getMessage() for record in records if 'auth failed' in record.getMessage()]
+        self.assertEqual(failures, ['auth failed: caller_id=<unknown>'] * 2)
     def test_summary_and_privacy(self):
         with PersonaHTTP() as app:
             captured = io.StringIO()

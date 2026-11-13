@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 MEMORY_PURGE_INTERVAL_MIN_SECONDS = 60
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 OWNER_PIN_LIMIT = 200
 _log = logging.getLogger(__name__)
 
@@ -113,6 +113,9 @@ _MIGRATIONS = {
     ),
     7: (
         '''CREATE TABLE IF NOT EXISTS memory_id_sequences (table_name TEXT PRIMARY KEY, next_id INTEGER NOT NULL)''',
+    ),
+    8: (
+        '''CREATE INDEX IF NOT EXISTS idx_memory_summaries_expiry ON memory_summaries(updated_at)''',
     ),
 }
 
