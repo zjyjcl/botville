@@ -157,6 +157,65 @@ final class GroupRoomTransportTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testRoomRefreshUsesProblemCodeRegardlessOfTitle() async throws {
+        let cases: [(Int, String?, String, Bool)] = [
+            (404, "room.not_found", "Room request rejected", true),
+            (404, "room.not_found", "Arbitrary title", true),
+            (409, "room.state_conflict", "Room request rejected", true),
+            (409, "room.state_conflict", "Something else entirely", true),
+            (404, "persona.not_found", "Room not found", false),
+            (409, "request.invalid", "Room state conflict", false),
+            (409, nil, "Room request rejected", false),
+        ]
+        for (status, code, title, refreshes) in cases {
+            var problem: [String: Any] = ["title": title, "status": status]
+            if let code { problem["code"] = code }
+            let disabledOwner = Data(String(decoding: ownerBody, as: UTF8.self)
+                .replacingOccurrences(of: "\"enabled\":true", with: "\"enabled\":false").utf8)
+            GroupRoomURLProtocol.reset(replies: [
+                (200, ownerBody), (200, activeRoomListBody),
+                (status, try JSONSerialization.data(withJSONObject: problem)),
+                (200, disabledOwner), (200, activeRoomListBody),
+            ])
+            let client = try makeClient()
+            let settings = PersonaGroupsSettingsController(personaID: "@ai:local.test",
+                initialGroups: .init(enabled: true, invitePolicy: .owner), client: client)
+            let model = PersonaGroupRoomsModel(personaID: "@ai:local.test", client: client, settings: settings)
+            await model.load()
+            await model.setMode(roomRef: String(repeating: "a", count: 64), mode: .muted)
+            XCTAssertEqual(GroupRoomURLProtocol.requests.count, refreshes ? 5 : 3)
+            XCTAssertEqual(model.errorMessage == "群状态已变化，已刷新", refreshes)
+            XCTAssertEqual(model.groupsEnabled, !refreshes)
+            XCTAssertEqual(model.rooms.count, 1)
+        }
+    }
+
+    func test503WithoutCodeAlwaysUsesGenericCopy() async throws {
+        for body in [Data(), Data("{\"status\":503,\"title\":\"Room unavailable\"}".utf8),
+                     Data("{\"status\":503,\"code\":\"\",\"title\":\"room.unavailable\"}".utf8)] {
+            GroupRoomURLProtocol.reset(status: 503, body: body)
+            let client = try makeClient()
+            do {
+                _ = try await client.groupRooms(personaID: "@ai:local.test")
+                XCTFail("Expected generic 503")
+            } catch let error as GatewayClientError {
+                XCTAssertEqual(error, .httpStatus(503))
+                XCTAssertEqual(error.errorDescription, "网关请求失败，请稍后重试。")
+            }
+            XCTAssertEqual(GroupRoomURLProtocol.requests.count, 1)
+        }
+        XCTAssertEqual(GatewayClientError.httpStatus(503).errorDescription, "网关请求失败，请稍后重试。")
+        XCTAssertEqual(GatewayClientError.problem(status: 503, code: "").errorDescription,
+                       "网关请求失败，请稍后重试。")
+    }
+
+    private var activeRoomListBody: Data {
+        let item = String(decoding: roomBody, as: UTF8.self)
+            .replacingOccurrences(of: "\"state\":\"left\"", with: "\"state\":\"accepted\"")
+        return Data("{\"items\":[\(item)],\"next_cursor\":null,\"has_more\":false,\"groups_enabled\":true}".utf8)
+    }
+
     private func makeClient() throws -> HTTPGatewayClient {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [GroupRoomURLProtocol.self]
@@ -203,12 +262,22 @@ private final class GroupRoomURLProtocol: URLProtocol, @unchecked Sendable {
     private static var status = 200
     private static var body = Data()
     private static var recorded: [URLRequest] = []
+    private static var replies: [(Int, Data)] = []
     static var requests: [URLRequest] { lock.withLock { recorded } }
     static func reset(status: Int, body: Data) {
         lock.withLock {
             self.status = status
             self.body = body
             recorded = []
+            replies = []
+        }
+    }
+    static func reset(replies: [(Int, Data)]) {
+        lock.withLock {
+            self.replies = replies
+            recorded = []
+            status = 500
+            body = Data()
         }
     }
     override class func canInit(with request: URLRequest) -> Bool {
@@ -218,6 +287,7 @@ private final class GroupRoomURLProtocol: URLProtocol, @unchecked Sendable {
     override func startLoading() {
         let (status, body) = Self.lock.withLock {
             Self.recorded.append(request)
+            if !Self.replies.isEmpty { return Self.replies.removeFirst() }
             return (Self.status, Self.body)
         }
         let response = HTTPURLResponse(

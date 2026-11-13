@@ -1,6 +1,7 @@
 // Copyright 2026 botville contributors
 // SPDX-License-Identifier: Apache-2.0
 
+import Combine
 import Foundation
 import XCTest
 
@@ -14,7 +15,7 @@ final class PersonaGroupRoomsModelTests: XCTestCase {
             .success(page([room("b"), room("c")], nil, false)),
             .success(page([room("left", state: "left")], nil, false)),
         ])
-        let model = PersonaGroupRoomsModel(personaID: "@ai:local", client: client)
+        let model = roomsModel(client)
         await model.load()
         await model.loadMore()
         XCTAssertEqual(model.rooms.map(\.roomRef), [ref("a"), ref("b"), ref("c")])
@@ -35,7 +36,7 @@ final class PersonaGroupRoomsModelTests: XCTestCase {
                 .success(room("a", state: "left", pending: true)),
                 .success(room("a", state: "left", pending: false)),
             ])
-        let model = PersonaGroupRoomsModel(personaID: "@ai:local", client: client)
+        let model = roomsModel(client)
         await model.load()
         await model.setMode(roomRef: ref("a"), mode: .muted)
         XCTAssertEqual(model.rooms.first?.mode, .muted)
@@ -62,7 +63,7 @@ final class PersonaGroupRoomsModelTests: XCTestCase {
                 .failure(.problem(status: 409, code: "room.state_conflict")),
                 .failure(.problem(status: 404, code: "room.not_found")),
             ])
-        let model = PersonaGroupRoomsModel(personaID: "@ai:local", client: client)
+        let model = roomsModel(client)
         await model.load()
         await model.setMode(roomRef: ref("a"), mode: .muted)
         XCTAssertEqual(model.rooms.map(\.roomRef), [ref("b")])
@@ -73,14 +74,14 @@ final class PersonaGroupRoomsModelTests: XCTestCase {
         XCTAssertEqual(model.errorMessage, "网关请求失败，请稍后重试。")
     }
 
-    func testSharedErrorsAndGroupsDisabledClearRooms() async {
+    func testSharedErrorsAndDisabledEmptyPage() async {
         let client = RoomsScriptClient(pages: [
             .failure(.httpStatus(401)), .failure(.httpStatus(403)),
             .failure(.problem(status: 404, code: "persona.not_found")),
             .failure(.problem(status: 503, code: "room.unavailable")),
             .success(GroupRoomListJSON.disabled),
         ])
-        let model = PersonaGroupRoomsModel(personaID: "@ai:local", client: client)
+        let model = roomsModel(client)
         await model.load()
         XCTAssertEqual(model.errorMessage, "会话已失效，请重新登录。")
         await model.refresh()
@@ -92,6 +93,110 @@ final class PersonaGroupRoomsModelTests: XCTestCase {
         await model.refresh()
         XCTAssertFalse(model.groupsEnabled)
         XCTAssertTrue(model.rooms.isEmpty)
+    }
+
+    func testDisabledDeploymentKeepsPagesAndAllowsOnlyMuteAndLeave() async {
+        let first = GroupRoomList(items: [room("a")], nextCursor: "next", hasMore: true, groupsEnabled: false)
+        let second = GroupRoomList(items: [room("b", state: "encrypted_disabled", mode: "muted")],
+                                   nextCursor: nil, hasMore: false, groupsEnabled: false)
+        let client = RoomsScriptClient(
+            pages: [.success(first), .success(second)],
+            modes: [.success(room("a", mode: "muted"))],
+            leaves: [.success(room("b", state: "left"))])
+        let model = roomsModel(client)
+        await model.load()
+        XCTAssertFalse(model.groupsEnabled)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertTrue(model.canLoadMore)
+        await model.loadMore()
+        XCTAssertEqual(model.rooms.count, 2)
+        await model.setMode(roomRef: ref("b"), mode: .mentionOnly)
+        let blocked = await client.modeRequests()
+        XCTAssertTrue(blocked.isEmpty)
+        await model.setMode(roomRef: ref("a"), mode: .muted)
+        await model.leave(roomRef: ref("b"))
+        XCTAssertEqual(model.rooms.first?.mode, .muted)
+        XCTAssertEqual(model.rooms.last?.state, .left)
+        let sent = await client.modeRequests()
+        XCTAssertEqual(sent, [.muted])
+    }
+
+    func testSharedPersonaSettingImmediatelyClosesRoomsAndRollbackRestoresIt() async {
+        let client = RoomsScriptClient(
+            pages: [.success(page([room("a", mode: "muted")], nil, false))],
+            modes: [.success(room("a", mode: "mention_only"))],
+            updates: [.success(owner(groups(false, .owner))), .failure(.httpStatus(500)),
+                      .success(owner(groups(true, .owner)))])
+        let model = roomsModel(client)
+        await model.load()
+        XCTAssertTrue(model.canEnableMentionOnly)
+        var changes = 0
+        let observation = model.objectWillChange.sink { changes += 1 }
+        await model.settings.setEnabled(false)
+        XCTAssertGreaterThan(changes, 0) // The mounted rooms view receives shared-setting updates.
+        withExtendedLifetime(observation) {}
+        XCTAssertFalse(model.groupsEnabled)
+        XCTAssertEqual(model.rooms.count, 1)
+        await model.setMode(roomRef: ref("a"), mode: .mentionOnly)
+        XCTAssertFalse(model.canEnableMentionOnly)
+        await model.settings.setEnabled(true) // Failed save rolls back to disabled.
+        XCTAssertFalse(model.groupsEnabled)
+        await model.setMode(roomRef: ref("a"), mode: .mentionOnly)
+        let blocked = await client.modeRequests()
+        XCTAssertTrue(blocked.isEmpty)
+        await model.settings.setEnabled(true)
+        XCTAssertTrue(model.canEnableMentionOnly)
+        await model.setMode(roomRef: ref("a"), mode: .mentionOnly)
+        let sent = await client.modeRequests()
+        XCTAssertEqual(sent, [.mentionOnly])
+    }
+
+    func testEnabledActiveStatesCanSwitchBothDirections() async {
+        for state in ["accepted", "encrypted_disabled"] {
+            let client = RoomsScriptClient(
+                pages: [.success(page([room("a", state: state)], nil, false))],
+                modes: [.success(room("a", state: state, mode: "muted")),
+                        .success(room("a", state: state, mode: "mention_only"))])
+            let model = roomsModel(client)
+            await model.load()
+            await model.setMode(roomRef: ref("a"), mode: .muted)
+            await model.setMode(roomRef: ref("a"), mode: .mentionOnly)
+            let sent = await client.modeRequests()
+            XCTAssertEqual(sent, [.muted, .mentionOnly])
+        }
+    }
+
+    func testConflictRefreshesPersonaAndPreventsAnotherMentionOnlyWrite() async {
+        let client = RoomsScriptClient(
+            pages: [.success(page([room("a", mode: "muted")], nil, false)),
+                    .success(page([room("a", mode: "muted")], nil, false))],
+            modes: [.failure(.problem(status: 409, code: "room.state_conflict"))],
+            personas: [.success(owner(groups(true, .owner))), .success(owner(groups(false, .owner)))])
+        let model = roomsModel(client)
+        await model.load()
+        await model.setMode(roomRef: ref("a"), mode: .mentionOnly)
+        XCTAssertFalse(model.groupsEnabled)
+        XCTAssertEqual(model.rooms.count, 1)
+        XCTAssertEqual(model.errorMessage, "群状态已变化，已刷新")
+        await model.setMode(roomRef: ref("a"), mode: .mentionOnly)
+        let sent = await client.modeRequests()
+        XCTAssertEqual(sent, [.mentionOnly])
+        let reads = await client.personaCount()
+        XCTAssertEqual(reads, 2)
+    }
+
+    func testFailedPersonaRefreshKeepsRoomsButCannotEnableReplies() async {
+        let client = RoomsScriptClient(
+            pages: [.success(page([room("a", mode: "muted")], nil, false))],
+            personas: [.failure(.httpStatus(503))])
+        let model = roomsModel(client)
+        await model.load()
+        XCTAssertEqual(model.rooms.count, 1)
+        XCTAssertFalse(model.canEnableMentionOnly)
+        XCTAssertEqual(model.errorMessage, "网关请求失败，请稍后重试。")
+        await model.setMode(roomRef: ref("a"), mode: .mentionOnly)
+        let sent = await client.modeRequests()
+        XCTAssertTrue(sent.isEmpty)
     }
 
     func testSettingsLoadSaveRollbackAndRejectsPublicOrFailedLoad() async {
@@ -150,7 +255,7 @@ final class PersonaGroupRoomsModelTests: XCTestCase {
     func testIncludeSwitchDiscardsInFlightLoadMoreAndRepeatedLeaveIsSerialized() async {
         let gate = RoomsGate()
         let client = GatedRoomsClient(gate: gate)
-        let model = PersonaGroupRoomsModel(personaID: "@ai:local", client: client)
+        let model = roomsModel(client)
         await model.load()
         let more = Task { @MainActor in await model.loadMore() }
         await gate.waitForMore()
@@ -172,6 +277,13 @@ final class PersonaGroupRoomsModelTests: XCTestCase {
         XCTAssertEqual(count, 1)
     }
 
+}
+
+@MainActor
+private func roomsModel(_ client: any GatewayClient) -> PersonaGroupRoomsModel {
+    PersonaGroupRoomsModel(personaID: "@ai:local", client: client,
+        settings: PersonaGroupsSettingsController(personaID: "@ai:local",
+            initialGroups: groups(true, .owner), client: client))
 }
 
 private enum GroupRoomListJSON {
@@ -247,6 +359,8 @@ private actor RoomsScriptClient: GatewayClient {
     private var roomCalls: [String] = []
     private var sentUpdates: [PersonaGroupsSettings] = []
     private var leavesSent = 0
+    private var modesSent: [GroupRoomMode] = []
+    private var personasRead = 0
     init(
         pages: [Result<GroupRoomList, GatewayClientError>] = [],
         modes: [Result<GroupRoom, GatewayClientError>] = [],
@@ -268,12 +382,20 @@ private actor RoomsScriptClient: GatewayClient {
     }
     func updateGroupRoomMode(personaID: String, roomRef: String, mode: GroupRoomMode) async throws
         -> GroupRoom
-    { try modes.removeFirst().get() }
+    {
+        modesSent.append(mode)
+        return try modes.removeFirst().get()
+    }
     func leaveGroupRoom(personaID: String, roomRef: String) async throws -> GroupRoom {
         leavesSent += 1
         return try leaves.removeFirst().get()
     }
-    func persona(id: String) async throws -> PersonaDetail { try personas.removeFirst().get() }
+    func persona(id: String) async throws -> PersonaDetail {
+        personasRead += 1
+        return try personas.isEmpty ? owner(groups(true, .owner)) : personas.removeFirst().get()
+    }
+    func personaCount() -> Int { personasRead }
+    func modeRequests() -> [GroupRoomMode] { modesSent }
     func updatePersonaGroups(id: String, groups: PersonaGroupsSettings) async throws
         -> PersonaDetail
     {
@@ -341,6 +463,7 @@ private actor GatedRoomsClient: GatewayClient {
     let gate: RoomsGate
     private var leaves = 0
     init(gate: RoomsGate) { self.gate = gate }
+    func persona(id: String) async throws -> PersonaDetail { owner(groups(true, .owner)) }
     func groupRooms(personaID: String, limit: Int?, cursor: String?, includeAll: Bool) async throws
         -> GroupRoomList
     {

@@ -2,9 +2,9 @@
 
 # C2.7 拉群与群管理
 
-依据 [网关契约 §2.4](../../gateway/docs/contract.md)、[OpenAPI](../../gateway/openapi/gateway.v1.yaml) 与 [#232 同步清单](https://github.com/zjyjcl/botville/pull/232)。本次仅覆盖 #40 的多 AI 拉群及群管理，不涵盖 AI 关系审批、撤销等其余验收。
+依据 [网关契约 §2.4](../../gateway/docs/contract.md)、[OpenAPI](../../gateway/openapi/gateway.v1.yaml) 、[#232 同步清单](https://github.com/zjyjcl/botville/pull/232) 与 [#235（B2.8d2）](https://github.com/zjyjcl/botville/pull/235)。本次仅覆盖 #40 的多 AI 拉群及群管理，不涵盖 AI 关系审批、撤销等其余验收。
 
-#232 清单 1 的既有版本断言调整已由上游 #234 处理；本分支独立实现后仅用普通 merge 同步 main，本 PR 不修改那些断言，也不新增硬编码的契约版本断言。
+#232 清单 1 的既有版本断言调整已由上游 #234 处理；第二轮补充合成夹具假版本说明、OpenAPI info.version 的可变缩进解析及严格唯一性测试，不新增硬编码的真实契约版本断言。
 
 ## 使用路径
 
@@ -12,7 +12,7 @@
 - 「允许被拉进群」和「谁可以拉它进群」保存完整的 `groups` 对象，失败恢复上次服务端值；不发送 revision、If-Match 或其他 persona 字段。
 - 群列表默认活跃群，切换「显示已退出的群」重置分页。下拉刷新重新请求第一页，加载更多原样传递 `next_cursor`，按 `room_ref` 去重。PATCH 成功后若还需加载更多，先刷新第一页以重新取得更新后排序的游标；写入期间暂停筛选、刷新和其他提交。
 - 每行用「群聊 1、2…」及可选加入时间展示；序号仅为本次列表位置。绝不向用户显示不透明引用或把它当作 Matrix room ID。
-- 安静模式仅在 accepted/encrypted_disabled 且模式已知时可改。开启后被 @ 也不回复，仍会记住群里的内容。
+- 安静模式仅在 accepted/encrypted_disabled 且模式已知时可改。群功能开启时可以切换 muted / mention_only；关闭时只有单向「设为安静」，已 muted 仅显示状态，同时保留「退出群聊」。控制器在关闭或 persona 设置尚未确认时拒绝 mention_only，不发请求。开启安静模式后被 @ 也不回复，仍会记住群里的内容。
 - AI 退群需红色 destructive 二次确认，明确不可撤销、不会继续发言或自动加入。成功使用响应原地更新，活跃视图暂保留「已退出」，下次刷新再移除。
 - `left` 始终显示「已退出」；`leave_pending=true` 只加弱提示「正在同步」。该字段不是持久状态，后续列表不承诺提供。未知 state/mode 显示未知提示并禁止操作。
 - 「新建会话 → 群聊」可多选已有 joined 私聊中的对方及我的 AI，同时保留手填 MXID。对私聊读取完整成员快照，仅恰好自己与另一位已加入成员时列为候选。按完整 server_name（包括端口）过滤跨服 AI；联系人按 MXID 去重，至少邀请一位，支持一次邀请多个 AI。
@@ -21,22 +21,39 @@
 
 ## 门控及错误
 
-没有已发布的群/rooms capability ID；不新增 ID，不改变 mock manifest。owner `groups` 字段控制入口与设置是否出现；列表响应 `groups_enabled=false` 时隐藏列表，显示「部署未开启群聊功能」。部署开关与 persona 邀请开关是两层独立条件。
+没有已发布的群/rooms capability ID；不新增 ID，不改变 mock manifest。owner `groups` 字段控制入口与设置是否出现。部署 `groups_enabled=false` **或** owner `groups.enabled=false` 即视为群功能关闭：仍显示现有列表与分页，顶部显示普通提示「群聊功能已关闭，AI 不会在群里发言」，不当作故障。关闭时内置 AI 即使被 @ 或回复也不发言，不自动退群。设置页与群列表共享 owner 设置控制器，关闭邀请开关后立即联动，保存失败会回滚；重载列表同时重取 owner 详情，详情失败时保留可读列表但禁止恢复 mention_only。
 
-所有页面复用 `GatewayClientError.errorDescription` 的脱敏错误映射，不显示服务端原始 detail：
+所有页面复用 `GatewayClientError.errorDescription` 的脱敏错误映射，只根据 problem `code` 与 HTTP status 分支；解析器不读取或保留 `title`，页面也不比较 title，不显示服务端原始 detail：
 
 | 返回 | 行为 |
 | --- | --- |
 | 401 | 既有 OpenID 换令牌一次的策略；会话失效提示重新登录。重复 invalid-token 沿用服务器认证异常提示。其他状态不触发重新登录。 |
 | 403（含无 problem body） | 显示「没有权限查看」，提供重试；不切到登录页。 |
 | 404 persona.not_found | 「不存在或不可见」。 |
-| 404 room.not_found / 409 room.state_conflict | 清理旧引用及分页，从第一页刷新；成功提示群状态已变化，失败显示刷新错误。 |
+| 404 room.not_found / 409 room.state_conflict | 清理旧引用及分页，从第一页刷新，并重新读取 persona 详情以更新群开关；成功提示群状态已变化，失败显示刷新错误。 |
 | 503 room.unavailable / persona.unavailable | 服务暂时不可用，可手动重试。 |
+| 纯 503 / 无 code 或空 code 的 503 problem | 「网关请求失败，请稍后重试。」；不映射为 room.unavailable。 |
 | 409 persona.state_conflict | 回滚设置，提示刷新重试。 |
-| 400 / 其他错误 | 共享通用失败提示。 |
+| 400 / 405 request.invalid（含 Allow）/ 其他错误 | 共享通用失败提示；正常 rooms 调用不会触发 405。 |
 | 403 conversation.e2ee | 「加密群不支持 AI 发言」，不重试。 |
 
 GET 保持现有有限退避重试；三个新 PATCH 均不携带 Idempotency-Key，遇 500 只发送一次。OpenID 路由严格按方法、组件数及非空组件匹配，不接受形似名称或额外层级。persona ID 和 room_ref 分别编码为一个 path 组件；cursor 仅原样传回，不解析或构造。
+
+## 依赖 #235（B2.8d2）
+
+依赖 #235（B2.8d2）的网关行为；#235 合入前旧网关在关闭时 GET 返回空页、PATCH mention_only 可能成功，App 行为仍安全：本地关闭判定后不提供也不发送 mention_only，仍可管理网关实际返回的房间。部署升级后关闭时会恢复显示现有房间，无需修改 App。开启时仍按 #232 允许 accepted/encrypted_disabled 在两种模式间切换。
+
+#235 的 C 线同步清单逐项对应：
+
+1. `POST /policy/evaluate` 的 404 conversation.not_found / 400 request.invalid：当前 App 没有该调用入口；共享传输只对 GET/带幂等键写的 500 internal.error 做有限重试，不把这两个 4xx 当作服务端故障重试。未来接入仍需按不可重试会话错误处理。
+2. rooms 不支持的方法返回 owner 鉴权后的 405 request.invalid + Allow：正常 GET/PATCH 不触发，沿用通用文案。
+3. rooms title 可为 Room request rejected 或任意其他值：只按 code 判断；测试同时验证看似匹配的 title 配其他 code 不会触发刷新。
+4. 关闭时内置群 AI 完全不发言、不自动退群：顶部使用非错误提示；DM 不受影响。
+5. 关闭时 GET 仍列出：列表、筛选、分页保留，合并部署开关与共享 persona 开关决定可用操作。
+6. 关闭时 PATCH 仅 muted / leave：隐藏双向切换，控制器也拒绝 mention_only；409 冲突刷新列表及 persona。
+7. 外部运行时 POST /messages 不受群开关限制：App 未引入该调用或额外禁令。
+
+#234 审查 nit：a 合成 manifest 使用注明用途的假版本；b 心情不可用文案统一句号；c info.version 解析及测试改为块内直接子级、可变缩进、引号可选且严格唯一；d 未新增视图层测试（现有测试目标只依赖 Core，现有心情展示模型测试和 SwiftUI 构建不能代替视图接线测试）；e mood.unavailable 的 OpenAPI 枚举归 B 线，本轮不修改 gateway/。
 
 ## 需要总管拿主意
 

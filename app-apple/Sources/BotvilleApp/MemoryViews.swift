@@ -166,7 +166,7 @@ private struct PersonaMemoryView: View {
     @State private var pendingDeletion: Memory?
     // Group settings exist only in an owner detail response. The list summary
     // deliberately does not carry them, so do not infer ownership from it.
-    @State private var ownerGroups: PersonaGroupsSettings?
+    @State private var ownerGroups: PersonaGroupsSettingsController?
     @State private var ownerGroupsError: String?
 
     init(persona: MemoryPersona, client: any GatewayClient) {
@@ -220,13 +220,12 @@ private struct PersonaMemoryView: View {
             if let ownerGroups {
                 Section("群聊") {
                     NavigationLink {
-                        PersonaGroupRoomsView(persona: persona, client: client)
+                        PersonaGroupRoomsView(persona: persona, client: client, settings: ownerGroups)
                     } label: {
                         Label("群聊", systemImage: "person.3")
                     }
                     NavigationLink {
-                        PersonaGroupsSettingsView(
-                            personaID: persona.id, initialGroups: ownerGroups, client: client)
+                        PersonaGroupsSettingsView(model: ownerGroups)
                     } label: {
                         Label("群聊设置", systemImage: "person.3.sequence")
                     }
@@ -338,6 +337,12 @@ private struct PersonaMemoryView: View {
     private func loadOwnerGroups() async {
         guard !Task.isCancelled else { return }
         ownerGroupsError = nil
+        if let ownerGroups {
+            await ownerGroups.refresh()
+            ownerGroupsError = ownerGroups.errorMessage
+            if !ownerGroups.hasLoaded { self.ownerGroups = nil }
+            return
+        }
         do {
             let detail = try await client.persona(id: persona.id)
             guard !Task.isCancelled else { return }
@@ -345,7 +350,9 @@ private struct PersonaMemoryView: View {
                 ownerGroups = nil
                 return
             }
-            ownerGroups = owner.groups
+            ownerGroups = owner.groups.map {
+                PersonaGroupsSettingsController(personaID: persona.id, initialGroups: $0, client: client)
+            }
         } catch {
             guard !Task.isCancelled else { return }
             ownerGroups = nil
@@ -518,14 +525,21 @@ private struct PersonaGroupRoomsView: View {
     @StateObject private var model: PersonaGroupRoomsModel
     @State private var roomToLeave: GroupRoom?
 
-    init(persona: MemoryPersona, client: any GatewayClient) {
+    init(persona: MemoryPersona, client: any GatewayClient, settings: PersonaGroupsSettingsController) {
         self.persona = persona
         self.client = client
-        _model = StateObject(wrappedValue: PersonaGroupRoomsModel(personaID: persona.id, client: client))
+        _model = StateObject(wrappedValue: PersonaGroupRoomsModel(
+            personaID: persona.id, client: client, settings: settings))
     }
 
     var body: some View {
         List {
+            if !model.groupsEnabled {
+                Section {
+                    Label("群聊功能已关闭，AI 不会在群里发言", systemImage: "info.circle")
+                        .foregroundStyle(.secondary)
+                }
+            }
             if let message = model.errorMessage {
                 Section {
                     Label(message, systemImage: "exclamationmark.triangle")
@@ -533,40 +547,35 @@ private struct PersonaGroupRoomsView: View {
                     Button("重试") { Task { await model.refresh() } }
                 }
             }
-            if !model.groupsEnabled, !model.isLoading {
+            Section {
+                Toggle("显示已退出的群", isOn: Binding(
+                    get: { model.includeAll },
+                    set: { value in Task { await model.setIncludeAll(value) } }
+                ))
+                .disabled(model.isUpdating)
+            }
+            if model.isLoading && model.rooms.isEmpty {
+                Section { HStack { Spacer(); ProgressView("正在加载…"); Spacer() } }
+            } else if model.rooms.isEmpty && model.errorMessage == nil {
                 ContentUnavailableView(
-                    "部署未开启群聊功能", systemImage: "person.3",
-                    description: Text("群聊功能由部署者控制，目前无法管理。"))
+                    "暂无群聊", systemImage: "person.3",
+                    description: Text(model.includeAll ? "没有可显示的群聊记录。" : "目前没有正在管理的群聊。"))
             } else {
-                Section {
-                    Toggle("显示已退出的群", isOn: Binding(
-                        get: { model.includeAll },
-                        set: { value in Task { await model.setIncludeAll(value) } }
-                    ))
-                    .disabled(model.isUpdating)
+                Section("群聊") {
+                    ForEach(Array(model.rooms.enumerated()), id: \.element.roomRef) { index, room in
+                        GroupRoomRow(room: room, ordinal: index + 1,
+                                     canEnableMentionOnly: model.canEnableMentionOnly,
+                                     isSubmitting: model.isUpdating || model.isLoading || model.isLoadingMore,
+                                     onModeChanged: { mode in
+                                         Task { await model.setMode(roomRef: room.roomRef, mode: mode) }
+                                     }, onLeave: { roomToLeave = room })
+                    }
                 }
-                if model.isLoading && model.rooms.isEmpty {
-                    Section { HStack { Spacer(); ProgressView("正在加载…"); Spacer() } }
-                } else if model.rooms.isEmpty && model.errorMessage == nil {
-                    ContentUnavailableView(
-                        "暂无群聊", systemImage: "person.3",
-                        description: Text(model.includeAll ? "没有可显示的群聊记录。" : "目前没有正在管理的群聊。"))
-                } else {
-                    Section("群聊") {
-                        ForEach(Array(model.rooms.enumerated()), id: \.element.roomRef) { index, room in
-                            GroupRoomRow(room: room, ordinal: index + 1,
-                                         isSubmitting: model.isUpdating || model.isLoading || model.isLoadingMore,
-                                         onModeChanged: { mode in
-                                             Task { await model.setMode(roomRef: room.roomRef, mode: mode) }
-                                         }, onLeave: { roomToLeave = room })
-                        }
+                if model.canLoadMore {
+                    Button(model.isLoadingMore ? "正在加载…" : "加载更多") {
+                        Task { await model.loadMore() }
                     }
-                    if model.canLoadMore {
-                        Button(model.isLoadingMore ? "正在加载…" : "加载更多") {
-                            Task { await model.loadMore() }
-                        }
-                        .disabled(model.isLoadingMore || model.isUpdating || model.isLoading)
-                    }
+                    .disabled(model.isLoadingMore || model.isUpdating || model.isLoading)
                 }
             }
         }
@@ -594,6 +603,7 @@ private struct PersonaGroupRoomsView: View {
 private struct GroupRoomRow: View {
     let room: GroupRoom
     let ordinal: Int
+    let canEnableMentionOnly: Bool
     let isSubmitting: Bool
     let onModeChanged: (GroupRoomMode) -> Void
     let onLeave: () -> Void
@@ -613,16 +623,23 @@ private struct GroupRoomRow: View {
                 Text("模式未知")
                     .font(.footnote).foregroundStyle(.secondary)
             } else if GroupRoomPresentation.canChangeMode(room) {
-                Toggle("安静模式", isOn: Binding(
-                    get: { room.mode == .muted },
-                    set: { onModeChanged($0 ? .muted : .mentionOnly) }
-                ))
-                .disabled(isSubmitting)
-                Text("开启后被 @ 也不回复，仍会记住群里的内容。")
-                    .font(.footnote).foregroundStyle(.secondary)
-                if room.mode == .mentionOnly {
-                    Text("关闭后，被 @ 或被回复时才会回复。")
+                if canEnableMentionOnly {
+                    Toggle("安静模式", isOn: Binding(
+                        get: { room.mode == .muted },
+                        set: { onModeChanged($0 ? .muted : .mentionOnly) }
+                    ))
+                    .disabled(isSubmitting)
+                    Text("开启后被 @ 也不回复，仍会记住群里的内容。")
                         .font(.footnote).foregroundStyle(.secondary)
+                    if room.mode == .mentionOnly {
+                        Text("关闭后，被 @ 或被回复时才会回复。")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                } else if room.mode == .muted {
+                    Text("已设为安静").font(.footnote).foregroundStyle(.secondary)
+                } else {
+                    Button("设为安静") { onModeChanged(.muted) }
+                        .disabled(isSubmitting)
                 }
                 Button("退出群聊", role: .destructive, action: onLeave)
                     .disabled(isSubmitting)
@@ -646,12 +663,7 @@ private struct GroupRoomRow: View {
 }
 
 private struct PersonaGroupsSettingsView: View {
-    @StateObject private var model: PersonaGroupsSettingsController
-
-    init(personaID: String, initialGroups: PersonaGroupsSettings, client: any GatewayClient) {
-        _model = StateObject(wrappedValue: PersonaGroupsSettingsController(
-            personaID: personaID, initialGroups: initialGroups, client: client))
-    }
+    @ObservedObject var model: PersonaGroupsSettingsController
 
     var body: some View {
         Form {
@@ -661,6 +673,12 @@ private struct PersonaGroupsSettingsView: View {
                     set: { enabled in Task { await model.setEnabled(enabled) } }
                 ))
                 .disabled(model.isSaving || model.isLoading || !model.hasLoaded)
+            }
+            if !model.groups.enabled {
+                Section {
+                    Text("群聊功能已关闭，AI 不会在群里发言")
+                        .foregroundStyle(.secondary)
+                }
             }
             Section("谁可以拉它进群") {
                 Picker("谁可以拉它进群", selection: Binding(

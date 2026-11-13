@@ -114,7 +114,14 @@ public enum GroupRoomPresentation {
 @MainActor
 public final class PersonaGroupRoomsModel: ObservableObject {
     @Published public private(set) var rooms: [GroupRoom] = []
-    @Published public private(set) var groupsEnabled = true
+    @Published private var deploymentGroupsEnabled = true
+    public let settings: PersonaGroupsSettingsController
+    private var settingsObservation: AnyCancellable?
+
+    public var groupsEnabled: Bool { deploymentGroupsEnabled && settings.groups.enabled }
+    public var canEnableMentionOnly: Bool {
+        groupsEnabled && settings.hasLoaded && !settings.isLoading && !settings.isSaving
+    }
     @Published public private(set) var includeAll = false
     @Published public private(set) var isLoading = false
     @Published public private(set) var isLoadingMore = false
@@ -128,9 +135,17 @@ public final class PersonaGroupRoomsModel: ObservableObject {
     private var seenCursors = Set<String>()
     private var paginationNeedsRefresh = false
 
-    public init(personaID: String, client: any GatewayClient) {
+    public init(
+        personaID: String, client: any GatewayClient, settings: PersonaGroupsSettingsController
+    ) {
         self.personaID = personaID
         self.client = client
+        self.settings = settings
+        // The settings screen and rooms screen share this owner-scoped object.
+        // Forward optimistic changes and rollbacks without reloading the page.
+        settingsObservation = settings.objectWillChange.sink { [weak self] in
+            self?.objectWillChange.send()
+        }
     }
 
     public var canLoadMore: Bool { hasMore && nextCursor != nil }
@@ -162,13 +177,16 @@ public final class PersonaGroupRoomsModel: ObservableObject {
         paginationNeedsRefresh = false
         errorMessage = nil
         defer { if requestGeneration == generation { isLoading = false } }
+        await settings.refresh()
+        guard !Task.isCancelled, requestGeneration == generation else { return false }
+        errorMessage = settings.errorMessage
         do {
             let page = try await client.groupRooms(
                 personaID: personaID, limit: 50,
                 cursor: nil, includeAll: includeAll)
             guard !Task.isCancelled, requestGeneration == generation else { return false }
             apply(page, replacing: true)
-            return true
+            return errorMessage == nil
         } catch {
             guard !Task.isCancelled, requestGeneration == generation else { return false }
             errorMessage = message(for: error)
@@ -210,6 +228,8 @@ public final class PersonaGroupRoomsModel: ObservableObject {
 
     public func setMode(roomRef: String, mode: GroupRoomMode) async {
         guard mode == .muted || mode == .mentionOnly else { return }
+        // Enforce the same one-way control as the UI, including stale callbacks.
+        guard mode != .mentionOnly || canEnableMentionOnly else { return }
         await mutate(roomRef) {
             try await self.client.updateGroupRoomMode(
                 personaID: self.personaID, roomRef: roomRef, mode: mode)
@@ -223,7 +243,7 @@ public final class PersonaGroupRoomsModel: ObservableObject {
     }
 
     private func mutate(_ ref: String, action: () async throws -> GroupRoom) async {
-        guard !isUpdating, !isLoading, !isLoadingMore, groupsEnabled,
+        guard !isUpdating, !isLoading, !isLoadingMore,
             let room = rooms.first(where: { $0.roomRef == ref }),
             GroupRoomPresentation.canChangeMode(room)
         else { return }
@@ -250,13 +270,8 @@ public final class PersonaGroupRoomsModel: ObservableObject {
     }
 
     private func apply(_ page: GroupRoomList, replacing: Bool) {
-        groupsEnabled = page.groupsEnabled
-        if replacing || !groupsEnabled { rooms = [] }
-        guard groupsEnabled else {
-            nextCursor = nil
-            hasMore = false
-            return
-        }
+        deploymentGroupsEnabled = page.groupsEnabled
+        if replacing { rooms = [] }
         for item in page.items { replace(item) }
         nextCursor = page.nextCursor
         hasMore = page.hasMore
