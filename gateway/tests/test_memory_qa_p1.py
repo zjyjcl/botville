@@ -20,13 +20,8 @@ from botville_gateway.user_identity import VERIFY_SERVER_ERROR
 
 
 class ManifestTests(unittest.TestCase):
-    @unittest.skipUnless(
-        json.loads((__import__('pathlib').Path(__file__).parents[1] / 'openapi' / 'examples'
-                    / 'capability-manifest.json').read_text(encoding='utf-8')).get('contract_version')
-        == CONTRACT_VERSION,
-        '示例 capability-manifest.json 的 contract_version 尚未由 C 线同步到当前契约版本（CONTRACT_VERSION），同步后自动启用',
-    )
     def test_example_contract_version_matches_runtime_contract(self):
+        # 硬断言：示例清单（App mock 逐字节同步）必须与运行时契约版本一致；升契约时须同步示例。
         example_path = (__import__('pathlib').Path(__file__).parents[1] / 'openapi' / 'examples'
                         / 'capability-manifest.json')
         self.assertEqual(json.loads(example_path.read_text(encoding='utf-8'))['contract_version'],

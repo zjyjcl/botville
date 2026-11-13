@@ -364,7 +364,7 @@ final class MemoryClientTests: XCTestCase {
             let list = try client.request(["personas"], query: [URLQueryItem(name: "cursor", value: "next")])
             XCTAssertTrue(try client.isOpenIDRequest(list))
             XCTAssertNil(list.value(forHTTPHeaderField: "Authorization"))
-            for segments in [["personasx"], ["personas", "id", "state"], ["personas/id"], ["personas?x"], ["other", "personas"], ["cards"]] {
+            for segments in [["personasx"], ["personas", "id", "other"], ["personas/id"], ["personas?x"], ["other", "personas"], ["cards"]] {
                 let request = try client.request(segments, query: [URLQueryItem(name: "path", value: "/v1/personas")])
                 XCTAssertFalse(try client.isOpenIDRequest(request))
                 XCTAssertTrue(request.value(forHTTPHeaderField: "Authorization")?.hasPrefix("Bearer ") == true)
@@ -469,8 +469,9 @@ final class MemoryClientTests: XCTestCase {
     func testPublicDetailDecodesAbsentNullKnownAndUnknownMoods() throws {
         for (mood, expected): (Any?, PersonaMood?) in [
             (nil, nil), (NSNull(), nil), ("future-mood", nil),
-            ("neutral", .neutral), ("happy", .happy), ("sad", .sad),
-            ("excited", .excited), ("calm", .calm), ("anxious", .anxious),
+            ("calm", .calm), ("happy", .happy), ("sad", .sad),
+            ("excited", .excited), ("tired", .tired),
+            ("neutral", nil), ("anxious", nil),
         ] {
             var object: [String: Any] = ["id": "@ai_demo:example.invalid", "display_name": "公开名字",
                                        "bio": NSNull(), "status": "active"]
@@ -516,6 +517,18 @@ final class MemoryClientTests: XCTestCase {
         }
     }
 
+    func testProfileMoodLabelUsesOnlyDisclosedKnownMood() async throws {
+        for mood in ["calm", "happy", "sad", "excited", "tired", "future", "neutral", "anxious", nil] {
+            let object: [String: Any] = ["id": "@ai_demo:example.invalid", "display_name": "Demo",
+                "bio": NSNull(), "status": "active", "mood": mood.map { $0 as Any } ?? NSNull()]
+            let (client, _, _) = try self.client(bodies: [JSONSerialization.data(withJSONObject: object)])
+            let initial = AIProfile(userID: "@ai_demo:example.invalid", displayName: "Demo",
+                avatarData: nil, signature: nil, localServerName: "example.invalid")
+            let displayed = try await initial.fetchingDetails(using: client)
+            XCTAssertEqual(displayed.mood, mood.flatMap(PersonaMood.init(rawValue:)))
+        }
+    }
+
     func testDetail404DisplaysMissingAndCrossServerNeverRequests() async throws {
         let (client, recorder, source) = try self.client(statuses: [404],
             bodies: [Data(#"{"code":"persona.not_found"}"#.utf8)])
@@ -525,9 +538,12 @@ final class MemoryClientTests: XCTestCase {
         catch { XCTAssertEqual((error as? GatewayClientError)?.errorDescription, "不存在或不可见") }
         for server in ["elsewhere.invalid", "sub.example.invalid", "example.invalid:8448", "", nil] {
             let crossServer = AIProfile(userID: local.userID, displayName: "Demo",
-                avatarData: nil, signature: nil, localServerName: server)
-            do { _ = try await crossServer.fetchingDetails(using: client); XCTFail("missing") }
-            catch { XCTAssertEqual((error as? GatewayClientError)?.errorDescription, "不存在或不可见") }
+                avatarData: Data([1]), signature: "stale", localServerName: server, mood: .happy)
+            let absent = try await crossServer.fetchingDetails(using: client)
+            XCTAssertNil(absent.signature)
+            XCTAssertNil(absent.mood)
+            XCTAssertEqual(absent.displayName, crossServer.displayName)
+            XCTAssertEqual(absent.avatarData, crossServer.avatarData)
         }
         XCTAssertEqual(recorder.requests.count, 1, "cross-server and unknown identities never issue details")
         let count = await source.count
@@ -547,7 +563,7 @@ final class MemoryClientTests: XCTestCase {
             }
             XCTAssertThrowsError(try client.request(["personas", ""]))
             let root = try XCTUnwrap(client.request(["personas"]).url?.absoluteString)
-            for suffix in ["/", "//id", "/id/", "/id/state", "x/id", "%2Fid"] {
+            for suffix in ["/", "//id", "/id/", "/id/other", "x/id", "%2Fid"] {
                 let request = URLRequest(url: try XCTUnwrap(URL(string: root + suffix + "?path=/personas/id")))
                 XCTAssertFalse(try client.isOpenIDRequest(request), suffix)
             }

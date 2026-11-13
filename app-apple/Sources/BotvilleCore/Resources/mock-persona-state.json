@@ -1,0 +1,10 @@
+{
+  "persona_id": "@ai_demo:example.invalid",
+  "mood": {
+    "label": "calm",
+    "source": "rule",
+    "set_at": "2026-11-03T11:50:00Z"
+  },
+  "mood_public": true,
+  "updated_at": "2026-11-03T11:50:00Z"
+}
