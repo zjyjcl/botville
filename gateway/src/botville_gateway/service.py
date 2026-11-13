@@ -70,6 +70,7 @@ from .policy import (
     CODE_AI_LOOP_TRIPPED,
     CODE_ANTI_SPAM_CONSECUTIVE,
     CODE_SILENT_HOURS,
+    DECISION_ALLOW,
     DECISION_BLOCK,
     DECISION_DEFER,
     PolicyDecision,
@@ -786,6 +787,48 @@ class GatewayService:
         )
         return decision.to_dict()
 
+    def reserve_proactive(
+        self, *, persona_id: str, conversation_id: str, peer_id: str,
+        token_estimate: int,
+    ) -> Optional[Reservation]:
+        """Atomically preflight and reserve an outbound proactive message.
+
+        Workers call this before invoking a model.  A rejected/deferred policy
+        result therefore cannot spend model capacity; a returned reservation
+        must be released by ``release_proactive`` or consumed by
+        ``send_ai_message(..., proactive_reservation=...)``.
+        """
+        if (not isinstance(persona_id, str) or not persona_id
+                or not isinstance(conversation_id, str) or not conversation_id
+                or not isinstance(peer_id, str) or not peer_id
+                or not isinstance(token_estimate, int)
+                or isinstance(token_estimate, bool) or token_estimate < 0):
+            raise ValidationError("request.invalid", "invalid proactive reservation request")
+        with self._lock:
+            self._check_peer_id(
+                conversation_id=conversation_id, sender=persona_id, peer_id=peer_id,
+            )
+            now = self._now()
+            decision = self._engine.evaluate(
+                persona_id=persona_id, conversation_id=conversation_id,
+                peer_id=peer_id, token_estimate=token_estimate, kind="proactive",
+                allow_deferred=False, now=now,
+            )
+            if decision.decision != DECISION_ALLOW:
+                return None
+            return self._reservations.reserve(
+                persona_id=persona_id, tokens=decision.estimated_tokens,
+                at=now, conversation_id=conversation_id, peer_id=peer_id,
+                kind="proactive",
+            )
+
+    def release_proactive(self, reservation: Reservation) -> bool:
+        """Release an unused proactive pre-model reservation."""
+        if not isinstance(reservation, Reservation) or reservation.kind != "proactive":
+            return False
+        with self._lock:
+            return self._reservations.release(reservation)
+
     # ------------------------------------------------------------- send flow
     def send_ai_message(
         self,
@@ -794,11 +837,20 @@ class GatewayService:
         *,
         idempotency_key: Optional[str] = None,
         allow_auto_join: bool = False,
+        proactive_reservation: Optional[Reservation] = None,
     ) -> Dict[str, Any]:
         if not isinstance(conversation_id, str) or not conversation_id:
             raise ValidationError("request.invalid", "conversation_id is required", "conversation_id")
 
         validated = self._validate_send(payload)
+        if proactive_reservation is not None and (
+            not isinstance(proactive_reservation, Reservation)
+            or proactive_reservation.kind != "proactive"
+            or proactive_reservation.conversation_id != conversation_id
+            or proactive_reservation.persona_id != validated["sender"]
+            or proactive_reservation.peer_id != validated["peer_id"]
+        ):
+            raise ValidationError("request.invalid", "invalid proactive reservation")
         fingerprint = self._fingerprint(conversation_id, payload)
 
         # 同 key 的并发请求在这里排队（只按 key 串行，不影响其它请求）。
@@ -806,15 +858,29 @@ class GatewayService:
         try:
             # ---- 第一段：锁内策略判断 + 预留名额 -------------------------
             with self._lock:
+                if (proactive_reservation is not None
+                        and not self._reservations.contains(proactive_reservation)):
+                    raise ValidationError("request.invalid", "inactive proactive reservation")
                 if idempotency_key:
                     entry = self._idempotency_get(idempotency_key)
                     if entry is not None:
                         if entry.fingerprint != fingerprint:
+                            if proactive_reservation is not None:
+                                self._reservations.release(proactive_reservation)
                             raise IdempotencyConflict(idempotency_key)
+                        if proactive_reservation is not None:
+                            self._reservations.release(proactive_reservation)
                         return json.loads(json.dumps(entry.receipt))  # 深拷贝，调用方改不坏缓存
 
+                if proactive_reservation is not None:
+                    # Replace the pre-model reservation with the final policy
+                    # decision under the same lock.  Releasing first prevents
+                    # it from counting itself against the daily slot.
+                    self._reservations.release(proactive_reservation)
+
                 prepared = self._prepare_send(
-                    conversation_id=conversation_id, **validated
+                    conversation_id=conversation_id, kind=("proactive" if proactive_reservation is not None else "message"),
+                    **validated
                 )
                 if not prepared.needs_delivery:
                     receipt = prepared.receipt
@@ -824,7 +890,10 @@ class GatewayService:
                         r.get("code") == "silent_hours.active"
                         for r in receipt.get("decision", {}).get("reasons", [])
                     )
-                    if idempotency_key and not quiet_block:
+                    # A proactive worker may retry this same slot after a
+                    # transient limit race; never turn a blocked result into a
+                    # permanent idempotency cache entry.
+                    if idempotency_key and not quiet_block and proactive_reservation is None:
                         self._idempotency_put(idempotency_key, fingerprint, receipt)
                     return json.loads(json.dumps(receipt))
 
@@ -879,6 +948,7 @@ class GatewayService:
                     peer_id=validated["peer_id"],
                     ledger_txn=ledger_txn,
                     forwarded_from=validated["forwarded_from"],
+                    event_kind=(EventKind.PROACTIVE if proactive_reservation is not None else EventKind.SENT),
                 )
                 if idempotency_key:
                     self._idempotency_put(idempotency_key, fingerprint, receipt)
@@ -1086,6 +1156,7 @@ class GatewayService:
         allow_deferred: bool,
         peer_id: Optional[str] = None,
         forwarded_from: Optional[str] = None,
+        kind: str = "message",
     ) -> _PreparedSend:
         """锁内阶段：策略判断 + 预留名额。调用方必须已持有 `self._lock`。
 
@@ -1108,6 +1179,7 @@ class GatewayService:
             peer_id=peer_id,
             text=text,
             token_estimate=token_estimate,
+            kind=kind,
             allow_deferred=allow_deferred,
             now=now,
             commit_state=True,  # 实发路径：冷却到期清零等状态变更落库（#117 N4）
@@ -1183,6 +1255,7 @@ class GatewayService:
             at=now,
             conversation_id=conversation_id,
             peer_id=peer_id,
+            kind=kind,
         )
         return _PreparedSend(
             decision, reservation=reservation, tokens_out=decision.estimated_tokens
@@ -1209,6 +1282,7 @@ class GatewayService:
         peer_id: Optional[str] = None,
         ledger_txn: Optional[str] = None,
         forwarded_from: Optional[str] = None,
+        event_kind: EventKind = EventKind.SENT,
     ) -> Dict[str, Any]:
         """锁内提交：调用方须持锁（`send_ai_message` 第三段）。
 
@@ -1251,7 +1325,7 @@ class GatewayService:
         if not deduped:
             self._store.append(
                 UsageEvent.make(
-                    EventKind.SENT,
+                    event_kind,
                     persona_id=sender,
                     conversation_id=conversation_id,
                     text=text,

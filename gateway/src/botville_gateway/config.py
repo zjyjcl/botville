@@ -23,7 +23,7 @@ from .as_txn_store import AS_TXN_PURGE_INTERVAL_MIN_SECONDS
 from .memory.store import MEMORY_PURGE_INTERVAL_MIN_SECONDS
 
 GATEWAY_VERSION = "0.1.0"
-CONTRACT_VERSION = "0.4.0"
+CONTRACT_VERSION = "0.5.0"
 
 # Token values that mean "no auth configured"; starting with these is unsafe
 # unless GATEWAY_DEV_MODE=true is explicitly set.
@@ -86,6 +86,10 @@ DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_TOKEN_BUDGET = 200_000
 DEFAULT_PROACTIVE_PER_DAY = 6
 DEFAULT_GROUP_MAX_RESPONDERS = 3
+DEFAULT_PROACTIVE_TICK_SECONDS = 300
+DEFAULT_PROACTIVE_MIN_IDLE_MINUTES = 180
+DEFAULT_PROACTIVE_MIN_INTERVAL_MINUTES = 240
+DEFAULT_PROACTIVE_PER_TARGET_PER_DAY = 1
 DEFAULT_MAX_USAGE_EVENTS = 10_000
 # B2.2 #114-7 保留期：事件超过该时长即优先淘汰（默认 30 天）。
 DEFAULT_USAGE_RETENTION_SECONDS = 2_592_000
@@ -193,6 +197,14 @@ def _env_int(env: Mapping[str, str], name: str, default: int, *, minimum: int = 
     if value < minimum:
         raise ConfigError(f"{name} must be >= {minimum}, got {value}")
     return value
+
+
+def _env_proactive_int(env: Mapping[str, str], name: str, default: int) -> int:
+    # Preserve the shared parser semantics without echoing a deployment value.
+    try:
+        return _env_int(env, name, default)
+    except ConfigError:
+        raise ConfigError(f"{name} must be a non-negative integer") from None
 
 
 def _env_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
@@ -535,6 +547,13 @@ class Config:
     # 开启但未配置 GATEWAY_AS_TXN_DB_PATH → 启动 warning 并不起线程（不拒绝启动）。
     # 开启但未配置模型 → 只记录和计数，不发言（/health 不 degraded）。
     consumer_enabled: bool = False
+    # PR4c proactive speech is opt-in at both deployment and persona levels.
+    proactive_enabled: bool = False
+    proactive_recent_contacts_enabled: bool = False
+    proactive_tick_seconds: int = DEFAULT_PROACTIVE_TICK_SECONDS
+    proactive_min_idle_minutes: int = DEFAULT_PROACTIVE_MIN_IDLE_MINUTES
+    proactive_min_interval_minutes: int = DEFAULT_PROACTIVE_MIN_INTERVAL_MINUTES
+    proactive_per_target_per_day: int = DEFAULT_PROACTIVE_PER_TARGET_PER_DAY
     # ---------- 内置角色引擎（B 线 PR2，contract §0 / §1.7.8 ②⑫）----------
     # 只读人设 JSON 文件（空 = 没有人设 → 引擎永不发言，消费者仍记录/计数）。
     # 启动期校验：读不到 / JSON 坏 / schema 错 / user_id 非本服 @ai_* / 重复 /
@@ -587,6 +606,17 @@ class Config:
             raise ConfigError("platform_proactive_per_day must be >= 0")
         if not isinstance(self.group_max_responders, int) or isinstance(self.group_max_responders, bool) or not 1 <= self.group_max_responders <= 20:
             raise ConfigError("GATEWAY_GROUP_MAX_RESPONDERS must be between 1 and 20")
+        proactive_ranges = (
+            (self.proactive_tick_seconds, 30, 86_400, "proactive_tick_seconds"),
+            (self.proactive_min_idle_minutes, 0, 43_200, "proactive_min_idle_minutes"),
+            (self.proactive_min_interval_minutes, 0, 43_200, "proactive_min_interval_minutes"),
+            (self.proactive_per_target_per_day, 0, 24, "proactive_per_target_per_day"),
+        )
+        for value, minimum, maximum, name in proactive_ranges:
+            if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
+                # Environment/persona configuration can carry sensitive deployment context.
+                # Do not include the supplied value in startup errors.
+                raise ConfigError(f"{name} is outside its supported range")
         # 容量上限必须 ≥ 1：0 会让 store 立刻清空，滑动窗口永远看不到历史事件。
         if self.max_usage_events < 1:
             raise ConfigError("max_usage_events must be >= 1")
@@ -815,6 +845,13 @@ class Config:
         # frozen dataclass 的 __post_init__ 不能直接赋值；用 object.__setattr__。
         secret = self.hmac_secret
         if secret is None or secret in _INSECURE_SECRET_BYTES:
+            if self.proactive_enabled:
+                # A generated dev secret changes after restart, which defeats
+                # Matrix txnId replay protection for queued proactive sends.
+                raise ConfigError(
+                    "GATEWAY_PROACTIVE_ENABLED requires an explicit persistent "
+                    "GATEWAY_HMAC_SECRET"
+                )
             if not self.dev_mode:
                 raise ConfigError(
                     "GATEWAY_HMAC_SECRET is unset or uses the default placeholder. "
@@ -1311,6 +1348,22 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         # 消费开关（contract §1.7.8）：默认关闭 = 现在行为完全不变。
         # 非法值（非布尔）由 _env_bool 抛 ConfigError，拒绝启动。
         consumer_enabled=_env_bool(source, "GATEWAY_CONSUMER_ENABLED", False),
+        proactive_enabled=_env_bool(source, "GATEWAY_PROACTIVE_ENABLED", False),
+        proactive_recent_contacts_enabled=_env_bool(
+            source, "GATEWAY_PROACTIVE_RECENT_CONTACTS_ENABLED", False
+        ),
+        proactive_tick_seconds=_env_proactive_int(
+            source, "GATEWAY_PROACTIVE_TICK_SECONDS", DEFAULT_PROACTIVE_TICK_SECONDS
+        ),
+        proactive_min_idle_minutes=_env_proactive_int(
+            source, "GATEWAY_PROACTIVE_MIN_IDLE_MINUTES", DEFAULT_PROACTIVE_MIN_IDLE_MINUTES
+        ),
+        proactive_min_interval_minutes=_env_proactive_int(
+            source, "GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES", DEFAULT_PROACTIVE_MIN_INTERVAL_MINUTES
+        ),
+        proactive_per_target_per_day=_env_proactive_int(
+            source, "GATEWAY_PROACTIVE_PER_TARGET_PER_DAY", DEFAULT_PROACTIVE_PER_TARGET_PER_DAY
+        ),
         # ---------- 内置角色引擎（B 线 PR2，contract §0 / §1.7.8 ②⑫）----------
         # 人设文件：空 = 没有人设 → 引擎不发言（消费者仍记录/计数）。
         # 文件内容（schema / @ai_* / credential_ref）由 engine.load_personas

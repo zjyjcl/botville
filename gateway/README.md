@@ -293,6 +293,12 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `MAX_MESSAGE_CHARS` | `8000` | 单条正文上限（超限 → 400，不是 blocked） |
 | `PLATFORM_TOKEN_BUDGET` | `200000` | 平台层 token 预算（窗口同 `RATE_LIMIT_WINDOW_SECONDS`）；`0` = 平台不设该限额 |
 | `PLATFORM_PROACTIVE_PER_DAY` | `6` | 平台层主动发言/日上限；`0` = 平台不设该限额 |
+| `GATEWAY_PROACTIVE_ENABLED` | `false` | 主动发言部署总开关；还需要 persona `proactive.enabled=true`。默认关闭；启用时必须显式设置持久 `GATEWAY_HMAC_SECRET`，不接受 dev 的重启即变随机密钥。 |
+| `GATEWAY_PROACTIVE_RECENT_CONTACTS_ENABLED` | `false` | 是否将最近 7×24 小时内有 DM 交互记录的本服人类账户加入 owner 以外的目标候选。 |
+| `GATEWAY_PROACTIVE_TICK_SECONDS` | `300` | 主动 worker 调度周期；范围 30–86400，越界拒绝启动。 |
+| `GATEWAY_PROACTIVE_MIN_IDLE_MINUTES` | `180` | 目标与 persona 最近交互后的最小空闲分钟数。 |
+| `GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES` | `240` | 同一 persona 两次主动发言的最小间隔分钟数。 |
+| `GATEWAY_PROACTIVE_PER_TARGET_PER_DAY` | `1` | 每 persona/目标每日主动发言上限；范围 0–24。 |
 | `PLATFORM_MAX_CONSECUTIVE_AI_MESSAGES` | `0` | 平台层 `anti_spam.max_consecutive_ai_messages`（N7）；`0` = 平台不设该项，非 0 取 **1–50**，owner/peer 更宽松 → `422 limit.out_of_range` |
 | `PLATFORM_ANTI_SPAM_COOLDOWN_SECONDS` | `0` | 平台层 `anti_spam.cooldown_seconds`；`0` = 平台不设该项，非 0 取 **1–86400**（越大越严） |
 | `PLATFORM_MAX_AI_MESSAGES_PER_HOUR` | `0` | 平台层 `ai_loop.max_ai_messages_per_hour`；`0` = 平台不设该项（**不是** API 的「一条都不允许」），非 0 取 **1–1000** |

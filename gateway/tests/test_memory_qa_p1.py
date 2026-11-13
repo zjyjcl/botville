@@ -24,7 +24,7 @@ class ManifestTests(unittest.TestCase):
         json.loads((__import__('pathlib').Path(__file__).parents[1] / 'openapi' / 'examples'
                     / 'capability-manifest.json').read_text(encoding='utf-8')).get('contract_version')
         == CONTRACT_VERSION,
-        'C 线同步示例 contract_version 后启用',
+        '示例 capability-manifest.json 的 contract_version 尚未由 C 线同步到当前契约版本（CONTRACT_VERSION），同步后自动启用',
     )
     def test_example_contract_version_matches_runtime_contract(self):
         example_path = (__import__('pathlib').Path(__file__).parents[1] / 'openapi' / 'examples'
