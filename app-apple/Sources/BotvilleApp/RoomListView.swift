@@ -191,10 +191,13 @@ private struct NewConversationSheet: View {
     @State private var isCreating = false
     @State private var errorMessage: String?
     @State private var isShowingEncryptionConfirmation = false
+    @State private var selectedIDs: Set<String> = []
+    @State private var candidates: [GroupInviteCandidate] = []
+    @State private var isLoadingCandidates = false
+    @State private var candidateError: String?
 
     private var invitees: [String] {
-        inviteesText.split(whereSeparator: { $0 == "," || $0 == "\n" || $0 == " " })
-            .map(String.init)
+        GroupInviteSelection.invitees(selectedIDs: isDirect ? [] : selectedIDs, manualText: inviteesText)
     }
 
     private var draft: RoomCreationDraft {
@@ -202,7 +205,9 @@ private struct NewConversationSheet: View {
     }
 
     private var participantStatus: AIParticipantStatus {
-        service.aiParticipantPolicy.classify(memberIDs: invitees + [service.userID].compactMap { $0 })
+        if GroupInviteSelection.containsAI(invitees: invitees, candidates: candidates,
+                                            policy: service.aiParticipantPolicy) { return .containsAI }
+        return service.aiParticipantPolicy.classify(memberIDs: invitees + [service.userID].compactMap { $0 })
     }
 
     private var encryptionPresentation: EncryptionPresentation {
@@ -230,13 +235,46 @@ private struct NewConversationSheet: View {
                     }
                 }
 
-                Section(isDirect ? "对方 Matrix ID" : "邀请 Matrix ID") {
+                if !isDirect {
+                    Section("选择联系人和我的 AI") {
+                        if isLoadingCandidates { ProgressView("正在加载联系人…") }
+                        ForEach(candidates) { candidate in
+                            Toggle(isOn: Binding(
+                                get: { selectedIDs.contains(candidate.id) },
+                                set: { selected in
+                                    if selected { selectedIDs.insert(candidate.id) }
+                                    else { selectedIDs.remove(candidate.id) }
+                                }
+                            )) {
+                                HStack {
+                                    Text(candidate.displayName)
+                                    if candidate.isAI { Text("AI").font(.caption).foregroundStyle(.secondary) }
+                                }
+                            }
+                        }
+                        if candidates.isEmpty && !isLoadingCandidates && candidateError == nil {
+                            Text("暂无可选联系人，可在下方手填 Matrix ID。")
+                                .foregroundStyle(.secondary)
+                        }
+                        if let candidateError {
+                            Text(candidateError).font(.footnote).foregroundStyle(.red)
+                            Button("重试加载联系人和 AI") { Task { await loadCandidates() } }
+                                .disabled(isLoadingCandidates)
+                        }
+                        if participantStatus == .containsAI {
+                            Text("AI 只加入未加密群；AI 需要主人开启『允许被拉进群』才会加入")
+                                .font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                Section(isDirect ? "对方 Matrix ID" : "手填 Matrix ID（可选）") {
                     TextField(isDirect ? "例如 @alice:example.org" : "每行或逗号分隔一个 MXID", text: $inviteesText, axis: .vertical)
 #if os(iOS)
                         .textInputAutocapitalization(.never)
 #endif
                         .autocorrectionDisabled()
-                    Text(isDirect ? "私聊必须填写一个 MXID。" : "群聊至少填写一个 MXID；输入的 MXID 会在创建后邀请。")
+                    Text(isDirect ? "私聊必须填写一个 MXID。" : "至少勾选一位联系人或手填一个 MXID；创建后会向这些账号发送邀请。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -265,16 +303,18 @@ private struct NewConversationSheet: View {
                     Text(errorMessage).foregroundStyle(.red)
                 }
             }
-            .navigationTitle("新建会话")
+            .disabled(isCreating)
+            .navigationTitle(isDirect ? "新建会话" : "发起群聊")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("取消") { dismiss() }.disabled(isCreating)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button(isCreating ? "创建中…" : "创建") { prepareCreation() }
-                        .disabled(isCreating)
+                        .disabled(isCreating || invitees.isEmpty)
                 }
             }
+            .task(id: isDirect) { if !isDirect { await loadCandidates() } }
             .alert("确认开启端对端加密？", isPresented: $isShowingEncryptionConfirmation) {
                 Button("开启并创建") { createAfterConfirmation() }
                 Button("返回", role: .cancel) { consent.cancel() }
@@ -284,6 +324,7 @@ private struct NewConversationSheet: View {
             .onChange(of: isDirect) { _, _ in consent.contextChanged(to: .newRoom(draft)) }
             .onChange(of: roomName) { _, _ in consent.contextChanged(to: .newRoom(draft)) }
             .onChange(of: inviteesText) { _, _ in consent.contextChanged(to: .newRoom(draft)) }
+            .onChange(of: selectedIDs) { _, _ in consent.contextChanged(to: .newRoom(draft)) }
             .onChange(of: encryptionPresentation.canEnable) { _, canEnable in
                 if !canEnable {
                     encryptionSelection.reconcile(presentation: encryptionPresentation)
@@ -291,6 +332,28 @@ private struct NewConversationSheet: View {
                 }
             }
         }
+    }
+
+    private func loadCandidates() async {
+        guard !isLoadingCandidates else { return }
+        isLoadingCandidates = true
+        candidateError = nil
+        defer { isLoadingCandidates = false }
+        let localUserID = service.userID
+        var contacts: [GroupInviteCandidate] = []
+        var personas: [MemoryPersona] = []
+        do { contacts = try await service.groupInviteContacts() }
+        catch is CancellationError { return }
+        catch { candidateError = "暂时无法加载联系人，请重试或手填 Matrix ID。" }
+        do {
+            if let client = try service.confirmedGatewayClient() { personas = try await client.personas() }
+        } catch is CancellationError { return }
+        catch {
+            candidateError = (error as? GatewayClientError)?.errorDescription ?? "暂时无法加载 AI，请稍后重试。"
+        }
+        guard !Task.isCancelled, service.userID == localUserID, service.isLoggedIn else { return }
+        candidates = GroupInviteSelection.candidates(contacts: contacts, personas: personas, localUserID: localUserID)
+        selectedIDs.formIntersection(Set(candidates.map(\.id)))
     }
 
     private func prepareCreation() {

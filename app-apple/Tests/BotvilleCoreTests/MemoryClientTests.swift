@@ -550,7 +550,7 @@ final class MemoryClientTests: XCTestCase {
         XCTAssertEqual(count, 1)
     }
 
-    func testPersonaDetailRoutingAcceptsOnlyExactGETResource() throws {
+    func testPersonaDetailRoutingAcceptsExactGETAndGroupsPATCH() throws {
         for base in ["https://gateway.example.invalid", "https://gateway.example.invalid/prefix/v1/",
                      "https://gateway.example.invalid/%E4%B8%AD"] {
             let client = try HTTPGatewayClient(baseURL: base, token: "synthetic-site")
@@ -567,7 +567,10 @@ final class MemoryClientTests: XCTestCase {
                 let request = URLRequest(url: try XCTUnwrap(URL(string: root + suffix + "?path=/personas/id")))
                 XCTAssertFalse(try client.isOpenIDRequest(request), suffix)
             }
-            for method in ["POST", "PATCH", "PUT", "DELETE", "HEAD"] {
+            let groupsPatch = try client.request(["personas", "id"], method: "PATCH")
+            XCTAssertTrue(try client.isOpenIDRequest(groupsPatch))
+            XCTAssertNil(groupsPatch.value(forHTTPHeaderField: "Authorization"))
+            for method in ["POST", "PUT", "DELETE", "HEAD"] {
                 let request = try client.request(["personas", "id"], method: method)
                 XCTAssertFalse(try client.isOpenIDRequest(request))
                 XCTAssertTrue(request.value(forHTTPHeaderField: "Authorization")?.hasPrefix("Bearer ") == true)

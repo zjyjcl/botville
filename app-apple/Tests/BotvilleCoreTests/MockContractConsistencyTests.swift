@@ -11,6 +11,58 @@ import XCTest
 #endif
 
 final class MockContractConsistencyTests: XCTestCase {
+    func testOpenAPIVersionAcceptsVariableInfoIndentationAndQuotedValues() throws {
+        XCTAssertEqual(try ContractTestVersions.openAPIVersion(in: """
+            openapi: 3.1.0
+            info:
+                title: Botville
+                version: '0.6.0'
+                description:
+                  version: ignored
+            paths: {}
+            """), "0.6.0")
+        XCTAssertEqual(try ContractTestVersions.openAPIVersion(in: """
+            info:
+             title: Botville
+             version: 0.6.1
+            paths: {}
+            """), "0.6.1")
+        XCTAssertEqual(try ContractTestVersions.openAPIVersion(in: """
+            # Contract metadata follows.
+            info:
+              # This comment is not a mapping child.
+              title: Botville
+              version: "0.6.2"
+            # The next top-level key ends info despite this comment.
+            paths: {}
+            """), "0.6.2")
+    }
+
+    func testOpenAPIVersionRejectsMissingOrAmbiguousDirectValues() {
+        XCTAssertThrowsError(try ContractTestVersions.openAPIVersion(in: """
+            info:
+              title: Botville
+            paths: {}
+            """))
+        XCTAssertThrowsError(try ContractTestVersions.openAPIVersion(in: """
+            info:
+              version: 0.6.0
+              version: 0.6.1
+            paths: {}
+            """))
+        XCTAssertThrowsError(try ContractTestVersions.openAPIVersion(in: """
+            info:
+              version: 0.6.0
+              version:
+            paths: {}
+            """))
+        XCTAssertThrowsError(try ContractTestVersions.openAPIVersion(in: """
+            info:
+              version: "0.6.0'
+            paths: {}
+            """))
+    }
+
     func testBundledExamplesStayIdenticalToGatewayContractExamples() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent()
@@ -154,9 +206,7 @@ struct ContractTestVersions {
             #"(?m)^CONTRACT_VERSION\s*=\s*["']([^"']+)["']\s*(?:#.*)?$"#, in: config)
         let yaml = try String(contentsOf: Self.root.appendingPathComponent(
             "gateway/openapi/gateway.v1.yaml"), encoding: .utf8)
-        let info = try Self.capture(#"(?m)^info:[ \t]*\n((?:[ \t]+[^\n]*\n|\n)+)"#, in: yaml)
-        openAPIVersion = try Self.capture(
-            #"(?m)^  version:[ \t]*["']?([^\s"']+)["']?[ \t]*$"#, in: info)
+        openAPIVersion = try Self.openAPIVersion(in: yaml)
         manifestVersion = try XCTUnwrap(Self.manifest(
             at: "gateway/openapi/examples/capability-manifest.json")["manifest_version"] as? String)
     }
@@ -164,6 +214,67 @@ struct ContractTestVersions {
     static func manifest(at path: String) throws -> [String: Any] {
         try XCTUnwrap(JSONSerialization.jsonObject(
             with: Data(contentsOf: root.appendingPathComponent(path))) as? [String: Any])
+    }
+
+    /// Reads only direct children of the top-level `info:` mapping. Keeping the
+    /// exact child indentation avoids matching prose or nested YAML values; a
+    /// contract source with zero or multiple versions must fail rather than
+    /// silently selecting one.
+    static func openAPIVersion(in yaml: String) throws -> String {
+        let lines = yaml.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let infoIndices = lines.indices.filter { lines[$0].range(of: #"^info:[ \t]*$"#, options: .regularExpression) != nil }
+        guard infoIndices.count == 1, let infoIndex = infoIndices.first else {
+            throw ContractVersionParseError.ambiguous
+        }
+
+        func isBlankOrComment(_ line: String) -> Bool {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty || trimmed.hasPrefix("#")
+        }
+        func isTopLevelKey(_ line: String) -> Bool {
+            guard !isBlankOrComment(line) else { return false }
+            return line.range(of: #"^[^ \t#:][^:]*:"#,
+                              options: .regularExpression) != nil
+        }
+        func leadingIndentation(of line: String) -> String {
+            String(line.prefix { $0 == " " || $0 == "\t" })
+        }
+        func isMappingKey(_ line: String) -> Bool {
+            line.range(of: #"^[ \t]+[^ \t#][^:]*:"#,
+                       options: .regularExpression) != nil
+        }
+
+        let block = lines.dropFirst(infoIndex + 1).prefix { !isTopLevelKey($0) }
+        guard let firstChild = block.first(where: { !isBlankOrComment($0) && isMappingKey($0) }) else {
+            throw ContractVersionParseError.ambiguous
+        }
+        let indentation = leadingIndentation(of: firstChild)
+        guard !indentation.isEmpty else {
+            throw ContractVersionParseError.ambiguous
+        }
+        let directChildren = block.compactMap { line -> String? in
+            guard !isBlankOrComment(line), leadingIndentation(of: line) == indentation else { return nil }
+            let value = String(line.dropFirst(indentation.count))
+            return value.range(of: #"^[^ \t#][^:]*:"#,
+                               options: .regularExpression) == nil ? nil : value
+        }
+        let versionDeclarations = directChildren.filter {
+            $0.range(of: #"^version:[ \t]*"#, options: .regularExpression) != nil
+        }
+        guard versionDeclarations.count == 1, let declaration = versionDeclarations.first else {
+            throw ContractVersionParseError.ambiguous
+        }
+        let pattern = #"^version:[ \t]*(?:"([^"]+)"|'([^']+)'|([^\s#"']+))[ \t]*(?:#.*)?$"#
+        let matches = try NSRegularExpression(pattern: pattern).matches(
+            in: declaration, range: NSRange(declaration.startIndex..., in: declaration))
+        guard matches.count == 1, let match = matches.first else {
+            throw ContractVersionParseError.ambiguous
+        }
+        for capture in 1...3 where match.range(at: capture).location != NSNotFound {
+            guard let range = Range(match.range(at: capture), in: declaration) else { continue }
+            return String(declaration[range])
+        }
+        throw ContractVersionParseError.ambiguous
     }
 
     private static func capture(_ pattern: String, in source: String) throws -> String {
@@ -175,3 +286,5 @@ struct ContractTestVersions {
         return String(source[range])
     }
 }
+
+private enum ContractVersionParseError: Error { case ambiguous }

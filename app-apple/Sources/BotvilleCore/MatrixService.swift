@@ -17,6 +17,32 @@ public struct RoomTimelineLease: Equatable, Sendable {
     fileprivate let id: UUID
 }
 
+/// A complete joined-member snapshot for the group information screen.  This
+/// intentionally contains no room events or credentials.
+public struct MatrixRoomMember: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let displayName: String
+    public let isAI: Bool
+
+    public init(id: String, displayName: String, isAI: Bool) {
+        self.id = id
+        self.displayName = displayName
+        self.isAI = isAI
+    }
+}
+
+/// Pure, SDK-independent validation for contacts offered by "start group".
+/// The caller supplies joined members from a complete iterator; anything other
+/// than the local user plus exactly one distinct counterpart is excluded.
+enum GroupInviteContactEligibility {
+    static func counterpartID(isDirect: Bool, localUserID: String?, joinedMemberIDs: [String]) -> String? {
+        guard isDirect, let localUserID, joinedMemberIDs.count == 2,
+              Set(joinedMemberIDs).count == 2,
+              joinedMemberIDs.contains(localUserID) else { return nil }
+        return joinedMemberIDs.first(where: { $0 != localUserID })
+    }
+}
+
 /// Serializes the UI ownership of the single SDK timeline. A room ID alone is
 /// insufficient: an old SwiftUI view can disappear after another instance has
 /// reopened the same room.
@@ -109,6 +135,7 @@ public final class MatrixService: ObservableObject {
     private var sendingGeneration: UUID?
     private var messageActions = Set<String>()
     private var invitationActions = Set<String>()
+    private var leaveActions = Set<String>()
     private var securityActions = Set<String>()
     private var isCreatingRoom = false
     private var observedEncryptedRooms = Set<String>()
@@ -1150,6 +1177,101 @@ public final class MatrixService: ObservableObject {
         } catch { throw await operationFailure(error, session: session) }
     }
 
+    /// Returns the complete joined-member snapshot used by the group room
+    /// information UI.  An incomplete iterator is rejected instead of being
+    /// presented as a member list.
+    public func groupMembers(roomID: String) async throws -> [MatrixRoomMember] {
+        guard let client, isLoggedIn, !isLoggingOut else { throw MatrixServiceError.notLoggedIn }
+        guard let room = try client.getRoom(roomId: roomID), room.membership() == .joined else {
+            throw MatrixServiceError.roomUnavailable
+        }
+        let session = sessionGeneration
+        do {
+            let iterator = try await room.members()
+            let expectedCount = iterator.len()
+            var values = [RoomMember]()
+            while let chunk = iterator.nextChunk(chunkSize: 100) {
+                try Task.checkCancellation()
+                guard !chunk.isEmpty else { break }
+                values.append(contentsOf: chunk)
+            }
+            guard UInt32(values.count) == expectedCount else { throw MatrixServiceError.operationFailed }
+            guard session == sessionGeneration, !isLoggingOut, !Task.isCancelled else { throw CancellationError() }
+            return values.filter { $0.membership == .join }.map { member in
+                MatrixRoomMember(
+                    id: member.userId,
+                    displayName: member.displayName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                        ? member.displayName! : member.userId,
+                    isAI: aiParticipantPolicy.classify(memberIDs: [member.userId]) == .containsAI
+                )
+            }.sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
+        } catch { throw await operationFailure(error, session: session) }
+    }
+
+    /// Candidate contacts are derived only from complete, strict two-person DM
+    /// snapshots. Filtering local versus federated AI accounts belongs to the
+    /// creation selector, which has the current homeserver context.
+    public func groupInviteContacts() async throws -> [GroupInviteCandidate] {
+        guard let client, isLoggedIn, !isLoggingOut, let localUserID = userID else {
+            throw MatrixServiceError.notLoggedIn
+        }
+        let session = sessionGeneration
+        var candidates = [GroupInviteCandidate]()
+        for snapshot in rooms where snapshot.membership == .joined && snapshot.isDirect {
+            guard session == sessionGeneration, !isLoggingOut, !Task.isCancelled else { throw CancellationError() }
+            guard let room = try? client.getRoom(roomId: snapshot.id), room.membership() == .joined else {
+                guard session == sessionGeneration, !isLoggingOut, !Task.isCancelled else { throw CancellationError() }
+                continue
+            }
+            let iterator: RoomMembersIterator
+            do { iterator = try await room.members() } catch {
+                guard session == sessionGeneration, !isLoggingOut, !Task.isCancelled else { throw CancellationError() }
+                continue
+            }
+            guard session == sessionGeneration, !isLoggingOut, !Task.isCancelled else { throw CancellationError() }
+            let expectedCount = iterator.len()
+            var members = [RoomMember]()
+            while let chunk = iterator.nextChunk(chunkSize: 100) {
+                try Task.checkCancellation()
+                guard !chunk.isEmpty else { break }
+                members.append(contentsOf: chunk)
+            }
+            guard UInt32(members.count) == expectedCount else { continue }
+            let joined = members.filter { $0.membership == .join }
+            guard let counterpartID = GroupInviteContactEligibility.counterpartID(
+                isDirect: snapshot.isDirect, localUserID: localUserID, joinedMemberIDs: joined.map(\.userId)
+            ), let counterpart = joined.first(where: { $0.userId == counterpartID }) else { continue }
+            candidates.append(GroupInviteCandidate(
+                id: counterpart.userId,
+                displayName: counterpart.displayName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                    ? counterpart.displayName! : counterpart.userId,
+                isAI: aiParticipantPolicy.classify(memberIDs: [counterpart.userId]) == .containsAI
+            ))
+            guard session == sessionGeneration, !isLoggingOut, !Task.isCancelled else { throw CancellationError() }
+        }
+        guard session == sessionGeneration, !isLoggingOut, !Task.isCancelled else { throw CancellationError() }
+        return candidates
+    }
+
+    /// Leaves a joined Matrix room for the signed-in human.  This is separate
+    /// from the owner gateway's irreversible AI-room leave operation.
+    public func leaveRoom(_ roomID: String) async throws {
+        guard let client, isLoggedIn, !isLoggingOut else { throw MatrixServiceError.notLoggedIn }
+        guard !leaveActions.contains(roomID) else { throw MatrixServiceError.busy }
+        guard let room = try client.getRoom(roomId: roomID), room.membership() == .joined else {
+            throw MatrixServiceError.roomUnavailable
+        }
+        let session = sessionGeneration
+        leaveActions.insert(roomID)
+        defer { if session == sessionGeneration { leaveActions.remove(roomID) } }
+        do {
+            try await room.leave()
+            guard session == sessionGeneration, !isLoggingOut else { throw CancellationError() }
+            await refreshRooms(from: client, session: session)
+            guard session == sessionGeneration, !isLoggingOut else { throw CancellationError() }
+        } catch { throw await operationFailure(error, session: session) }
+    }
+
     public func refreshRoomSecurity(_ roomID: String) async {
         guard let client, isLoggedIn, !isLoggingOut, !securityActions.contains(roomID),
               let room = try? client.getRoom(roomId: roomID), room.membership() == .joined else { return }
@@ -1761,6 +1883,7 @@ public final class MatrixService: ObservableObject {
         connectionStatus = .idle
         syncError = nil
         invitationActions.removeAll()
+        leaveActions.removeAll()
         securityActions.removeAll()
         securityReadGenerations.removeAll()
         roomSecurityRevisions.removeAll()

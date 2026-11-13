@@ -117,6 +117,30 @@ public struct ProactiveSettings: Codable, Sendable, Equatable {
     }
 }
 
+/// Owner-only group invitation settings. Missing `enabled` never opts in.
+public struct PersonaGroupsSettings: Codable, Sendable, Equatable {
+    public let enabled: Bool
+    public let invitePolicy: InvitePolicy
+    public enum InvitePolicy: String, Codable, Sendable, CaseIterable, Hashable {
+        case owner
+        case localHumans = "local_humans"
+    }
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case invitePolicy = "invite_policy"
+    }
+    public init(enabled: Bool = false, invitePolicy: InvitePolicy = .owner) {
+        self.enabled = enabled
+        self.invitePolicy = invitePolicy
+    }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try values.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        invitePolicy =
+            try values.decodeIfPresent(InvitePolicy.self, forKey: .invitePolicy) ?? .owner
+    }
+}
+
 public struct SilentHours: Codable, Sendable, Equatable {
     public let enabled: Bool
     public let start: String
@@ -150,8 +174,10 @@ public struct MemoryPersona: Codable, Sendable, Equatable, Identifiable {
     public let mood: PersonaMood?
     /// Full Persona configuration only; summaries and detail views omit it.
     public let proactive: ProactiveSettings?
+    /// Absent outside an owner detail response; absence must not be treated as disabled.
+    public let groups: PersonaGroupsSettings?
     enum CodingKeys: String, CodingKey {
-        case id, bio, kind, status, revision, visibility, mood, proactive
+        case id, bio, kind, status, revision, visibility, mood, proactive, groups
         case displayName = "display_name"
         case ownerID = "owner_id"
         case createdAt = "created_at"
@@ -172,6 +198,7 @@ public struct MemoryPersona: Codable, Sendable, Equatable, Identifiable {
         visibility = try values.decode(String.self, forKey: .visibility)
         mood = try values.decodeIfPresent(String.self, forKey: .mood).flatMap(PersonaMood.init(rawValue:))
         proactive = try values.decodeIfPresent(ProactiveSettings.self, forKey: .proactive)
+        groups = try values.decodeIfPresent(PersonaGroupsSettings.self, forKey: .groups)
     }
 
     public func aiProfile(localServerName: String?) -> AIProfile {
@@ -193,6 +220,7 @@ public struct MemoryPersona: Codable, Sendable, Equatable, Identifiable {
         try values.encode(visibility, forKey: .visibility)
         try values.encodeIfPresent(mood, forKey: .mood)
         try values.encodeIfPresent(proactive, forKey: .proactive)
+        try values.encodeIfPresent(groups, forKey: .groups)
     }
 }
 

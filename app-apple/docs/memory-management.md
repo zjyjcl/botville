@@ -73,7 +73,7 @@ GET 集合、恰好一个非空 id 的详情路径，以及恰好一个非空 id
 GET/PATCH 错误复用 `GatewayClientError.errorDescription`：401 提示重新登录；403（含无
 problem body）显示「没有权限查看」；`404 mood.disabled` 隐藏整个心情块且不提示错误，
 其他 404 走现有映射（如 `persona.not_found` 为「不存在或不可见」）；
-`503 mood.unavailable` 显示「心情暂时不可用」，无 problem code 的纯 503 保留通用网关错误。
+`503 mood.unavailable` 显示「心情暂时不可用。」，无 problem code 的纯 503 保留通用网关错误。
 422/429 保留心情块本地固定文案：422 为「操作失败，请稍后重试」，429 为
 「操作太频繁，请稍后再试。」。非 GatewayClientError（如网络 URLError）及无共享描述的
 错误兜底为「操作失败，请稍后重试」。PATCH 没有 Idempotency-Key，因此 500 不重试。

@@ -1,0 +1,14 @@
+{
+  "items": [
+    {
+      "room_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "state": "accepted",
+      "mode": "muted",
+      "joined_at": "2026-11-13T00:00:00Z",
+      "updated_at": "2026-11-13T01:00:00Z"
+    }
+  ],
+  "next_cursor": null,
+  "has_more": false,
+  "groups_enabled": true
+}

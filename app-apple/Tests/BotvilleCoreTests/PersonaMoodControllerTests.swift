@@ -22,7 +22,7 @@ final class PersonaMoodControllerTests: XCTestCase {
             (GatewayClientError.problem(status: 429, code: "rate_limited.transport"), "操作太频繁，请稍后再试。"),
             (GatewayClientError.httpStatus(429), "操作太频繁，请稍后再试。"),
             (GatewayClientError.serverAuthMisconfigured, "服务器认证异常，请联系部署者"),
-            (GatewayClientError.problem(status: 503, code: "mood.unavailable"), "心情暂时不可用"),
+            (GatewayClientError.problem(status: 503, code: "mood.unavailable"), "心情暂时不可用。"),
             (GatewayClientError.httpStatus(503), "网关请求失败，请稍后重试。"),
             (URLError(.notConnectedToInternet), "操作失败，请稍后重试"),
             (GatewayClientError.invalidResponse, "操作失败，请稍后重试"),
@@ -63,7 +63,7 @@ final class PersonaMoodControllerTests: XCTestCase {
 
     func testMoodUnavailableUsesSharedDescription() {
         XCTAssertEqual(GatewayClientError.problem(status: 503, code: "mood.unavailable").errorDescription,
-                       "心情暂时不可用")
+                       "心情暂时不可用。")
     }
 
     func testDisabledMoodHidesBlockWithoutError() async {
