@@ -2,7 +2,10 @@
 """Gateway mood (B line PR4b) / proactive speech (B line PR4c) / group reply
 cap (B line B2.8a, GATEWAY_GROUP_MAX_RESPONDERS) / group invites (B line
 B2.8b, GATEWAY_GROUPS_ENABLED, GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA,
-GATEWAY_INVITE_LEDGER_TTL_SECONDS) pass-through.
+GATEWAY_INVITE_LEDGER_TTL_SECONDS) / group throttling (B line B2.8c,
+GATEWAY_GROUP_FORGET_STALE_KEYS, GATEWAY_GROUP_COOLDOWN_SECONDS,
+GATEWAY_GROUP_MAX_REPLIES_PER_HOUR, GATEWAY_GROUP_AI_LOOP_MAX_PER_HOUR,
+GATEWAY_GROUP_MAX_CONSECUTIVE_AI_MESSAGES) pass-through.
 
 The names and defaults must agree across the compose file, all three
 .env.example files (repo root, server/compose, gateway), the CI allowlist,
@@ -50,6 +53,13 @@ EXPECTED = {
     "GATEWAY_GROUPS_ENABLED": ("false", "groups_enabled", False),
     "GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA": ("20", "group_max_rooms_per_persona", 20),
     "GATEWAY_INVITE_LEDGER_TTL_SECONDS": ("86400", "invite_ledger_ttl_seconds", 86400),
+    # B line B2.8c group throttling.
+    "GATEWAY_GROUP_FORGET_STALE_KEYS": ("false", "group_forget_stale_keys", False),
+    "GATEWAY_GROUP_COOLDOWN_SECONDS": ("30", "group_cooldown_seconds", 30),
+    "GATEWAY_GROUP_MAX_REPLIES_PER_HOUR": ("20", "group_max_replies_per_hour", 20),
+    "GATEWAY_GROUP_AI_LOOP_MAX_PER_HOUR": ("30", "group_ai_loop_max_per_hour", 30),
+    "GATEWAY_GROUP_MAX_CONSECUTIVE_AI_MESSAGES": (
+        "3", "group_max_consecutive_ai_messages", 3),
 }
 # Supported ranges: name -> (minimum, maximum).
 # KEEP IN SYNC with gateway/src (change both together -- the edge tests below
@@ -59,6 +69,12 @@ EXPECTED = {
 #   GROUP_MAX_RESPONDERS            config.py _env_group_max_responders + __post_init__
 #   GROUP_MAX_ROOMS_PER_PERSONA     config.py Config.__post_init__ (1-200)
 #   INVITE_LEDGER_TTL_SECONDS       as_txn_store.py INVITE_LEDGER_TTL_MIN/MAX_SECONDS
+#   GROUP_COOLDOWN_SECONDS,         config.py Config.__post_init__ B2.8c loop
+#   GROUP_MAX_REPLIES_PER_HOUR,       ("group_cooldown_seconds", 0, 3600), ...
+#   GROUP_AI_LOOP_MAX_PER_HOUR,
+#   GROUP_MAX_CONSECUTIVE_AI_MESSAGES
+# BOOLS below pairs with the _env_bool(...) calls in config.py load_config
+# (GATEWAY_GROUP_FORGET_STALE_KEYS: __post_init__ boolean check).
 # The docs tables (appservice.md), the .env.example comments and the
 # compose comments quote the same ranges.
 RANGES = {
@@ -70,12 +86,17 @@ RANGES = {
     "GATEWAY_GROUP_MAX_RESPONDERS": (1, 20),
     "GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA": (1, 200),
     "GATEWAY_INVITE_LEDGER_TTL_SECONDS": (60, 2_592_000),
+    "GATEWAY_GROUP_COOLDOWN_SECONDS": (0, 3600),
+    "GATEWAY_GROUP_MAX_REPLIES_PER_HOUR": (1, 200),
+    "GATEWAY_GROUP_AI_LOOP_MAX_PER_HOUR": (1, 1000),
+    "GATEWAY_GROUP_MAX_CONSECUTIVE_AI_MESSAGES": (1, 50),
 }
 # Distinctive invalid values: if one shows up in an error message, the
 # gateway echoed deployment input. None of them can occur in a fixed message.
 SENTINEL = "873461"
 BOOLS = ("GATEWAY_MOOD_ENABLED", "GATEWAY_PROACTIVE_ENABLED",
-         "GATEWAY_PROACTIVE_RECENT_CONTACTS_ENABLED", "GATEWAY_GROUPS_ENABLED")
+         "GATEWAY_PROACTIVE_RECENT_CONTACTS_ENABLED", "GATEWAY_GROUPS_ENABLED",
+         "GATEWAY_GROUP_FORGET_STALE_KEYS")
 
 # Runs gateway/src load_config on a JSON env from argv; prints the parsed
 # fields, or the ConfigError message. Dev mode, no secrets.
@@ -165,9 +186,51 @@ class MoodProactiveEnvStaticTest(unittest.TestCase):
             # A plain number must not appear as a standalone number. (Fixed
             # messages may quote the range, e.g. "within 60-2592000", so a
             # substring check would flag "59" / "0" without any echo.)
+            # LIMITATION: this regex cannot see the value embedded in a
+            # longer digit run (an echo such as "got 590" for value 59 is
+            # missed; see test_standalone_number_check_limitation). The gap
+            # is closed by test_error_messages_do_not_depend_on_the_value,
+            # which requires the SAME message for different invalid values.
             self.assertNotRegex(message, r"(?<![0-9]){}(?![0-9])".format(re.escape(digits)))
         else:
             self.assertNotIn(value.strip(), message)
+        return message
+
+    def test_standalone_number_check_limitation(self):
+        """Documents why the value-independence test exists: the standalone
+        regex used above misses a value glued into a longer number."""
+        pattern = r"(?<![0-9]){}(?![0-9])".format(re.escape("59"))
+        self.assertIsNone(re.search(pattern, "must be within 60-2592000"))  # no false hit
+        self.assertIsNone(re.search(pattern, "got 590"))  # an echo it cannot see
+        self.assertIsNotNone(re.search(pattern, "got 59"))
+
+    def test_error_messages_do_not_depend_on_the_value(self):
+        """#229 nit: invalid values of the same kind must produce the SAME
+        error text. Any echo -- even one embedded in a longer number -- makes
+        two such messages differ."""
+        def message(key, value):
+            got = run_gateway_config({"GATEWAY_DEV_MODE": "true", key: value})
+            self.assertIn("error", got, "{}={} accepted".format(key, value))
+            return got["error"]
+        for key, (minimum, maximum) in RANGES.items():
+            above = {message(key, str(maximum + 1)), message(key, SENTINEL + "0"),
+                     message(key, str(maximum + 7)), message(key, " " + SENTINEL + "0 ")}
+            if minimum > 0:
+                above |= {message(key, str(minimum - 1))}
+            with self.subTest(key=key, kind="out of range"):
+                self.assertEqual(len(above), 1, above)
+            negative = {message(key, "-1"), message(key, "-" + SENTINEL),
+                        message(key, "-" + SENTINEL + "9")}
+            with self.subTest(key=key, kind="negative"):
+                self.assertEqual(len(negative), 1, negative)
+            garbage = {message(key, "x" + SENTINEL), message(key, "y" + SENTINEL + "1"),
+                       message(key, SENTINEL + ".5")}
+            with self.subTest(key=key, kind="not an integer"):
+                self.assertEqual(len(garbage), 1, garbage)
+        for key in BOOLS:
+            texts = {message(key, v) for v in ("maybe-" + SENTINEL, SENTINEL, "-" + SENTINEL, "2")}
+            with self.subTest(key=key, kind="boolean"):
+                self.assertEqual(len(texts), 1, texts)
 
     def test_gateway_src_rejects_invalid_values_without_echoing_them(self):
         """Every invalid value is refused at startup and never reflected in
@@ -245,6 +308,33 @@ class MoodProactiveEnvStaticTest(unittest.TestCase):
         got = run_gateway_config(base)
         self.assertNotIn("error", got)
 
+    def test_production_missing_hmac_is_stopped_by_the_global_rule(self):
+        """#229 nit (docs): the "no memory DB -> WARNING, groups off" case only
+        applies with a real HMAC secret or in dev mode. In production (no dev
+        mode) a missing secret is refused by the global rule first; with a
+        memory DB the groups-specific check runs before it (also refused)."""
+        prod = {"GATEWAY_AUTH_TOKEN": "test-only-auth-" + "t" * 40,
+                "GATEWAY_GROUPS_ENABLED": "true"}
+        got = run_gateway_config(prod)
+        self.assertIn("error", got)
+        self.assertIn("GATEWAY_HMAC_SECRET is unset", got["error"])
+        with tempfile.TemporaryDirectory() as tmp:
+            got = run_gateway_config(dict(prod, GATEWAY_MEMORY_DB_PATH=str(Path(tmp) / "m.db")))
+            self.assertIn("error", got)
+            self.assertIn("GATEWAY_GROUPS_ENABLED requires an explicit persistent", got["error"])
+        # Test-only value generated here, never a deployment secret.
+        got = run_gateway_config(dict(prod, GATEWAY_HMAC_SECRET="cd" * 32))
+        self.assertNotIn("error", got)
+
+    def test_forget_stale_keys_is_a_plain_startup_flag(self):
+        """GATEWAY_GROUP_FORGET_STALE_KEYS parses as a strict boolean on its
+        own (no other switch needed to start) -- the cleanup it triggers runs
+        at startup only when a memory DB is configured (documented)."""
+        for value, expected in (("true", True), ("false", False), ("", False)):
+            got = run_gateway_config({"GATEWAY_DEV_MODE": "true",
+                                      "GATEWAY_GROUP_FORGET_STALE_KEYS": value})
+            self.assertIs(got.get("group_forget_stale_keys"), expected, value)
+
     def test_init_sh_generates_none_of_them(self):
         init = (REPO_ROOT / "server" / "scripts" / "init.sh").read_text(encoding="utf-8")
         for key in EXPECTED:
@@ -293,6 +383,21 @@ class MoodProactiveEnvStaticTest(unittest.TestCase):
             self.assertRegex(block, r"invalidates every accepted group|会让已接受的群全部失效")
             self.assertRegex(text, r"three \.env\.example|三份 \.env\.example")
         self.assertNotIn("两份 .env.example", doc + readme + z423)
+        # B2.8c: one-off cleanup switch (what it deletes, set back to false)
+        # and counters reset on restart -- in every doc.
+        for text in (doc, readme, z423):
+            self.assertIn("GATEWAY_GROUP_FORGET_STALE_KEYS", text)
+            self.assertIn("重启后清零", text)
+            self.assertRegex(text, r"一次性")
+            self.assertRegex(text, r"永久删除旧 key_id 的群台账")
+            self.assertRegex(text, r"改回 `?false`?")
+        self.assertIn("⚠️ **`GATEWAY_GROUP_FORGET_STALE_KEYS` 是轮换密钥后的一次性清理开关**", doc)
+        self.assertIn("⚠️ **节流计数只在网关进程内存里，重启后清零**", doc)
+        self.assertIn("**生产环境（非 dev）全局缺 HMAC 时，会先被\n  全局规则拦下**", doc)
+        for path in ENV_EXAMPLES[:2]:
+            text = path.read_text(encoding="utf-8")
+            self.assertRegex(text, r"reset on gateway restart|网关重启后清零")
+            self.assertRegex(text, r"set it back to false|改回 false")
 
     def test_no_hmac_secret_value_written_anywhere(self):
         """The HMAC secret is only ever a placeholder / empty in tracked text."""
@@ -347,6 +452,11 @@ class MoodProactiveEnvRenderTest(unittest.TestCase):
             "GATEWAY_GROUPS_ENABLED": "true",
             "GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA": "150",
             "GATEWAY_INVITE_LEDGER_TTL_SECONDS": "3600",
+            "GATEWAY_GROUP_FORGET_STALE_KEYS": "true",
+            "GATEWAY_GROUP_COOLDOWN_SECONDS": "0",
+            "GATEWAY_GROUP_MAX_REPLIES_PER_HOUR": "150",
+            "GATEWAY_GROUP_AI_LOOP_MAX_PER_HOUR": "999",
+            "GATEWAY_GROUP_MAX_CONSECUTIVE_AI_MESSAGES": "50",
         }
         self.assertEqual(set(values), set(EXPECTED))
         env = self.gateway_env("".join("{}={}\n".format(k, v) for k, v in values.items()))

@@ -374,6 +374,19 @@ services:
       GATEWAY_GROUPS_ENABLED: ${GATEWAY_GROUPS_ENABLED:-false}
       GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA: ${GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA:-20}
       GATEWAY_INVITE_LEDGER_TTL_SECONDS: ${GATEWAY_INVITE_LEDGER_TTL_SECONDS:-86400}
+      # Group throttling (B line B2.8c), defaults/ranges as in gateway/src
+      # config.py. FORGET_STALE_KEYS is a one-off operator switch after an
+      # HMAC rotation: while true, every gateway start permanently deletes
+      # group rows of old HMAC key_ids (lifting rotation quarantine, losing
+      # old left / encrypted_disabled records); set it back to false after
+      # that restart. Cooldown 0-3600 s (0 = off), replies/hour 1-200, room
+      # AI-loop/hour 1-1000, consecutive AI messages 1-50. Throttle counters
+      # live in process memory and reset on restart.
+      GATEWAY_GROUP_FORGET_STALE_KEYS: ${GATEWAY_GROUP_FORGET_STALE_KEYS:-false}
+      GATEWAY_GROUP_COOLDOWN_SECONDS: ${GATEWAY_GROUP_COOLDOWN_SECONDS:-30}
+      GATEWAY_GROUP_MAX_REPLIES_PER_HOUR: ${GATEWAY_GROUP_MAX_REPLIES_PER_HOUR:-20}
+      GATEWAY_GROUP_AI_LOOP_MAX_PER_HOUR: ${GATEWAY_GROUP_AI_LOOP_MAX_PER_HOUR:-30}
+      GATEWAY_GROUP_MAX_CONSECUTIVE_AI_MESSAGES: ${GATEWAY_GROUP_MAX_CONSECUTIVE_AI_MESSAGES:-3}
       # Four-layer memory (B line PR3a). Empty path = memory off (PR2 ring
       # buffer). To enable, keep it at the TOP LEVEL of the gateway-data
       # volume, e.g. /var/lib/botville-gateway/memory.db: backups checkpoint

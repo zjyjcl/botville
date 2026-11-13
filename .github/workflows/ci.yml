@@ -761,6 +761,12 @@ jobs:
               "GATEWAY_GROUPS_ENABLED": "false",
               "GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA": "20",
               "GATEWAY_INVITE_LEDGER_TTL_SECONDS": "86400",
+              # Group throttling (B line B2.8c).
+              "GATEWAY_GROUP_FORGET_STALE_KEYS": "false",
+              "GATEWAY_GROUP_COOLDOWN_SECONDS": "30",
+              "GATEWAY_GROUP_MAX_REPLIES_PER_HOUR": "20",
+              "GATEWAY_GROUP_AI_LOOP_MAX_PER_HOUR": "30",
+              "GATEWAY_GROUP_MAX_CONSECUTIVE_AI_MESSAGES": "3",
               "GATEWAY_MODEL_BASE_URL": "",
               "GATEWAY_MODEL_NAME": "",
               "GATEWAY_MODEL_API_KEY": "",
