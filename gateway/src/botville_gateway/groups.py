@@ -38,8 +38,9 @@ class GroupInvites:
         self._rate = {}
         self._attempt_owner = uuid.uuid4().hex
         if forget_stale_keys and store is not None:
+            store.backfill_group_key_ids()
             with store._lock, store._db:
-                count = store._db.execute('DELETE FROM group_rooms WHERE key_id != ?',
+                count = store._db.execute("DELETE FROM group_rooms WHERE key_id IS NOT NULL AND key_id != '' AND key_id != ?",
                                           (store.group_key_id(),)).rowcount
             _LOG.info('Group stale key rows deleted: %d', count)
         if enabled and store is None:

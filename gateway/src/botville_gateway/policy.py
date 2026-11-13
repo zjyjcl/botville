@@ -366,6 +366,7 @@ class PolicyEngine:
         `commit_state=True` 仅由 service 的实发路径（`_prepare_send`）传入：
         冷却到期清零等状态变更才会落库（该调用在 `service._lock` 内）。
         """
+        persona_id, conversation_id = self.normalize_group_target(persona_id, conversation_id)
         now = now or self._now()
         # 计量取 max（B3）：客户端给的 token_estimate 只是**下限**，不能低于按
         # 正文估算的值；否则 `token_estimate: 0` 可以完全绕过 token 预算
@@ -582,6 +583,34 @@ class PolicyEngine:
                 winner = (value, layer.layer, layer.scope_id)
         return winner
 
+    def normalize_group_target(self, persona, room):
+        """Resolve before group classification; unknown aliases fail closed.
+
+        Reuse the transport resolver/cache, never a separate lookup path.
+        Preserve legacy non-group accounting identifiers.
+        """
+        groups = self.group_invites
+        if not room or groups is None or not groups.enabled:
+            return persona, room
+        canonical = persona
+        sender_resolver = getattr(groups.transport, 'resolve_sender', None)
+        if sender_resolver is not None:
+            canonical = sender_resolver(persona)
+        elif not persona.startswith('@') and groups.server_name:
+            local = persona if persona.startswith('ai_') else 'ai_' + persona
+            canonical = '@' + local + ':' + groups.server_name
+        resolver = getattr(groups.transport, 'resolve_room', None)
+        if resolver is not None:
+            room_id = resolver(room)
+        elif room.startswith('!'):
+            room_id = room
+        else:
+            from .matrix import DeliveryError
+            raise DeliveryError('conversation.not_found', 'Conversation could not be resolved')
+        if groups.is_throttled(canonical, room_id) or groups.is_disabled(canonical, room_id):
+            return canonical, room_id
+        return persona, room
+
     def _group_key(self, persona, room):
         # No raw identifiers in the new bounded counter keys.
         return (text_digest("group-persona:" + persona, self._config.hmac_secret),
@@ -589,6 +618,7 @@ class PolicyEngine:
 
     def record_group_send(self, persona, room, at):
         # Called only by service's successful, deduplicated commit under its lock.
+        persona, room = self.normalize_group_target(persona, room)
         if self.group_invites is None or not self.group_invites.is_throttled(persona, room):
             return
         key = self._group_key(persona, room)
@@ -1072,7 +1102,7 @@ class PolicyEngine:
 
     # ---------------------------------------------- B2.2 anti_spam / ai_loop
     def _anti_spam_key(self, persona_id: str, conversation_id: str) -> Tuple[str, str]:
-        return (persona_id, conversation_id)
+        return self._group_key(persona_id, conversation_id)
 
     def _trim_state_locked(self) -> None:
         """冷却/计数起点/去重表按 max_usage_events 设上限（最旧优先淘汰，#117 N3）。"""
@@ -1133,12 +1163,13 @@ class PolicyEngine:
         计数事件已落库，后续若再进入 blocked 状态应允许重新写一条。
         `persona_id=None` 表示清该会话下所有 persona 的记录（人类消息场景）。
         """
+        persona_key, room_key = self._group_key(persona_id or "", conversation_id)
         with self._state_lock:
             for k in [
                 k
                 for k in self._blocked_recorded
-                if k[1] == conversation_id
-                and (persona_id is None or k[0] == persona_id)
+                if k[1] == room_key
+                and (persona_id is None or k[0] == persona_key)
             ]:
                 del self._blocked_recorded[k]
 
