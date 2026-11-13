@@ -38,8 +38,8 @@ E6 写事实只有客户端接口与测试，本轮没有编辑页面。
 主人 `PersonaMemoryView` 固定显示「私聊内容是否可见由服务端开关决定」。
 #211 已将 `owner_can_read_dm` 的 schema 默认值改为 `false`，已在 main
 `a7d5a7f` 的 `gateway/openapi/gateway.v1.yaml` 核对；App 缺失字段仍默认隐藏。
-新增 memory.manage 能力时 manifest 升到 1.3.0；本次契约元数据更新按
-`contract.md` §3.7 升 patch 到 1.3.1，contract_version 同步为 0.3.0。
+新增 memory.manage 能力时 manifest 升到 1.3.0；本次只把 contract_version 同步为 0.3.0，
+manifest_version 保持 1.3.0，与 #218 网关运行时清单及其测试（`test_memory_qa_p1`）一致。
 
 ## 集成边界
 
