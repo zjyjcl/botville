@@ -356,7 +356,11 @@ PR4b/PR4c 的 `GATEWAY_MOOD_*` / `GATEWAY_PROACTIVE_*`（默认全关；开启�
 `BOTVILLE_GATEWAY_HMAC_SECRET` 持久不变）、
 B2.8b 群邀请的 `GATEWAY_GROUPS_ENABLED`（默认 false）/ `GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA`（20，1–200）/
 `GATEWAY_INVITE_LEDGER_TTL_SECONDS`（86400，60–2592000）——⚠️ **开启群功能必须有持久的 HMAC 密钥**
-（`.env` 的 `BOTVILLE_GATEWAY_HMAC_SECRET`，不能清空、不能重新生成；**轮换会让已接受的群失效**）
+（`.env` 的 `BOTVILLE_GATEWAY_HMAC_SECRET`，不能清空、不能重新生成；**轮换会让已接受的群失效**）、
+B2.8c 群节流的 `GATEWAY_GROUP_COOLDOWN_SECONDS`（30）/ `GATEWAY_GROUP_MAX_REPLIES_PER_HOUR`（20）/
+`GATEWAY_GROUP_AI_LOOP_MAX_PER_HOUR`（30）/ `GATEWAY_GROUP_MAX_CONSECUTIVE_AI_MESSAGES`（3）（**节流计数重启后清零**）
+和 `GATEWAY_GROUP_FORGET_STALE_KEYS`（默认 false；**轮换密钥后一次性打开**，
+启动时永久删除旧 key_id 的群台账，**重启一次后改回 false**）
 从 `.env` 透传给网关（init.sh 不生成，开关默认关；设了 embedding 模型后私聊正文会发给
 embedding 服务商，地址留空即聊天模型同一家）；
 人设目录 `server/compose/gateway-personas/` 只读挂到 `/etc/botville-gateway`（真实人设

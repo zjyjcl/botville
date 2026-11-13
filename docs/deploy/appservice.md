@@ -197,7 +197,7 @@ sender → **400 `request.invalid`**；房间别名不存在 → **404
     | `GATEWAY_AS_TOKEN` | `${APPSERVICE_AS_TOKEN:-}` | 空（appservice 模式会拒绝启动） |
     | `GATEWAY_HS_TOKEN` | `${APPSERVICE_HS_TOKEN:-}` | 空（AS 回调一律 403） |
     | `GATEWAY_AS_TXN_DB_PATH` | 固定 | `/var/lib/botville-gateway/as_transactions.db` |
-    | `GATEWAY_MODEL_*` / `GATEWAY_PERSONAS_FILE` / `GATEWAY_CONSUMER_ENABLED` / `GATEWAY_GROUP_MAX_RESPONDERS` / `GATEWAY_GROUPS_ENABLED` / `GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA` / `GATEWAY_INVITE_LEDGER_TTL_SECONDS` / `GATEWAY_MEMORY_*` / `GATEWAY_EMBEDDING_*` / `GATEWAY_MOOD_*` / `GATEWAY_PROACTIVE_*` | 透传 | 见[角色引擎](#角色引擎模型与人设)的回退值表 |
+    | `GATEWAY_MODEL_*` / `GATEWAY_PERSONAS_FILE` / `GATEWAY_CONSUMER_ENABLED` / `GATEWAY_GROUP_MAX_RESPONDERS` / `GATEWAY_GROUPS_ENABLED` / `GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA` / `GATEWAY_INVITE_LEDGER_TTL_SECONDS` / `GATEWAY_GROUP_FORGET_STALE_KEYS` / `GATEWAY_GROUP_COOLDOWN_SECONDS` / `GATEWAY_GROUP_MAX_REPLIES_PER_HOUR` / `GATEWAY_GROUP_AI_LOOP_MAX_PER_HOUR` / `GATEWAY_GROUP_MAX_CONSECUTIVE_AI_MESSAGES` / `GATEWAY_MEMORY_*` / `GATEWAY_EMBEDDING_*` / `GATEWAY_MOOD_*` / `GATEWAY_PROACTIVE_*` | 透传 | 见[角色引擎](#角色引擎模型与人设)的回退值表 |
 
   - **只通过 `make up` 重建网关**：`BOTVILLE_HOMESERVER` / `GATEWAY_MATRIX_TRANSPORT`
     只在 `make up` 里导出（`HS=` 可能与 `.env` 不同），注册 url 也只在
@@ -242,6 +242,11 @@ B 线 PR2（角色引擎回复）读的变量，compose 原样透传给 `gateway
 | `GATEWAY_CONSUMER_ENABLED` | `${GATEWAY_CONSUMER_ENABLED:-false}` | `false` | 事务消费者总开关，默认关 |
 | `GATEWAY_GROUPS_ENABLED` | `${GATEWAY_GROUPS_ENABLED:-false}` | `false` | 群邀请自动接受的部署开关（B 线 B2.8b），persona 还要 `groups.enabled`。⚠️ **开启必须有持久的 HMAC 密钥**（compose 里即 `.env` 的 `BOTVILLE_GATEWAY_HMAC_SECRET`，不能清空、不能重新生成；**轮换会让已接受的群失效**），并需记忆库；见下方「群邀请」。严格布尔，非法值拒绝启动 |
 | `GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA` | `${GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA:-20}` | `20` | 每个 persona 最多加入的群数，整数 1–200，越界拒绝启动 |
+| `GATEWAY_GROUP_FORGET_STALE_KEYS` | `${GATEWAY_GROUP_FORGET_STALE_KEYS:-false}` | `false` | 轮换 HMAC 密钥后由运维**一次性**打开的清理开关（B 线 B2.8c）：打开期间**每次启动**都永久删除旧 key_id 的群台账，解除轮换隔离，旧 left / encrypted_disabled 记录丢失；**重启一次后改回 `false`**。严格布尔 |
+| `GATEWAY_GROUP_COOLDOWN_SECONDS` | `${GATEWAY_GROUP_COOLDOWN_SECONDS:-30}` | `30` | 每 (persona, 群) 冷却秒数，整数 0–3600；`0` = 关闭 |
+| `GATEWAY_GROUP_MAX_REPLIES_PER_HOUR` | `${GATEWAY_GROUP_MAX_REPLIES_PER_HOUR:-20}` | `20` | 每 (persona, 群) 滚动一小时回复上限，整数 1–200 |
+| `GATEWAY_GROUP_AI_LOOP_MAX_PER_HOUR` | `${GATEWAY_GROUP_AI_LOOP_MAX_PER_HOUR:-30}` | `30` | 整群 AI 循环熔断（滚动一小时），整数 1–1000，人类发言不重置 |
+| `GATEWAY_GROUP_MAX_CONSECUTIVE_AI_MESSAGES` | `${GATEWAY_GROUP_MAX_CONSECUTIVE_AI_MESSAGES:-3}` | `3` | 同一 persona 在同一群连续 AI 消息上限，整数 1–50，人类发言归零 |
 | `GATEWAY_INVITE_LEDGER_TTL_SECONDS` | `${GATEWAY_INVITE_LEDGER_TTL_SECONDS:-86400}` | `86400` | 邀请台账过期秒数，整数 60–2592000；过期邀请改由 `/sync` 权威确认，越界拒绝启动 |
 | `GATEWAY_GROUP_MAX_RESPONDERS` | `${GATEWAY_GROUP_MAX_RESPONDERS:-3}` | `3` | 每条群聊人类消息最多几个 AI 回复（B 线 B2.8a）；整数 1–20，私聊不受影响；超出范围或不是整数时网关拒绝启动（报错不回显取值） |
 | `GATEWAY_MODEL_BASE_URL` | `${GATEWAY_MODEL_BASE_URL:-}` | 空 | OpenAI 兼容接口地址；空 = 未配模型，只记录不发言 |
@@ -295,9 +300,9 @@ B 线 PR2（角色引擎回复）读的变量，compose 原样透传给 `gateway
   `GATEWAY_EMBEDDING_DIM` 负数、`GATEWAY_MEMORY_VECTOR_BACKEND` 不在
   `none|python|sqlite-vec` 内、设了 embedding 模型却没有可用的 http(s) 地址时，网关拒绝启动。
 
-**群邀请（B 线 B2.8b）**
+**群邀请与群节流（B 线 B2.8b / B2.8c）**
 
-三个变量由 compose 原样透传，init.sh 不生成；默认值以 `gateway/src` 的 `config.py` 为准，
+群邀请的三个变量和群节流的五个变量都由 compose 原样透传，init.sh 不生成；默认值以 `gateway/src` 的 `config.py` 为准，
 三份 `.env.example`（根目录、`server/compose`、`gateway`）保持一致。默认关闭。
 
 > ⚠️ **开启 `GATEWAY_GROUPS_ENABLED` 必须配置持久的 HMAC 密钥。** compose 部署里它就是
@@ -306,10 +311,26 @@ B 线 PR2（角色引擎回复）读的变量，compose 原样透传给 `gateway
 > 配了记忆库却没有显式密钥时网关拒绝启动。它是密钥，只放本地 `.env`，不要贴到文档、聊天或日志。
 
 - 还需要记忆库（`GATEWAY_MEMORY_DB_PATH`）；没配时网关记 WARNING，群功能保持关闭。
+  注意这只在已配显式 HMAC 密钥或 dev 模式下成立：**生产环境（非 dev）全局缺 HMAC 时，会先被
+  全局规则拦下**，网关以 `GATEWAY_HMAC_SECRET is unset ...` 拒绝启动，走不到这条 WARNING；
+  配了记忆库时，群功能的专用检查（`GATEWAY_GROUPS_ENABLED requires an explicit persistent
+  GATEWAY_HMAC_SECRET`）排在全局规则之前，同样拒绝启动。
   人设里该 persona 也要 `groups.enabled`（部署开关 + persona 开关缺一不可）。
 - `GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA`：每个 persona 的群数上限，1–200，默认 20。
 - `GATEWAY_INVITE_LEDGER_TTL_SECONDS`：邀请台账过期秒数，60–2592000，默认 86400；过期的邀请
   不走快路径，改由 `/sync` 权威确认。
+- 群节流（B2.8c）只作用于部署开关和 persona 开关都开、且在当前 HMAC key_id 下已接受的群：
+  `GATEWAY_GROUP_COOLDOWN_SECONDS`（0–3600，默认 30，0 = 关）、
+  `GATEWAY_GROUP_MAX_REPLIES_PER_HOUR`（1–200，默认 20）、`GATEWAY_GROUP_AI_LOOP_MAX_PER_HOUR`
+  （1–1000，默认 30，整群、人类发言不重置）、`GATEWAY_GROUP_MAX_CONSECUTIVE_AI_MESSAGES`
+  （1–50，默认 3，人类发言归零）。⚠️ **节流计数只在网关进程内存里，重启后清零**（小时窗口和
+  连续计数都从头算）。
+- ⚠️ **`GATEWAY_GROUP_FORGET_STALE_KEYS` 是轮换密钥后的一次性清理开关**（默认 `false`）。轮换
+  HMAC 密钥后，旧 key_id 的群台账不再匹配，相关 persona 进入轮换隔离（当前密钥下未知的群不会
+  自动加入）。运维确认要放弃旧记录时：设为 `true` → 重启一次（启动时**永久删除**所有旧 key_id
+  的群台账行并解除隔离；旧 left / encrypted_disabled 记录随之丢失，被踢或退出的群收到新的合格
+  邀请后可以再次接受）→ **改回 `false` 再重启**。保持 `true` 的话，之后每次启动都会删一遍，下次
+  轮换时会不经确认直接删掉旧记录。只在配了记忆库时生效。
 - 布尔值非法、整数越界或不是整数时网关拒绝启动（报错不回显取值）。改完 `make up GATEWAY=1` 生效。
 
 **情绪与主动发言（B 线 PR4b / PR4c）**
