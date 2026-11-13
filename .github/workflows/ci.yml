@@ -774,6 +774,15 @@ jobs:
               "GATEWAY_MEMORY_VECTOR_BACKEND": "python",
               # Owner reads DM memory (B line PR3d): strictly off by default.
               "GATEWAY_MEMORY_OWNER_CAN_READ_DM": "false",
+              # Mood (B line PR4b) / proactive speech (B line PR4c): off by default.
+              "GATEWAY_MOOD_ENABLED": "false",
+              "GATEWAY_MOOD_HALF_LIFE_MINUTES": "240",
+              "GATEWAY_PROACTIVE_ENABLED": "false",
+              "GATEWAY_PROACTIVE_RECENT_CONTACTS_ENABLED": "false",
+              "GATEWAY_PROACTIVE_TICK_SECONDS": "300",
+              "GATEWAY_PROACTIVE_MIN_IDLE_MINUTES": "180",
+              "GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES": "240",
+              "GATEWAY_PROACTIVE_PER_TARGET_PER_DAY": "1",
               "POSTGRES_IMAGE": "docker.io/library/postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab",
               "SYNAPSE_IMAGE": "docker.io/matrixdotorg/synapse:v1.164.1@sha256:fa4aa980f279bcf26d4e7ecc2a2c9a701c73f2ebe8841da9bdcf3b2fdf693d75",
               "TUWUNEL_IMAGE": "ghcr.io/matrix-construct/tuwunel:v1.9.4@sha256:0e86c6164d6c9f5b60291938eb61ad8395021c37fe58d47a963ea7edddbedaec",
