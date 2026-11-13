@@ -389,6 +389,21 @@ services:
       # false); anything else refuses to start. When true, the App shows a
       # disclosure to the AI's chat partners.
       GATEWAY_MEMORY_OWNER_CAN_READ_DM: ${GATEWAY_MEMORY_OWNER_CAN_READ_DM:-false}
+      # Persona mood (B line PR4b) and proactive speech (B line PR4c), all off
+      # by default; defaults mirror gateway/src config.py. Mood needs the
+      # memory DB (GATEWAY_MEMORY_DB_PATH; without it the gateway logs a
+      # warning and keeps mood off). GATEWAY_PROACTIVE_ENABLED=true needs the
+      # memory DB, a configured model and a persistent GATEWAY_HMAC_SECRET
+      # (here BOTVILLE_GATEWAY_HMAC_SECRET from .env; the gateway refuses to
+      # start without an explicit one). Personas must opt in as well.
+      GATEWAY_MOOD_ENABLED: ${GATEWAY_MOOD_ENABLED:-false}
+      GATEWAY_MOOD_HALF_LIFE_MINUTES: ${GATEWAY_MOOD_HALF_LIFE_MINUTES:-240}
+      GATEWAY_PROACTIVE_ENABLED: ${GATEWAY_PROACTIVE_ENABLED:-false}
+      GATEWAY_PROACTIVE_RECENT_CONTACTS_ENABLED: ${GATEWAY_PROACTIVE_RECENT_CONTACTS_ENABLED:-false}
+      GATEWAY_PROACTIVE_TICK_SECONDS: ${GATEWAY_PROACTIVE_TICK_SECONDS:-300}
+      GATEWAY_PROACTIVE_MIN_IDLE_MINUTES: ${GATEWAY_PROACTIVE_MIN_IDLE_MINUTES:-180}
+      GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES: ${GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES:-240}
+      GATEWAY_PROACTIVE_PER_TARGET_PER_DAY: ${GATEWAY_PROACTIVE_PER_TARGET_PER_DAY:-1}
     ports:
       - "127.0.0.1:${BOTVILLE_GATEWAY_PORT:-8020}:8080"
     volumes:

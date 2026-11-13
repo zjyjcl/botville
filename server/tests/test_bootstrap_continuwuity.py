@@ -474,6 +474,14 @@ class InitScriptTest(unittest.TestCase):
         "GATEWAY_EMBEDDING_DIM=0\n"
         "GATEWAY_MEMORY_VECTOR_BACKEND=python\n"
         "GATEWAY_MEMORY_OWNER_CAN_READ_DM=false\n"
+        "GATEWAY_MOOD_ENABLED=false\n"
+        "GATEWAY_MOOD_HALF_LIFE_MINUTES=240\n"
+        "GATEWAY_PROACTIVE_ENABLED=false\n"
+        "GATEWAY_PROACTIVE_RECENT_CONTACTS_ENABLED=false\n"
+        "GATEWAY_PROACTIVE_TICK_SECONDS=300\n"
+        "GATEWAY_PROACTIVE_MIN_IDLE_MINUTES=180\n"
+        "GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES=240\n"
+        "GATEWAY_PROACTIVE_PER_TARGET_PER_DAY=1\n"
     )
 
     def test_model_env_is_passed_through_never_generated_or_printed(self):
@@ -499,6 +507,15 @@ class InitScriptTest(unittest.TestCase):
         self.assertEqual(self.env_value("GATEWAY_EMBEDDING_DIM"), "0")
         self.assertEqual(self.env_value("GATEWAY_MEMORY_VECTOR_BACKEND"), "python")
         self.assertEqual(self.env_value("GATEWAY_MEMORY_OWNER_CAN_READ_DM"), "false")
+        for key, value in (("GATEWAY_MOOD_ENABLED", "false"),
+                           ("GATEWAY_MOOD_HALF_LIFE_MINUTES", "240"),
+                           ("GATEWAY_PROACTIVE_ENABLED", "false"),
+                           ("GATEWAY_PROACTIVE_RECENT_CONTACTS_ENABLED", "false"),
+                           ("GATEWAY_PROACTIVE_TICK_SECONDS", "300"),
+                           ("GATEWAY_PROACTIVE_MIN_IDLE_MINUTES", "180"),
+                           ("GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES", "240"),
+                           ("GATEWAY_PROACTIVE_PER_TARGET_PER_DAY", "1")):
+            self.assertEqual(self.env_value(key), value, key)
 
         sentinel = "sentinel-model-key-must-not-print-0123456789"
         emb_sentinel = "sentinel-embedding-key-must-not-print-0123456789"

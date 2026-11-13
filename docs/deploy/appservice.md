@@ -197,7 +197,7 @@ sender → **400 `request.invalid`**；房间别名不存在 → **404
     | `GATEWAY_AS_TOKEN` | `${APPSERVICE_AS_TOKEN:-}` | 空（appservice 模式会拒绝启动） |
     | `GATEWAY_HS_TOKEN` | `${APPSERVICE_HS_TOKEN:-}` | 空（AS 回调一律 403） |
     | `GATEWAY_AS_TXN_DB_PATH` | 固定 | `/var/lib/botville-gateway/as_transactions.db` |
-    | `GATEWAY_MODEL_*` / `GATEWAY_PERSONAS_FILE` / `GATEWAY_CONSUMER_ENABLED` / `GATEWAY_MEMORY_*` / `GATEWAY_EMBEDDING_*` | 透传 | 见[角色引擎](#角色引擎模型与人设)的回退值表 |
+    | `GATEWAY_MODEL_*` / `GATEWAY_PERSONAS_FILE` / `GATEWAY_CONSUMER_ENABLED` / `GATEWAY_MEMORY_*` / `GATEWAY_EMBEDDING_*` / `GATEWAY_MOOD_*` / `GATEWAY_PROACTIVE_*` | 透传 | 见[角色引擎](#角色引擎模型与人设)的回退值表 |
 
   - **只通过 `make up` 重建网关**：`BOTVILLE_HOMESERVER` / `GATEWAY_MATRIX_TRANSPORT`
     只在 `make up` 里导出（`HS=` 可能与 `.env` 不同），注册 url 也只在
@@ -255,6 +255,14 @@ B 线 PR2（角色引擎回复）读的变量，compose 原样透传给 `gateway
 | `GATEWAY_EMBEDDING_DIM` | `${GATEWAY_EMBEDDING_DIM:-0}` | `0` = 自动探测 | 正整数要求响应维度一致；负数拒绝启动 |
 | `GATEWAY_MEMORY_VECTOR_BACKEND` | `${GATEWAY_MEMORY_VECTOR_BACKEND:-python}` | `python` | `none` / `python` / `sqlite-vec`（扩展加载不了时回退 python）；其他值拒绝启动 |
 | `GATEWAY_MEMORY_OWNER_CAN_READ_DM` | `${GATEWAY_MEMORY_OWNER_CAN_READ_DM:-false}` | `false` | 主人能否读 AI 的私聊记忆（B 线 PR3d）。⚠️ **打开后主人能看到 AI 的私聊正文和事实值，App 会向聊天对方显示披露**；关闭时主人仍可管理元数据。严格布尔（`true`/`false`，也认 `1`/`0`、`yes`/`no`、`on`/`off`），其他值网关拒绝启动 |
+| `GATEWAY_MOOD_ENABLED` | `${GATEWAY_MOOD_ENABLED:-false}` | `false` | persona 情绪开关（B 线 PR4b）。依赖记忆库：`GATEWAY_MEMORY_DB_PATH` 为空时网关记 warning、情绪保持关闭。严格布尔，非法值拒绝启动 |
+| `GATEWAY_MOOD_HALF_LIFE_MINUTES` | `${GATEWAY_MOOD_HALF_LIFE_MINUTES:-240}` | `240` | 情绪衰减半衰期（分钟），1–10080，超出范围拒绝启动 |
+| `GATEWAY_PROACTIVE_ENABLED` | `${GATEWAY_PROACTIVE_ENABLED:-false}` | `false` | AI 主动发言部署总开关（B 线 PR4c），persona 也要单独启用。⚠️ **开启前必须先启用记忆库（`GATEWAY_MEMORY_DB_PATH`），并有持久的 `GATEWAY_HMAC_SECRET`**，见下方「情绪与主动发言」 |
+| `GATEWAY_PROACTIVE_RECENT_CONTACTS_ENABLED` | `${GATEWAY_PROACTIVE_RECENT_CONTACTS_ENABLED:-false}` | `false` | `false` = 只对主人主动发言；`true` = 还包括七日内私聊过的本服真人联系人 |
+| `GATEWAY_PROACTIVE_TICK_SECONDS` | `${GATEWAY_PROACTIVE_TICK_SECONDS:-300}` | `300` | 调度间隔（秒），30–86400 |
+| `GATEWAY_PROACTIVE_MIN_IDLE_MINUTES` | `${GATEWAY_PROACTIVE_MIN_IDLE_MINUTES:-180}` | `180` | 对话空闲多久才可主动发言（分钟），0–43200 |
+| `GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES` | `${GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES:-240}` | `240` | 每个 persona 两次主动发言的最小间隔（分钟），0–43200 |
+| `GATEWAY_PROACTIVE_PER_TARGET_PER_DAY` | `${GATEWAY_PROACTIVE_PER_TARGET_PER_DAY:-1}` | `1` | 每个 persona 对每个对象每天最多几条，0–24；`0` = 不发送 |
 | `BOTVILLE_GATEWAY_PERSONAS_DIR` | 挂载源 `${BOTVILLE_GATEWAY_PERSONAS_DIR:-./gateway-personas}` | `server/compose/gateway-personas` | 只读挂到容器 `/etc/botville-gateway` |
 
 **记忆库（B 线 PR3a / PR3b）**
@@ -278,10 +286,36 @@ B 线 PR2（角色引擎回复）读的变量，compose 原样透传给 `gateway
   （备份脚本已 chmod 600）。恢复时卷内所有 SQLite 文件（`*.db` 和 `-wal`/`-shm`/`-journal`，
   任意深度）都会显式 `chmod 600`，旧备份里权限宽松的文件也不例外。
 - 保留期与清理间隔不合法（保留天数 <1、清理间隔非 0 且 <60）时网关拒绝启动。
-- PR3b 变量：`GATEWAY_EMBEDDING_API_KEY` 是密钥，和模型 key 一样只放本地 `.env`，
-  不要贴 `docker compose config` 的输出（CI 用哨兵值验证 `config --quiet` 不会打印它）；
+- PR3b 变量：`GATEWAY_EMBEDDING_API_KEY` 是密钥，和模型 key 一样只放本地 `.env`
+  （输出规则见下方「`GATEWAY_MODEL_API_KEY` 不外泄」）；
   `GATEWAY_EMBEDDING_DIM` 负数、`GATEWAY_MEMORY_VECTOR_BACKEND` 不在
   `none|python|sqlite-vec` 内、设了 embedding 模型却没有可用的 http(s) 地址时，网关拒绝启动。
+
+**情绪与主动发言（B 线 PR4b / PR4c）**
+
+八个变量都由 compose 原样透传，init.sh 一个都不生成；默认值与 `gateway/src` 的
+`config.py`、`gateway/.env.example` 一致（`server/tests/test_compose_gateway_mood_proactive.py`
+守着）。全部默认关闭，不改 `.env` 行为就和以前一样。
+
+> ⚠️ **开启 `GATEWAY_PROACTIVE_ENABLED` 的前提**：
+> 1. **先启用记忆库**：`GATEWAY_MEMORY_DB_PATH=/var/lib/botville-gateway/memory.db`
+>    （主动发言的候选对象、队列和去重都在记忆库里；没有记忆库就不会启动主动发言）；
+> 2. **持久的 `GATEWAY_HMAC_SECRET`**：compose 部署里它来自 `server/compose/.env` 的
+>    `BOTVILLE_GATEWAY_HMAC_SECRET`（init.sh 首次生成后保留，重启不变）。不要清空、
+>    不要每次重新生成——它用于 Matrix txnId 防重放，变了会让排队中的主动消息失去保护；
+>    没有显式值时网关直接拒绝启动。它是**密钥**，只放本地 `.env`，不要贴到文档、聊天或日志；
+> 3. 配好模型（`GATEWAY_MODEL_BASE_URL` / `GATEWAY_MODEL_NAME`），并在人设里为该 persona
+>    单独启用主动发言（部署开关 + persona 开关缺一不可）。
+
+- 情绪（`GATEWAY_MOOD_ENABLED`）同样依赖记忆库；没配 `GATEWAY_MEMORY_DB_PATH` 时只记
+  warning，情绪保持关闭，网关照常启动。
+- `GATEWAY_PROACTIVE_RECENT_CONTACTS_ENABLED=false`（默认）只对主人主动发言；设为
+  `true` 还会找七日内私聊过的本服真人联系人。
+- 频率三件套：`GATEWAY_PROACTIVE_MIN_IDLE_MINUTES`（对话空闲多久）、
+  `GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES`（同一 persona 两次之间）、
+  `GATEWAY_PROACTIVE_PER_TARGET_PER_DAY`（每对象每天，`0` = 不发）。
+- 布尔值非法、整数不是非负整数或超出范围时网关拒绝启动（错误信息不回显取值）。
+- 改完 `make up GATEWAY=1` 重建网关生效。
 
 **人设文件（只读挂载）**
 
@@ -312,8 +346,8 @@ B 线 PR2（角色引擎回复）读的变量，compose 原样透传给 `gateway
   原样打印出来——不只模型 key，`GATEWAY_EMBEDDING_API_KEY`、网关 token / HMAC 密钥、
   AS/HS token 都会出现在终端或日志里。只用 `config --quiet`（或只列名字的
   `--volumes` / `--services`）；仓库里的脚本、Makefile 和 CI 都由
-  `server/tests/test_compose_config_quiet.py` 守着，不会回退。CI 与文档一律用 `config --quiet`；CI 另有一步用哨兵值验证
-  12 种 HS × profile 组合都不会打印它，`server/tests` 里也有对应断言。
+  `server/tests/test_compose_config_quiet.py` 守着，不会回退。CI 另有一步用哨兵值验证
+  12 种 HS × profile 组合下模型 / embedding key 都不会被打印。
 - 轮换：改 `.env` 后 `make up GATEWAY=1`。
 
 ## 注册方式差异

@@ -351,7 +351,9 @@ curl -s http://127.0.0.1:8020/health   # 端口 = .env 的 BOTVILLE_GATEWAY_PORT
 `GATEWAY_MEMORY_RETENTION_DAYS` / `GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS`，以及 PR3b 的
 `GATEWAY_MEMORY_SUMMARY_MODEL` / `GATEWAY_EMBEDDING_BASE_URL` / `GATEWAY_EMBEDDING_MODEL` /
 `GATEWAY_EMBEDDING_API_KEY`（密钥）/ `GATEWAY_EMBEDDING_DIM` / `GATEWAY_MEMORY_VECTOR_BACKEND`、
-PR3d 的 `GATEWAY_MEMORY_OWNER_CAN_READ_DM`（默认 false；打开后主人能看 AI 的私聊记忆，App 向对方披露）
+PR3d 的 `GATEWAY_MEMORY_OWNER_CAN_READ_DM`（默认 false；打开后主人能看 AI 的私聊记忆，App 向对方披露）、
+PR4b/PR4c 的 `GATEWAY_MOOD_*` / `GATEWAY_PROACTIVE_*`（默认全关；开启主动发言前须先启用记忆库并保持
+`BOTVILLE_GATEWAY_HMAC_SECRET` 持久不变）
 从 `.env` 透传给网关（init.sh 不生成，开关默认关；设了 embedding 模型后私聊正文会发给
 embedding 服务商，地址留空即聊天模型同一家）；
 人设目录 `server/compose/gateway-personas/` 只读挂到 `/etc/botville-gateway`（真实人设
