@@ -88,6 +88,7 @@ public enum GatewayClientError: Error, Equatable, LocalizedError {
             case "memory.not_found": return "这条记忆已不存在。"
             case "memory.not_pinnable": return "这条记忆不能固定。"
             case "memory.pin_limit": return "固定记忆数量已达上限。"
+            case "mood.unavailable": return "心情暂时不可用"
             case "memory.unavailable": return "记忆服务暂时不可用，请稍后重试。"
             case "persona.not_owned": return "你无权管理该 AI 的记忆。"
             case "persona.not_found": return "不存在或不可见"

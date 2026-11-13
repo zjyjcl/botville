@@ -8,21 +8,24 @@ import XCTest
 
 @MainActor
 final class PersonaMoodControllerTests: XCTestCase {
-    private var errorCases: [(GatewayClientError, String)] {
+    private var errorCases: [(Error, String)] {
         [
-            (.problem(status: 401, code: "auth.required"), "会话已失效，请重新登录。"),
-            (.httpStatus(401), "会话已失效，请重新登录。"),
-            (.problem(status: 403, code: "persona.not_owned"), "没有权限查看"),
-            (.httpStatus(403), "没有权限查看"),
-            (.problem(status: 404, code: "persona.not_found"), "不存在或不可见"),
-            (.problem(status: 404, code: "unknown"), "网关请求失败，请稍后重试。"),
-            (.httpStatus(404), "网关请求失败，请稍后重试。"),
-            (.problem(status: 422, code: "validation.failed"), "操作失败，请稍后重试"),
-            (.httpStatus(422), "操作失败，请稍后重试"),
-            (.problem(status: 429, code: "rate_limited.transport"), "操作太频繁，请稍后再试"),
-            (.httpStatus(429), "操作太频繁，请稍后再试"),
-            (.serverAuthMisconfigured, "服务器认证异常，请联系部署者"),
-            (.invalidResponse, "操作失败，请稍后重试"),
+            (GatewayClientError.problem(status: 401, code: "auth.required"), "会话已失效，请重新登录。"),
+            (GatewayClientError.httpStatus(401), "会话已失效，请重新登录。"),
+            (GatewayClientError.problem(status: 403, code: "persona.not_owned"), "没有权限查看"),
+            (GatewayClientError.httpStatus(403), "没有权限查看"),
+            (GatewayClientError.problem(status: 404, code: "persona.not_found"), "不存在或不可见"),
+            (GatewayClientError.problem(status: 404, code: "unknown"), "网关请求失败，请稍后重试。"),
+            (GatewayClientError.httpStatus(404), "网关请求失败，请稍后重试。"),
+            (GatewayClientError.problem(status: 422, code: "validation.failed"), "操作失败，请稍后重试"),
+            (GatewayClientError.httpStatus(422), "操作失败，请稍后重试"),
+            (GatewayClientError.problem(status: 429, code: "rate_limited.transport"), "操作太频繁，请稍后再试。"),
+            (GatewayClientError.httpStatus(429), "操作太频繁，请稍后再试。"),
+            (GatewayClientError.serverAuthMisconfigured, "服务器认证异常，请联系部署者"),
+            (GatewayClientError.problem(status: 503, code: "mood.unavailable"), "心情暂时不可用"),
+            (GatewayClientError.httpStatus(503), "网关请求失败，请稍后重试。"),
+            (URLError(.notConnectedToInternet), "操作失败，请稍后重试"),
+            (GatewayClientError.invalidResponse, "操作失败，请稍后重试"),
         ]
     }
 
@@ -38,20 +41,33 @@ final class PersonaMoodControllerTests: XCTestCase {
         }
     }
 
-    func testPrivateMoodMarkerIsOnlyWiredIntoOwnerView() throws {
-        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-            .deletingLastPathComponent().deletingLastPathComponent()
-        let owner = try String(contentsOf: root.appendingPathComponent("Sources/BotvilleApp/MemoryViews.swift"), encoding: .utf8)
-        let counterpart = try String(contentsOf: root.appendingPathComponent("Sources/BotvilleApp/AIProfileView.swift"), encoding: .utf8)
-        XCTAssertTrue(owner.contains("if state.showsPrivateMoodMarker"))
-        XCTAssertTrue(owner.contains("Text(\"仅自己可见\")"))
-        XCTAssertFalse(counterpart.contains("showsPrivateMoodMarker"))
-        XCTAssertFalse(counterpart.contains("仅自己可见"))
-        XCTAssertTrue(counterpart.contains("PersonaMoodBadge(mood: mood)"))
+    func testPrivateMoodMarkerPresentationForOwnerAndCounterpart() {
+        for mood in PersonaMood.allCases {
+            for moodPublic in [false, true] {
+                let state = PersonaState(personaID: "p", mood: mood, moodPublic: moodPublic)
+                let owner = PersonaMoodPresentation(ownerState: state)
+                XCTAssertEqual(owner.mood, mood)
+                XCTAssertEqual(owner.privateMarkerText,
+                               state.showsPrivateMoodMarker ? "仅自己可见" : nil)
+                let counterpart = PersonaMoodPresentation(counterpartMood: mood)
+                XCTAssertEqual(counterpart.mood, mood)
+                XCTAssertNil(counterpart.privateMarkerText)
+            }
+        }
+        for moodPublic in [false, true] {
+            let state = PersonaState(personaID: "p", mood: nil, moodPublic: moodPublic)
+            XCTAssertNil(PersonaMoodPresentation(ownerState: state).privateMarkerText)
+        }
+        XCTAssertNil(PersonaMoodPresentation(counterpartMood: nil).privateMarkerText)
+    }
+
+    func testMoodUnavailableUsesSharedDescription() {
+        XCTAssertEqual(GatewayClientError.problem(status: 503, code: "mood.unavailable").errorDescription,
+                       "心情暂时不可用")
     }
 
     func testDisabledMoodHidesBlockWithoutError() async {
-        let client = MoodClient(load: .failure(.problem(status: 404, code: "mood.disabled")))
+        let client = MoodClient(load: .failure(GatewayClientError.problem(status: 404, code: "mood.disabled")))
         let controller = PersonaMoodController(personaID: "p", client: client)
 
         await controller.load()
@@ -73,7 +89,7 @@ final class PersonaMoodControllerTests: XCTestCase {
 
     func testFailedOptimisticUpdateRestoresPreviousState() async {
         let initial = PersonaState(personaID: "p", mood: .calm, moodPublic: true)
-        let client = MoodClient(load: .success(initial), update: .failure(.httpStatus(500)))
+        let client = MoodClient(load: .success(initial), update: .failure(GatewayClientError.httpStatus(500)))
         let controller = PersonaMoodController(personaID: "p", client: client)
         await controller.load()
 
@@ -88,7 +104,7 @@ final class PersonaMoodControllerTests: XCTestCase {
     func testPatchDisabledHidesBlockWithoutError() async {
         let initial = PersonaState(personaID: "p", mood: .calm, moodPublic: true)
         let client = MoodClient(load: .success(initial),
-                                update: .failure(.problem(status: 404, code: "mood.disabled")))
+                                update: .failure(GatewayClientError.problem(status: 404, code: "mood.disabled")))
         let controller = PersonaMoodController(personaID: "p", client: client)
         await controller.load()
         await controller.setMood(.happy)
@@ -131,7 +147,7 @@ final class PersonaMoodControllerTests: XCTestCase {
 
     func testFailedVisibilityUpdateRestoresPreviousSwitch() async {
         let initial = PersonaState(personaID: "p", mood: .tired, moodPublic: true)
-        let client = MoodClient(load: .success(initial), update: .failure(.httpStatus(422)))
+        let client = MoodClient(load: .success(initial), update: .failure(GatewayClientError.httpStatus(422)))
         let controller = PersonaMoodController(personaID: "p", client: client)
         await controller.load()
         await controller.setMoodPublic(false)
@@ -206,13 +222,13 @@ private actor PendingMoodClient: GatewayClient {
 }
 
 private actor MoodClient: GatewayClient {
-    private let loadResult: Result<PersonaState, GatewayClientError>
-    private var updateResults: [Result<PersonaState, GatewayClientError>]
+    private let loadResult: Result<PersonaState, Error>
+    private var updateResults: [Result<PersonaState, Error>]
     private var receivedPatches: [PersonaStatePatch] = []
 
-    init(load: Result<PersonaState, GatewayClientError>,
-         update: Result<PersonaState, GatewayClientError>? = nil,
-         updates: [Result<PersonaState, GatewayClientError>] = []) {
+    init(load: Result<PersonaState, Error>,
+         update: Result<PersonaState, Error>? = nil,
+         updates: [Result<PersonaState, Error>] = []) {
         loadResult = load
         updateResults = updates.isEmpty ? (update.map { [$0] } ?? []) : updates
     }
