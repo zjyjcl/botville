@@ -308,6 +308,7 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_AS_TXN_PURGE_INTERVAL_SECONDS` | `86400` | AS 事务保留期清理间隔（秒）：启动先跑一次，之后后台按间隔跑，失败只记日志（不记 token / 事件体）。`0` = 关闭（启动不跑、不起线程，库会持续增长）；非 0 时 **≥60**，否则拒绝启动。**校验与 `GATEWAY_AS_TXN_DB_PATH` 是否配置无关**。见 [docs/contract.md](docs/contract.md) §1.7.7 |
 | `GATEWAY_CONSUMER_ENABLED` | `false` | 进程内 AS 事务消费者（B 线 PR1，契约 §1.7.8）总开关。**默认 false = 行为与之前完全一致**（不起线程、不唤醒）。开启后：事务落库立即唤醒 + 5 秒兜底轮询，按 rowid 顺序消费，做事件分类 / trust / 防循环 / 计数并调用钩子。开启但 `GATEWAY_AS_TXN_DB_PATH` 未配置 → 启动 warning 且不起线程（不拒绝启动）；开启但未配置模型/人设 → 只记录计数，`/health` 不 degraded |
 | `GATEWAY_MEMORY_DB_PATH` | 空 | 可选记忆 SQLite 路径；空 = 关闭，继续 ring buffer；新库 0600、WAL，备份敏感 |
+| `GATEWAY_MEMORY_OWNER_CAN_READ_DM` | `false` | 主人是否可读 DM 正文/事实值；严格布尔解析，关闭仍可管理元数据和写入 |
 | `GATEWAY_MEMORY_RETENTION_DAYS` | `90` | 保留天数 ≥1；pinned 不到期，撤回仍删除 |
 | `GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS` | `86400` | 启动清理及后台间隔（秒）；0 关闭清理，非零 ≥60；模块关闭也校验 |
 | `GATEWAY_MEMORY_SUMMARY_MODEL` | `GATEWAY_MODEL_NAME` | 空闲滚动摘要/事实抽取所用模型名；空时复用聊天模型名。仅模型已配置时启用这些整理任务 |
@@ -371,13 +372,20 @@ hours 或 block/defer 时静默延期。无 embedding 不影响 health。
 ### 主人记忆管理（PR3c）
 
 记忆模块启用时，owner 可用 Matrix OpenID 或 Matrix user token 管理自己 AI 的记忆；站点 bearer
-不能调用这些端点。**该 AI 的主人可以查看和删除它与你的聊天记忆**。群组记忆正文仅在 owner
+不能调用这些端点。`GATEWAY_MEMORY_OWNER_CAN_READ_DM` 默认 false，非法布尔值拒绝启动。
+关闭时 E1/E2 的 DM recent、summary、profile counterpart scope（包括 shared fact）仅有元数据：
+`text: null`、`redacted: true`，fact 的 `value: null`；DELETE、pin/unpin、E6 owner 写入仍可用，
+E6 创建、更新及重放响应也脱敏。开启恢复 DM 可读行为。群组记忆正文仅在 owner
 当前仍 joined 到对应房间时返回，查询失败同样脱敏；响应一律 `Cache-Control: no-store`。删除
 extracted 事实会抑制模型为同一 counterpart/key 重写，owner 显式设置可解除该抑制。审计行不含
 记忆正文、事实值、消息体、原始 txn ID 或密钥。
 counterpart 只以 HMAC 存储；审计表在 memory.db（0600）中，随记忆保留期一同清理。
-`GET /v1/capabilities` 的 `memory.manage` 条目带布尔 `owner_can_read_dm`（默认 true），供客户端
-向聊天对象披露上述事实（App 文案由 C 线负责）。端点、错误码与限流见 contract §1.7.8 ⑩。
+`GET /v1/capabilities` 的 `memory.manage` 条目带布尔 `owner_can_read_dm`（反映实际配置，默认 false）。仅当
+`owner_can_read_dm=true` 时向聊天对象展示「该 AI 的主人可以查看和删除它与你的聊天记忆」；
+关闭时主人只能看到元数据并删除/取消固定（固定和显式写入权限也保留）（App 文案由 C 线负责）。端点、错误码与限流见 contract §1.7.8 ⑩。
+
+E6 的 `Idempotency-Key` 缓存是进程内内存缓存（24 小时、最多 2000 key），网关重启后丢失；
+重启后同 key 重放按新请求处理。日志和错误信息也不得包含记忆正文或事实值。
 
 ### 测试
 

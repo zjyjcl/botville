@@ -67,7 +67,7 @@ def capabilities(server, query):
                             title='记忆管理', summary='查看、删除和固定该 AI 的聊天记忆',
                             status='enabled', scopes=['memory.read', 'memory.write'],
                             entry=dict(type='native', deep_link='botville://memory'),
-                            owner_can_read_dm=True))
+                            owner_can_read_dm=server.config.memory_owner_can_read_dm))
     for name in ('module', 'status'):
         if name in params:
             entries = [entry for entry in entries if entry[name] == params[name][-1]]
@@ -89,6 +89,9 @@ def _owner(server, persona_id, caller):
 def _redact(server, caller, item):
     item = {key: value for key, value in item.items() if key in MEMORY_FIELDS}
     scope = item['scope']
+    redact = (not server.config.memory_owner_can_read_dm and
+              (scope['kind'] == 'dm' or
+               (item['layer'] == 'profile' and scope.get('counterpart') is not None)))
     if scope['kind'] == 'group':
         source = server.room_member_source
         try:
@@ -96,10 +99,11 @@ def _redact(server, caller, item):
                 scope.get('room_id'), caller, item['persona_id'])
         except Exception:
             joined = False
-        if not joined:
-            item = dict(item, text=None, redacted=True)
-            if 'value' in item:
-                item['value'] = None
+        redact = redact or not joined
+    if redact:
+        item = dict(item, text=None, redacted=True)
+        if 'value' in item:
+            item['value'] = None
     return item
 
 

@@ -48,7 +48,7 @@ class Verifier:
 
 
 class MemoryHTTPServer:
-    def __init__(self, enabled=True, access_log=False):
+    def __init__(self, enabled=True, access_log=False, owner_can_read_dm=False):
         self.tmp = tempfile.mkdtemp(prefix='memory-owner-http-')
         personas = os.path.join(self.tmp, 'personas.json')
         with open(personas, 'w', encoding='utf-8') as handle:
@@ -60,6 +60,7 @@ class MemoryHTTPServer:
                       silent_hours_enabled=False, matrix_server_name=SERVER,
                       personas_file=personas,
                       access_log=access_log,
+                      memory_owner_can_read_dm=owner_can_read_dm,
                       hmac_secret=b'0123456789abcdef0123456789abcdef')
         if enabled:
             values['memory_db_path'] = os.path.join(self.tmp, 'memory.db')
@@ -99,7 +100,7 @@ class MemoryHTTPServer:
 
     def item(self, *, group=False, text='private phrase'):
         store = self.server.memory_store
-        event_id = '$event' + text
+        event_id = '$event' + hashlib.sha256(text.encode()).hexdigest()
         store.add_item(persona_id=PERSONA, scope_kind='group' if group else 'dm',
                        scope_key='!group:' + SERVER if group else HUMAN,
                        room_id='!group:' + SERVER if group else None,
@@ -242,7 +243,7 @@ class OwnerMemoryHTTPTests(unittest.TestCase):
             status, _, body = app.request('GET', '/v1/capabilities')
             self.assertEqual(status, 200)
             capability = next(item for item in body['capabilities'] if item['id'] == 'memory.manage')
-            self.assertTrue(capability['owner_can_read_dm'])
+            self.assertFalse(capability['owner_can_read_dm'])
             valid = {'persona_id': PERSONA, 'counterpart': HUMAN, 'key': 'likes',
                      'value': 'tea'}
             status, _, item = app.request('PUT', '/v1/memories/facts', body=valid,

@@ -939,11 +939,20 @@ PR3c 的 HTTP 主人端点已启用。
   `GET`/`DELETE /memories/{memory_id}`、`PUT`/`DELETE /memories/{memory_id}/pin`、
   `PUT /memories/facts`。它们只接收 matrix OpenID 或 Matrix user token，拒绝站点 bearer；
   响应为 `Cache-Control: no-store`。读取限 60/min、写入限 20/min。可选
-  `Idempotency-Key` 的 set-fact 使用有界、进程内 24 小时（最多 2000 key）缓存；同 key
+  `Idempotency-Key` 的 set-fact 使用有界、进程内 24 小时（最多 2000 key）内存缓存；
+  网关重启后丢失，重启后同 key 重放按新请求处理。同 key
   同请求重放返回该**当前仍存在**的事实，已删除目标重放返回 `404 memory.not_found`，不同请求
   返回 `409 idempotency.conflict`。profile 的 shared fact 仍是 DM counterpart scope；成员门禁
   只适用于 group-scoped recent/summary。群组正文只有 owner 当前 joined 时返回，成员查询失败
-  按非成员脱敏。**该 AI 的主人可以查看和删除它与你的聊天记忆**。审计不存正文、事实值、消息体、原始 txn ID 或凭据。
+  按非成员脱敏（约束 A）。
+  **约束 B（PR3d）**：`GATEWAY_MEMORY_OWNER_CAN_READ_DM` 默认 false，使用 `_env_bool`
+  严格解析，非法值以 `ConfigError` 拒绝启动（错误只含变量名，不回显值）。关闭时 E1/E2 的
+  DM recent、summary 及 profile counterpart scope（含 shared fact）只返回元数据：
+  `text: null`、`redacted: true`，fact 的 `value: null`。DELETE、pin/unpin 和 E6 owner 写入
+  仍可用；E6 创建、更新及幂等重放响应也按相同规则脱敏，不回显事实值。开启时恢复 PR3c
+  的 DM 可读行为，群组仍独立遵守约束 A。仅当 `owner_can_read_dm=true` 时向聊天对象展示
+  「该 AI 的主人可以查看和删除它与你的聊天记忆」；关闭时主人只能看到元数据并删除/取消固定
+  （固定和显式写入权限也保留）。审计、日志和错误信息不存正文、事实值、消息体、原始 txn ID 或凭据。
 
   **PR3c 端点、审计与 Q1–Q7 定论**：E1 `GET /memories` 接受必填 `persona_id`、重复
   `layer=recent|summary|profile`、`scope_kind`、`counterpart`、`room_id`、`pinned`、cursor、limit；
@@ -963,7 +972,7 @@ PR3c 的 HTTP 主人端点已启用。
 
   Q1 extracted fact 显示 `trust=derived`，与 owner fact 分组；Q2 模块关闭用 404；Q3 删除 extracted
   fact 必须 suppression；Q4 启用时 capability manifest 发布 `memory.manage`（memory.read/write、native
-  entry、`owner_can_read_dm=true`），关闭时不发布；Q5 v1 不提供 audit query；Q6 v1 不提供 bulk delete
+  entry、`owner_can_read_dm` 反映实际配置，默认 false；约束 B 控制 DM 可读性），关闭时不发布；Q5 v1 不提供 audit query；Q6 v1 不提供 bulk delete
   （CLI 可用）；Q7 `persona_id` 保留在 query/body，而非路径。
 - **R5 lite/full（PR3b，已实现）**：lite 仅 stdlib，float32 BLOB 存 memory.db，纯 Python cosine；
   sqlite-vec 可选加速，仅当 sqlite3 enable_load_extension 可用且扩展可加载时自动启用，
@@ -1213,7 +1222,7 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 | `session_token.ttl_seconds` | ❌ | 建议 TTL，60–86400，默认 300 |
 | `min_app_version` | ❌ | 低于此版本的 App 不显示该能力（由服务端按 `?app_version=` 过滤） |
 | `i18n` | ❌ | 语言 → `{title, summary, description}`；缺失时回退顶层字段 |
-| `owner_can_read_dm` | ❌ | `memory.manage` 的披露布尔值，默认 `true` |
+| `owner_can_read_dm` | ❌ | `memory.manage` 的 DM 可读披露布尔值，反映实际配置，默认 `false` |
 
 ### 3.4 四种入口
 
@@ -1274,7 +1283,7 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 
 当记忆模块启用时，清单额外发布 `memory.manage`：`module: memory`、
 `scopes: ["memory.read", "memory.write"]`、`entry.type: native` 指向 App 原生记忆管理页，且
-`owner_can_read_dm: true`；模块关闭时不得发布该 capability。`memory.search` 仍只是示例能力。
+`owner_can_read_dm` 反映 `GATEWAY_MEMORY_OWNER_CAN_READ_DM`（默认 false）；模块关闭时不得发布该 capability。`memory.search` 仍只是示例能力。
 
 ### 3.7 命名约定
 
@@ -1675,6 +1684,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.2.0 | 2026-11-13 | [B 线 PR3d DM 可读开关] 0.2.0 草案内补充部署开关，默认 false；按 §5.3 将默认可读改为默认脱敏视为准破坏并在此公告，随本次 0.2.0 minor 契约交付。E1/E2/E6（含重放）DM 正文/事实值脱敏，保留写入及 pin/unpin/delete；capability 反映配置，披露仅在开启时展示；群成员门禁独立生效。E6 幂等缓存重启后丢失。 |
 | 0.2.0 | 2026-11-13 | [B 线 PR3c memory-owner，**新增端点（minor），不改既有字段/状态码**] 新增 owner memory 浏览、删除、固定与显式事实端点，以及 `memory.manage` capability、审计与群组成员脱敏约束。 |
 | 0.1.0 | 2026-11-13 | [B 线 #207 nits，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 抽取事实标为 derived 并与主人事实分别隔离召回；空闲门忽略尚未到期的 defer 事务；永久错误按 scope 退避而非全局阻塞；摘要输入按 6000 tokens 最早分块滚动；纯 Python 向量仅扫 scope 最新 500 条、sqlite-vec 覆盖全 scope；回复 query embedding 先预留预算；memory usage 归属 persona/会话；补独立 embedding 提供方 DM/群聊文本披露，以及可信本地人类指令式档案值永不执行的边界。 |
 | 0.1.0 | 2026-11-13 | [B 线 PR3b memory-idle，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 实现空闲批处理滚动摘要、可信本服人类事实抽取、embedding 与 scope 隔离向量召回；memory-idle-worker 在端口绑定后启动，真人回复优先，内部 memory token 用量照常计入预算而不暴露新 /v1 枚举。新增 summaries/vectors 加法迁移、撤回 dirty 重算及 sqlite-vec 回退；/v1 服务端 token floor 现将 CJK 按约 1 token/字估算（字段/状态无变化）。 |
