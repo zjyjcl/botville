@@ -20,6 +20,17 @@ from botville_gateway.user_identity import VERIFY_SERVER_ERROR
 
 
 class ManifestTests(unittest.TestCase):
+    def test_static_manifest_matches_example_in_order(self):
+        import pathlib
+        example_path = pathlib.Path(__file__).parents[1] / 'openapi' / 'examples' / 'capability-manifest.json'
+        with example_path.open(encoding='utf-8') as source:
+            example = json.load(source)
+        expected = list(BASE_CAPABILITIES)
+        expected.insert(2, dict(MEMORY_MANAGE, owner_can_read_dm=False))
+        self.assertEqual(expected, example['capabilities'])
+        self.assertEqual(DEFAULTS, example['defaults'])
+        self.assertEqual('1.3.0', example['manifest_version'])
+
     def test_complete_manifest_enabled_disabled_and_switch(self):
         base_ids = {'chat.direct', 'memory.search', 'notify.approvals', 'town.enter'}
         self.assertEqual({entry['id'] for entry in BASE_CAPABILITIES}, base_ids)
@@ -34,11 +45,12 @@ class ManifestTests(unittest.TestCase):
                 self.assertEqual(manifest['defaults'], DEFAULTS)
                 datetime.fromisoformat(manifest['generated_at'])
                 entries = manifest['capabilities']
-                self.assertEqual(entries[:len(BASE_CAPABILITIES)], BASE_CAPABILITIES)
                 self.assertEqual(len(entries), len(base_ids) + int(enabled))
                 if enabled:
-                    self.assertEqual(entries[-1], dict(MEMORY_MANAGE, owner_can_read_dm=dm))
-                    self.assertEqual(entries[-1]['entry']['deep_link'], 'botville://memories')
+                    expected = list(BASE_CAPABILITIES)
+                    expected.insert(2, dict(MEMORY_MANAGE, owner_can_read_dm=dm))
+                    self.assertEqual(entries, expected)
+                    self.assertEqual(entries[2]['entry']['deep_link'], 'botville://memories')
                 else:
                     self.assertNotIn('memory.manage', {e['id'] for e in entries})
                 # Returned nested structures must not mutate process-wide metadata.

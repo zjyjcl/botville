@@ -94,7 +94,7 @@ class CallerAuthenticator:
         )
 
     # ------------------------------------------------------------- public
-    def authenticate(self, header: Optional[str]) -> Tuple[str, CallerIdentity]:
+    def authenticate(self, header: Optional[str], *, log_failure: bool = True) -> Tuple[str, CallerIdentity]:
         """校验 `Authorization` 头，返回 (结果码, 调用方身份)。
 
         结果码为 `AUTH_PASS_THROUGH` / `AUTH_MISSING` / `AUTH_INVALID` / `AUTH_OK`；
@@ -104,7 +104,8 @@ class CallerAuthenticator:
             return AUTH_PASS_THROUGH, CallerIdentity()
 
         if not header or not header.startswith("Bearer "):
-            self._log("failed", None)
+            if log_failure:
+                self._log("failed", None)
             return AUTH_MISSING, CallerIdentity()
 
         presented = self._digest(header[len("Bearer "):].strip())
@@ -127,7 +128,8 @@ class CallerAuthenticator:
             # 站点级 token 没有 caller_id，日志按 §1.2.2 记 <unknown>。
             self._log("ok", None)
             return AUTH_OK, CallerIdentity(legacy=True)
-        self._log("failed", None)
+        if log_failure:
+            self._log("failed", None)
         return AUTH_INVALID, CallerIdentity()
 
 

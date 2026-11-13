@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import json
+import errno
 import os
 import sys
 import tempfile
@@ -97,8 +98,9 @@ def _http(method, url, body=None, headers=None, timeout=5, raw_body=None):
         req.add_header("Content-Type", "application/json")
     for k, v in (headers or {}).items():
         req.add_header(k, v)
+    # Test servers are loopback-only; ignore a developer's ambient proxies.
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout) as resp:
             raw = resp.read()
             return resp.status, (json.loads(raw) if raw else None), dict(resp.headers)
     except urllib.error.HTTPError as exc:
@@ -108,6 +110,14 @@ def _http(method, url, body=None, headers=None, timeout=5, raw_body=None):
 
 def _auth(token=HS_TOKEN):
     return {"Authorization": f"Bearer {token}"}
+
+
+def _retryable_local_client_error(exc):
+    """Limit macOS loopback retries to transient connection setup failures."""
+    if isinstance(exc, urllib.error.URLError):
+        exc = exc.reason
+    return isinstance(exc, OSError) and getattr(exc, 'errno', None) in (
+        errno.EINVAL, errno.ECONNRESET)
 
 
 _TXN_BODY = {"events": [{"type": "m.room.message", "room_id": "!r:hs", "content": {"body": "hi"}}]}
@@ -1113,19 +1123,35 @@ class TestAsTxnSQLiteFailure(_Base):
             lock = threading.Lock()
 
             def _send():
-                st, bd, _ = _http(
-                    "PUT", f"{s.base}/_matrix/app/v1/transactions/concurrent1",
-                    _TXN_BODY, headers=_auth()
-                )
+                try:
+                    # macOS can intermittently reset a just-opened SQLite HTTP
+                    # connection.  Retrying belongs to this test client only.
+                    for attempt in range(3):
+                        try:
+                            st, bd, _ = _http(
+                                "PUT", f"{s.base}/_matrix/app/v1/transactions/concurrent1",
+                                _TXN_BODY, headers=_auth())
+                            break
+                        except (OSError, urllib.error.URLError) as exc:
+                            if attempt == 2 or not _retryable_local_client_error(exc):
+                                raise
+                    else:  # pragma: no cover - loop always breaks or raises
+                        raise AssertionError('unreachable')
+                    result = (st, bd, None)
+                except BaseException as exc:
+                    result = (None, None, exc)
                 with lock:
-                    results.append((st, bd))
+                    results.append(result)
 
             threads = [threading.Thread(target=_send) for _ in range(8)]
             for t in threads:
                 t.start()
             for t in threads:
                 t.join(timeout=10)
-        for st, bd in results:
+            self.assertFalse(any(t.is_alive() for t in threads))
+        self.assertEqual(len(results), 8)
+        for st, bd, exc in results:
+            self.assertIsNone(exc)
             self.assertEqual(st, 200)
             self.assertEqual(bd, {})
         store = build_as_txn_store(self.db_path)

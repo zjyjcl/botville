@@ -174,7 +174,8 @@ continuwuity 仍用 `memory`（尚无文件注册）。运维注意见
 **安全边界（已知，待 B2.x）**：`/v1/context/assemble` 的 persona 区按 caller token 携带的
 `owner_id` 鉴权（#124）：非 owner 或未证明 owner 时 persona 区为空，状态码仍 `200`（不改
 任何字段集合与状态码，见契约 §1.2.2）。`persona.not_owned`（403）只用于 assemble 以外的
-persona 写操作，发送路径 `sender_persona_id` 的所有权校验不在本期，留待 B2.x。
+persona owner 列表或写操作；`GET /personas` 推不出 owner（legacy 站点 token、dev 无身份放行）
+返回 `403 persona.not_owned`。发送路径 `sender_persona_id` 的所有权校验不在本期，留待 B2.x。
 
 ### 策略算法
 

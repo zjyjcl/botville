@@ -210,10 +210,12 @@ App                          网关                        模块网页（WKWebV
   `403`**——推不出 owner 或非 owner 都只是让 persona 区为空，`outcome` 仍按 §7.2 正常判定
   （`allowed` / `blocked`）；请求本身非法时仍按 `400` / `401` / `422` 返回，这些状态码与
   persona 归属无关。这与 #123 已合的 fail-closed 行为及其测试一致，PR-D 不得改写为 `403`。
-- **`403` 只用于 `/context/assemble` 以外的 persona 写操作**：例如模块以 `author_persona_id`
+- **`403` 用于 `/context/assemble` 以外的 persona owner 列表或写操作**：例如模块以 `author_persona_id`
   写动态、写 persona 设置等，调用方 token 有效但该 persona 不归其 owner 所有时返回
   **`403 persona.not_owned`**（错误码统一为 `persona.not_owned`，不使用
   `auth.insufficient_scope`；见 §1.3 与 OpenAPI 的 `persona.not_owned` 定义）。
+  读取人设列表 `GET /personas` 在推不出 owner（如 legacy 站点 token、dev 无身份放行）时，
+  同样返回 `403 persona.not_owned`。
 - **不改请求字段、不改 `401` 语义**：本节不向任何请求体新增字段；无有效 token（caller token
   未配置且 legacy 关闭、或 token 不匹配）仍走 §1.3 的 `401 auth.invalid_token`。本节不新增
   任何错误码。
@@ -939,7 +941,8 @@ PR3c 的 HTTP 主人端点已启用。
   `GET`/`DELETE /memories/{memory_id}`、`PUT`/`DELETE /memories/{memory_id}/pin`、
   `PUT /memories/facts`。它们只接收 matrix OpenID 或 Matrix user token，拒绝站点 bearer；
   响应为 `Cache-Control: no-store`。读取限 60/min、写入限 20/min。可选
-  `Idempotency-Key` 的 set-fact 使用有界、进程内 24 小时（最多 2000 key）内存缓存；
+  `Idempotency-Key` 的 set-fact 使用有界、进程内 24 小时（全局最多 2000 条）内存缓存；
+  缓存键为 `(caller, Idempotency-Key)`，每 owner 最多 200 条，超限按 LRU 淘汰该 owner 自己最旧条目。
   网关重启后丢失，重启后同 key 重放按新请求处理。同 key
   同请求重放返回该**当前仍存在**的事实，已删除目标重放返回 `404 memory.not_found`，不同请求
   返回 `409 idempotency.conflict`。profile 的 shared fact 仍是 DM counterpart scope；成员门禁
@@ -982,7 +985,8 @@ PR3c 的 HTTP 主人端点已启用。
 - **R6 存储与开关（PR3a）**：`GATEWAY_MEMORY_DB_PATH` 默认空 = 模块关闭，
   引擎继续 PR2 进程内 ring buffer。启用后独立 SQLite memory.db，WAL，版本化增量
   幂等迁移；schema 版本表在 BEGIN IMMEDIATE 下迁移为单行并折叠旧重复行；新库以 0600 创建，旧库及现存 WAL/SHM 打开时收紧为 0600。`GATEWAY_MEMORY_RETENTION_DAYS` 默认 90，必须 ≥1；
-  pinned 永不过期。`GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS` 默认 86400，0 = 关闭清理，
+  保留期只删除时间戳严格早于 cutoff 的行，恰好等于 cutoff 时保留；items、facts、summaries
+  及可到期的 tombstones、audit 均采用此边界（摘要按 updated_at）。pinned 永不过期。`GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS` 默认 86400，0 = 关闭清理，
   非零必须 ≥60；非法配置即使模块关闭也拒绝启动。启用时启动先清一次，随后 daemon
   按间隔清理；失败仅记录异常类型。**备份属于敏感数据**。Compose 透传后续由 A 线完成。
 - **R7 召回预算（PR3a）**：代码常量约 2000 tokens，使用引擎 estimate_tokens，按
@@ -1210,7 +1214,7 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 | `cache_ttl_seconds` | ❌ | 建议缓存时长，默认 300 |
 | `defaults.unknown_capability` | ❌ | 遇到未知能力 ID 时 `hidden`（忽略）或 `disabled`（显示为不可用）。仅适用 native 入口（无法路由到对应能力时） |
 | `defaults.card_fallback` | ❌ | 卡片渲染失败时降级为 `text` |
-| `capabilities[]` | ✅ | 能力数组，按 `id` 唯一 |
+| `capabilities[]` | ✅ | 能力数组，按 `id` 唯一；客户端不得依赖 capabilities 数组顺序 |
 
 ### 3.3 单个 capability
 
@@ -1698,6 +1702,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.2.0 | 2026-11-13 | [PR4a] 修正 caller token 格式与 GET /personas 无 owner 的 403 文档；修复不可变向量召回、策略先行、worker 有界停止与退避、E6 caller 隔离和 owner 配额、鉴权失败日志、保留期边界与摘要索引、SQL keyset 分页；明确 capabilities 顺序不可依赖并以示例测试守护输出；加固并发与本地 HTTP 测试。自 #211 起，所有布尔环境变量非法值的错误信息仅含变量名、不再回显输入值。本次不升契约版本。 |
 | 0.2.0 | 2026-11-13 | [additive] 新增实现 `GET /personas` owner 摘要列表及 keyset 分页；其他人设操作尚未实现。 |
 | 0.2.0 | 2026-11-13 | [B 线 PR3d DM 可读开关] 0.2.0 草案内补充部署开关，默认 false；按 §5.3 将默认可读改为默认脱敏视为准破坏并在此公告，随本次 0.2.0 minor 契约交付。E1/E2/E6（含重放）DM 正文/事实值脱敏，保留写入及 pin/unpin/delete；capability 反映配置，披露仅在开启时展示；群成员门禁独立生效。E6 幂等缓存重启后丢失。 |
 | 0.2.0 | 2026-11-13 | [B 线 PR3c memory-owner，**新增端点（minor），不改既有字段/状态码**] 新增 owner memory 浏览、删除、固定与显式事实端点，以及 `memory.manage` capability、审计与群组成员脱敏约束。 |

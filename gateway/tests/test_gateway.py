@@ -43,6 +43,7 @@ from botville_gateway.policy import PolicyEngine, estimate_tokens  # noqa: E402
 
 def _cfg(**overrides):
     base = dict(
+        port=0,
         dev_mode=True,  # 单元测试不打 token；见 TestAuthHardening 的 fail-closed 测试
         rate_limit_messages=3,
         rate_limit_window_seconds=3600,

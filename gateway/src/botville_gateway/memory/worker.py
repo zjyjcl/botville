@@ -6,6 +6,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+import logging
 from typing import Callable
 
 from ..as_consumer import ConsumerStats, TransientUnavailable
@@ -17,6 +18,8 @@ MEMORY_IDLE_SECONDS = 120
 MEMORY_ROUND_CONVERSATIONS = 8
 MEMORY_ITEMS_PER_SCOPE = 8
 MEMORY_OUTPUT_RESERVE = 2048
+MEMORY_WORKER_STOP_TIMEOUT_SECONDS = 35
+_log = logging.getLogger(__name__)
 
 
 class MemoryDeferred(Exception):
@@ -95,8 +98,10 @@ class MemoryIdleWorker:
     def stop(self):
         self._stop.set()
         if self._thread is not None:
-            # Network calls have finite timeouts; never close SQLite under this thread.
-            self._thread.join()
+            # Never hold process shutdown hostage to a misbehaving provider.
+            self._thread.join(MEMORY_WORKER_STOP_TIMEOUT_SECONDS)
+            if self._thread.is_alive():
+                _log.warning('Memory idle worker did not stop before timeout')
 
     def _run(self):
         while not self._stop.wait(1):
@@ -152,8 +157,8 @@ class MemoryIdleWorker:
             self._retry_at = self.clock() + min(3600, 30 * 2 ** min(self._failures - 1, 7))
             self.stats.inc('transient_failures')
         except Exception:
-            # Permanent/provider validation errors do not kill the daemon or leak data.
-            self._retry_at = self.clock() + 3600
+            # Scope-local permanent failures are handled in the loop above.  A
+            # daemon-level programming error must not impose a global retry.
             self.stats.inc('permanent_failures')
         return count
 

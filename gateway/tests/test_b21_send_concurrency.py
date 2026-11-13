@@ -35,6 +35,8 @@ _SRC = os.path.join(GATEWAY_ROOT, "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 from botville_gateway.config import Config  # noqa: E402
 from botville_gateway.errors import GatewayDeliveryError  # noqa: E402
 from botville_gateway.http_server import build_server  # noqa: E402
@@ -122,6 +124,7 @@ class SlowTransport:
 def make_config(**overrides) -> Config:
     base = dict(
         dev_mode=True,
+        port=0,
         rate_limit_messages=5,
         rate_limit_window_seconds=3600,
         silent_hours_enabled=False,
@@ -603,7 +606,7 @@ def _post(url: str, body: dict):
     )
     req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with _LOCAL_OPENER.open(req, timeout=10) as resp:
             raw = resp.read()
             return resp.status, json.loads(raw) if raw else None
     except urllib.error.HTTPError as exc:
