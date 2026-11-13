@@ -46,6 +46,12 @@ class GroupInvites:
         if enabled and store is None:
             _LOG.warning('Groups disabled: memory database is not configured')
 
+    def groups_active(self, persona_user_id) -> bool:
+        """Whether deployment storage and this persona allow group speech."""
+        entry = self.personas.get(persona_user_id)
+        return bool(self.enabled and self.store is not None and entry
+                    and entry.groups.get('enabled', False))
+
     def _key(self, purpose, *parts):
         secret = self.store._hmac_secret
         if not secret:
@@ -102,6 +108,8 @@ class GroupInvites:
                 raise RoomError(404, 'room.not_found')
             if 'mode' in body and row['state'] not in ('accepted', 'encrypted_disabled'):
                 raise RoomError(409, 'room.state_conflict')
+            if body.get('mode') == 'mention_only' and not self.groups_active(persona):
+                raise RoomError(409, 'room.state_conflict')
             leaving = body.get('action') == 'leave'
             with self.store._lock, self.store._db:
                 self.store._db.execute(
@@ -137,9 +145,7 @@ class GroupInvites:
         return bool(row and row[0] == 'muted')
 
     def is_throttled(self, persona, room):
-        entry = self.personas.get(persona)
-        return bool(self.enabled and entry and entry.groups.get('enabled', False)
-                    and self.is_accepted(persona, room))
+        return self.groups_active(persona) and self.is_accepted(persona, room)
 
     def is_disabled(self, persona, room):
         return self._state(persona, room) in ('encrypted_disabled', 'rejected_encrypted')

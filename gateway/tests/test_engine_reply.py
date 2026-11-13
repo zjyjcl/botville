@@ -932,6 +932,7 @@ class TestEngineServerIntegration(unittest.TestCase):
             server.server_close()
 
     def test_engine_uses_service_appservice_transport(self):
+        from dataclasses import replace
         from botville_gateway.matrix_appservice import AppServiceMatrixTransport
         server, _ = self._server(personas_data=[_base_persona_dict()],
             model_url="http://fake.invalid", matrix_transport="appservice",
@@ -942,7 +943,9 @@ class TestEngineServerIntegration(unittest.TestCase):
             sent = InMemoryMatrixTransport()
             with mock.patch.object(server.transport, "send_text", side_effect=sent.send_text) as send:
                 server.engine_hooks._client = _mock_client("pong")
-                ctx = TestEngineHooks._make_ctx(self)
+                # No group storage is configured; exercise the confirmed DM path.
+                ctx = replace(TestEngineHooks._make_ctx(self),
+                              room_members_confirmed=True, room_is_dm=True)
                 server.engine_hooks.on_human_text(ctx)
                 self.assertEqual(send.call_args.kwargs["sender_id"], AI_A)
                 self.assertEqual(send.call_args.kwargs["txn_id"],

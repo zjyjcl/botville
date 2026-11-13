@@ -33,6 +33,7 @@ ROOM = '!room-private:' + SERVER
 def seed(app, state='accepted', room=ROOM):
     groups = app.server.group_invites
     groups.enabled = True
+    groups.personas[PERSONA].groups['enabled'] = True
     groups._record(PERSONA, room, OWNER, state)
     return groups._key('room', room)
 

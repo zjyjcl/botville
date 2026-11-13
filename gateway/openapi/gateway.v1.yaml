@@ -686,7 +686,8 @@ paths:
       description: |
         鉴权与 /state 一致；非 owner、跨服及未知 persona 隐藏为 404 persona.not_found。
         仅当前 HMAC 密钥的行，按 updated_at、room_ref 升序 keyset 分页；更新期间不提供快照。
-        部署关闭或无 memory DB 返回空页和 groups_enabled=false。
+        有 memory DB 时，即使部署或 persona 群功能关闭也按现有分页/过滤规则列出当前 key_id 的行。
+        无 memory DB 返回空页；groups_enabled 仅表示部署开启且有 memory DB，persona 开关不改变它。
       security: [{matrixOpenIdToken: []}, {matrixUserToken: []}, {bearerAuth: []}]
       parameters:
         - $ref: '#/components/parameters/PersonaId'
@@ -721,6 +722,8 @@ paths:
       description: |
         鉴权与 /state 一致；无效、非当前密钥或不属于 persona 的 room_ref 统一 404 room.not_found。
         只有 accepted/encrypted_disabled 可设置 mode，否则 409 room.state_conflict。
+        群功能（部署或 persona）关闭时仅接受 muted、leave 或两者组合；含 mention_only 返回 409 room.state_conflict，不修改行。
+        校验顺序：400 参数、404 房间、409 冲突，再执行；无 memory DB 仍为 404。
         muted 在 policy 前禁止内置引擎回复（包括被 @/回复），仍按原规则写群记忆，不消耗回复限额。
         leave 立即置 left，再使用 persona masquerade joined_rooms 的 HMAC 匹配恢复路由；找不到视为已确认。
         响应 200，action=leave 必带 leave_pending。找到时先入持久清理队列，失败由后台自动重试。
@@ -754,7 +757,7 @@ paths:
               schema: {$ref: '#/components/schemas/Problem'}
               example: {type: 'urn:botville:error:room.not_found', title: Room request rejected, status: 404, code: room.not_found, request_id: example-request}
         '409':
-          description: 当前房间状态不允许设置 mode。
+          description: 当前房间状态不允许设置 mode，或群功能关闭时设置 mention_only。
           content:
             application/problem+json:
               schema: {$ref: '#/components/schemas/Problem'}
