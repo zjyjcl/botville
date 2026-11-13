@@ -757,6 +757,10 @@ jobs:
               "GATEWAY_CONSUMER_ENABLED": "false",
               # Group reply cap (B line B2.8a): 1-20, default 3.
               "GATEWAY_GROUP_MAX_RESPONDERS": "3",
+              # Group invites (B line B2.8b): off by default.
+              "GATEWAY_GROUPS_ENABLED": "false",
+              "GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA": "20",
+              "GATEWAY_INVITE_LEDGER_TTL_SECONDS": "86400",
               "GATEWAY_MODEL_BASE_URL": "",
               "GATEWAY_MODEL_NAME": "",
               "GATEWAY_MODEL_API_KEY": "",

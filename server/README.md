@@ -49,6 +49,11 @@ make down            # 停止（不传 -v，不删任何卷）。清卷：docker
 [docs/deploy/appservice.md](../docs/deploy/appservice.md#角色引擎模型与人设)。
 群聊回复上限 `GATEWAY_GROUP_MAX_RESPONDERS`（B 线 B2.8a，默认 `3`，整数 1–20，私聊不受影响）
 同样原样透传，init.sh 不生成；超出范围网关拒绝启动。
+群邀请（B 线 B2.8b）：`GATEWAY_GROUPS_ENABLED`（默认 `false`，严格布尔）、
+`GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA`（20，1–200）、`GATEWAY_INVITE_LEDGER_TTL_SECONDS`
+（86400，60–2592000）原样透传，init.sh 不生成。⚠️ **开启群功能必须有持久的 HMAC 密钥**：
+compose 部署里就是 `.env` 的 `BOTVILLE_GATEWAY_HMAC_SECRET`，**不能清空，也不能重新生成；
+轮换它会让已接受的群失效**（它是密钥，别贴出来）。还需记忆库和 persona 的 `groups.enabled`。
 
 记忆（B 线 PR3a）：`GATEWAY_MEMORY_DB_PATH` 默认空 = 关闭；启用时写
 `/var/lib/botville-gateway/memory.db`（gateway-data 卷顶层，`make backup` /

@@ -364,6 +364,16 @@ services:
       # 1-20, default 3 as in gateway/src config.py; DMs unaffected; out of
       # range refuses to start.
       GATEWAY_GROUP_MAX_RESPONDERS: ${GATEWAY_GROUP_MAX_RESPONDERS:-3}
+      # Group invites (B line B2.8b), defaults as in gateway/src config.py:
+      # deployment switch off (strict boolean), max 20 groups per persona
+      # (1-200), invite ledger TTL 86400 s (60-2592000). Turning groups on
+      # needs the memory DB, personas with groups.enabled and a PERSISTENT
+      # GATEWAY_HMAC_SECRET (here BOTVILLE_GATEWAY_HMAC_SECRET from .env:
+      # never empty it or regenerate it -- rotating it invalidates every
+      # accepted group). Invalid values refuse to start.
+      GATEWAY_GROUPS_ENABLED: ${GATEWAY_GROUPS_ENABLED:-false}
+      GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA: ${GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA:-20}
+      GATEWAY_INVITE_LEDGER_TTL_SECONDS: ${GATEWAY_INVITE_LEDGER_TTL_SECONDS:-86400}
       # Four-layer memory (B line PR3a). Empty path = memory off (PR2 ring
       # buffer). To enable, keep it at the TOP LEVEL of the gateway-data
       # volume, e.g. /var/lib/botville-gateway/memory.db: backups checkpoint

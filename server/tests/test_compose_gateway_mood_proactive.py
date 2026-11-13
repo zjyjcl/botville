@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Gateway mood (B line PR4b) / proactive speech (B line PR4c) / group reply
-cap (B line B2.8a, GATEWAY_GROUP_MAX_RESPONDERS) pass-through.
+cap (B line B2.8a, GATEWAY_GROUP_MAX_RESPONDERS) / group invites (B line
+B2.8b, GATEWAY_GROUPS_ENABLED, GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA,
+GATEWAY_INVITE_LEDGER_TTL_SECONDS) pass-through.
 
-The names and defaults must agree across the compose file, both deployment
-.env.example files, gateway/.env.example, the CI allowlist, the docs and what
-gateway/src config.py actually does (load_config is run in a subprocess with
+The names and defaults must agree across the compose file, all three
+.env.example files (repo root, server/compose, gateway), the CI allowlist,
+the docs and what gateway/src config.py actually does (load_config is run in a subprocess with
 a throwaway env; nothing secret is involved). Render checks need docker
 compose and are skipped without it. Run with:
   python3 -m unittest discover -s server/tests -p "test_*.py" -v
@@ -44,8 +46,21 @@ EXPECTED = {
     "GATEWAY_PROACTIVE_PER_TARGET_PER_DAY": ("1", "proactive_per_target_per_day", 1),
     # B line B2.8a: max AIs answering one human group message, 1-20.
     "GATEWAY_GROUP_MAX_RESPONDERS": ("3", "group_max_responders", 3),
+    # B line B2.8b group invites.
+    "GATEWAY_GROUPS_ENABLED": ("false", "groups_enabled", False),
+    "GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA": ("20", "group_max_rooms_per_persona", 20),
+    "GATEWAY_INVITE_LEDGER_TTL_SECONDS": ("86400", "invite_ledger_ttl_seconds", 86400),
 }
-# Supported ranges (config.py): name -> (minimum, maximum).
+# Supported ranges: name -> (minimum, maximum).
+# KEEP IN SYNC with gateway/src (change both together -- the edge tests below
+# start the gateway at both ends and just outside, so drift fails here):
+#   MOOD_HALF_LIFE_MINUTES          config.py MOOD_HALF_LIFE_MINUTES_MIN / _MAX
+#   PROACTIVE_* (4 ranges)          config.py Config.__post_init__ proactive_ranges
+#   GROUP_MAX_RESPONDERS            config.py _env_group_max_responders + __post_init__
+#   GROUP_MAX_ROOMS_PER_PERSONA     config.py Config.__post_init__ (1-200)
+#   INVITE_LEDGER_TTL_SECONDS       as_txn_store.py INVITE_LEDGER_TTL_MIN/MAX_SECONDS
+# The docs tables (appservice.md), the .env.example comments and the
+# compose comments quote the same ranges.
 RANGES = {
     "GATEWAY_MOOD_HALF_LIFE_MINUTES": (1, 10_080),
     "GATEWAY_PROACTIVE_TICK_SECONDS": (30, 86_400),
@@ -53,12 +68,14 @@ RANGES = {
     "GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES": (0, 43_200),
     "GATEWAY_PROACTIVE_PER_TARGET_PER_DAY": (0, 24),
     "GATEWAY_GROUP_MAX_RESPONDERS": (1, 20),
+    "GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA": (1, 200),
+    "GATEWAY_INVITE_LEDGER_TTL_SECONDS": (60, 2_592_000),
 }
 # Distinctive invalid values: if one shows up in an error message, the
 # gateway echoed deployment input. None of them can occur in a fixed message.
 SENTINEL = "873461"
 BOOLS = ("GATEWAY_MOOD_ENABLED", "GATEWAY_PROACTIVE_ENABLED",
-         "GATEWAY_PROACTIVE_RECENT_CONTACTS_ENABLED")
+         "GATEWAY_PROACTIVE_RECENT_CONTACTS_ENABLED", "GATEWAY_GROUPS_ENABLED")
 
 # Runs gateway/src load_config on a JSON env from argv; prints the parsed
 # fields, or the ConfigError message. Dev mode, no secrets.
@@ -141,13 +158,16 @@ class MoodProactiveEnvStaticTest(unittest.TestCase):
         got = run_gateway_config({"GATEWAY_DEV_MODE": "true", key: value})
         self.assertIn("error", got, "{}={} accepted".format(key, value))
         message = got["error"]
-        self.assertNotIn(value.strip(), message)
         if SENTINEL in value:
             self.assertNotIn(SENTINEL, message)
-        # A plain number must not appear as a standalone number either.
         digits = value.strip().lstrip("+-")
         if digits.isdigit():
+            # A plain number must not appear as a standalone number. (Fixed
+            # messages may quote the range, e.g. "within 60-2592000", so a
+            # substring check would flag "59" / "0" without any echo.)
             self.assertNotRegex(message, r"(?<![0-9]){}(?![0-9])".format(re.escape(digits)))
+        else:
+            self.assertNotIn(value.strip(), message)
 
     def test_gateway_src_rejects_invalid_values_without_echoing_them(self):
         """Every invalid value is refused at startup and never reflected in
@@ -199,12 +219,40 @@ class MoodProactiveEnvStaticTest(unittest.TestCase):
         self.assertIn("error", got)
         self.assertIn("GATEWAY_HMAC_SECRET", got["error"])
 
+    def test_groups_require_a_persistent_hmac_secret(self):
+        """config.py: GATEWAY_GROUPS_ENABLED=true with a memory DB and no
+        explicit GATEWAY_HMAC_SECRET refuses to start, even in dev mode (the
+        accepted-group state depends on that secret). Without a memory DB
+        groups stay off (WARNING) and the gateway starts. With an explicit
+        throwaway test secret it starts."""
+        base = {"GATEWAY_DEV_MODE": "true", "GATEWAY_GROUPS_ENABLED": "true"}
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "memory.db")
+            got = run_gateway_config(dict(base, GATEWAY_MEMORY_DB_PATH=db))
+            self.assertIn("error", got)
+            self.assertIn("GATEWAY_GROUPS_ENABLED requires an explicit persistent "
+                          "GATEWAY_HMAC_SECRET", got["error"])
+            for placeholder in ("", "<change-me>"):
+                with self.subTest(placeholder=placeholder):
+                    got = run_gateway_config(dict(base, GATEWAY_MEMORY_DB_PATH=db,
+                                                  GATEWAY_HMAC_SECRET=placeholder))
+                    self.assertIn("error", got)
+            # Test-only value generated here, never a deployment secret.
+            got = run_gateway_config(dict(base, GATEWAY_MEMORY_DB_PATH=db,
+                                          GATEWAY_HMAC_SECRET="ab" * 32))
+            self.assertNotIn("error", got)
+            self.assertIs(got["groups_enabled"], True)
+        got = run_gateway_config(base)
+        self.assertNotIn("error", got)
+
     def test_init_sh_generates_none_of_them(self):
         init = (REPO_ROOT / "server" / "scripts" / "init.sh").read_text(encoding="utf-8")
         for key in EXPECTED:
             self.assertNotIn(key, init, key)
         self.assertNotIn("GATEWAY_MOOD_", init)
         self.assertNotIn("GATEWAY_PROACTIVE_", init)
+        self.assertNotIn("GATEWAY_GROUPS_", init)
+        self.assertNotIn("GATEWAY_INVITE_", init)
 
     def test_ci_allowlist(self):
         ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
@@ -225,6 +273,26 @@ class MoodProactiveEnvStaticTest(unittest.TestCase):
         for path in ENV_EXAMPLES[:2]:
             text = path.read_text(encoding="utf-8")
             self.assertIn("GATEWAY_MEMORY_DB_PATH", text.split("GATEWAY_PROACTIVE_ENABLED", 1)[1][:400])
+        # Group invites: persistent HMAC secret, never emptied / regenerated,
+        # rotation invalidates accepted groups -- prominent in every doc.
+        z423 = (REPO_ROOT / "docs" / "deploy" / "z423-synapse.md").read_text(encoding="utf-8")
+        self.assertIn("> ⚠️ **开启 `GATEWAY_GROUPS_ENABLED` 必须配置持久的 HMAC 密钥。**", doc)
+        self.assertIn("**轮换这个密钥会让已接受的群失效**", doc)
+        self.assertIn("**轮换会让已接受的群失效**", doc)  # table row
+        self.assertIn("⚠️ **开启群功能必须有持久的 HMAC 密钥**", readme)
+        self.assertIn("轮换它会让已接受的群失效", readme)
+        self.assertIn("⚠️ **开启群功能必须有持久的 HMAC 密钥**", z423)
+        self.assertIn("**轮换会让已接受的群失效**", z423)
+        for text in (doc, readme, z423):
+            self.assertIn("BOTVILLE_GATEWAY_HMAC_SECRET", text)
+            self.assertIn("不能清空", text)
+            self.assertIn("重新生成", text)
+        for path in ENV_EXAMPLES[:2]:
+            text = path.read_text(encoding="utf-8")
+            block = text.split("GATEWAY_GROUPS_ENABLED", 1)[1][:600]
+            self.assertRegex(block, r"invalidates every accepted group|会让已接受的群全部失效")
+            self.assertRegex(text, r"three \.env\.example|三份 \.env\.example")
+        self.assertNotIn("两份 .env.example", doc + readme + z423)
 
     def test_no_hmac_secret_value_written_anywhere(self):
         """The HMAC secret is only ever a placeholder / empty in tracked text."""
@@ -276,6 +344,9 @@ class MoodProactiveEnvRenderTest(unittest.TestCase):
             "GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES": "30",
             "GATEWAY_PROACTIVE_PER_TARGET_PER_DAY": "3",
             "GATEWAY_GROUP_MAX_RESPONDERS": "7",
+            "GATEWAY_GROUPS_ENABLED": "true",
+            "GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA": "150",
+            "GATEWAY_INVITE_LEDGER_TTL_SECONDS": "3600",
         }
         self.assertEqual(set(values), set(EXPECTED))
         env = self.gateway_env("".join("{}={}\n".format(k, v) for k, v in values.items()))
