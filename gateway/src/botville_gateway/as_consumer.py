@@ -678,7 +678,16 @@ class AsTransactionConsumer:
             return
         self._stats.inc(f"event.{category}")
         if event.get("type") == "m.room.member":
+            content = event.get("content")
             persona = event.get("state_key")
+            membership = content.get("membership") if isinstance(content, dict) else None
+            # A malformed member event (non-object content, non-string
+            # membership or state_key) skips only this event; it must not
+            # fail the whole transaction or touch the invite ledger.
+            if not isinstance(persona, str) or not isinstance(membership, str):
+                self._stats.inc("invalid_events")
+                self._stats.inc("invalid_member_events")
+                return
             room = fields.get("room_id")
             if isinstance(persona, str) and self._is_local_ai(persona) and isinstance(room, str) and room.startswith("!"):
                 unsigned = event.get("unsigned")
@@ -689,7 +698,7 @@ class AsTransactionConsumer:
                 )
                 # Storage failures must retry the transaction, not silently retain
                 # a stale invitation after leave/ban.
-                self._store.invitation_update(persona, room, event["content"].get("membership"), encrypted, event_id)
+                self._store.invitation_update(persona, room, membership, encrypted, event_id)
 
         if event.get("type") == "m.room.member" and self._room_member_observer is not None:
             try:

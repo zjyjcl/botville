@@ -50,6 +50,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -108,6 +109,12 @@ CREATE TABLE IF NOT EXISTS as_speech_dedupe (
     sent_at    TEXT
 );
 """
+
+# 邀请台账 TTL（秒）：超过即视为过期，不再作为 join 快路径，转 `/sync` 权威确认。
+# **唯一定义处**：config.py 从这里 import 默认值与范围。
+DEFAULT_INVITE_LEDGER_TTL_SECONDS = 86400
+INVITE_LEDGER_TTL_MIN_SECONDS = 60
+INVITE_LEDGER_TTL_MAX_SECONDS = 30 * 86400
 
 # 内存库 / URI 形式不是真实文件，跳过 0600 预建。
 _NON_FILE_DB_PREFIXES = (":memory:", "file:")
@@ -205,7 +212,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.execute(_SPEECH_DEDUPE_DDL)
     conn.execute("CREATE TABLE IF NOT EXISTS as_invitation_events (key TEXT PRIMARY KEY)")
     conn.execute("CREATE TABLE IF NOT EXISTS as_invitations ("
-                 "key TEXT PRIMARY KEY, encrypted INTEGER NOT NULL)")
+                 "key TEXT PRIMARY KEY, encrypted INTEGER NOT NULL,"
+                 " created_at REAL NOT NULL DEFAULT 0)")
+    # Additive migration for #226 ledgers: pre-TTL rows get created_at=0 and
+    # are therefore already expired, falling back to authoritative /sync.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(as_invitations)")}
+    if "created_at" not in columns:
+        conn.execute("ALTER TABLE as_invitations ADD COLUMN created_at REAL NOT NULL DEFAULT 0")
     conn.execute("CREATE TABLE IF NOT EXISTS as_pending_cleanup ("
                  "key TEXT PRIMARY KEY, persona TEXT NOT NULL, room TEXT NOT NULL,"
                  " attempts INTEGER NOT NULL, next_at REAL NOT NULL)")
@@ -244,9 +257,13 @@ class AsTransactionStore:
         conn: sqlite3.Connection,
         purge_retention_days: Optional[int] = None,
         *,
+        invite_ttl_seconds: int = DEFAULT_INVITE_LEDGER_TTL_SECONDS,
         _wait_fn=None,
+        _clock: Callable[[], float] = time.time,
     ) -> None:
         self._conn = conn
+        self._invite_ttl = invite_ttl_seconds
+        self._clock = _clock
         self._lock = threading.Lock()
         # 保留期天数；None = 不启用清理（直接构造 / 测试重开库时）。
         self._purge_retention_days = purge_retention_days
@@ -484,8 +501,11 @@ class AsTransactionStore:
                 if not inserted.rowcount:
                     return
             if membership == "invite":
-                self._conn.execute("INSERT OR REPLACE INTO as_invitations VALUES (?, ?)",
-                                   (key, int(encrypted)))
+                now = self._clock()
+                self._conn.execute("DELETE FROM as_invitations WHERE created_at < ?",
+                                   (now - self._invite_ttl,))
+                self._conn.execute("INSERT OR REPLACE INTO as_invitations (key, encrypted, created_at) "
+                                   "VALUES (?, ?, ?)", (key, int(encrypted), now))
                 # Bound the fallback cache; eviction requires authoritative sync confirmation.
                 if not self._conn.execute("PRAGMA database_list").fetchone()[2]:
                     self._conn.execute("DELETE FROM as_invitations WHERE rowid NOT IN "
@@ -493,12 +513,26 @@ class AsTransactionStore:
             elif membership in ("join", "leave", "ban"):
                 self._conn.execute("DELETE FROM as_invitations WHERE key = ?", (key,))
 
-    def invitation(self, persona: str, room: str) -> Optional[bool]:
-        """None means no pending invite; bool reports stripped encryption state."""
+    def set_invite_ttl(self, seconds: int) -> None:
         with self._lock:
-            row = self._conn.execute("SELECT encrypted FROM as_invitations WHERE key = ?",
-                                     (self.room_persona_key(persona, room),)).fetchone()
-            return None if row is None else bool(row[0])
+            self._invite_ttl = seconds
+
+    def invitation(self, persona: str, room: str) -> Optional[bool]:
+        """None means no fresh pending invite; bool reports stripped encryption state.
+
+        Entries older than the TTL are expired (deleted) and reported as None,
+        so the caller falls back to the authoritative homeserver check.
+        """
+        key = self.room_persona_key(persona, room)
+        with self._lock, self._conn:
+            row = self._conn.execute("SELECT encrypted, created_at FROM as_invitations WHERE key = ?",
+                                     (key,)).fetchone()
+            if row is None:
+                return None
+            if row[1] < self._clock() - self._invite_ttl:
+                self._conn.execute("DELETE FROM as_invitations WHERE key = ?", (key,))
+                return None
+            return bool(row[0])
 
     def cleanup_enqueue(self, persona: str, room: str) -> None:
         # Raw routing IDs are necessary for leave after restart. Like transaction
@@ -698,6 +732,7 @@ def build_as_txn_store(
     *,
     purge_retention_days: Optional[int] = None,
     purge_interval_seconds: int = 0,
+    invite_ttl_seconds: int = DEFAULT_INVITE_LEDGER_TTL_SECONDS,
 ) -> Optional[AsTransactionStore]:
     """按配置装配 AS 事务存储；db_path 为空/None → None（调用方需处理 500）。
 
@@ -708,7 +743,8 @@ def build_as_txn_store(
     if not db_path:
         return None
     conn = connect(db_path)
-    store = AsTransactionStore(conn, purge_retention_days=purge_retention_days)
+    store = AsTransactionStore(conn, purge_retention_days=purge_retention_days,
+                               invite_ttl_seconds=invite_ttl_seconds)
     if purge_retention_days is not None:
         store.run_purge_safely()
         if purge_interval_seconds > 0:

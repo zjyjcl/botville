@@ -551,6 +551,7 @@ HTTP 消息与主动发言复核为非 DM 后立即尝试退出，不重试发�
 |---|---|---|
 | `GATEWAY_GROUPS_ENABLED` | `false` | 部署群邀请开关；还需 persona groups.enabled、memory DB 与持久 HMAC 密钥。无 DB 时 WARNING 并关闭 |
 | `GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA` | `20` | 每 persona 群数上限，整数 1–200，非法值拒绝启动 |
+| `GATEWAY_INVITE_LEDGER_TTL_SECONDS` | `86400` | 邀请台账过期秒数，整数 60–2592000；过期邀请不作快路径，改由 `/sync` 权威确认，非法值拒绝启动 |
 
 persona 可配置 `"groups": {"enabled": true, "invite_policy": "owner"}`；
 默认关闭，策略仅支持 owner/local_humans。关闭部署开关保持邀请 no-op，DM 继续按 B2.8a 发送时复核。

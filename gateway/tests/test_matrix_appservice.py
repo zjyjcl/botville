@@ -381,13 +381,22 @@ class AppServiceTransportTest(unittest.TestCase):
         self.assertEqual(event.event_id, "$after-join")
         sync = self.hs.matching("GET", "/_matrix/client/v3/sync")
         self.assertEqual(len(sync), 1)
-        self.assertEqual(set(sync[0]["query"]), {"user_id", "timeout", "filter"})
+        # #226 nit a: a throwaway invites-only request. No `since` (to-device
+        # messages are never acknowledged), presence untouched, everything
+        # except this room's invite filtered out.
+        self.assertEqual(set(sync[0]["query"]),
+                         {"user_id", "timeout", "set_presence", "full_state", "filter"})
+        self.assertNotIn("since", sync[0]["query"])
         self.assertEqual(sync[0]["query"]["user_id"], [AI])
         self.assertEqual(sync[0]["query"]["timeout"], ["0"])
+        self.assertEqual(sync[0]["query"]["set_presence"], ["offline"])
+        self.assertEqual(sync[0]["query"]["full_state"], ["false"])
         self.assertEqual(sync[0]["authorization"], "Bearer " + AS_TOKEN)
         self.assertEqual(json.loads(sync[0]["query"]["filter"][0]), {
-            "room": {"rooms": [ROOM], "timeline": {"limit": 0},
-                     "state": {"lazy_load_members": True},
+            "event_fields": ["type"],
+            "room": {"rooms": [ROOM], "include_leave": False,
+                     "timeline": {"limit": 0, "not_types": ["*"]},
+                     "state": {"not_types": ["*"]},
                      "ephemeral": {"not_types": ["*"]},
                      "account_data": {"not_types": ["*"]}},
             "presence": {"not_types": ["*"]}, "account_data": {"not_types": ["*"]},
@@ -399,6 +408,23 @@ class AppServiceTransportTest(unittest.TestCase):
         self.assertEqual(len(sends), 2)
         self.assertEqual(sends[0], sends[1])
         self.assertEqual(self.hs.matching("POST", "/_matrix/client/v3/rooms/"), [])
+
+    def test_sync_never_stores_or_sends_since_token(self):
+        payload = {"next_batch": "s_should_never_be_reused", "to_device": {"events": [{"type": "x"}]},
+                   "rooms": {"invite": {}}}
+        self.recovery_routes((AI, "@alice:localhost"))
+        self.hs.route("GET", "/_matrix/client/v3/sync", [(200, payload), (200, payload)])
+        transport = self.make_transport()
+        before = dict(vars(transport))
+        for _ in range(2):
+            self.assertIsNone(transport._sync_invitation(ROOM, AI))
+        calls = self.hs.matching("GET", "/_matrix/client/v3/sync")
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assertNotIn("since", call["query"])
+            self.assertNotIn("s_should_never_be_reused", json.dumps(call))
+        self.assertNotIn("s_should_never_be_reused", repr(vars(transport)))
+        self.assertEqual(set(vars(transport)), set(before))
 
     def assert_sync_denied(self, payload, status=200):
         transport = self.sync_recovery(payload, status)
@@ -491,6 +517,43 @@ class AppServiceTransportTest(unittest.TestCase):
         self.assert_recovery_requests(leave_attempts=2)
         sleep.assert_called_once_with(0.05)
         self.assertEqual(transport.safety_store.cleanup_due(float("inf")), [])
+
+    def test_leave_forbidden_not_in_room_counts_as_done(self):
+        # #226 nit b: the AI is already out of the room -> cleanup done.
+        self.recovery_routes((AI,))
+        self.hs.route("POST", "/_matrix/client/v3/rooms/",
+                      [(403, {"errcode": "M_FORBIDDEN", "error": "not in room"})])
+        sleep = mock.Mock()
+        transport = self.make_transport(sleep=sleep)
+        with self.assertRaises(DeliveryError) as caught:
+            transport.send_text(room_id=ROOM, sender_id=AI, text="x")
+        self.assertEqual(caught.exception.detail, "original send denied")
+        self.assert_recovery_requests(leave_attempts=1)
+        sleep.assert_not_called()
+        self.assertEqual(transport.safety_store.cleanup_due(float("inf")), [])
+        self.assertFalse(transport.safety_store.cleanup_pending(AI, ROOM))
+
+    def test_queued_cleanup_forbidden_leave_clears_and_unblocks_join(self):
+        transport = self.make_transport()
+        transport.safety_store.cleanup_enqueue(AI, ROOM)
+        self.assertTrue(transport.safety_store.cleanup_pending(AI, ROOM))
+        self.hs.route("POST", "/_matrix/client/v3/rooms/",
+                      [(403, {"errcode": "M_FORBIDDEN", "error": "not in room"})])
+        transport.retry_cleanup()
+        self.assertFalse(transport.safety_store.cleanup_pending(AI, ROOM))
+        # Other leave errors still keep the entry queued.
+        transport.safety_store.cleanup_enqueue(AI, ROOM)
+        self.hs.route("POST", "/_matrix/client/v3/rooms/", [(500, {"errcode": "M_UNKNOWN"})])
+        transport.retry_cleanup()
+        self.assertTrue(transport.safety_store.cleanup_pending(AI, ROOM))
+        self.assertEqual(transport.safety_store.cleanup_due(float("inf"))[0]["attempts"], 1)
+        # Once cleared, the invite-gated auto-join is no longer blocked.
+        self.hs.requests.clear()
+        transport.safety_store.cleanup_done(transport.safety_store.room_persona_key(AI, ROOM))
+        self.recovery_routes((AI, "@alice:localhost"))
+        transport.safety_store.invitation_update(AI, ROOM, "invite")
+        event = transport.send_text(room_id=ROOM, sender_id=AI, text="hello")
+        self.assertEqual(event.event_id, "$after-join")
 
     def test_cleanup_survives_restart_and_background_drains(self):
         import tempfile

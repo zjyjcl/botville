@@ -442,6 +442,17 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(load_config({'GATEWAY_DEV_MODE': 'true',
                 'GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA': value}).group_max_rooms_per_persona, int(value))
 
+    def test_invite_ledger_ttl_config(self):
+        cfg = load_config({'GATEWAY_DEV_MODE': 'true'})
+        self.assertEqual(cfg.invite_ledger_ttl_seconds, 86400)
+        for value in ('60', '2592000', '3600'):
+            self.assertEqual(load_config({'GATEWAY_DEV_MODE': 'true',
+                'GATEWAY_INVITE_LEDGER_TTL_SECONDS': value}).invite_ledger_ttl_seconds, int(value))
+        for value in ('0', '59', '2592001', '-1', 'sensitive', '1.5'):
+            with self.subTest(value=value), self.assertRaises(ConfigError) as caught:
+                load_config({'GATEWAY_DEV_MODE': 'true', 'GATEWAY_INVITE_LEDGER_TTL_SECONDS': value})
+            self.assertNotIn(repr(value), str(caught.exception))
+
     def test_invalid_bool_and_persistent_secret(self):
         for extra in ({'GATEWAY_GROUPS_ENABLED': 'sensitive'},
                       {'GATEWAY_GROUPS_ENABLED': 'true', 'GATEWAY_MEMORY_DB_PATH': '/tmp/unused'}):

@@ -909,6 +909,7 @@ ephemeral 不在 AS 注册里开启，忽略。
   `unsigned.invite_room_state` 不含 `m.room.encryption` → room_id 如带 domain 必须为本服 →
   群数与邀请限频。v1 不接受跨服邀请者或跨服房间。
 - `GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA` 为 int，默认 20，范围 1–200，越界拒绝启动且不回显。
+- `GATEWAY_INVITE_LEDGER_TTL_SECONDS` 为 int，默认 86400，范围 60–2592000，越界拒绝启动且不回显（邀请台账过期时间，见 §1.7.8 自动 join）。
   accepted 与仍保留成员资格的 encrypted_disabled 均占名额。限频为每 persona 滚动 60 秒最多
   10 个新邀请（拒绝也计入），进程内最多 4096 个桶、每桶最多 10 个时间戳，过期清理；重放不占额。
 - 通过后 AS masquerade join，再以 persona GET `/rooms/{room}/state/m.room.encryption/`；
@@ -1002,13 +1003,14 @@ DM 不受此上限影响。`m.mentions.room=true`（`@room`）本身不产生目
 包括已确认 DM 的 `allow_auto_join=true` 在内，邀请台账命中为快路径；未命中则以该 AI masquerade 向 homeserver 的 `/sync` 权威确认待处理邀请；无邀请绝不自行加入公开房间。
 消费者记录本服 persona 的 invite，join/leave/ban 清除邀请；事件哈希去重防止事务重试恢复旧邀请，清理待办未完成时拒绝再次自动 join；邀请表位于 AS 事务 SQLite，键为 SHA-256(persona, room)，不保存原始标识。
 未配置持久库时使用最多 1000 项的进程内邀请缓存，缺失/淘汰转 `/sync` 权威确认；内存事件去重墓碑上限 1000，满后拒绝记录新邀请直至重启，避免淘汰墓碑后重放恢复旧邀请。
-权威确认使用 `GET /_matrix/client/v3/sync?user_id=...&timeout=0&filter=<内联 JSON>`，不带 since；filter 为 `{"room":{"rooms":[room],"timeline":{"limit":0},"state":{"lazy_load_members":true},"ephemeral":{"not_types":["*"]},"account_data":{"not_types":["*"]}},"presence":{"not_types":["*"]},"account_data":{"not_types":["*"]}}`。
+邀请台账条目带写入时间，超过 `GATEWAY_INVITE_LEDGER_TTL_SECONDS`（默认 86400，范围 60–2592000，越界拒绝启动且不回显）即过期删除，不再作为快路径，转 `/sync` 权威确认；#226 时期无时间列的旧条目迁移后视为已过期。格式异常的 `m.room.member` 事件（content 非对象、membership 或 state_key 非字符串）只跳过该事件并计数，不影响事务内其他事件、不写台账。
+权威确认是一次性请求，使用 `GET /_matrix/client/v3/sync?user_id=...&timeout=0&set_presence=offline&full_state=false&filter=<内联 JSON>`；不带 since、不保存 `next_batch`，因此 to-device 消息不会被确认消费（HS 只在后续请求出示该 token 时删除），也不改变 AI 在线状态。filter 仅保留该房间邀请：`{"event_fields":["type"],"room":{"rooms":[room],"include_leave":false,"timeline":{"limit":0,"not_types":["*"]},"state":{"not_types":["*"]},"ephemeral":{"not_types":["*"]},"account_data":{"not_types":["*"]}},"presence":{"not_types":["*"]},"account_data":{"not_types":["*"]}}`。
 请求超时 5 秒，不跟随重定向；任何错误或结构异常均 fail-closed，上抛原 `M_FORBIDDEN`。`rooms.join` 含该房间时不 join/leave，直接上抛原错误；否则须在 `rooms.invite` 中确认该房间，并检查 `invite_state.events`。邀请 stripped state 含 `m.room.encryption` 时拒绝 join。
 join 后再次以该 AI GET `/_matrix/client/v3/rooms/{room}/state/m.room.encryption/`：仅 HTTP 404 视为未加密，其余响应/错误均按加密处理，不发送并退出。
 默认路径（包括 HTTP 发送与主动发言）还须复核完整 joined 成员恰好为 {发送者，一个本服人类}；人类 localpart
 不以 `ai_` 开头且不是 AS sender，domain 与配置 server_name 大小写不敏感匹配。缺少 server_name 或查询失败视为非 DM。
 引擎已确认 DM 可跳过重复 DM 分类，但不能跳过邀请门禁、已有成员检查和加密检查。join 失败上抛，复核失败退出后上抛原 `M_FORBIDDEN`；仅通过检查才重试发送一次。
-退出前先写 pending-cleanup，leave 最多立即尝试 3 次，短退避 0.05/0.1 秒；成功删除，失败保留队列。
+退出前先写 pending-cleanup，leave 最多立即尝试 3 次，短退避 0.05/0.1 秒；成功删除，失败保留队列。leave 返回 `M_FORBIDDEN`（AI 已不在房间：已离开/被踢/被封禁）视为完成并移出队列，避免过期条目永久阻塞后续邀请门禁 join；其他错误照常重试。
 同库清理队列以 persona/room 的 SHA-256 为键，另存执行 leave 必需的原始 persona/room（明文敏感数据，沿用事务库新建 0600、WAL 权限保护，不保存密钥）。
 哈希不可逆，故仅存哈希无法重启后执行 leave；日志不含这些原值、正文或异常详情。每次失败累加次数，按 min(5×2^(n−1), 3600) 秒退避。
 后台每 5 秒处理最多 20 项，与网关启动/停止，独立于消费者开关；单次 leave 超时 5 秒，stop 等待最多 5 秒，未完成队列重启后续办。
@@ -1849,10 +1851,11 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.5.0 | 2026-11-13 | [#226 评审 nit] `/sync` 权威确认改为仅邀请的一次性请求（set_presence=offline、无 since、不消费 to-device）；leave 遇 `M_FORBIDDEN` 视为已离开并移出清理队列；格式异常的成员事件只跳过该事件；邀请台账 TTL（`GATEWAY_INVITE_LEDGER_TTL_SECONDS`，默认 1 天）。无 API 字段变化。 |
 | 0.5.0 | 2026-11-13 | [M_FORBIDDEN 安全加固] 自动 join 需邀请台账命中或 /sync 权威确认，前后排除加密；已有成员不 join/leave；leave 有限重试与持久清理队列，无新增开关或 API 字段。 |
 | 0.5.0 | 2026-11-13 | [PR4c quasi-breaking] 新增默认关闭的主动发言部署/人设配置、DM-only 候选、持久化队列与 stable txnId 重放语义；`ProactiveSettings.enabled` 默认值由 true 改为 false。该默认值改变未显式设置旧部署的行为，按准破坏性变更公告。 |
 | 0.5.0 | 2026-11-13 | [#221 proactive 修正] 启用但无法启动 worker 记录 WARNING；owner 无 DM 日志每目标限频且缓存有界；过期且成员不匹配的队列转 abandoned，终态保留 30 天；跨午夜静默时段与严格 DM 协同验证。 |
-| 0.5.0 | 2026-11-13 | [B2.8b] 默认关闭的本服群邀请自动接受、owner/local_humans 策略、持久去重与群数上限；加密邀请拒绝、中途加密停用、accepted 群自动 rejoin。无版本升级。 |
+| 0.5.0 | 2026-11-13 | [B2.8b] 默认关闭的本服群邀请自动接受、owner/local_humans 策略、持久去重与群数上限；加密邀请拒绝、中途加密停用、accepted 群 `M_FORBIDDEN` 后 rejoin（仍须邀请门禁与加密检查，仅免 DM 复核）。无版本升级。 |
 | 0.5.0 | 2026-11-13 | [B2.8a 行为修正，无 API 字段变化] 一个 AI + 多个人类的房间现在只在被 @ 或被回复时回复；严格两人本服 DM、成员失败按群、群回复者上限、忽略 @room 广播、群 AI 文本记忆 untrusted、join 后复核：仅 DM 继续发送，否则立即退出并报错。 |
 | 0.4.0 | 2026-11-13 | [PR4b] 新增 owner-only `GET/PATCH /personas/{id}/state` 与 memory.db persona_state；新增 `GATEWAY_MOOD_ENABLED` / `GATEWAY_MOOD_HALF_LIFE_MINUTES`、确定性窗口规则及读时半衰期衰减。PersonaMood 删除 `neutral`、`anxious`，最终为 calm/happy/sad/excited/tired；详情增加 mood，列表项不变；`mood_public` 默认 true，非 owner 仅在 mood 开启且 `mood_public` 为真时见标签。模块关闭时通过 owner 校验后 404 `mood.disabled`；`/state` 写限流返回 429，mood 存储不可用返回 503 `mood.unavailable`。 |
 | 0.3.0 | 2026-11-13 | [PR4d additive] owner 文件签名 bio（500 码点），列表扩展与分级 GET 详情；本服非 owner 最小视图，跨服/无 owner/未知或非法 id 统一 404 persona.not_found。mood 可缺省/null 枚举，当前 null；自身和他人 bio 均不注入 system。 |

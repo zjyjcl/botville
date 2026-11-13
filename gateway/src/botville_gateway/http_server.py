@@ -1414,10 +1414,15 @@ class GatewayServer(http.server.ThreadingHTTPServer):
                 else None
             ),
             purge_interval_seconds=config.as_txn_purge_interval_seconds,
+            invite_ttl_seconds=config.invite_ledger_ttl_seconds,
         )
         from .matrix_appservice import AppServiceMatrixTransport
-        if isinstance(transport, AppServiceMatrixTransport) and self.as_txn_store is not None:
-            transport.safety_store = self.as_txn_store
+        if isinstance(transport, AppServiceMatrixTransport):
+            if self.as_txn_store is not None:
+                transport.safety_store = self.as_txn_store
+            else:
+                # The bounded in-memory fallback ledger honours the same TTL.
+                transport.safety_store.set_invite_ttl(config.invite_ledger_ttl_seconds)
         # B2.6 PR3a: local persistent memory is opt-in.  This is deliberately
         # independent of the AS transaction database and never affects health.
         self.memory_store: Optional[MemoryStore] = None

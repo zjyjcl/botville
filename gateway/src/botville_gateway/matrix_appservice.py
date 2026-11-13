@@ -361,8 +361,10 @@ class AppServiceMatrixTransport:
         self._check_sender(user_id)
         try:
             self._request("GET", "/_matrix/client/v3/rooms/{}/state/m.room.encryption/".format(
-                urllib.parse.quote(room_id, safe="")), query={"user_id": user_id})
+                urllib.parse.quote(room_id, safe="")), query={"user_id": user_id},
+                timeout=MEMBER_LOOKUP_TIMEOUT_SECONDS)
         except DeliveryError as exc:
+            # Only an actual HTTP 404 proves that the state is absent.
             return getattr(exc, "http_status", None) != 404
         except Exception:
             return True
@@ -473,10 +475,20 @@ class AppServiceMatrixTransport:
 
     def _sync_invitation(self, room: str, sender: str) -> Optional[bool]:
         """Return invitation encryption status; unknown or joined fails closed."""
+        # Throwaway authoritative check, never an ongoing sync loop: no
+        # `since` is sent and `next_batch` is never stored, so to-device
+        # messages are delivered but not acknowledged (the homeserver only
+        # deletes them once a later request presents the returned token).
+        # The filter narrows the response to this room's invite and drops
+        # timeline, state, ephemeral, account data and presence; the joined
+        # section is kept only so an existing membership is still detected.
         sync_filter = {
+            "event_fields": ["type"],
             "room": {
-                "rooms": [room], "timeline": {"limit": 0},
-                "state": {"lazy_load_members": True},
+                "rooms": [room],
+                "include_leave": False,
+                "timeline": {"limit": 0, "not_types": ["*"]},
+                "state": {"not_types": ["*"]},
                 "ephemeral": {"not_types": ["*"]},
                 "account_data": {"not_types": ["*"]},
             },
@@ -486,7 +498,8 @@ class AppServiceMatrixTransport:
         try:
             response = self._request(
                 "GET", "/_matrix/client/v3/sync",
-                query={"user_id": sender, "timeout": "0",
+                query={"user_id": sender, "timeout": "0", "set_presence": "offline",
+                       "full_state": "false",
                        "filter": json.dumps(sync_filter, separators=(",", ":"))},
                 timeout=MEMBER_LOOKUP_TIMEOUT_SECONDS,
             )
@@ -512,16 +525,21 @@ class AppServiceMatrixTransport:
             return None
 
     def _room_encrypted(self, room: str, sender: str) -> bool:
+        return self.room_is_encrypted(room, sender)
+
+    def _leave_for_cleanup(self, room: str, sender: str) -> None:
+        """Leave; M_FORBIDDEN means the AI is no longer in the room (done).
+
+        A member may always leave, so the homeserver only refuses a leave
+        when there is no membership left to end (already left, kicked or
+        banned). Treating it as done stops a stale queue entry from blocking
+        future invite-gated joins forever.
+        """
         try:
-            self._request("GET", "/_matrix/client/v3/rooms/{}/state/m.room.encryption/".format(
-                urllib.parse.quote(room, safe="")), query={"user_id": sender},
-                timeout=MEMBER_LOOKUP_TIMEOUT_SECONDS)
+            self.leave(room, sender)
         except DeliveryError as exc:
-            # Only an actual HTTP 404 proves that the state is absent.
-            return not (isinstance(exc.__cause__, urllib.error.HTTPError) and exc.__cause__.code == 404)
-        except OSError:
-            return True
-        return True
+            if exc.code != "M_FORBIDDEN":
+                raise
 
     def _rollback_join(self, room: str, sender: str) -> None:
         store = self.safety_store
@@ -530,7 +548,7 @@ class AppServiceMatrixTransport:
         store.cleanup_enqueue(sender, room)
         for attempt in range(3):
             try:
-                self.leave(room, sender)
+                self._leave_for_cleanup(room, sender)
             except (DeliveryError, OSError):
                 store.cleanup_failed(key, time.time())
                 if attempt < 2:
@@ -546,7 +564,7 @@ class AppServiceMatrixTransport:
                 if self._cleanup_stop.is_set():
                     return
                 try:
-                    self.leave(row["room"], row["persona"])
+                    self._leave_for_cleanup(row["room"], row["persona"])
                 except (DeliveryError, OSError):
                     self.safety_store.cleanup_failed(row["key"], time.time())
                 else:
