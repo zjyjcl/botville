@@ -1415,6 +1415,9 @@ class GatewayServer(http.server.ThreadingHTTPServer):
             ),
             purge_interval_seconds=config.as_txn_purge_interval_seconds,
         )
+        from .matrix_appservice import AppServiceMatrixTransport
+        if isinstance(transport, AppServiceMatrixTransport) and self.as_txn_store is not None:
+            transport.safety_store = self.as_txn_store
         # B2.6 PR3a: local persistent memory is opt-in.  This is deliberately
         # independent of the AS transaction database and never affects health.
         self.memory_store: Optional[MemoryStore] = None
@@ -1542,6 +1545,8 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         log_startup_warnings(config)
         super().__init__((config.host, config.port), GatewayHandler)
         # 监听端口绑定成功后才起消费线程：绑定失败（OSError）时不留下孤儿线程。
+        if isinstance(transport, AppServiceMatrixTransport):
+            transport.start_cleanup()
         if self.as_consumer is not None:
             self.as_consumer.start()
         if self.memory_purger is not None:
@@ -1653,6 +1658,9 @@ class GatewayServer(http.server.ThreadingHTTPServer):
     def server_close(self) -> None:
         """关闭监听前先停消费者，再停清理线程（未启用时为 no-op）。"""
         # 消费者先于清理线程停（避免清理线程 purge 后消费者还在处理已清理行）。
+        from .matrix_appservice import AppServiceMatrixTransport
+        if isinstance(getattr(self, "transport", None), AppServiceMatrixTransport):
+            self.transport.stop_cleanup(timeout=5.0)
         consumer = getattr(self, "as_consumer", None)
         if consumer is not None:
             consumer.stop(timeout=5.0)

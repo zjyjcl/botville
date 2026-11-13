@@ -593,7 +593,7 @@ class ProactiveTests(unittest.TestCase):
         join.assert_not_called()
         self.assertFalse(send.call_args.kwargs.get('allow_auto_join', False))
 
-    def test_proactive_forbidden_rechecks_after_join(self):
+    def test_proactive_forbidden_existing_member_never_joins_or_leaves(self):
         from botville_gateway.matrix import DeliveryError
         from botville_gateway.matrix_appservice import AppServiceMatrixTransport
         transport = AppServiceMatrixTransport(homeserver_url='https://matrix.invalid',
@@ -616,9 +616,10 @@ class ProactiveTests(unittest.TestCase):
         with patch.object(transport, '_request', side_effect=request), \
                 patch.object(transport, 'ensure_user'), \
                 patch.object(transport, 'send_text', wraps=transport.send_text) as send:
-            self.assertEqual(self.worker.run_once(), 1)
+            self.assertEqual(self.worker.run_once(), 0)
         self.assertFalse(send.call_args.kwargs.get('allow_auto_join', False))
-        self.assertEqual([m for m, _ in calls][-4:], ['PUT', 'POST', 'GET', 'PUT'])
+        self.assertEqual([m for m, _ in calls][-2:], ['PUT', 'GET'])
+        self.assertFalse(any(method == 'POST' for method, _ in calls))
 
     def test_recent_contacts_recheck_legacy_dm_membership(self):
         self.worker.config = replace(self.config, proactive_recent_contacts_enabled=True)

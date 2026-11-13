@@ -43,6 +43,7 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Sequence, Set, Tuple
 
+from .as_txn_store import AsTransactionStore, connect
 from .matrix import DeliveryError, SentEvent, resolve_txn_id
 
 # 注册文件里 exclusive user namespace 的 localpart 前缀（与
@@ -98,12 +99,19 @@ class AppServiceMatrixTransport:
         timeout: float = 30.0,
         health_timeout: float = 2.0,
         health_cache_seconds: float = 5.0,
+        safety_store: Optional[AsTransactionStore] = None,
+        sleep=time.sleep,
     ) -> None:
         if room_cache_ttl_seconds < 0:
             raise ValueError(
                 "room_cache_ttl_seconds must be >= 0 (0 disables the "
                 "alias->room cache), got {!r}".format(room_cache_ttl_seconds)
             )
+        self.safety_store = safety_store if safety_store is not None else AsTransactionStore(connect(":memory:"))
+        self._sleep = sleep
+        self._recovery_lock = threading.Lock()
+        self._cleanup_stop = threading.Event()
+        self._cleanup_thread = None
         self._base = homeserver_url.rstrip("/")
         self._as_token = as_token
         self._server_name = server_name
@@ -337,7 +345,7 @@ class AppServiceMatrixTransport:
         self._request(
             "POST",
             "/_matrix/client/v3/rooms/{}/leave".format(urllib.parse.quote(room_id, safe="")),
-            body={}, query={"user_id": user_id},
+            body={}, query={"user_id": user_id}, timeout=MEMBER_LOOKUP_TIMEOUT_SECONDS,
         )
 
     def _joined_room_is_dm(self, room: str, sender: str) -> bool:
@@ -390,17 +398,24 @@ class AppServiceMatrixTransport:
         except DeliveryError as exc:
             if exc.code != "M_FORBIDDEN":
                 raise
-            self.join(room, sender)
-            # B2.8b may allow accepted group_rooms here. Until then, only a
-            # confirmed DM may continue sending after automatic join.
-            if not allow_auto_join and not self._joined_room_is_dm(room, sender):
+            with self._recovery_lock:
                 try:
-                    self.leave(room, sender)
+                    already_joined = sender in self.joined_members(room, (sender,))
                 except (DeliveryError, OSError):
-                    # Never log IDs, message text, or HS exception details.
-                    logging.getLogger(__name__).warning("Auto-join rollback leave failed")
-                raise
-            resp = self._request("PUT", path, body=content, query={"user_id": sender})
+                    already_joined = False
+                if already_joined:
+                    raise exc
+                if (self.safety_store.cleanup_pending(sender, room)
+                        or self.safety_store.invitation(sender, room) is not False):
+                    raise exc
+                self.join(room, sender)
+                self.safety_store.invitation_update(sender, room, "join")
+                if self._room_encrypted(room, sender) or (
+                    not allow_auto_join and not self._joined_room_is_dm(room, sender)
+                ):
+                    self._rollback_join(room, sender)
+                    raise exc
+                resp = self._request("PUT", path, body=content, query={"user_id": sender})
 
         event_id = resp.get("event_id")
         if not event_id:
@@ -417,6 +432,68 @@ class AppServiceMatrixTransport:
             content_type=content_type,
             txn_id=txn,
         )
+
+    def _room_encrypted(self, room: str, sender: str) -> bool:
+        try:
+            self._request("GET", "/_matrix/client/v3/rooms/{}/state/m.room.encryption/".format(
+                urllib.parse.quote(room, safe="")), query={"user_id": sender},
+                timeout=MEMBER_LOOKUP_TIMEOUT_SECONDS)
+        except DeliveryError as exc:
+            # Only an actual HTTP 404 proves that the state is absent.
+            return not (isinstance(exc.__cause__, urllib.error.HTTPError) and exc.__cause__.code == 404)
+        except OSError:
+            return True
+        return True
+
+    def _rollback_join(self, room: str, sender: str) -> None:
+        store = self.safety_store
+        key = store.room_persona_key(sender, room)
+        # Persist before retrying so a crash during rollback does not lose work.
+        store.cleanup_enqueue(sender, room)
+        for attempt in range(3):
+            try:
+                self.leave(room, sender)
+            except (DeliveryError, OSError):
+                store.cleanup_failed(key, time.time())
+                if attempt < 2:
+                    self._sleep(0.05 * 2 ** attempt)
+            else:
+                store.cleanup_done(key)
+                return
+        logging.getLogger(__name__).warning("Auto-join rollback queued for cleanup")
+
+    def retry_cleanup(self) -> None:
+        with self._recovery_lock:
+            for row in self.safety_store.cleanup_due(time.time()):
+                if self._cleanup_stop.is_set():
+                    return
+                try:
+                    self.leave(row["room"], row["persona"])
+                except (DeliveryError, OSError):
+                    self.safety_store.cleanup_failed(row["key"], time.time())
+                else:
+                    self.safety_store.cleanup_done(row["key"])
+
+    def start_cleanup(self, interval: float = 5.0) -> None:
+        if self._cleanup_thread is not None and self._cleanup_thread.is_alive():
+            return
+        self._cleanup_stop.clear()
+        def loop():
+            while not self._cleanup_stop.is_set():
+                try:
+                    self.retry_cleanup()
+                except Exception:
+                    logging.getLogger(__name__).warning("Auto-join cleanup iteration failed")
+                self._cleanup_stop.wait(interval)
+        self._cleanup_thread = threading.Thread(target=loop, name="as-join-cleanup", daemon=True)
+        self._cleanup_thread.start()
+
+    def stop_cleanup(self, timeout: float = 5.0) -> None:
+        self._cleanup_stop.set()
+        if self._cleanup_thread is not None:
+            self._cleanup_thread.join(timeout)
+            if self._cleanup_thread.is_alive():
+                logging.getLogger(__name__).warning("Auto-join cleanup still stopping; pending work retained")
 
     def event_sender(self, room_id: str, event_id: str) -> Optional[str]:
         """查一条事件的 sender（消费侧「是否被某个 AI 回复」的回填路径）。
