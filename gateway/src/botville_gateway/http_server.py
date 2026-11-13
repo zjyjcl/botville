@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import re
+import threading
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
@@ -500,6 +501,15 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         parts = rest.split("/")
         if len(parts) == 2 and parts[1] == "state" and self.command in ("GET", "HEAD", "PATCH"):
             handle_mood(self, parts[0])
+        elif len(parts) == 2 and parts[1] == "rooms" and self.command in ("GET", "HEAD"):
+            from .group_rooms_http import handle
+            handle(self, parts[0])
+        elif len(parts) == 3 and parts[1] == "rooms" and self.command == "PATCH":
+            from .group_rooms_http import handle
+            handle(self, parts[0], parts[2])
+        elif len(parts) == 1 and self.command == "PATCH":
+            from .personas_update import handle
+            handle(self, parts[0])
         elif len(parts) == 1 and self.command in ("GET", "HEAD"):
             self._handle_persona_detail(rest)
         else:
@@ -1462,6 +1472,7 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         self.engine_hooks: Optional[EngineHooks] = None
         # Persona ownership is a startup-time security boundary, independent
         # of whether this process currently starts the consumer/model engine.
+        self.personas_update_lock = threading.RLock()
         self.memory_personas = load_personas(
             config.personas_file, server_name=config.matrix_server_name,
             max_message_chars=config.max_message_chars)

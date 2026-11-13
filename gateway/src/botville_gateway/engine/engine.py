@@ -239,6 +239,12 @@ class EngineHooks(ConsumerHooks):
         if self._group_invites is not None and self._group_invites.is_disabled(persona.user_id, room_id):
             self.stats.inc("group_encrypted_skipped")
             return
+        if self._group_invites is not None and self._group_invites.is_left(persona.user_id, room_id):
+            self.stats.inc("group_left_skipped")
+            return
+        if self._group_invites is not None and self._group_invites.is_muted(persona.user_id, room_id):
+            self.stats.inc("group_muted_skipped")
+            return
         if not self._client.config.configured:
             return
         idem_key = speech_idempotency_key(persona.user_id, event_id)

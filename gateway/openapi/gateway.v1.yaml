@@ -9,7 +9,7 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: botville AI Gateway API
-  version: 0.5.0
+  version: 0.6.0
   summary: AI 网关契约初稿：对话与消息、角色、功能清单、卡片、用量与限额。
   description: |
     botville 自部署 AI 网关的开放 HTTP API。网关位于 Matrix homeserver 与 AI 运行时之间：
@@ -613,8 +613,11 @@ paths:
       operationId: updatePersona
       summary: 更新角色
       description: |
-        部分更新。请求头 `If-Match` 可选；也可在请求体传 `revision` 做乐观并发控制，
-        不一致返回 409 并附带当前 revision。改动对后续消息立即生效。
+        0.6.0 参考实现仅支持 groups 整体替换，鉴权与 /state 一致。进程内串行，校验后原子替换
+        personas 文件并更新内存；文件需可写。检测到外部修改返回 409 persona.state_conflict。
+        revision/If-Match 与其它规划字段尚未实现，传入返回 400；revision 仍为文件型摘要的 1。
+        不支持多进程并发写同一 personas 文件；外部管理程序应停止网关后编辑并重启。
+      security: [{matrixOpenIdToken: []}, {matrixUserToken: []}, {bearerAuth: []}]
       parameters:
         - $ref: '#/components/parameters/PersonaId'
         - name: If-Match
@@ -634,7 +637,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Persona'
+                $ref: '#/components/schemas/PersonaOwnerDetail'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -647,6 +650,8 @@ paths:
           $ref: '#/components/responses/Conflict'
         '422':
           $ref: '#/components/responses/UnprocessableEntity'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -672,6 +677,89 @@ paths:
           $ref: '#/components/responses/Conflict'
         '500':
           $ref: '#/components/responses/InternalError'
+
+  /personas/{persona_id}/rooms:
+    get:
+      tags: [Personas]
+      operationId: listPersonaRooms
+      summary: 列出 owner 的群房间
+      description: |
+        鉴权与 /state 一致；非 owner、跨服及未知 persona 隐藏为 404 persona.not_found。
+        仅当前 HMAC 密钥的行，按 updated_at、room_ref 升序 keyset 分页；更新期间不提供快照。
+        部署关闭或无 memory DB 返回空页和 groups_enabled=false。
+      security: [{matrixOpenIdToken: []}, {matrixUserToken: []}, {bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/PersonaId'
+        - name: include
+          in: query
+          schema: {type: string, enum: [active, all], default: active}
+          description: active 仅 accepted/encrypted_disabled；all 包含 left/rejected_encrypted。
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+        - name: cursor
+          in: query
+          schema: {type: string}
+          description: 上一页 next_cursor；客户端不得构造或解析。
+      responses:
+        '200':
+          description: 群房间列表，不含 inviter 或原始 room_id。
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GroupRoomList'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /personas/{persona_id}/rooms/{room_ref}:
+    patch:
+      tags: [Personas]
+      operationId: updatePersonaRoom
+      summary: owner 设置安静模式或不可撤销地退群
+      description: |
+        鉴权与 /state 一致；无效、非当前密钥或不属于 persona 的 room_ref 统一 404 room.not_found。
+        只有 accepted/encrypted_disabled 可设置 mode，否则 409 room.state_conflict。
+        muted 在 policy 前禁止内置引擎回复（包括被 @/回复），仍按原规则写群记忆，不消耗回复限额。
+        leave 立即置 left，再使用 persona masquerade joined_rooms 的 HMAC 匹配恢复路由；找不到视为已确认。
+        响应 200，action=leave 必带 leave_pending。找到时先入持久清理队列，失败由后台自动重试。
+        查询失败仍返回 left 和 leave_pending=true，但无原始 room_id 无法入队；owner 可再次 PATCH leave 重试。
+        退群不可撤销，本 API 不支持 rejoin；left 禁止模型回复、发送和自动加入。
+      security: [{matrixOpenIdToken: []}, {matrixUserToken: []}, {bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/PersonaId'
+        - name: room_ref
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/UpdateGroupRoomRequest'}
+      responses:
+        '200':
+          description: 更新后的群房间项。
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GroupRoom'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404':
+          description: persona.not_found 或 room.not_found，隐藏存在性。
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+              example: {type: 'urn:botville:error:room.not_found', title: Room not found, status: 404, code: room.not_found, request_id: example-request}
+        '409':
+          description: 当前房间状态不允许设置 mode。
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+              example: {type: 'urn:botville:error:room.state_conflict', title: Room state conflict, status: 409, code: room.state_conflict, request_id: example-request}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
 
   /personas/{persona_id}/state:
     get:
@@ -2593,6 +2681,60 @@ components:
           type: string
           example: Asia/Shanghai
 
+    PersonaGroupsSettings:
+      type: object
+      additionalProperties: false
+      description: 整体替换群设置；省略的子字段恢复默认。邀请需部署及 persona 双开关开启。
+      properties:
+        enabled: {type: boolean, default: false}
+        invite_policy: {type: string, enum: [owner, local_humans], default: owner}
+
+    GroupRoom:
+      type: object
+      additionalProperties: false
+      required: [room_ref, state, mode, joined_at, updated_at]
+      properties:
+        room_ref:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+          description: 不透明 HMAC room_key，稳定不可逆。密钥轮换后旧引用失效并从列表消失。
+        state: {type: string, enum: [accepted, encrypted_disabled, rejected_encrypted, left]}
+        mode: {type: string, enum: [mention_only, muted]}
+        joined_at:
+          type: [string, "null"]
+          format: date-time
+          description: UTC RFC3339；从未接受的邀请为 null。
+        updated_at: {type: string, format: date-time}
+        leave_pending:
+          type: boolean
+          description: |
+            仅 action=leave 响应必带。false：已确认退出。true：已退出群聊，homeserver 退出仍待确认。
+            已入队时后台自动重试，无需操作；查询失败无法入队时可再次退出重试。
+            App 对 left 显示“已退出”。这是本次请求的确认结果，列表不携带此字段。
+
+    GroupRoomList:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, has_more, groups_enabled]
+      properties:
+        items:
+          type: array
+          maxItems: 200
+          items: {$ref: '#/components/schemas/GroupRoom'}
+        next_cursor: {type: [string, "null"]}
+        has_more: {type: boolean}
+        groups_enabled:
+          type: boolean
+          description: 部署群开关开启且 memory DB 可用；与 persona 邀请开关区分。
+
+    UpdateGroupRoomRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        mode: {type: string, enum: [mention_only, muted]}
+        action: {type: string, enum: [leave]}
+
     ProactiveSettings:
       type: object
       description: |
@@ -2762,7 +2904,7 @@ components:
       description: owner 的详情视图；列表 `PersonaSummary` 保持不含 mood。
       type: object
       additionalProperties: false
-      required: [id, owner_id, display_name, bio, kind, status, revision, created_at, updated_at, visibility, mood]
+      required: [id, owner_id, display_name, bio, kind, status, revision, created_at, updated_at, visibility, mood, groups]
       example:
         id: '@ai_demo:example.invalid'
         owner_id: '@owner:example.invalid'
@@ -2775,7 +2917,9 @@ components:
         updated_at: '2026-11-13T00:00:00Z'
         visibility: private
         mood: calm
+        groups: {enabled: false, invite_policy: owner}
       properties:
+        groups: {$ref: '#/components/schemas/PersonaGroupsSettings'}
         id: {type: string}
         owner_id: {type: string}
         display_name: {type: string}
@@ -2854,8 +2998,9 @@ components:
 
     UpdatePersonaRequest:
       type: object
-      description: 部分更新；未出现的字段保持不变。
+      description: 参考实现仅支持 groups；其他字段为规划，当前返回 400。groups 整体替换，未出现的子字段取默认。
       properties:
+        groups: {$ref: '#/components/schemas/PersonaGroupsSettings'}
         display_name:
           type: string
           minLength: 1

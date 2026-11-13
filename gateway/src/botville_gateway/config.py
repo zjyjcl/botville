@@ -28,7 +28,7 @@ from .as_txn_store import (
 from .memory.store import MEMORY_PURGE_INTERVAL_MIN_SECONDS
 
 GATEWAY_VERSION = "0.1.0"
-CONTRACT_VERSION = "0.5.0"
+CONTRACT_VERSION = "0.6.0"
 
 # Token values that mean "no auth configured"; starting with these is unsafe
 # unless GATEWAY_DEV_MODE=true is explicitly set.
@@ -206,12 +206,17 @@ def _env_int(env: Mapping[str, str], name: str, default: int, *, minimum: int = 
     return value
 
 
-def _env_proactive_int(env: Mapping[str, str], name: str, default: int) -> int:
-    # Preserve the shared parser semantics without echoing a deployment value.
+def _env_proactive_int(env: Mapping[str, str], name: str, default: int,
+                       *, minimum: int, maximum: int) -> int:
+    # Validate the real range without reflecting deployment input.
+    raw = env.get(name)
     try:
-        return _env_int(env, name, default)
-    except ConfigError:
-        raise ConfigError(f"{name} must be a non-negative integer") from None
+        value = default if raw is None or raw.strip() == "" else int(raw.strip())
+        if not minimum <= value <= maximum:
+            raise ValueError()
+    except (TypeError, ValueError):
+        raise ConfigError(f"{name} must be an integer within {minimum}–{maximum}") from None
+    return value
 
 
 def _env_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
@@ -323,32 +328,15 @@ def _env_int_range(env: Mapping[str, str], name: str, default: int, *, minimum: 
 
 def _env_group_max_responders(env: Mapping[str, str]) -> int:
     """Parse this routing limit without reflecting deployment input."""
-    raw = env.get("GATEWAY_GROUP_MAX_RESPONDERS")
-    if raw is None or raw.strip() == "":
-        return DEFAULT_GROUP_MAX_RESPONDERS
-    try:
-        value = int(raw.strip())
-    except (TypeError, ValueError):
-        raise ConfigError("GATEWAY_GROUP_MAX_RESPONDERS must be an integer in range") from None
-    # KEEP IN SYNC: deploy-side RANGES in server/tests/test_compose_gateway_mood_proactive.py
-    # (GATEWAY_GROUP_MAX_RESPONDERS); change both together.
-    if not 1 <= value <= 20:
-        raise ConfigError("GATEWAY_GROUP_MAX_RESPONDERS must be in range")
-    return value
+    return _env_proactive_int(env, "GATEWAY_GROUP_MAX_RESPONDERS",
+                              DEFAULT_GROUP_MAX_RESPONDERS, minimum=1, maximum=20)
 
 
 def _env_mood_half_life(env: Mapping[str, str]) -> int:
-    """Read the mood decay period without reflecting a deployment value."""
-    raw = env.get("GATEWAY_MOOD_HALF_LIFE_MINUTES")
-    if raw is None or raw.strip() == "":
-        return DEFAULT_MOOD_HALF_LIFE_MINUTES
-    try:
-        value = int(raw.strip())
-    except ValueError:
-        raise ConfigError("GATEWAY_MOOD_HALF_LIFE_MINUTES must be an integer in range") from None
-    if not MOOD_HALF_LIFE_MINUTES_MIN <= value <= MOOD_HALF_LIFE_MINUTES_MAX:
-        raise ConfigError("GATEWAY_MOOD_HALF_LIFE_MINUTES must be in range")
-    return value
+    return _env_proactive_int(env, "GATEWAY_MOOD_HALF_LIFE_MINUTES",
+                              DEFAULT_MOOD_HALF_LIFE_MINUTES,
+                              minimum=MOOD_HALF_LIFE_MINUTES_MIN,
+                              maximum=MOOD_HALF_LIFE_MINUTES_MAX)
 
 
 def normalize_http_path_prefix(prefix: str) -> str:
@@ -604,8 +592,7 @@ class Config:
     mood_half_life_minutes: int = DEFAULT_MOOD_HALF_LIFE_MINUTES
 
     def __post_init__(self) -> None:
-        # KEEP IN SYNC: GATEWAY_GROUP_FORGET_STALE_KEYS is not yet in deploy-side RANGES/BOOLS
-        # (server/tests/test_compose_gateway_mood_proactive.py); A line still needs to add them.
+        # KEEP IN SYNC: deploy-side BOOLS in server/tests/test_compose_gateway_mood_proactive.py
         if not isinstance(self.group_forget_stale_keys, bool):
             raise ConfigError("GATEWAY_GROUP_FORGET_STALE_KEYS must be a boolean")
         if not isinstance(self.groups_enabled, bool):
@@ -615,8 +602,7 @@ class Config:
         if (type(self.group_max_rooms_per_persona) is not int
                 or not 1 <= self.group_max_rooms_per_persona <= 200):
             raise ConfigError("GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA must be within 1–200")
-        # KEEP IN SYNC: the four B2.8c group ranges below are not yet in deploy-side RANGES/BOOLS
-        # (server/tests/test_compose_gateway_mood_proactive.py); A line still needs to add them.
+        # KEEP IN SYNC: deploy-side RANGES in server/tests/test_compose_gateway_mood_proactive.py (the four B2.8c group ranges below)
         for name, low, high in (
             ("group_cooldown_seconds", 0, 3600),
             ("group_max_replies_per_hour", 1, 200),
@@ -1289,13 +1275,13 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         ),
         groups_enabled=_env_bool(source, "GATEWAY_GROUPS_ENABLED", False),
         group_forget_stale_keys=_env_bool(source, "GATEWAY_GROUP_FORGET_STALE_KEYS", False),
-        group_cooldown_seconds=_env_proactive_int(source, "GATEWAY_GROUP_COOLDOWN_SECONDS", 30),
-        group_max_replies_per_hour=_env_proactive_int(source, "GATEWAY_GROUP_MAX_REPLIES_PER_HOUR", 20),
-        group_ai_loop_max_per_hour=_env_proactive_int(source, "GATEWAY_GROUP_AI_LOOP_MAX_PER_HOUR", 30),
-        group_max_consecutive_ai_messages=_env_proactive_int(source, "GATEWAY_GROUP_MAX_CONSECUTIVE_AI_MESSAGES", 3),
-        group_max_rooms_per_persona=_env_proactive_int(source, "GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA", 20),
+        group_cooldown_seconds=_env_proactive_int(source, "GATEWAY_GROUP_COOLDOWN_SECONDS", 30, minimum=0, maximum=3600),
+        group_max_replies_per_hour=_env_proactive_int(source, "GATEWAY_GROUP_MAX_REPLIES_PER_HOUR", 20, minimum=1, maximum=200),
+        group_ai_loop_max_per_hour=_env_proactive_int(source, "GATEWAY_GROUP_AI_LOOP_MAX_PER_HOUR", 30, minimum=1, maximum=1000),
+        group_max_consecutive_ai_messages=_env_proactive_int(source, "GATEWAY_GROUP_MAX_CONSECUTIVE_AI_MESSAGES", 3, minimum=1, maximum=50),
+        group_max_rooms_per_persona=_env_proactive_int(source, "GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA", 20, minimum=1, maximum=200),
         invite_ledger_ttl_seconds=_env_proactive_int(
-            source, "GATEWAY_INVITE_LEDGER_TTL_SECONDS", DEFAULT_INVITE_LEDGER_TTL_SECONDS),
+            source, "GATEWAY_INVITE_LEDGER_TTL_SECONDS", DEFAULT_INVITE_LEDGER_TTL_SECONDS, minimum=INVITE_LEDGER_TTL_MIN_SECONDS, maximum=INVITE_LEDGER_TTL_MAX_SECONDS),
         group_max_responders=_env_group_max_responders(source),
         # N7：三个数值项 0 = 平台不设该项；非 0 的区间由 Config 校验（fail-closed）。
         platform_max_consecutive_ai_messages=_env_int(
@@ -1415,16 +1401,16 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
             source, "GATEWAY_PROACTIVE_RECENT_CONTACTS_ENABLED", False
         ),
         proactive_tick_seconds=_env_proactive_int(
-            source, "GATEWAY_PROACTIVE_TICK_SECONDS", DEFAULT_PROACTIVE_TICK_SECONDS
+            source, "GATEWAY_PROACTIVE_TICK_SECONDS", DEFAULT_PROACTIVE_TICK_SECONDS, minimum=30, maximum=86400
         ),
         proactive_min_idle_minutes=_env_proactive_int(
-            source, "GATEWAY_PROACTIVE_MIN_IDLE_MINUTES", DEFAULT_PROACTIVE_MIN_IDLE_MINUTES
+            source, "GATEWAY_PROACTIVE_MIN_IDLE_MINUTES", DEFAULT_PROACTIVE_MIN_IDLE_MINUTES, minimum=0, maximum=43200
         ),
         proactive_min_interval_minutes=_env_proactive_int(
-            source, "GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES", DEFAULT_PROACTIVE_MIN_INTERVAL_MINUTES
+            source, "GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES", DEFAULT_PROACTIVE_MIN_INTERVAL_MINUTES, minimum=0, maximum=43200
         ),
         proactive_per_target_per_day=_env_proactive_int(
-            source, "GATEWAY_PROACTIVE_PER_TARGET_PER_DAY", DEFAULT_PROACTIVE_PER_TARGET_PER_DAY
+            source, "GATEWAY_PROACTIVE_PER_TARGET_PER_DAY", DEFAULT_PROACTIVE_PER_TARGET_PER_DAY, minimum=0, maximum=24
         ),
         # ---------- 内置角色引擎（B 线 PR2，contract §0 / §1.7.8 ②⑫）----------
         # 人设文件：空 = 没有人设 → 引擎不发言（消费者仍记录/计数）。

@@ -738,6 +738,12 @@ class GatewayService:
         self._group_invites = groups
         self._engine.group_invites = groups
 
+    def _normalize_group_target(self, persona, room):
+        try:
+            return self._engine.normalize_group_target(persona, room)
+        except DeliveryError as exc:
+            raise GatewayDeliveryError(exc.code, 'Conversation could not be resolved') from exc
+
     def _check_group_encryption(self, persona_id, conversation_id) -> None:
         if (conversation_id and self._group_invites is not None
                 and self._group_invites.is_disabled(persona_id, conversation_id)):
@@ -761,6 +767,7 @@ class GatewayService:
             raise ValidationError(
                 "request.invalid", "'conversation_id' must be a string", "conversation_id"
             )
+        persona_id, conversation_id = self._normalize_group_target(persona_id, conversation_id)
         self._check_group_encryption(persona_id, conversation_id)
         peer_id = payload.get("peer_id")
         if peer_id is not None and not isinstance(peer_id, str):
@@ -856,6 +863,7 @@ class GatewayService:
             raise ValidationError("request.invalid", "conversation_id is required", "conversation_id")
 
         validated = self._validate_send(payload)
+        validated["sender"], conversation_id = self._normalize_group_target(validated["sender"], conversation_id)
         self._check_group_encryption(validated["sender"], conversation_id)
         if proactive_reservation is not None and (
             not isinstance(proactive_reservation, Reservation)

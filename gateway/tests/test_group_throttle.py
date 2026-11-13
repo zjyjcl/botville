@@ -9,6 +9,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+import urllib.parse
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
@@ -23,6 +24,7 @@ from botville_gateway.groups import GroupInvites
 from botville_gateway.http_server import build_server
 from botville_gateway.limits import LimitLayer
 from botville_gateway.matrix import DeliveryError, InMemoryMatrixTransport
+from botville_gateway.matrix_appservice import AppServiceMatrixTransport
 from botville_gateway.memory.store import MemoryStore
 from botville_gateway.service import GatewayService
 from botville_gateway.store import EventKind
@@ -220,6 +222,71 @@ class GroupThrottleTests(unittest.TestCase):
         self.svc._reservations.release(reservation)
         self.assertTrue(self.evaluate()['allowed'])
 
+    def install_room_resolver(self):
+        resolver = AppServiceMatrixTransport(
+            homeserver_url='http://unused.invalid', as_token='test-token',
+            server_name='local.test')
+        resolver._request = Mock(return_value={'room_id': ROOM})
+        self.tr.resolve_room = resolver.resolve_room
+        return resolver
+
+    def test_transport_sender_resolution_precedes_group_classification(self):
+        resolver = self.install_room_resolver()
+        self.tr.resolve_sender = Mock(wraps=resolver.resolve_sender)
+        # ai_0 is a literal persona id: the transport maps it to ai_ai_0.
+        persona = '@ai_ai_0:local.test'
+        self.groups.personas[persona] = Persona(persona, 'Be brief.', groups={'enabled': True})
+        self.groups._record(persona, ROOM, HUMAN, 'accepted')
+        self.assertTrue(self.evaluate('ai_0', 'group')['allowed'])
+        self.assertEqual(self.send('ai_0', 'group')['outcome'], 'delivered')
+        self.blocked(self.evaluate(persona, ROOM), 'min_interval.too_soon')
+        self.blocked(self.send(persona, ROOM), 'min_interval.too_soon')
+        key = self.svc._engine._group_key(persona, ROOM)
+        self.assertEqual(len(self.svc._engine._group_sends[key]), 1)
+        self.tr.resolve_sender.assert_any_call('ai_0')
+        self.assertEqual(self.svc._engine.normalize_group_target('ai_0', '!dm:local.test'),
+                         ('ai_0', '!dm:local.test'))
+
+    def test_canonical_group_counters_in_both_directions(self):
+        alias = 'group'
+        for code, options, count in (
+            ('min_interval.too_soon', {}, 1),
+            ('group.replies_per_hour.exceeded', {'group_cooldown_seconds': 0,
+                'group_max_replies_per_hour': 2}, 2),
+            ('anti_spam.consecutive', {'group_cooldown_seconds': 0}, 3),
+            ('ai_loop.tripped', {'group_cooldown_seconds': 0,
+                'group_ai_loop_max_per_hour': 2}, 2),
+        ):
+            for first, second in ((alias, ROOM), (ROOM, alias)):
+                for bare in ('0', 'ai_0'):
+                    for sender, other in ((bare, AIS[0]), (AIS[0], bare)):
+                        with self.subTest(code=code, first=first, sender=sender, other=other):
+                            self.make(**options)
+                            resolver = self.install_room_resolver()
+                            for _ in range(count):
+                                self.assertEqual(self.send(sender, first)['outcome'], 'delivered')
+                                self.advance(1)
+                            self.blocked(self.evaluate(other, second), code)
+                            self.blocked(self.send(other, second), code)
+                            self.assertTrue(self.evaluate(other, '!dm:local.test')['allowed'])
+                            state = repr((self.svc._engine._group_sends,
+                                          self.svc._engine._cooldowns,
+                                          self.svc._engine._blocked_recorded))
+                            self.assertNotIn(ROOM, state)
+                            self.assertNotIn(AIS[0], state)
+                            resolver._request.assert_called_once_with(
+                                'GET', '/_matrix/client/v3/directory/room/' +
+                                urllib.parse.quote('#botville_conv_group:local.test', safe=''))
+
+    def test_unresolved_alias_fails_closed(self):
+        self.tr.resolve_room = Mock(side_effect=DeliveryError('conversation.not_found', 'private'))
+        for action in (self.evaluate, self.send):
+            with self.assertRaises(GatewayDeliveryError) as caught:
+                action('0', 'missing')
+            self.assertEqual(caught.exception.code, 'conversation.not_found')
+        self.assertEqual(self.tr.sent, [])
+        self.assertEqual(self.svc._engine._group_sends, {})
+
     def start_http(self):
         path = os.path.join(self.tmp.name, 'personas.json')
         with open(path, 'w') as handle:
@@ -359,8 +426,8 @@ class GroupConfigTests(unittest.TestCase):
             for value in (str(low-1), str(high+1), 'private-secret', '1.2', 'true'):
                 with self.subTest(name=name, value=value), self.assertRaises(ConfigError) as caught:
                     load_config({'GATEWAY_DEV_MODE': 'true', env: value})
-                self.assertNotIn(repr(value), str(caught.exception))
-                self.assertNotIn('private-secret', str(caught.exception))
+                self.assertEqual(str(caught.exception),
+                    f'{env} must be an integer within {low}–{high}')
             with self.assertRaises(ConfigError):
                 Config(**{name: True})
 

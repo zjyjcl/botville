@@ -645,7 +645,7 @@ class ProactiveTests(unittest.TestCase):
         with self.assertRaises(ConfigError): Config(proactive_per_target_per_day=25)
         with open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "openapi", "gateway.v1.yaml"), encoding="utf8") as handle:
             text = handle.read()
-        self.assertIn("version: 0.5.0", text)
+        self.assertIn("version: 0.6.0", text)
         section = text[text.index("    ProactiveSettings:"):text.index("    RelationDefaults:")]
         self.assertIn("default: false", section)
 

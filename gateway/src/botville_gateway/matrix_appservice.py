@@ -356,6 +356,18 @@ class AppServiceMatrixTransport:
         )
         return resp.get("room_id") or room_id
 
+    def joined_rooms(self, user_id: str):
+        """Read memberships as the persona; raw routing IDs stay in memory."""
+        self._check_sender(user_id)
+        response = self._request(
+            "GET", "/_matrix/client/v3/joined_rooms", query={"user_id": user_id},
+            timeout=MEMBER_LOOKUP_TIMEOUT_SECONDS)
+        rooms = response.get("joined_rooms") if isinstance(response, dict) else None
+        if not isinstance(rooms, list) or any(not isinstance(room, str) or not room.startswith("!")
+                                               for room in rooms):
+            raise DeliveryError("matrix.unavailable", "Invalid membership response")
+        return rooms
+
     def leave(self, room_id: str, user_id: str) -> None:
         """Leave a room using the sender's AS masquerade identity."""
         self._check_sender(user_id)
@@ -380,6 +392,8 @@ class AppServiceMatrixTransport:
         return True
 
     def _check_group_send(self, room: str, sender: str) -> None:
+        if self.left_group is not None and self.left_group(sender, room):
+            raise DeliveryError("M_FORBIDDEN", "Room participation has ended")
         if self.disabled_group is not None and self.disabled_group(sender, room):
             raise DeliveryError("conversation.e2ee", "Encrypted room participation is disabled")
 
@@ -619,6 +633,10 @@ class AppServiceMatrixTransport:
                 raise
 
     def _rollback_join(self, room: str, sender: str) -> None:
+        self.leave_with_cleanup(room, sender)
+
+    def leave_with_cleanup(self, room: str, sender: str) -> bool:
+        """Persist owner leave or rollback before attempting it; return confirmation."""
         store = self.safety_store
         key = store.room_persona_key(sender, room)
         # Persist before retrying so a crash during rollback does not lose work.
@@ -632,8 +650,9 @@ class AppServiceMatrixTransport:
                     self._sleep(0.05 * 2 ** attempt)
             else:
                 store.cleanup_done(key)
-                return
-        logging.getLogger(__name__).warning("Auto-join rollback queued for cleanup")
+                return True
+        logging.getLogger(__name__).warning("Room leave queued for cleanup")
+        return False
 
     def retry_cleanup(self) -> None:
         with self._recovery_lock:

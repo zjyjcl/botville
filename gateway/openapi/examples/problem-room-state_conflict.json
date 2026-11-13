@@ -1,0 +1,7 @@
+{
+  "type": "urn:botville:error:room.state_conflict",
+  "title": "Room request rejected",
+  "status": 409,
+  "code": "room.state_conflict",
+  "request_id": "example-request"
+}

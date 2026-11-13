@@ -92,6 +92,6 @@ def persona_detail(server, caller, persona_id):
         state = None
     label = state['label'] if state else None
     if persona.owner_user_id == caller:
-        return dict(summary, mood=label)
+        return dict(summary, mood=label, groups=dict(persona.groups))
     return {**{key: summary[key] for key in ("id", "display_name", "bio", "status")},
             "mood": label if state and state["mood_public"] else None}

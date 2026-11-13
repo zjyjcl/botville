@@ -192,6 +192,7 @@ class MemoryStore:
             self._db.execute('PRAGMA foreign_keys=ON')
             self._migrate()
             self._backfill_public_ids()
+            self.backfill_group_key_ids()
             self._tighten_permissions()
         except Exception:
             self._db.close()
@@ -325,9 +326,15 @@ class MemoryStore:
                 raise RuntimeError('memory owner HMAC secret changed')
             self._hmac_secret = secret
             self._backfill_public_ids()
-            # Rows migrated before a secret was installed carry an empty key id.
-            with self._db:
-                self._db.execute("UPDATE group_rooms SET key_id=? WHERE key_id=''", (self.group_key_id(),))
+            self.backfill_group_key_ids()
+
+    def backfill_group_key_ids(self) -> None:
+        """Fill unknown fingerprints before stale-key deletion; keep known keys."""
+        if not self._hmac_secret:
+            return
+        with self._lock, self._db:
+            self._db.execute("UPDATE group_rooms SET key_id=? WHERE key_id='' OR key_id IS NULL",
+                             (self.group_key_id(),))
 
     def close(self) -> None:
         with self._lock:

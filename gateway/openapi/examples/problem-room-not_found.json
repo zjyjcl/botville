@@ -1,0 +1,7 @@
+{
+  "type": "urn:botville:error:room.not_found",
+  "title": "Room request rejected",
+  "status": 404,
+  "code": "room.not_found",
+  "request_id": "example-request"
+}

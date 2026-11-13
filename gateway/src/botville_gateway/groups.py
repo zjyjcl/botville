@@ -38,8 +38,9 @@ class GroupInvites:
         self._rate = {}
         self._attempt_owner = uuid.uuid4().hex
         if forget_stale_keys and store is not None:
+            store.backfill_group_key_ids()
             with store._lock, store._db:
-                count = store._db.execute('DELETE FROM group_rooms WHERE key_id != ?',
+                count = store._db.execute("DELETE FROM group_rooms WHERE key_id IS NOT NULL AND key_id != '' AND key_id != ?",
                                           (store.group_key_id(),)).rowcount
             _LOG.info('Group stale key rows deleted: %d', count)
         if enabled and store is None:
@@ -87,6 +88,53 @@ class GroupInvites:
 
     def is_accepted(self, persona, room):
         return self._state(persona, room) == 'accepted'
+
+    def update_room(self, persona, room_ref, body):
+        from .group_rooms_http import RoomError, room_item
+        if self.store is None:
+            raise RoomError(404, 'room.not_found')
+        with self._lock:
+            with self.store._lock:
+                row = self.store._db.execute(
+                    'SELECT * FROM group_rooms WHERE persona_id=? AND room_key=? AND key_id=?',
+                    (persona, room_ref, self.store.group_key_id())).fetchone()
+            if row is None:
+                raise RoomError(404, 'room.not_found')
+            if 'mode' in body and row['state'] not in ('accepted', 'encrypted_disabled'):
+                raise RoomError(409, 'room.state_conflict')
+            leaving = body.get('action') == 'leave'
+            with self.store._lock, self.store._db:
+                self.store._db.execute(
+                    'UPDATE group_rooms SET mode=?,state=?,updated_at=? WHERE persona_id=? AND room_key=? AND key_id=?',
+                    (body.get('mode', row['mode']), 'left' if leaving else row['state'],
+                     time.time(), persona, room_ref, self.store.group_key_id()))
+                row = self.store._db.execute(
+                    'SELECT * FROM group_rooms WHERE persona_id=? AND room_key=? AND key_id=?',
+                    (persona, room_ref, self.store.group_key_id())).fetchone()
+            result = room_item(row)
+            if leaving:
+                # Commit the speech veto before any homeserver request.
+                result['leave_pending'] = True
+                try:
+                    rooms = self.transport.joined_rooms(persona)
+                    room = next((room for room in rooms
+                                 if self._key('room', room) == room_ref), None)
+                    result['leave_pending'] = (False if room is None else
+                        not self.transport.leave_with_cleanup(room, persona))
+                except (DeliveryError, OSError, ValueError):
+                    # No raw route is available when membership lookup fails.
+                    # Keep left; the owner can repeat this idempotent request.
+                    pass
+            return result
+
+    def is_muted(self, persona, room):
+        if self.store is None:
+            return False
+        with self.store._lock:
+            row = self.store._db.execute(
+                "SELECT mode FROM group_rooms WHERE persona_id=? AND room_key=? AND key_id=?",
+                (persona, self._key('room', room), self.store.group_key_id())).fetchone()
+        return bool(row and row[0] == 'muted')
 
     def is_throttled(self, persona, room):
         entry = self.personas.get(persona)
@@ -165,6 +213,14 @@ class GroupInvites:
             return
         pid, room, inviter = persona.user_id, ctx.room_id, ctx.sender
         with self._lock:
+            if self.is_left(pid, room):
+                # Decline fresh invitations without restoring participation.
+                self._result('left_ignored')
+                try:
+                    self._leave(room, pid)
+                except Exception:
+                    self._result('leave_failed')
+                return
             key = self._key('invite', pid, ctx.event_id)
             now = time.time()
             with self.store._lock, self.store._db:

@@ -57,6 +57,12 @@ PROBLEM_MEDIA_TYPE = "application/problem+json"
 # example file -> JSON pointer to the schema it must satisfy.
 # Pointers target the contract itself, so a schema change breaks examples too.
 EXAMPLE_TARGETS = {
+    "group-room.json": "#/components/schemas/GroupRoom",
+    "group-room-list.json": "#/components/schemas/GroupRoomList",
+    "update-group-room-request.json": "#/components/schemas/UpdateGroupRoomRequest",
+    "persona-groups-settings.json": "#/components/schemas/PersonaGroupsSettings",
+    "problem-room-not_found.json": "#/components/schemas/Problem",
+    "problem-room-state_conflict.json": "#/components/schemas/Problem",
     "persona-page.json": "#/paths/~1personas/get/responses/200/content/application~1json/schema",
     "health.json": "#/paths/~1health/get/responses/200/content/application~1json/schema",
     "capability-manifest.json": "#/paths/~1capabilities/get/responses/200/content/application~1json/schema",
@@ -672,7 +678,7 @@ def check_examples(document, report):
         else:
             report.ok(name + " detail example")
     public = document["components"]["schemas"]["PersonaPublicView"]
-    for key in ("owner_id", "model_binding", "credential_ref", "created_at", "updated_at", "visibility"):
+    for key in ("owner_id", "model_binding", "credential_ref", "created_at", "updated_at", "visibility", "groups"):
         payload = dict(public["example"], **{key: "forbidden"})
         if validate(payload, public, document):
             report.ok("public detail rejects " + key)

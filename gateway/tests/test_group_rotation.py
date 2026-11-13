@@ -64,6 +64,31 @@ class GroupRotationTests(unittest.TestCase):
         self.assertEqual(migrated._db.execute('SELECT version FROM memory_schema').fetchone()[0],
                          SCHEMA_VERSION)
 
+    def unknown_key_rows(self, store):
+        # Nullable legacy schema explicitly exercises NULL as well as empty.
+        with store._db:
+            store._db.execute('ALTER TABLE group_rooms RENAME COLUMN key_id TO saved_key_id')
+            store._db.execute('ALTER TABLE group_rooms ADD COLUMN key_id TEXT')
+            for room, key in (('empty', ''), ('null', None), ('old', 'old-fingerprint')):
+                store._db.execute("INSERT INTO group_rooms (persona_id,room_key,state,inviter,updated_at,key_id) VALUES(?,?,'accepted','opaque',0,?)",
+                                  (AI, room, key))
+
+    def test_install_secret_backfills_empty_and_null_preserves_known(self):
+        store = MemoryStore(self.path)
+        self.addCleanup(store.close)
+        self.unknown_key_rows(store)
+        store.set_hmac_secret(NEW)
+        rows = dict(store._db.execute('SELECT room_key,key_id FROM group_rooms'))
+        self.assertEqual(rows, {'empty': store.group_key_id(), 'null': store.group_key_id(),
+                                'old': 'old-fingerprint'})
+
+    def test_forget_backfills_before_deleting_stale_rows(self):
+        store, transport, _ = self.open(NEW)
+        self.unknown_key_rows(store)
+        GroupInvites(store, transport, {AI: self.persona}, forget_stale_keys=True)
+        self.assertEqual(dict(store._db.execute('SELECT room_key,key_id FROM group_rooms')),
+                         {'empty': store.group_key_id(), 'null': store.group_key_id()})
+
     def test_rotation_does_not_count_old_rooms_and_can_forget_them(self):
         old_store, _, old_groups = self.open(OLD)
         for number in range(20):
