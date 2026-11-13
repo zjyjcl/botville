@@ -39,9 +39,12 @@ public enum MatrixOpenIDError: Error, Equatable {
 
 public actor MatrixOpenIDTokenProvider {
     public typealias Source = @Sendable () async throws -> MatrixOpenIDToken
+    /// An injected sleeper must throw `CancellationError` only when its task is
+    /// cancelled. A cancellation error intentionally leaves the shared source
+    /// flight alive; any other error releases its waiters as request failure.
     public typealias TimeoutSleep = @Sendable (TimeInterval) async throws -> Void
     public static let defaultRequestTimeout: TimeInterval = 30
-    public static let maximumRequestTimeout: TimeInterval = 300
+    private static let maximumRequestTimeout: TimeInterval = 300
     private var source: Source?
     private let now: @Sendable () -> Date
     private let requestTimeout: TimeInterval

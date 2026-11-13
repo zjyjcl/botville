@@ -141,7 +141,7 @@ struct RoomView: View {
             ToolbarItem(placement: .primaryAction) {
                 Menu {
                     Button { isPresentingSettings = true } label: {
-                        Label("房间设置", systemImage: "gearshape")
+                        Label("房间信息", systemImage: "info.circle")
                     }
                     Button {
                         isPresentingInvite = true
@@ -174,7 +174,7 @@ struct RoomView: View {
         .onChange(of: isInputFocused) { _, _ in updateInputActivity() }
         .onChange(of: draft) { _, _ in updateInputActivity() }
         .sheet(isPresented: $isPresentingSettings) {
-            RoomNotificationSettingsSheet(controller: service.roomNotifications, room: currentRoom)
+            RoomNotificationSettingsSheet(service: service, controller: service.roomNotifications, room: currentRoom)
         }
         .sheet(isPresented: $isPresentingInvite) {
             InviteMemberSheet(service: service, room: currentRoom)
@@ -842,15 +842,36 @@ private struct TimelineLastRowTrace: Equatable {
 @MainActor
 private struct RoomNotificationSettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @ObservedObject var service: MatrixService
     @ObservedObject var controller: RoomMuteController
     let room: MatrixRoom
     @State private var presentedError: String?
+    @State private var aiProfile: AIProfile?
+    @State private var profileError: String?
+    @State private var loadingProfile = false
 
     private var state: RoomMuteState { controller.state(for: room.id) }
 
     var body: some View {
         NavigationStack {
             Form {
+                if let aiProfile {
+                    Section {
+                        NavigationLink {
+                            AIProfileView(service: service, profile: aiProfile)
+                        } label: {
+                            Label("AI 资料", systemImage: "person.crop.square")
+                        }
+                        .tint(aiProfileAccent)
+                    }
+                } else if loadingProfile {
+                    ProgressView("正在读取成员资料…")
+                } else if let profileError {
+                    Section {
+                        Text(profileError).font(.footnote).foregroundStyle(.secondary)
+                        Button("重试读取资料") { Task { await loadProfile() } }
+                    }
+                }
                 Section {
                     Toggle("消息免打扰", isOn: Binding(
                         get: { state.isMuted },
@@ -872,9 +893,17 @@ private struct RoomNotificationSettingsSheet: View {
                     ProgressView("正在读取设置…")
                 }
             }
-            .navigationTitle("房间设置")
+            .navigationTitle("房间信息")
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
             .task(id: room.id) { await controller.refresh(room) }
+            .task(id: room.id) { await loadProfile() }
+            .onChange(of: service.userID) { _, _ in
+                aiProfile = nil
+                dismiss()
+            }
+            .onChange(of: service.isLoggedIn) { _, loggedIn in
+                if !loggedIn { aiProfile = nil; dismiss() }
+            }
             .onChange(of: state.errorMessage, initial: true) { _, error in
                 // Keep the failure visible even if the next sync already
                 // reconciles the settings and clears the controller's error.
@@ -888,6 +917,22 @@ private struct RoomNotificationSettingsSheet: View {
             } message: {
                 Text(presentedError ?? "")
             }
+        }
+    }
+    private func loadProfile() async {
+        guard room.isDirect, !loadingProfile else { return }
+        loadingProfile = true
+        aiProfile = nil
+        profileError = nil
+        defer { loadingProfile = false }
+        do {
+            let profile = try await service.aiProfile(roomID: room.id)
+            guard !Task.isCancelled else { return }
+            aiProfile = profile
+        } catch is CancellationError {
+            // A closed sheet/session must never publish an earlier profile.
+        } catch {
+            profileError = "暂时无法读取成员资料。"
         }
     }
 }

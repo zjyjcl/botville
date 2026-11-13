@@ -22,7 +22,11 @@ public struct Memory: Codable, Sendable, Equatable, Identifiable {
     public let expiresAt: Date?
     /// Future layers remain visible as metadata but are not offered mutations.
     public var canMutate: Bool { ["recent", "summary", "profile"].contains(layer) }
-    public var canPin: Bool { canMutate && layer != "summary" }
+    public var actions: MemoryPresentationPolicy.Actions {
+        MemoryPresentationPolicy.actions(layer: layer, redacted: redacted, pinned: pinned)
+    }
+    /// Whether toggling the current pin state is allowed (including unpin).
+    public var canPin: Bool { actions.canTogglePin }
     enum CodingKeys: String, CodingKey {
         case id, layer, scope, visibility, trust, source, pinned, text, key, value, dirty, redacted
         case personaID = "persona_id"
