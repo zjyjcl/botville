@@ -469,7 +469,23 @@ paths:
       tags: [Personas]
       operationId: listPersonas
       summary: 列出角色
-      description: 列出调用者可见的 AI 角色。默认只返回自己拥有的角色；`owner_id` 仅对本服所有者生效。
+      description: |
+        已实现：仅返回调用者拥有的文件型人设摘要视图，无 owner 的人设永不返回。
+        MatrixOpenID / Matrix 用户 Bearer 使用已验证的 Matrix user_id；
+        GATEWAY_CALLER_TOKENS 使用对应 owner_id。legacy 站点凭据、空 owner 或
+        AUTH_PASS_THROUGH 无身份放行均返回 403 persona.not_owned。
+        owner_id 只接受调用者自身；其他合法本服人类用户返回 403 persona.not_owned；
+        格式非法、非 GATEWAY_MATRIX_SERVER_NAME 域或 @ai_* 返回 400 request.invalid。
+        摘要仅含 id、owner_id、display_name、kind、status、revision、created_at、updated_at、visibility。
+        id 为 Matrix user_id，与记忆 persona_id 一致；display_name 为空时回退 localpart。
+        文件型 kind=custom、status=active、revision=1、visibility=private。
+        时间为启动时文件 mtime（UTC RFC3339 Z），不可得时用网关启动时间，均为近似值。
+        kind/status 作用于映射后的值，其他合法枚举返回空页，非法枚举返回 400 request.invalid。
+        按 id 升序；cursor 是最后返回 id 的无填充 base64url keyset 游标；
+        畸形 cursor 或非法 limit（整数 1–100，默认 20）返回 400 request.invalid。
+        最后一页 next_cursor=null。未配置文件时返回空页，与记忆模块开关无关。
+        其他 /personas* 操作尚未实现，保持 404；不发布 role.personas capability。
+      security: [{matrixOpenIdToken: []}, {matrixUserToken: []}, {bearerAuth: []}]
       parameters:
         - name: owner_id
           in: query
@@ -2139,12 +2155,12 @@ components:
 
         **调用方身份（#124，contract.md §1.2.2）**：`GATEWAY_CALLER_TOKENS` 可配置
         per-caller token（每条形如 `caller_id:token:owner_id`，多条用分号 `;` 或换行分隔，
-        token ≥32 字节）；服务端先对请求 token 与存储 token 各做 `HMAC-SHA256(进程随机键)`
+        token ≥32 字节，按前两个冒号切分，owner_id 可为完整 Matrix user ID）；服务端先对请求 token 与存储 token 各做 `HMAC-SHA256(进程随机键)`
         统一长度，再 `hmac.compare_digest` 全量比较（不提前返回）。`owner_id` 由 token 推出，
-        **只用于 `/context/assemble` 的 persona 区**：推不出或非 owner 时 persona 区为空
+        **用于 `/personas` owner 列表及 `/context/assemble` 的 persona 区**：推不出或非 owner 时 persona 区为空
         （正常结果，非错误），**persona 归属不改变状态码（`200`）**，请求非法时仍按
         `400` / `401` / `422` 返回。`403 persona.not_owned` 只用于
-        **`/context/assemble` 以外**的 persona 写操作（如以 `author_persona_id` 写动态）。
+        **`/context/assemble` 以外**的 persona owner 列表或写操作（如以 `author_persona_id` 写动态）。
         `GATEWAY_LEGACY_TOKEN_ENABLED` 默认 `true`（兼容站点级 token），**开启调用方 token
         后建议关闭**；配置了 caller token 而旧 token 仍开启时启动打 WARNING。
         日志只记 `caller_id`，不记 token、token 哈希或 owner_id 明文。本节不新增请求字段，
@@ -2627,7 +2643,24 @@ components:
           type: string
           format: date-time
 
+    PersonaSummary:
+      description: 文件型人设列表摘要；时间为近似值，不包含配置与扩展字段。
+      type: object
+      additionalProperties: false
+      required: [id, owner_id, display_name, kind, status, revision, created_at, updated_at, visibility]
+      properties:
+        id: {type: string}
+        owner_id: {type: string}
+        display_name: {type: string}
+        kind: {type: string, enum: [custom]}
+        status: {type: string, enum: [active]}
+        revision: {type: integer, enum: [1]}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        visibility: {type: string, enum: [private]}
+
     PersonaPage:
+      description: 列表项为 Persona 的九字段摘要视图，不含配置或扩展字段。
       allOf:
         - $ref: '#/components/schemas/PageMeta'
         - type: object
@@ -2636,7 +2669,7 @@ components:
             items:
               type: array
               items:
-                $ref: '#/components/schemas/Persona'
+                $ref: '#/components/schemas/PersonaSummary'
 
     CreatePersonaRequest:
       type: object

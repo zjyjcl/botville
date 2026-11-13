@@ -36,6 +36,7 @@ import hmac
 import http.server
 import json
 import logging
+import os
 import re
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -80,6 +81,7 @@ from .matrix import InMemoryMatrixTransport, MatrixTransport
 from .room_members import RoomMemberSource
 from .moments.http_api import handle as _handle_moments_dispatch
 from .moments.service import build_moments_service
+from .personas_list import PersonaListError, persona_page
 from .service import GatewayService
 from .store import UsageStore
 from .timeutil import iso_utc
@@ -171,7 +173,8 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: Any) -> None:
         # Memory URLs can contain private counterpart filters. Never access-log them.
-        if "/memories" in unquote(getattr(self, "path", "")):
+        if any(part in unquote(getattr(self, "path", ""))
+               for part in ("/memories", "/personas")):
             return
         if self.server.config.access_log:  # type: ignore[attr-defined]
             super().log_message(fmt, *_redact_args(args))
@@ -434,6 +437,55 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         # AUTH_INVALID：错 token，或 legacy 关闭且无 caller token 命中。
         self._send_problem(401, "auth.invalid_token", "Invalid bearer token")
         return False
+
+    def _auth_capabilities_ok(self) -> bool:
+        """Accept site/caller or end-user identity without sending an early 401."""
+        header = self.headers.get("Authorization")
+        outcome, identity = self.server.authenticator.authenticate(header)
+        if outcome in (AUTH_OK, AUTH_PASS_THROUGH):
+            self._caller = identity
+            return True
+        user_outcome, user_id = self.server.user_verifier.verify(header)
+        if user_outcome == VERIFY_OK:
+            self._user_id = user_id
+            return True
+        if not header:
+            self._send_problem(401, "auth.missing", "Authorization header required")
+        elif user_outcome in (VERIFY_MISSING, VERIFY_INVALID):
+            self._send_problem(401, "auth.invalid_token", "Invalid bearer token")
+        else:
+            # Same as /moments: homeserver unavailable is retryable, not an invalid token.
+            self._send_problem(
+                500,
+                "internal.error",
+                "Homeserver unavailable",
+                detail="user identity could not be verified; retry later",
+            )
+        return False
+
+    def _persona_owner_identity(self) -> Optional[str]:
+        """Resolve an owner only after shared authentication succeeds."""
+        user_id = getattr(self, "_user_id", None)
+        if user_id:
+            return user_id
+        identity = self._caller_identity()
+        if not identity.legacy and identity.owner_id:
+            return identity.owner_id
+        self._send_problem(403, "persona.not_owned", "Persona access denied")
+        return None
+
+    def _handle_personas_list(self, query: str) -> None:
+        if not self._auth_capabilities_ok():
+            return
+        owner = self._persona_owner_identity()
+        if owner is None:
+            return
+        try:
+            page = persona_page(self.server, owner, query)
+        except PersonaListError as exc:
+            self._send_problem(exc.status, exc.code, "Persona request rejected")
+            return
+        self._send_json(200, page)
 
     def _caller_identity(self) -> CallerIdentity:
         """当前请求的调用方身份；未经鉴权（如 /health）时为空身份。"""
@@ -788,6 +840,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             if _is_moments_path(path):
                 self._handle_moments()
                 return
+            if path == "/v1/personas":
+                self._handle_personas_list(query)
+                return
             if not self._auth_ok():
                 return
             if path == "/v1/capabilities":
@@ -893,6 +948,10 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 return
             if path == "/v1/memories" or path.startswith("/v1/memories/"):
                 handle_memory(self)
+                return
+            if path == "/v1/personas" or path.startswith("/v1/personas/"):
+                if self._auth_ok():
+                    self._send_problem(404, "not_found", "Not Found")
                 return
             if _is_moments_path(path):
                 # 先校验用户身份；鉴权失败已在 _auth_user_ok 里发响应。
@@ -1340,6 +1399,13 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         self.memory_personas = load_personas(
             config.personas_file, server_name=config.matrix_server_name,
             max_message_chars=config.max_message_chars)
+        self.personas_timestamp = iso_utc(service.started_at)
+        if config.personas_file:
+            try:
+                self.personas_timestamp = iso_utc(datetime.fromtimestamp(
+                    os.stat(config.personas_file).st_mtime, timezone.utc))
+            except (OSError, ValueError, OverflowError):
+                pass
         if config.consumer_enabled:
             if self.as_txn_store is None:
                 logging.getLogger(__name__).warning(

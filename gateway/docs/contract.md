@@ -769,7 +769,7 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
   `GATEWAY_MATRIX_SERVER_NAME` → **拒绝启动**（exit 2）。错误消息只报**位置与字段名**，
   **不回显文件内容或任何字段原值**（人设文件可能含部署侧写的密钥）。
 - 房间归属由房间内 `@ai_*` 成员的成员关系推出（`room_members` 回调的返回值会被过滤，
-  只保留本服 `@ai_*`；回调缺失/出错时 fail-closed）；`/v1/personas` 端点以后再做
+  只保留本服 `@ai_*`；回调缺失/出错时 fail-closed）；`GET /v1/personas` 列表已实现，其他 `/personas*` 操作尚未实现（保持 404）
   （不在 v1 PR1–PR3B 范围）。
 
 **③ 消费者形态**
@@ -1072,7 +1072,7 @@ token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，�
 | GET | `/capabilities/{capability_id}` | 单个能力 | App |
 | POST | `/capabilities/{capability_id}/session-tokens` | 签发模块网页一次性 code | App 内置浏览器 |
 | POST | `/capabilities/{capability_id}/session-cookies` | 一次性 code 换 HttpOnly cookie | 模块网页 |
-| GET | `/personas` | 角色列表 | 我的 AI（C2.4） |
+| GET | `/personas` | 已实现：仅 owner 的文件型人设摘要列表（见下文） | 我的 AI（C2.4） |
 | POST | `/personas` | 创建角色 | 简单接入、我的 AI |
 | GET/PATCH/DELETE | `/personas/{persona_id}` | 角色读写 | 我的 AI |
 | GET/PATCH | `/personas/{persona_id}/state` | 心情/需求/主动发言预算 | 我的 AI、群调度 |
@@ -1101,6 +1101,10 @@ token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，�
 | DELETE | `/moments/{moment_id}/comments/{comment_id}` | 删除评论 | App / A2.2 |
 | PUT/DELETE | `/moments/{moment_id}/likes/me` | 点赞与取消点赞 | App / A2.2 |
 | GET | `/moments/{moment_id}/likes` | 点赞列表 | App / A2.2 |
+
+`GET /personas` 返回摘要视图，仅含 `id`（Matrix user_id，与记忆 persona_id 一致）、`owner_id`（owner_user_id）、`display_name`（为空回退 localpart）、`kind=custom`、`status=active`、`revision=1`、`created_at`、`updated_at`、`visibility=private`。时间取启动时文件 mtime（UTC RFC3339 Z），不可得则取网关启动时间，是文件型人设的近似时间。配置及其他扩展字段均省略，无 owner 的人设永不列出。
+
+用户 OpenID / Matrix 用户 Bearer 使用已验证 user_id，调用方凭据使用其 owner_id（注：§1.2.2 的 `owner_id` 目前不得含 `:`，无法写成 Matrix user ID，因此调用方 token 当前只会得到空页；是否放宽格式另行决定）；legacy、空 owner 与 dev 无身份放行返回 403 `persona.not_owned`。`owner_id` 只允许自身，其他合法本服人类用户返回 403；格式非法、非 `GATEWAY_MATRIX_SERVER_NAME` 域或 `@ai_*` 返回 400 `request.invalid`。kind/status 按映射值过滤，其他合法枚举返回空，非法枚举返回 400。按 id 升序，cursor 为最后返回 id 的无填充 base64url keyset 游标；畸形 cursor、非法 limit 返回 400。limit 为 1–100 整数，默认 20。响应 `{items, next_cursor, has_more}`，末页游标为 null。复用启动时人设快照，未配置文件返回空页，与记忆开关无关。仅列表已实现，POST、单项 GET/PATCH/DELETE 及 state 操作尚未实现（保持 404），不发布 `role.personas` capability。
 
 ### 2.0 动态（Moments）接口说明
 
@@ -1675,6 +1679,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.2.0 | 2026-11-13 | [additive] 新增实现 `GET /personas` owner 摘要列表及 keyset 分页；其他人设操作尚未实现。 |
 | 0.2.0 | 2026-11-13 | [B 线 PR3c memory-owner，**新增端点（minor），不改既有字段/状态码**] 新增 owner memory 浏览、删除、固定与显式事实端点，以及 `memory.manage` capability、审计与群组成员脱敏约束。 |
 | 0.1.0 | 2026-11-13 | [B 线 #207 nits，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 抽取事实标为 derived 并与主人事实分别隔离召回；空闲门忽略尚未到期的 defer 事务；永久错误按 scope 退避而非全局阻塞；摘要输入按 6000 tokens 最早分块滚动；纯 Python 向量仅扫 scope 最新 500 条、sqlite-vec 覆盖全 scope；回复 query embedding 先预留预算；memory usage 归属 persona/会话；补独立 embedding 提供方 DM/群聊文本披露，以及可信本地人类指令式档案值永不执行的边界。 |
 | 0.1.0 | 2026-11-13 | [B 线 PR3b memory-idle，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 实现空闲批处理滚动摘要、可信本服人类事实抽取、embedding 与 scope 隔离向量召回；memory-idle-worker 在端口绑定后启动，真人回复优先，内部 memory token 用量照常计入预算而不暴露新 /v1 枚举。新增 summaries/vectors 加法迁移、撤回 dirty 重算及 sqlite-vec 回退；/v1 服务端 token floor 现将 CJK 按约 1 token/字估算（字段/状态无变化）。 |
