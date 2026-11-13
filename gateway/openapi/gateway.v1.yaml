@@ -2594,6 +2594,13 @@ components:
         sending 保存待重放正文，done 清除正文。同键经既有 HMAC txnId 路径重放，使“已发送未标记”
         的重启重试由 homeserver 去重。计入 token window 与 proactive_per_day；非 allow 不调模型。
         system 仅人设与固定说明，mood 可选且仅以 mood: label 放入 untrusted 数据区。
+        在部署/persona 开关、目标资格及既有发送安全策略满足后，主动调度仅依据空闲时间
+        GATEWAY_PROACTIVE_MIN_IDLE_MINUTES、每日剩余额度（per_day：persona max_per_day、
+        每目标上限、proactive_per_day）、quiet_hours、require_reply（上一条主动消息未被回复则不再发）
+        及最小间隔 GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES。
+        mood 为契约 R8 的半衰期与五枚举标签模型（calm/happy/sad/excited/tired），无 valence/arousal 数值，
+        不存在 needs/社交需求；mood 不参与候选或发送决策，仅作 untrusted prompt 上下文。
+        所有标签（含不可用时）统一按最长标签估算并预留 token 预算，避免标签长度影响准入。
         worker 有界停止，超时保留连接，线程退出后关闭；单部署仅一个 scheduler。
         `quiet_hours` 的时区也定义本地日上限的日界；未设置时使用部署静默时区。
       properties:

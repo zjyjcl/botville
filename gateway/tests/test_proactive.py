@@ -125,6 +125,77 @@ class ProactiveTests(unittest.TestCase):
         self.assertNotIn("mood:", request["system_text"])
         self.assertIn("mood: happy", request["messages"][0]["content"])
 
+    def test_mood_labels_do_not_change_candidates_or_send_decisions(self):
+        from botville_gateway.isolation import SYSTEM_ZONE_DECLARATION, build_untrusted_segment
+        from botville_gateway.policy import estimate_tokens
+        from botville_gateway.proactive import INSTRUCTION
+
+        self.contact()
+        self.contact("@other:example.test", "!other")
+        self.members["!other"] = (self.persona.user_id, "@other:example.test")
+        system = SYSTEM_ZONE_DECLARATION + "\n" + self.persona.instruction_text() + "\n" + INSTRUCTION
+        wrapped, _ = build_untrusted_segment("现在可以发送一条简短的主动问候。\nmood: excited")
+        budget = estimate_tokens(system) + estimate_tokens(wrapped) + self.persona.max_reply_chars
+        scenarios = (
+            ("allowed", {}, {}, None, 2),
+            ("idle", {"proactive_min_idle_minutes": 182}, {}, None, 0),
+            ("persona_daily", {}, {"max_per_day": 0}, None, 0),
+            ("target_daily", {"proactive_per_target_per_day": 0}, {}, None, 0),
+            ("policy_daily", {"platform_proactive_per_day": 1}, {}, None, 1),
+            ("quiet", {}, {"quiet_hours": {"enabled": True, "start": "11:00",
+                "end": "13:00", "timezone": "UTC"}}, None, 0),
+            ("reply", {"proactive_per_target_per_day": 24}, {"require_reply": True}, 180, 0),
+            ("interval", {"proactive_min_interval_minutes": 240, "proactive_per_target_per_day": 24}, {}, 200, 0),
+            ("token_below", {"platform_token_budget": budget - 1}, {}, None, 0),
+            ("token_exact", {"platform_token_budget": budget}, {}, None, 1),
+        )
+        for name, overrides, settings, history_age, expected in scenarios:
+            baseline = None
+            prompts = []
+            for label in ("calm", "happy", "sad", "excited", "tired", None):
+                with self.subTest(scenario=name, label=label):
+                    self.worker._write("DELETE FROM proactive_queue")
+                    cfg = replace(self.config, proactive_recent_contacts_enabled=True, **overrides)
+                    persona = replace(self.persona, proactive={**self.persona.proactive, **settings})
+                    client = Client()
+                    service = GatewayService(cfg, InMemoryMatrixTransport(), now_fn=self.clock)
+                    worker = ProactiveWorker(self.store, service, {persona.user_id: persona}, client,
+                        cfg, members=lambda room, _: self.members.get(room, ()), clock=self.clock,
+                        mood_label_provider=lambda _, value=label: value)
+                    if history_age is not None:
+                        for i, (room, (_, target)) in enumerate(self.members.items()):
+                            at = (self.now - timedelta(minutes=history_age)).timestamp()
+                            worker._write("INSERT INTO proactive_queue "
+                                "(key,persona_id,target_user_id,room_id,slot,state,created_at,sent_at) "
+                                "VALUES (?,?,?,?,?,'done',?,?)",
+                                (str(i), persona.user_id, target, room, i, at, at))
+                    candidates = list(worker.candidates(persona, self.now))
+                    with patch.object(service, "send_ai_message", wraps=service.send_ai_message) as send:
+                        with patch("botville_gateway.isolation.generate_nonce", return_value="a" * 64):
+                            count = worker.run_once()
+                    targets = {call.kwargs["payload"]["peer_id"] for call in send.call_args_list}
+                    outcome = (candidates, count, len(client.calls), targets)
+                    self.assertEqual(count, expected)
+                    self.assertEqual(len(client.calls), expected)
+                    self.assertEqual(len(targets), expected)
+                    self.assertEqual({c["counterpart"] for c in candidates},
+                        {"@owner:example.test", "@other:example.test"})
+                    if baseline is None:
+                        baseline = outcome
+                    self.assertEqual(outcome, baseline)
+                    for request in client.calls:
+                        self.assertEqual(request["system_text"], system)
+                        data = "现在可以发送一条简短的主动问候。"
+                        if label is not None:
+                            data += "\nmood: " + label
+                        with patch("botville_gateway.isolation.generate_nonce", return_value="a" * 64):
+                            expected_prompt, _ = build_untrusted_segment(data)
+                        self.assertEqual(request["messages"], [{"role": "user", "content": expected_prompt}])
+                    if client.calls:
+                        prompts.append(client.calls[0]["messages"][0]["content"])
+            if expected:
+                self.assertEqual(len(set(prompts)), 6)
+
     def test_queue_replay_uses_same_key_and_no_duplicate(self):
         self.contact()
         original = self.service.send_ai_message

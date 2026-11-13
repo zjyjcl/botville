@@ -192,13 +192,16 @@ class ProactiveWorker:
             return 0
         system = SYSTEM_ZONE_DECLARATION + '\n' + persona.instruction_text() + '\n' + INSTRUCTION
         data = '现在可以发送一条简短的主动问候。'
+        # Reserve the same worst-case prompt cost for every label, including None.
+        # Mood is context only and must not change policy budget admission.
+        budget_wrapped, _ = build_untrusted_segment(data + '\nmood: ' + max(LABELS, key=len))
         if self.mood_label_provider is not None:
             label = self.mood_label_provider(persona.user_id)
             if isinstance(label, str) and label in LABELS:
                 data += '\nmood: ' + label
         wrapped, _ = build_untrusted_segment(data)
         messages = [{'role': 'user', 'content': wrapped}]
-        estimate = (estimate_tokens(system) + estimate_tokens(wrapped) + persona.max_reply_chars)
+        estimate = (estimate_tokens(system) + estimate_tokens(budget_wrapped) + persona.max_reply_chars)
         if row and row['body'] is not None:
             estimate = row['tokens']
         reservation = self.service.reserve_proactive(

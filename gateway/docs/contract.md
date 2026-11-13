@@ -794,6 +794,14 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 hours 复用静默时段逻辑。主动发言不创建通知卡片。启用部署开关时必须显式配置持久
 `GATEWAY_HMAC_SECRET`；dev 的每进程随机密钥会改变重启后的 txnId，因此拒绝用于该功能。
 
+在部署/persona 开关、目标资格及既有发送安全策略满足后，主动调度仅依据：空闲时间
+`GATEWAY_PROACTIVE_MIN_IDLE_MINUTES`、每日剩余额度（per_day：persona `max_per_day`、
+每目标上限及 policy `proactive_per_day`）、`quiet_hours`、`require_reply`（上一条主动消息未被回复则不再发）
+和最小间隔 `GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES`。
+mood 采用契约 R8 的半衰期与五枚举标签模型（calm/happy/sad/excited/tired），无 valence/arousal 数值，
+不存在 needs/社交需求；mood 不参与候选选择或发/不发决策，只作为 untrusted prompt 上下文。
+为避免标签长度间接影响预算准入，所有标签（含不可用时）统一按最长标签估算并预留 token 预算。
+
 `quiet_hours.timezone` 同时定义 persona `max_per_day` 和每目标日上限的日界；未给 quiet_hours 时回退
 部署静默时区。`require_reply=true`（默认）时，一次主动发言后必须等该目标发来新的 DM 人类消息；否则
 该 persona 不再向该目标主动发言。未知、过期或因 memory 保留清理而没有可用 DM 记录的目标都跳过，
