@@ -110,7 +110,7 @@ final class MemoryClientTests: XCTestCase {
             "这条记忆已不存在。")
         XCTAssertEqual(
             GatewayClientError.problem(status: 403, code: "persona.not_owned").errorDescription,
-            "你无权管理该 AI 的记忆。")
+            "没有权限查看")
         XCTAssertEqual(
             GatewayClientError.problem(status: 429, code: "rate_limited.transport")
                 .errorDescription,
@@ -325,7 +325,7 @@ final class MemoryClientTests: XCTestCase {
         }
     }
 
-    // Pinned #215 schema/example: 1d4fc06a41870420ae9cbdc2b01ad0bde421e1ab.
+    // Pinned #218 schema/example: 391a248ee004fda5b57761bc607c662453af7f40.
     private func personaPageData(id: String = "@ai_demo:example.invalid", next: String? = nil,
                                  empty: Bool = false) throws -> Data {
         let resources = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
@@ -364,7 +364,7 @@ final class MemoryClientTests: XCTestCase {
             let list = try client.request(["personas"], query: [URLQueryItem(name: "cursor", value: "next")])
             XCTAssertTrue(try client.isOpenIDRequest(list))
             XCTAssertNil(list.value(forHTTPHeaderField: "Authorization"))
-            for segments in [["personasx"], ["personas", "id"], ["personas/id"], ["personas?x"], ["other", "personas"], ["cards"]] {
+            for segments in [["personasx"], ["personas", "id", "state"], ["personas/id"], ["personas?x"], ["other", "personas"], ["cards"]] {
                 let request = try client.request(segments, query: [URLQueryItem(name: "path", value: "/v1/personas")])
                 XCTAssertFalse(try client.isOpenIDRequest(request))
                 XCTAssertTrue(request.value(forHTTPHeaderField: "Authorization")?.hasPrefix("Bearer ") == true)
@@ -420,7 +420,7 @@ final class MemoryClientTests: XCTestCase {
         XCTAssertEqual(model.personas.count, 1)
         XCTAssertFalse(model.isEmpty)
         await model.load()
-        XCTAssertEqual(model.errorMessage, "当前身份无权查看我的 AI，请重新登录后重试。")
+        XCTAssertEqual(model.errorMessage, "没有权限查看")
         XCTAssertTrue(model.personas.isEmpty)
         XCTAssertFalse(model.isEmpty, "permission denial must remain an error, not a successful empty list")
         XCTAssertEqual(recorder.requests.count, 2, "403 must not refresh/retry")
@@ -430,7 +430,7 @@ final class MemoryClientTests: XCTestCase {
         XCTAssertFalse(model.isLoading)
     }
 
-    func testMockPersonaMatchesNineFieldSummaryAndMemoryIDs() async throws {
+    func testMockPersonaMatchesTenFieldSummaryAndMemoryIDs() async throws {
         let client = MockGatewayClient()
         let personas = try await client.personas()
         let persona = try XCTUnwrap(personas.first)
@@ -438,7 +438,7 @@ final class MemoryClientTests: XCTestCase {
         encoder.dateEncodingStrategy = .iso8601
         let encoded = try encoder.encode(persona)
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
-        XCTAssertEqual(Set(object.keys), ["id", "owner_id", "display_name", "kind", "status", "revision", "created_at", "updated_at", "visibility"])
+        XCTAssertEqual(Set(object.keys), ["id", "owner_id", "display_name", "bio", "kind", "status", "revision", "created_at", "updated_at", "visibility"])
         XCTAssertEqual(persona.kind, "custom")
         XCTAssertEqual(persona.status, "active")
         XCTAssertEqual(persona.revision, 1)
@@ -446,6 +446,165 @@ final class MemoryClientTests: XCTestCase {
         let page = try await client.memories(personaID: persona.id)
         XCTAssertFalse(page.items.isEmpty)
         XCTAssertTrue(page.items.allSatisfy { $0.personaID == persona.id })
+    }
+
+    private func personaObject(bio: Any = NSNull()) throws -> [String: Any] {
+        let page = try XCTUnwrap(JSONSerialization.jsonObject(with: personaPageData()) as? [String: Any])
+        var item = try XCTUnwrap((page["items"] as? [[String: Any]])?.first)
+        item["bio"] = bio
+        return item
+    }
+
+    func testPersonaBioNullBlankAndValueMapToSignature() throws {
+        for (bio, expected): (Any, String?) in [(NSNull(), nil), (" \n\t ", nil), ("  你好\n世界  ", "你好\n世界")] {
+            let data = try JSONSerialization.data(withJSONObject: personaObject(bio: bio))
+            let summary = try GatewayCoding.decoder.decode(MemoryPersona.self, from: data)
+            XCTAssertEqual(summary.aiProfile(localServerName: "example.invalid").signature, expected)
+            let detail = try GatewayCoding.decoder.decode(PersonaDetail.self, from: data)
+            guard case .owner(let owner) = detail else { return XCTFail("expected owner summary") }
+            XCTAssertEqual(owner, summary)
+        }
+    }
+
+    func testPublicDetailDecodesAbsentNullKnownAndUnknownMoods() throws {
+        for (mood, expected): (Any?, PersonaMood?) in [
+            (nil, nil), (NSNull(), nil), ("future-mood", nil),
+            ("neutral", .neutral), ("happy", .happy), ("sad", .sad),
+            ("excited", .excited), ("calm", .calm), ("anxious", .anxious),
+        ] {
+            var object: [String: Any] = ["id": "@ai_demo:example.invalid", "display_name": "公开名字",
+                                       "bio": NSNull(), "status": "active"]
+            object["mood"] = mood
+            let detail = try GatewayCoding.decoder.decode(PersonaDetail.self,
+                from: JSONSerialization.data(withJSONObject: object))
+            guard case .publicView(let view) = detail else { return XCTFail("expected public view") }
+            XCTAssertEqual(view.mood, expected)
+            XCTAssertNil(view.bio)
+            XCTAssertEqual(view.displayName, "公开名字")
+        }
+    }
+
+    func testMalformedOwnerDoesNotFallBackToPublicView() throws {
+        var object = try personaObject()
+        object.removeValue(forKey: "revision")
+        XCTAssertThrowsError(try GatewayCoding.decoder.decode(PersonaDetail.self,
+            from: JSONSerialization.data(withJSONObject: object)))
+        object["owner_id"] = NSNull()
+        XCTAssertThrowsError(try GatewayCoding.decoder.decode(PersonaDetail.self,
+            from: JSONSerialization.data(withJSONObject: object)))
+    }
+
+    func testDetailGETMapsBothViewsToProfileAndKeepsAvatar() async throws {
+        let publicView: [String: Any] = ["id": "@ai_demo:example.invalid", "display_name": "公开名字",
+            "bio": "  公开签名  ", "status": "active", "mood": "future"]
+        for object in [try personaObject(bio: "公开签名"), publicView] {
+            let (client, recorder, source) = try self.client(bodies: [JSONSerialization.data(withJSONObject: object)])
+            let initial = AIProfile(userID: "@ai_demo:example.invalid", displayName: "Matrix 名字",
+                avatarData: Data([1, 2]), signature: nil, localServerName: "example.invalid")
+            let result = try await initial.fetchingDetails(using: client)
+            XCTAssertEqual(result.signature, "公开签名")
+            XCTAssertEqual(result.displayName, object["display_name"] as? String)
+            XCTAssertEqual(result.avatarData, initial.avatarData)
+            XCTAssertEqual(recorder.requests.count, 1)
+            let request = try XCTUnwrap(recorder.requests.first)
+            XCTAssertEqual(request.httpMethod, "GET")
+            XCTAssertEqual(URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?.percentEncodedPath,
+                           "/v1/personas/%40ai_demo%3Aexample.invalid")
+            XCTAssertTrue(request.value(forHTTPHeaderField: "Authorization")?.hasPrefix("MatrixOpenID ") == true)
+            let count = await source.count
+            XCTAssertEqual(count, 1)
+        }
+    }
+
+    func testDetail404DisplaysMissingAndCrossServerNeverRequests() async throws {
+        let (client, recorder, source) = try self.client(statuses: [404],
+            bodies: [Data(#"{"code":"persona.not_found"}"#.utf8)])
+        let local = AIProfile(userID: "@ai_demo:example.invalid", displayName: "Demo",
+            avatarData: nil, signature: nil, localServerName: "example.invalid")
+        do { _ = try await local.fetchingDetails(using: client); XCTFail("missing") }
+        catch { XCTAssertEqual((error as? GatewayClientError)?.errorDescription, "不存在或不可见") }
+        for server in ["elsewhere.invalid", "sub.example.invalid", "example.invalid:8448", "", nil] {
+            let crossServer = AIProfile(userID: local.userID, displayName: "Demo",
+                avatarData: nil, signature: nil, localServerName: server)
+            do { _ = try await crossServer.fetchingDetails(using: client); XCTFail("missing") }
+            catch { XCTAssertEqual((error as? GatewayClientError)?.errorDescription, "不存在或不可见") }
+        }
+        XCTAssertEqual(recorder.requests.count, 1, "cross-server and unknown identities never issue details")
+        let count = await source.count
+        XCTAssertEqual(count, 1)
+    }
+
+    func testPersonaDetailRoutingAcceptsOnlyExactGETResource() throws {
+        for base in ["https://gateway.example.invalid", "https://gateway.example.invalid/prefix/v1/",
+                     "https://gateway.example.invalid/%E4%B8%AD"] {
+            let client = try HTTPGatewayClient(baseURL: base, token: "synthetic-site")
+            for id in ["@ai_demo:example.invalid", "中文 /?%#", ".", ".."] {
+                let request = try client.request(["personas", id], query: [URLQueryItem(name: "next", value: "/other/path")])
+                XCTAssertTrue(try client.isOpenIDRequest(request))
+                XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+                let path = try XCTUnwrap(URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?.percentEncodedPath)
+                XCTAssertEqual(String(try XCTUnwrap(path.split(separator: "/").last)).removingPercentEncoding, id)
+            }
+            XCTAssertThrowsError(try client.request(["personas", ""]))
+            let root = try XCTUnwrap(client.request(["personas"]).url?.absoluteString)
+            for suffix in ["/", "//id", "/id/", "/id/state", "x/id", "%2Fid"] {
+                let request = URLRequest(url: try XCTUnwrap(URL(string: root + suffix + "?path=/personas/id")))
+                XCTAssertFalse(try client.isOpenIDRequest(request), suffix)
+            }
+            for method in ["POST", "PATCH", "PUT", "DELETE", "HEAD"] {
+                let request = try client.request(["personas", "id"], method: method)
+                XCTAssertFalse(try client.isOpenIDRequest(request))
+                XCTAssertTrue(request.value(forHTTPHeaderField: "Authorization")?.hasPrefix("Bearer ") == true)
+            }
+        }
+    }
+
+    @MainActor
+    func testPersonaList401400And403WithoutProblemAreErrorsNotEmpty() async throws {
+        for (status, body, message) in [
+            (401, Data(#"{"code":"auth.unauthorized"}"#.utf8), "会话已失效，请重新登录。"),
+            (400, Data(#"{"code":"request.invalid"}"#.utf8), "网关请求失败，请稍后重试。"),
+            (403, Data(), "没有权限查看"),
+        ] {
+            let (client, recorder, _) = try self.client(statuses: [status, 200],
+                bodies: [body, try personaPageData(empty: true)])
+            let model = PersonaListModel(client: client)
+            XCTAssertFalse(model.isEmpty)
+            XCTAssertFalse(model.hasLoaded)
+            XCTAssertTrue(model.showsLoading)
+            await model.load()
+            XCTAssertEqual(model.errorMessage, message)
+            XCTAssertFalse(model.isEmpty)
+            XCTAssertFalse(model.hasLoaded)
+            XCTAssertFalse(model.showsLoading)
+            XCTAssertEqual(recorder.requests.count, 1)
+            await model.load()
+            XCTAssertNil(model.errorMessage)
+            XCTAssertTrue(model.hasLoaded)
+            XCTAssertTrue(model.isEmpty)
+        }
+    }
+
+    @MainActor
+    func testPersonaListShowsLoadingUntilFirstSuccessAndDuringReload() async throws {
+        let (client, recorder, _) = try self.client(bodies: [personaPageData(empty: true), personaPageData(empty: true)])
+        let model = PersonaListModel(client: client)
+        for round in 1...2 {
+            let started = expectation(description: "request started")
+            recorder.holdNextResponse(started: { started.fulfill() })
+            let task = Task { await model.load() }
+            await fulfillment(of: [started], timeout: 3)
+            XCTAssertTrue(model.isLoading)
+            XCTAssertTrue(model.showsLoading)
+            XCTAssertFalse(model.isEmpty)
+            await model.load() // A second load must not race the in-flight request.
+            XCTAssertEqual(recorder.requests.count, round)
+            recorder.releaseResponse()
+            await task.value
+            XCTAssertTrue(model.hasLoaded)
+            XCTAssertFalse(model.showsLoading)
+            XCTAssertTrue(model.isEmpty)
+        }
     }
 
     func testContractMemoryExamplesDecode() throws {
@@ -494,6 +653,19 @@ private final class MemoryRecorder: @unchecked Sendable {
         defer { lock.unlock() }
         return captured
     }
+    private var started: (() -> Void)?
+    private var held: (MemoryURLProtocol, Int, Data)?
+    func holdNextResponse(started: @escaping () -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        self.started = started
+    }
+    func releaseResponse() {
+        lock.lock()
+        let response = held
+        held = nil
+        lock.unlock()
+        if let (loader, status, body) = response { loader.complete(status, body: body) }
+    }
     func receive(_ loader: MemoryURLProtocol) {
         lock.lock()
         var request = loader.request
@@ -512,8 +684,15 @@ private final class MemoryRecorder: @unchecked Sendable {
         captured.append(request)
         let status = statuses.isEmpty ? 200 : statuses.removeFirst()
         let body = bodies.isEmpty ? Data("{}".utf8) : bodies.removeFirst()
-        lock.unlock()
-        loader.complete(status, body: body)
+        if let started {
+            self.started = nil
+            held = (loader, status, body)
+            lock.unlock()
+            started()
+        } else {
+            lock.unlock()
+            loader.complete(status, body: body)
+        }
     }
 }
 private final class MemoryURLProtocol: URLProtocol {

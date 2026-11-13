@@ -45,6 +45,8 @@ enum SDKEncryptionState {
         policy: AIParticipantPolicy,
         membersAreComplete: Bool = false
     ) -> AIParticipantStatus {
+        // Safety counts join + invite: an invited AI must block encryption before
+        // it joins. Profile/active-member display counts join only; do not unify them.
         let active = members.filter { member in
             switch member.membership {
             case .join, .invite:

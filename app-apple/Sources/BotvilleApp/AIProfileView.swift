@@ -17,6 +17,11 @@ struct AIProfileView: View {
     @ObservedObject var service: MatrixService
     let profile: AIProfile
     @State private var showOwnerDisclosure = false
+    @State private var detailedProfile: AIProfile?
+    @State private var detailError: String?
+    @State private var isLoading = true
+
+    private var displayedProfile: AIProfile { detailedProfile ?? profile }
 
     var body: some View {
         List {
@@ -27,7 +32,12 @@ struct AIProfileView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 16))
                         .accessibilityHidden(true)
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(profile.displayName).font(.title2.weight(.semibold))
+                        Text(displayedProfile.displayName).font(.title2.weight(.semibold))
+                        if let signature = displayedProfile.signature {
+                            Text(signature)
+                                .font(.subheadline).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                         Text("AI")
                             .font(.caption.weight(.semibold))
                             .padding(.horizontal, 9).padding(.vertical, 3)
@@ -38,8 +48,13 @@ struct AIProfileView: View {
                 }
                 .padding(.vertical, 12)
             }
-            if let signature = profile.signature, !signature.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                Section("签名") { Text(signature) }
+            if isLoading {
+                ProgressView("正在加载…")
+            } else if let detailError {
+                Section {
+                    Text(detailError).foregroundStyle(.secondary)
+                    Button("重试") { Task { await loadDetails() } }
+                }
             }
             if showOwnerDisclosure {
                 Section {
@@ -52,10 +67,30 @@ struct AIProfileView: View {
         .tint(aiProfileAccent)
         .task(id: service.userID) {
             showOwnerDisclosure = false
+            detailedProfile = nil
+            await loadDetails()
+            guard !Task.isCancelled else { return }
             let disclosure = await service.aiProfileDisclosure(aiUserID: profile.userID)
             guard !Task.isCancelled else { return }
             showOwnerDisclosure = disclosure
         }
+    }
+
+    private func loadDetails() async {
+        let userID = service.userID
+        isLoading = true
+        detailError = nil
+        do {
+            let result = try await service.aiProfileDetails(profile)
+            guard !Task.isCancelled, userID == service.userID else { return }
+            detailedProfile = result
+        } catch {
+            guard !Task.isCancelled, userID == service.userID else { return }
+            detailedProfile = nil
+            detailError = (error as? GatewayClientError)?.errorDescription
+                ?? "暂时无法加载 AI 资料，请稍后重试。"
+        }
+        isLoading = false
     }
 
     @ViewBuilder
@@ -65,7 +100,7 @@ struct AIProfileView: View {
         } else {
             ZStack {
                 aiProfileAccent.opacity(0.12)
-                Text(String(profile.displayName.prefix(1)).uppercased())
+                Text(String(displayedProfile.displayName.prefix(1)).uppercased())
                     .font(.largeTitle.weight(.medium)).foregroundStyle(aiProfileAccent)
             }
         }

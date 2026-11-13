@@ -19,7 +19,7 @@ struct MyAIListView: View {
                 ContentUnavailableView(
                     "加载失败", systemImage: "exclamationmark.triangle", description: Text(message))
                 Button("重试") { Task { await model.load() } }
-            } else if model.isLoading && model.personas.isEmpty {
+            } else if model.showsLoading {
                 HStack {
                     Spacer()
                     ProgressView("正在加载…")
@@ -173,6 +173,9 @@ private struct PersonaMemoryView: View {
     var body: some View {
         List {
             Section {
+                if let signature = persona.aiProfile(localServerName: nil).signature {
+                    Text(signature).font(.subheadline).foregroundStyle(.secondary)
+                }
                 Label(MemoryPresentationPolicy.ownerExplanationText, systemImage: "info.circle")
                     .font(.footnote).foregroundStyle(.secondary)
             }

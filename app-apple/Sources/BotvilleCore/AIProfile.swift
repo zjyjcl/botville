@@ -9,7 +9,7 @@ public struct AIProfile: Equatable, Sendable {
     public let userID: String
     public let displayName: String
     public let avatarData: Data?
-    /// The current Matrix SDK profile has no bio or signature field.
+    /// Gateway persona bio, trimmed for presentation; absent or blank is hidden.
     public let signature: String?
     /// The signed-in account's Matrix server name, used for disclosure policy.
     public let localServerName: String?
@@ -18,8 +18,24 @@ public struct AIProfile: Equatable, Sendable {
         self.userID = userID
         self.displayName = displayName
         self.avatarData = avatarData
-        self.signature = signature
+        let trimmed = signature?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.signature = trimmed?.isEmpty == false ? trimmed : nil
         self.localServerName = localServerName
+    }
+
+    /// The local gateway cannot resolve identities on another Matrix server.
+    /// Check this before even requesting a detail, including unknown local names.
+    public func fetchingDetails(using client: (any GatewayClient)?) async throws -> AIProfile {
+        guard let localServerName, !localServerName.isEmpty,
+              MemoryPresentationPolicy.matrixServerName(in: userID) == localServerName else {
+            throw GatewayClientError.problem(status: 404, code: "persona.not_found")
+        }
+        guard let client else { throw GatewayClientError.invalidResponse }
+        let detail = try await client.persona(id: userID)
+        try Task.checkCancellation()
+        guard detail.id == userID else { throw GatewayClientError.invalidResponse }
+        return AIProfile(userID: userID, displayName: detail.displayName, avatarData: avatarData,
+                         signature: detail.bio, localServerName: localServerName)
     }
 }
 
@@ -49,7 +65,8 @@ public enum AIProfileEligibility {
         snapshotComplete: Bool = true,
         policy: AIParticipantPolicy
     ) -> String? {
-        // Invites are not active participants; only joined members count.
+        // Profile display counts joined members only. Encryption safety instead
+        // includes invites conservatively, to block encryption before an AI joins.
         let members = members.filter(\.isJoined)
         guard isDirect, snapshotComplete, let localUserID, members.count == 2,
               members.allSatisfy(\.isActive) else { return nil }
