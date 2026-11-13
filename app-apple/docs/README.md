@@ -10,3 +10,4 @@
 - [会话安全与 soft logout](session-security.md)：固定 SDK refresh 能力评估及保留设备数据的密码重新认证。
 - [加密策略（C2.6）](encryption-policy.md)：默认选择、二次确认、AI 命名空间配置、状态标识及设备验证/备份提示。
 - [拉群与群管理（C2.7）](group-rooms.md)：owner 群列表与设置、多 AI 拉群、Matrix 聊天信息、错误与契约缺口。
+- [视图测试结构](view-testing.md)：Core view state、类型化接线守卫、渲染层边界与后续方案。

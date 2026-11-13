@@ -53,7 +53,7 @@ GET 保持现有有限退避重试；三个新 PATCH 均不携带 Idempotency-Ke
 6. 关闭时 PATCH 仅 muted / leave：隐藏双向切换，控制器也拒绝 mention_only；409 冲突刷新列表及 persona。
 7. 外部运行时 POST /messages 不受群开关限制：App 未引入该调用或额外禁令。
 
-#234 审查 nit：a 合成 manifest 使用注明用途的假版本；b 心情不可用文案统一句号；c info.version 解析及测试改为块内直接子级、可变缩进、引号可选且严格唯一；d 未新增视图层测试（现有测试目标只依赖 Core，现有心情展示模型测试和 SwiftUI 构建不能代替视图接线测试）；e mood.unavailable 的 OpenAPI 枚举归 B 线，本轮不修改 gateway/。
+#234 审查 nit：a 合成 manifest 使用注明用途的假版本；b 心情不可用文案统一句号；c info.version 解析及测试改为块内直接子级、可变缩进、引号可选且严格唯一；d 群管理、新建会话和心情的展示决策现由 view state 测试覆盖，并有展示组件初始化类型守卫；渲染层未测（见 [视图测试结构](view-testing.md)）；e mood.unavailable 的 OpenAPI 枚举归 B 线，本轮不修改 gateway/。
 
 ## 需要总管拿主意
 

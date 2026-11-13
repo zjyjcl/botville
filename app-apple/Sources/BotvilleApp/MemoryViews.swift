@@ -534,9 +534,9 @@ private struct PersonaGroupRoomsView: View {
 
     var body: some View {
         List {
-            if !model.groupsEnabled {
+            if let notice = GroupRoomListViewState(groupsEnabled: model.groupsEnabled).disabledNotice {
                 Section {
-                    Label("群聊功能已关闭，AI 不会在群里发言", systemImage: "info.circle")
+                    Label(notice, systemImage: "info.circle")
                         .foregroundStyle(.secondary)
                 }
             }
@@ -563,12 +563,14 @@ private struct PersonaGroupRoomsView: View {
             } else {
                 Section("群聊") {
                     ForEach(Array(model.rooms.enumerated()), id: \.element.roomRef) { index, room in
-                        GroupRoomRow(room: room, ordinal: index + 1,
-                                     canEnableMentionOnly: model.canEnableMentionOnly,
-                                     isSubmitting: model.isUpdating || model.isLoading || model.isLoadingMore,
-                                     onModeChanged: { mode in
-                                         Task { await model.setMode(roomRef: room.roomRef, mode: mode) }
-                                     }, onLeave: { roomToLeave = room })
+                        GroupRoomRow(
+                            state: GroupRoomRowViewState(
+                                room: room, ordinal: index + 1, groupsEnabled: model.groupsEnabled,
+                                canEnableMentionOnly: model.canEnableMentionOnly,
+                                isSubmitting: model.isUpdating || model.isLoading || model.isLoadingMore),
+                            onModeChanged: { mode in
+                                Task { await model.setMode(roomRef: room.roomRef, mode: mode) }
+                            }, onLeave: { roomToLeave = room })
                     }
                 }
                 if model.canLoadMore {
@@ -597,68 +599,6 @@ private struct PersonaGroupRoomsView: View {
         } message: {
             Text("退出后不可撤销，AI 不会再在这个群发言，也不会自动重新加入。")
         }
-    }
-}
-
-private struct GroupRoomRow: View {
-    let room: GroupRoom
-    let ordinal: Int
-    let canEnableMentionOnly: Bool
-    let isSubmitting: Bool
-    let onModeChanged: (GroupRoomMode) -> Void
-    let onLeave: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("群聊 \(ordinal)").font(.headline)
-                Spacer()
-                Text(statusLabel).font(.caption.weight(.medium)).foregroundStyle(.secondary)
-            }
-            if let joinedAt = room.joinedAt {
-                Text("加入于 \(joinedAt.formatted(date: .abbreviated, time: .shortened))")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            if isKnownMode == false {
-                Text("模式未知")
-                    .font(.footnote).foregroundStyle(.secondary)
-            } else if GroupRoomPresentation.canChangeMode(room) {
-                if canEnableMentionOnly {
-                    Toggle("安静模式", isOn: Binding(
-                        get: { room.mode == .muted },
-                        set: { onModeChanged($0 ? .muted : .mentionOnly) }
-                    ))
-                    .disabled(isSubmitting)
-                    Text("开启后被 @ 也不回复，仍会记住群里的内容。")
-                        .font(.footnote).foregroundStyle(.secondary)
-                    if room.mode == .mentionOnly {
-                        Text("关闭后，被 @ 或被回复时才会回复。")
-                            .font(.footnote).foregroundStyle(.secondary)
-                    }
-                } else if room.mode == .muted {
-                    Text("已设为安静").font(.footnote).foregroundStyle(.secondary)
-                } else {
-                    Button("设为安静") { onModeChanged(.muted) }
-                        .disabled(isSubmitting)
-                }
-                Button("退出群聊", role: .destructive, action: onLeave)
-                    .disabled(isSubmitting)
-            }
-            if room.state == .left, room.leavePending == true {
-                Text("正在同步")
-                    .font(.footnote).foregroundStyle(.secondary)
-            }
-        }
-        .padding(.vertical, 3)
-    }
-
-    private var statusLabel: String {
-        GroupRoomPresentation.label(room)
-    }
-
-    private var isKnownMode: Bool {
-        if case .unknown = room.mode { return false }
-        return true
     }
 }
 
