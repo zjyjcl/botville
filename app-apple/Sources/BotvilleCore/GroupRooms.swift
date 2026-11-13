@@ -169,9 +169,12 @@ public final class PersonaGroupRoomsModel: ObservableObject {
     /// next loadMore restarts from the first page instead of an old cursor.
     /// The room list and persona settings refresh independently; each flag reports
     /// only its own request so a settings failure never hides a fresh room page.
+    /// `settingsError` is the settings error captured by this reload, so the
+    /// combined conflict message never needs its own fallback text.
     struct ReloadOutcome: Equatable {
         var roomsRefreshed = false
-        var settingsRefreshed = false
+        var settingsError: String?
+        var settingsRefreshed: Bool { settingsError == nil }
     }
 
     static let conflictRefreshedMessage = "群状态已变化，已刷新"
@@ -193,7 +196,7 @@ public final class PersonaGroupRoomsModel: ObservableObject {
         defer { if requestGeneration == generation { isLoading = false } }
         await settings.refresh()
         guard !Task.isCancelled, requestGeneration == generation else { return ReloadOutcome() }
-        var outcome = ReloadOutcome(settingsRefreshed: settings.errorMessage == nil)
+        var outcome = ReloadOutcome(settingsError: settings.errorMessage)
         errorMessage = settings.errorMessage
         do {
             let page = try await client.groupRooms(
@@ -297,11 +300,10 @@ public final class PersonaGroupRoomsModel: ObservableObject {
     /// mention_only stays unavailable until settings load. Rooms failed: keep reload's error.
     private func reportConflictRefresh(_ outcome: ReloadOutcome) {
         guard outcome.roomsRefreshed else { return }
-        if outcome.settingsRefreshed {
-            errorMessage = Self.conflictRefreshedMessage
-        } else {
-            let detail = settings.errorMessage ?? "网关请求失败，请稍后重试。"
+        if let detail = outcome.settingsError {
             errorMessage = "\(Self.conflictRefreshedMessage)；群设置未能刷新：\(detail)"
+        } else {
+            errorMessage = Self.conflictRefreshedMessage
         }
     }
 

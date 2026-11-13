@@ -275,7 +275,11 @@ final class MatrixServiceLifecycleTests: XCTestCase {
     }
 
     func testAuthDelegatePreservesSoftLogoutFlag() async throws {
-        for testCase in [(isSoftLogout: true, retainsStore: true), (isSoftLogout: false, retainsStore: false)] {
+        for testCase in [
+            (isSoftLogout: true, retainsStore: true,
+             expectedError: "会话需要重新输入密码；将使用当前设备 ID 重新登录，已加密的本地数据会保留。"),
+            (isSoftLogout: false, retainsStore: false, expectedError: "会话已失效，请重新登录。"),
+        ] {
             let temporary = try makeTemporaryDirectory()
             defer { try? FileManager.default.removeItem(at: temporary) }
             let saved = testCredentials(userID: "@delegate-\(testCase.isSoftLogout):matrix.test")
@@ -295,7 +299,9 @@ final class MatrixServiceLifecycleTests: XCTestCase {
             let detached = expectation(description: "session no longer visible")
             let completed = expectation(description: "auth error cleanup completed")
             let visibility = service.$isLoggedIn.dropFirst().filter { !$0 }.sink { _ in detached.fulfill() }
-            let completion = service.$sessionError.compactMap { $0 }.sink { _ in completed.fulfill() }
+            // Only the error published by this auth-error path counts as completion.
+            let completion = service.$sessionError.filter { $0 == testCase.expectedError }
+                .sink { _ in completed.fulfill() }
             defer { visibility.cancel(); completion.cancel() }
             client.emitAuthError(isSoftLogout: testCase.isSoftLogout)
             await fulfillment(of: [detached], timeout: 0.5)
@@ -308,6 +314,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
             client.releaseBlockedSync()
             await fulfillment(of: [completed], timeout: 0.5)
             XCTAssertFalse(service.isLoggedIn)
+            XCTAssertEqual(service.sessionError, testCase.expectedError)
             XCTAssertEqual(service.requiresPasswordReauthentication, testCase.isSoftLogout)
 
             if testCase.retainsStore {
