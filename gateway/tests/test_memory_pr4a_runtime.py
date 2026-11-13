@@ -9,10 +9,11 @@ import threading
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'src'))
 
+from botville_gateway.http_server import GatewayServer
 from botville_gateway.memory.store import MemoryStore
 from botville_gateway.memory.vector import PythonVectorStore, SqliteVecStore, VectorRecall
 from botville_gateway.memory.worker import IdleSignal, MemoryIdleWorker
@@ -56,6 +57,14 @@ class VectorRecallRuntimeTests(unittest.TestCase):
         self.assertEqual({tuple(call['query_vec']) for call in store.calls},
                          {(marker, 0) for marker in range(20)})
 
+    def test_recall_missing_visibility_defaults_to_dm_only(self):
+        for kind in ('dm', 'group'):
+            row = dict(persona_id='p', scope_kind=kind, scope_key='u', text='fixture')
+            store = Mock()
+            store.search.return_value = [row]
+            result = VectorRecall(store, [1]).recall(persona_id='p', scope_kind=kind, scope_key='u')
+            self.assertEqual(result[0]['visibility'], 'dm_only')
+
     def test_recall_discards_every_scope_mismatch_and_keeps_row_visibility(self):
         class Store:
             def search(self, **kwargs):
@@ -91,6 +100,22 @@ class VectorStoreVisibilityRuntimeTests(unittest.TestCase):
                                    query_vec=[1, 0], model='m', dim=2)
         self.assertEqual(rows[0]['visibility'], 'stored_visibility')
 
+    def test_sqlite_vec_missing_visibility_and_portable_fallback(self):
+        native = object.__new__(SqliteVecStore)
+        native.store, native.scan_limit = self.store, 500
+        # Without the extension function the native query must use portable search.
+        rows = native.search(persona_id='p', scope_kind='dm', scope_key='u', query_vec=[1, 0])
+        self.assertEqual(rows[0]['visibility'], 'stored_visibility')
+        row = dict(item_text='fixture', summary_text=None, item_trust='trusted',
+                   summary_trust=None, item_created_at='2026', summary_updated_at=None,
+                   created_at='2026', distance=0, scope_kind='group')
+        fake_store = SimpleNamespace(_lock=threading.Lock(), _db=Mock())
+        fake_store._db.execute.return_value.fetchall.return_value = [row]
+        native.store = fake_store
+        with patch.object(PythonVectorStore, 'search', side_effect=AssertionError('unexpected fallback')):
+            rows = native.search(persona_id='p', scope_kind='group', scope_key='u', query_vec=[1])
+        self.assertEqual(rows[0]['visibility'], 'dm_only')
+
     def test_sqlite_vec_path_returns_item_visibility(self):
         # Exercise the native SQL path without requiring sqlite-vec to be
         # installed: this function is the only extension primitive it uses.
@@ -105,6 +130,34 @@ class VectorStoreVisibilityRuntimeTests(unittest.TestCase):
 
 
 class WorkerStopRuntimeTests(unittest.TestCase):
+    def test_server_closes_storage_only_after_worker_exit(self):
+        for blocked in (True, False):
+            with self.subTest(blocked=blocked):
+                store = Mock()
+                worker = MemoryIdleWorker(store, None, {}, idle_signal=IdleSignal())
+                release = threading.Event()
+                thread = threading.Thread(target=release.wait)
+                worker._thread = thread
+                if not blocked:
+                    release.set()
+                thread.start()
+                server = object.__new__(GatewayServer)
+                server.memory_worker, server.memory_store = worker, store
+                try:
+                    with patch('botville_gateway.memory.worker.MEMORY_WORKER_STOP_TIMEOUT_SECONDS', 0.01), \
+                            patch('http.server.ThreadingHTTPServer.server_close'):
+                        if blocked:
+                            with self.assertLogs('botville_gateway.memory.worker', 'WARNING') as logs:
+                                server.server_close()
+                            self.assertEqual(len(logs.records), 1)
+                            store.close.assert_not_called()
+                        else:
+                            server.server_close()
+                            store.close.assert_called_once_with()
+                finally:
+                    release.set()
+                    thread.join(2)
+
     def test_stop_times_out_while_a_real_model_call_is_blocked(self):
         store = MemoryStore(':memory:')
         self.addCleanup(store.close)
@@ -138,10 +191,10 @@ class WorkerStopRuntimeTests(unittest.TestCase):
             with patch('botville_gateway.memory.worker.MEMORY_WORKER_STOP_TIMEOUT_SECONDS', 0.05), \
                     self.assertLogs('botville_gateway.memory.worker', 'WARNING') as logged:
                 started = time.monotonic()
-                worker.stop()
+                self.assertFalse(worker.stop())
                 elapsed = time.monotonic() - started
             self.assertLess(elapsed, 0.5)
-            self.assertEqual(logged.output, ['WARNING:botville_gateway.memory.worker:Memory idle worker did not stop before timeout'])
+            self.assertEqual(logged.output, ['WARNING:botville_gateway.memory.worker:Memory idle worker did not stop before timeout; storage left open'])
         finally:
             release.set()
             thread.join(2)

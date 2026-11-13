@@ -7,6 +7,7 @@ from collections import OrderedDict, deque
 from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
+import hmac
 import json
 import math
 import re
@@ -41,6 +42,7 @@ class MemoryHTTPState:
     def __init__(self, store, secret):
         from .owner import OwnerMemoryService
         self.service = OwnerMemoryService(store, secret) if store is not None else None
+        self._secret = secret if isinstance(secret, bytes) else secret.encode("utf-8")
         self.lock = threading.RLock()
         self.rates = {}
         self.idempotency = OrderedDict()
@@ -232,7 +234,8 @@ def _route(handler, state, caller, params, rest, audit):
             raise HTTPError(422, 'request.invalid')
         idem = handler._idempotency_key()
         fingerprint = hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
-        idem_key = (caller, idem) if idem else None
+        idem_key = (caller, hmac.new(state._secret, b"idempotency\x00" + idem.encode("utf-8"),
+                                     hashlib.sha256).hexdigest()) if idem else None
         with state.lock:
             now = time.monotonic()
             _expire_idempotency(state, now)

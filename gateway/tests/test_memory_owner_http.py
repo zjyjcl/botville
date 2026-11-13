@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import contextlib
 import hashlib
 import hmac
@@ -118,6 +119,23 @@ class MemoryHTTPServer:
 
 
 class OwnerMemoryHTTPTests(unittest.TestCase):
+    def test_raw_idempotency_key_absent_from_cache_and_logs(self):
+        raw = 'private-idempotency-sentinel'
+        with MemoryHTTPServer(access_log=True) as app:
+            body = dict(persona_id=PERSONA, counterpart=HUMAN, key='likes', value='one')
+            captured = io.StringIO()
+            with self.assertLogs(level='INFO') as logs, contextlib.redirect_stderr(captured):
+                logging.getLogger(__name__).info('Starting replay privacy check')
+                first = app.request('PUT', '/v1/memories/facts', body=body,
+                                    headers={'Idempotency-Key': raw})
+                replay = app.request('PUT', '/v1/memories/facts', body=body,
+                                     headers={'Idempotency-Key': raw})
+            self.assertEqual((first[0], replay[0]), (201, 201))
+            self.assertEqual(first[2], replay[2])
+            self.assertTrue(app.server.memory_http.idempotency)
+            self.assertNotIn(raw, repr(app.server.memory_http.idempotency))
+            self.assertNotIn(raw, '\n'.join(logs.output) + captured.getvalue())
+
     def test_idempotency_key_is_independent_per_owner_over_http(self):
         with MemoryHTTPServer(two_owners=True) as app:
             common = {'Idempotency-Key': 'same-idempotency-key'}

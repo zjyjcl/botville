@@ -99,9 +99,12 @@ class _Flight:
 
 
 class UserIdentityVerifier:
-    """进程内终端用户身份校验器。GatewayServer 持有一个实例（线程安全）。"""
+    """线程安全身份验证器；详情使用独立实例保留跨服身份以统一返回 404。"""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, *, allow_foreign_identity: bool = False) -> None:
+        # Detail-only verifier: retain verified foreign identities for a uniform 404.
+        # Separate instance/cache prevents relaxing any existing endpoint policy.
+        self._allow_foreign_identity = allow_foreign_identity
         self._cs_base = (config.homeserver_url or "").rstrip("/")
         fed_url = config.homeserver_federation_url or config.homeserver_url or ""
         self._fed_base = fed_url.rstrip("/")
@@ -351,6 +354,9 @@ class UserIdentityVerifier:
     def _check_domain(self, matrix_id: str) -> Tuple[str, Optional[str]]:
         """校验 Matrix user_id 的域（§1.2.3，大小写归一）。
 
+        默认拒绝跨服身份；详情专用实例保留 homeserver 已验证的跨服身份，
+        由 persona_detail 的可见性门禁统一拒绝为 404，不授予读取权限。
+
         ``GATEWAY_MATRIX_SERVER_NAME`` 未配置时 **fail closed** 返回
         VERIFY_INVALID——不放行 server_name 未知的情况，也不为此新增启动必填
         （memory 模式仍可无该配置启动）。
@@ -372,7 +378,7 @@ class UserIdentityVerifier:
         if not sep or not localpart or not server_name:
             return VERIFY_INVALID, None
 
-        if server_name.lower() != self._server_name.lower():
+        if not self._allow_foreign_identity and server_name.lower() != self._server_name.lower():
             return VERIFY_INVALID, None
 
         return VERIFY_OK, matrix_id

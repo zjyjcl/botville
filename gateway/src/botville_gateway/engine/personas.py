@@ -28,7 +28,8 @@
 | 字段 | 必填 | 含义 |
 |---|---|---|
 | `user_id` | 是 | **本服** `@ai_*` Matrix 用户 ID（domain 必须等于 `GATEWAY_MATRIX_SERVER_NAME`，大小写不敏感） |
-| `display_name` | 否 | 展示名；只用于拼系统提示 |
+| `display_name` | 否 | 展示名；用于摘要与系统提示 |
+| `bio` | 否 | owner 文件签名，最多 500 Unicode 码点；不进入任何 system 指令 |
 | `system_prompt` | 是 | 人设指令正文（进入 **system/instructions 区**，不是数据区） |
 | `personality` | 否 | 追加的性格描述（同样属指令区） |
 | `model` | 否 | 该人设的模型名覆盖；缺省用 `GATEWAY_MODEL_NAME` |
@@ -58,6 +59,7 @@ _PERSONA_FIELDS = frozenset(
     {
         "user_id",
         "display_name",
+        "bio",
         "system_prompt",
         "personality",
         "model",
@@ -90,6 +92,9 @@ class Persona:
     max_reply_chars: int = DEFAULT_MAX_REPLY_CHARS
     # Optional local human account authorized for the internal memory API.
     owner_user_id: Optional[str] = None
+
+    # Owner-authored display data; never part of instructions or logs.
+    bio: Optional[str] = field(default=None, repr=False)
 
     @property
     def credential_env_name(self) -> Optional[str]:
@@ -206,6 +211,11 @@ def load_personas(
         display_name = entry.get("display_name", "")
         if not isinstance(display_name, str):
             raise PersonaConfigError(f"{where}.display_name must be a string")
+        bio = entry.get("bio")
+        if bio is not None and not isinstance(bio, str):
+            raise PersonaConfigError(f"{where}.bio must be a string")
+        if bio is not None and len(bio) > 500:
+            raise PersonaConfigError(f"{where}.bio must contain at most 500 Unicode code points")
         personality = entry.get("personality", "")
         if not isinstance(personality, str):
             raise PersonaConfigError(f"{where}.personality must be a string")
@@ -256,5 +266,6 @@ def load_personas(
             credential_ref=credential_ref,
             max_reply_chars=max_reply_chars,
             owner_user_id=owner_user_id,
+            bio=bio,
         )
     return personas

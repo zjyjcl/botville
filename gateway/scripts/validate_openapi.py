@@ -28,6 +28,7 @@ Exit code 0 on success, 1 on any failure. Requires PyYAML (``pip install pyyaml`
 from __future__ import annotations
 
 import argparse
+import ast
 import datetime as _dt
 import json
 import os
@@ -59,7 +60,7 @@ EXAMPLE_TARGETS = {
     "persona-page.json": "#/paths/~1personas/get/responses/200/content/application~1json/schema",
     "health.json": "#/paths/~1health/get/responses/200/content/application~1json/schema",
     "capability-manifest.json": "#/paths/~1capabilities/get/responses/200/content/application~1json/schema",
-    "persona.json": "#/paths/~1personas~1{persona_id}/get/responses/200/content/application~1json/schema",
+    "persona.json": "#/components/schemas/Persona",
     "create-persona-request.json": "#/paths/~1personas/post/requestBody/content/application~1json/schema",
     "persona-state.json": "#/paths/~1personas~1{persona_id}~1state/get/responses/200/content/application~1json/schema",
     "conversation.json": "#/paths/~1conversations~1{conversation_id}/get/responses/200/content/application~1json/schema",
@@ -660,6 +661,37 @@ def check_examples(document, report):
         report.ok("all examples validate (%d files)" % (len(EXAMPLE_TARGETS),))
 
     check_assemble_nonce_binding(report)
+    # PR4d examples exercise the actual GET union, including a strict public allowlist.
+    detail = resolve_pointer(document, "#/paths/~1personas~1{persona_id}/get/responses/200/content/application~1json/schema")
+    for name in ("PersonaSummary", "PersonaPublicView"):
+        schema = document["components"]["schemas"][name]
+        payload = schema["example"]
+        errors = validate(payload, schema, document) + validate(payload, detail, document)
+        if errors:
+            report.fail(name + " detail example", "\n".join(errors))
+        else:
+            report.ok(name + " detail example")
+    public = document["components"]["schemas"]["PersonaPublicView"]
+    for key in ("owner_id", "model_binding", "credential_ref", "created_at", "updated_at", "visibility"):
+        payload = dict(public["example"], **{key: "forbidden"})
+        if validate(payload, public, document):
+            report.ok("public detail rejects " + key)
+        else:
+            report.fail("public detail rejects " + key, "unexpected field accepted")
+    # Module versions and the C-line manifest fixture evolve independently.
+    config_path = os.path.join(REPO_ROOT, "gateway", "src", "botville_gateway", "config.py")
+    with open(config_path, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    version = next(ast.literal_eval(node.value) for node in tree.body
+                   if isinstance(node, ast.Assign)
+                   and any(isinstance(t, ast.Name) and t.id == "CONTRACT_VERSION" for t in node.targets))
+    with open(os.path.join(EXAMPLES_DIR, "health.json"), encoding="utf-8") as handle:
+        health = json.load(handle)
+    if version == document["info"]["version"] == health["contract_version"]:
+        report.ok("runtime, OpenAPI and health contract versions agree")
+    else:
+        report.fail("contract versions agree", "runtime/OpenAPI/health mismatch")
+
 
 
 # `id="<nonce>"` on both the opening (`<untrusted id=...>`) and closing

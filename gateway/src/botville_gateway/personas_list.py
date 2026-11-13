@@ -51,12 +51,34 @@ def persona_page(server, owner, query):
     rows = sorted((p for p in server.memory_personas.values()
                    if p.owner_user_id and p.owner_user_id == owner and p.user_id > after
                    and kind == "custom" and status == "active"), key=lambda p: p.user_id)
-    items = [{"id": p.user_id, "owner_id": p.owner_user_id,
-              "display_name": p.display_name or p.user_id[1:].split(":", 1)[0],
-              "kind": "custom", "status": "active", "revision": 1,
-              "created_at": server.personas_timestamp, "updated_at": server.personas_timestamp,
-              "visibility": "private"} for p in rows[:limit]]
+    items = [persona_summary(server, p) for p in rows[:limit]]
     has_more = len(rows) > limit
     cursor = (base64.urlsafe_b64encode(items[-1]["id"].encode()).decode().rstrip("=")
               if has_more else None)
     return {"items": items, "next_cursor": cursor, "has_more": has_more}
+
+
+def persona_summary(server, persona):
+    """One allowlist shared by owner detail and list responses."""
+    return {"id": persona.user_id, "owner_id": persona.owner_user_id,
+            "display_name": persona.display_name or persona.user_id[1:].split(":", 1)[0],
+            "bio": persona.bio, "kind": "custom", "status": "active", "revision": 1,
+            "created_at": server.personas_timestamp, "updated_at": server.personas_timestamp,
+            "visibility": "private"}
+
+
+def persona_detail(server, caller, persona_id):
+    # Validate decoded IDs, including encoded path separators, without logging input.
+    local_user = re.fullmatch(r"@[A-Za-z0-9._=/-]+:([^\s/?#%]+)", caller)
+    server_name = server.config.matrix_server_name or ""
+    if (not re.fullmatch(r"@ai_[A-Za-z0-9._=/-]+:[^\s/?#%]+", persona_id)
+            or not local_user or local_user[1].lower() != server_name.strip().lower()):
+        raise PersonaListError(404, "persona.not_found")
+    persona = server.memory_personas.get(persona_id)
+    if persona is None or not persona.owner_user_id:
+        raise PersonaListError(404, "persona.not_found")
+    summary = persona_summary(server, persona)
+    if persona.owner_user_id == caller:
+        return summary
+    return {**{key: summary[key] for key in ("id", "display_name", "bio", "status")},
+            "mood": None}

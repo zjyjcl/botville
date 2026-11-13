@@ -62,6 +62,7 @@ class PersonaHTTP:
               if stat_failure else contextlib.nullcontext()):
             self.server = build_server(config)
         self.server.user_verifier = Verifier()
+        self.server.persona_detail_verifier = self.server.user_verifier
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     def __enter__(self):
@@ -80,7 +81,7 @@ class PersonaHTTP:
         if auth:
             req.add_header('Authorization', auth)
         try:
-            response = urllib.request.urlopen(req, timeout=5)
+            response = urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=5)
         except urllib.error.HTTPError as exc:
             response = exc
         with response:
@@ -88,6 +89,24 @@ class PersonaHTTP:
 
 
 class PersonasListTests(unittest.TestCase):
+    def test_homeserver_failure_is_not_logged_as_auth_failure(self):
+        with PersonaHTTP() as app:
+            paths = ('/v1/capabilities', '/v1/personas',
+                     '/v1/personas/@ai_a:example.invalid', '/v1/moments')
+            for path in paths:
+                with self.subTest(path=path), self.assertLogs(level='INFO') as logs:
+                    # A successful caller check guarantees a real log record even
+                    # when the following unavailable verifier is correctly silent.
+                    app.request(auth='Bearer caller', path='/v1/capabilities')
+                    status, body = app.request(auth='Bearer offline', path=path)
+                self.assertEqual((status, body['code']), (500, 'internal.error'))
+                self.assertFalse(any('auth failed' in line for line in logs.output))
+            for path in paths[:-1]:
+                with self.subTest(path=path), self.assertLogs(
+                        'botville_gateway.caller_identity', level='INFO') as logs:
+                    self.assertEqual(app.request(auth='Bearer invalid', path=path)[0], 401)
+                self.assertEqual(sum('auth failed' in line for line in logs.output), 1)
+
     def test_user_bearer_does_not_log_speculative_caller_failure(self):
         log = logging.getLogger('botville_gateway.caller_identity')
         records = []
@@ -125,7 +144,8 @@ class PersonasListTests(unittest.TestCase):
                 self.assertNotIn(forbidden, encoded)
             for row in page['items']:
                 self.assertEqual(set(row), {'id', 'owner_id', 'display_name', 'kind', 'status',
-                                           'revision', 'created_at', 'updated_at', 'visibility'})
+                                           'revision', 'created_at', 'updated_at', 'visibility', 'bio'})
+                self.assertIsNone(row['bio'])
                 self.assertEqual((row['owner_id'], row['kind'], row['status'], row['revision'], row['visibility']),
                                  (OWNER, 'custom', 'active', 1, 'private'))
                 self.assertEqual(row['created_at'], '2023-11-14T22:13:20Z')
