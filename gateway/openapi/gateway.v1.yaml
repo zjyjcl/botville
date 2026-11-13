@@ -688,6 +688,7 @@ paths:
         仅当前 HMAC 密钥的行，按 updated_at、room_ref 升序 keyset 分页；更新期间不提供快照。
         有 memory DB 时，即使部署或 persona 群功能关闭也按现有分页/过滤规则列出当前 key_id 的行。
         无 memory DB 返回空页；groups_enabled 仅表示部署开启且有 memory DB，persona 开关不改变它。
+        群功能关闭时内置引擎不发言，仍按现有规则记录群记忆（group scope，含其他 AI 发言作为 untrusted）。
       security: [{matrixOpenIdToken: []}, {matrixUserToken: []}, {bearerAuth: []}]
       parameters:
         - $ref: '#/components/parameters/PersonaId'
@@ -712,6 +713,18 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '405':
+          description: '其他方法在 owner 鉴权后返回 405 request.invalid；Allow: GET, HEAD'
+          headers:
+            Allow:
+              schema: {type: string}
+              example: "GET, HEAD"
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+              example: {type: 'urn:botville:error:request.invalid', title: Method Not Allowed, status: 405, code: request.invalid, request_id: example-request}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
 
   /personas/{persona_id}/rooms/{room_ref}:
@@ -729,6 +742,7 @@ paths:
         响应 200，action=leave 必带 leave_pending。找到时先入持久清理队列，失败由后台自动重试。
         查询失败仍返回 left 和 leave_pending=true，但无原始 room_id 无法入队；owner 可再次 PATCH leave 重试。
         退群不可撤销，本 API 不支持 rejoin；left 禁止模型回复、发送和自动加入。
+        群功能关闭时内置引擎不发言，仍按现有规则记录群记忆（group scope，含其他 AI 发言作为 untrusted）。
       security: [{matrixOpenIdToken: []}, {matrixUserToken: []}, {bearerAuth: []}]
       parameters:
         - $ref: '#/components/parameters/PersonaId'
@@ -756,6 +770,18 @@ paths:
             application/problem+json:
               schema: {$ref: '#/components/schemas/Problem'}
               example: {type: 'urn:botville:error:room.not_found', title: Room request rejected, status: 404, code: room.not_found, request_id: example-request}
+        '405':
+          description: '其他方法在 owner 鉴权后返回 405 request.invalid；Allow: PATCH'
+          headers:
+            Allow:
+              schema: {type: string}
+              example: "PATCH"
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+              example: {type: 'urn:botville:error:request.invalid', title: Method Not Allowed, status: 405, code: request.invalid, request_id: example-request}
         '409':
           description: 当前房间状态不允许设置 mode，或群功能关闭时设置 mention_only。
           content:
@@ -793,7 +819,7 @@ paths:
         '429':
           $ref: '#/components/responses/TooManyRequests'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/MoodUnavailable'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -835,7 +861,7 @@ paths:
         '429':
           $ref: '#/components/responses/TooManyRequests'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/MoodUnavailable'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -1256,7 +1282,6 @@ paths:
                     title: Conversation not found
                     status: 404
                     detail: Conversation could not be resolved
-                    instance: /v1/policy/evaluate
                     code: conversation.not_found
                     request_id: req_demo_policy_not_found
         '422':
@@ -2561,6 +2586,25 @@ components:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/Problem'
+    MoodUnavailable:
+      description: 心情存储不可用：503 `mood.unavailable`，带 Retry-After。
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: urn:botville:error:mood.unavailable
+            title: mood.unavailable
+            status: 503
+            code: mood.unavailable
+            request_id: example-request
+            retry_after_seconds: 5
+
     ServiceUnavailable:
       description: 记忆存储或必要依赖暂不可用。
       headers:

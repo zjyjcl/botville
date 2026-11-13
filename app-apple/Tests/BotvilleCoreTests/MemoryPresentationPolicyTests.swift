@@ -13,8 +13,9 @@ final class MemoryPresentationPolicyTests: XCTestCase {
             from: JSONSerialization.data(
                 withJSONObject: [
                     // This is a synthetic capability fixture, not a gateway
-                    // manifest; its version must not track the live contract.
-                    "manifest_version": "1.3.0", "contract_version": "0.0.0-synthetic",
+                    // manifest; neither version may track the live contract or
+                    // manifest schema, so both use an obviously fake value.
+                    "manifest_version": "0.0.0-synthetic", "contract_version": "0.0.0-synthetic",
                     "generated_at": "2026-11-13T00:00:00Z", "capabilities": capabilities,
                 ]))
     }

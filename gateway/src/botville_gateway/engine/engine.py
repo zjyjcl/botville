@@ -237,6 +237,7 @@ class EngineHooks(ConsumerHooks):
         # PR3a may install the hooks solely to persist layer-1 memory while no
         # model is configured.  Preserve PR2's record/count-only behaviour.
         # Only confirmed DMs bypass the switch; missing context fails closed.
+        # _group_invites is None only in unit tests/embedded construction; production http_server always injects GroupInvites.
         if (self._group_invites is not None
                 and not (ctx and ctx.room_members_confirmed and ctx.room_is_dm)
                 and not self._group_invites.groups_active(persona.user_id)):
