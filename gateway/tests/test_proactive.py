@@ -593,6 +593,33 @@ class ProactiveTests(unittest.TestCase):
         join.assert_not_called()
         self.assertFalse(send.call_args.kwargs.get('allow_auto_join', False))
 
+    def test_proactive_forbidden_rechecks_after_join(self):
+        from botville_gateway.matrix import DeliveryError
+        from botville_gateway.matrix_appservice import AppServiceMatrixTransport
+        transport = AppServiceMatrixTransport(homeserver_url='https://matrix.invalid',
+            as_token='test-placeholder', server_name='example.test')
+        self.worker.service = GatewayService(self.config, transport, now_fn=self.clock)
+        self.worker.members = transport.joined_members
+        self.contact()
+        calls = []
+        def request(method, path, **kwargs):
+            calls.append((method, path))
+            if method == 'GET' and path.endswith('/joined_members'):
+                return {'joined': {uid: {} for uid in self.members['!owner']}}
+            if method == 'POST' and '/join/' in path:
+                return {'room_id': '!owner'}
+            if method == 'PUT':
+                if sum(m == 'PUT' for m, _ in calls) == 1:
+                    raise DeliveryError('M_FORBIDDEN', 'not joined')
+                return {'event_id': '$after-join'}
+            self.fail('unexpected Matrix request')
+        with patch.object(transport, '_request', side_effect=request), \
+                patch.object(transport, 'ensure_user'), \
+                patch.object(transport, 'send_text', wraps=transport.send_text) as send:
+            self.assertEqual(self.worker.run_once(), 1)
+        self.assertFalse(send.call_args.kwargs.get('allow_auto_join', False))
+        self.assertEqual([m for m, _ in calls][-4:], ['PUT', 'POST', 'GET', 'PUT'])
+
     def test_recent_contacts_recheck_legacy_dm_membership(self):
         self.worker.config = replace(self.config, proactive_recent_contacts_enabled=True)
         target = '@friend:example.test'

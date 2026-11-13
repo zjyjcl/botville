@@ -247,7 +247,7 @@ class MatrixTransport(Protocol):
   application service 身份对接真实 homeserver——`m.login.application_service`
   在 exclusive 命名空间内免密建号、`?user_id=` masquerade 以 `@ai_*` 身份
   join / send（`PUT /_matrix/client/v3/rooms/{roomId}/send/m.room.message/{txnId}`）、
-  未加入房间（`M_FORBIDDEN`）自动 join 后重试一次、命名空间外 sender 客户端侧
+  未加入房间（`M_FORBIDDEN`）自动 join 后复核，仅 DM 重试一次，否则退出并报错、命名空间外 sender 客户端侧
   直接拒绝。只用 Matrix 标准接口；部署侧注册方式与 token 约定见
   [`docs/deploy/appservice.md`](../docs/deploy/appservice.md)。对真实 Synapse /
   Tuwunel 的验收是 `make appservice-e2e`（CI `appservice-e2e` job）。
@@ -539,7 +539,8 @@ npx --yes @redocly/cli lint gateway/openapi/gateway.v1.yaml
 只有完整 joined 成员恰好为一个本服 persona 和一个本服人类（非 AI、非 AS sender）才算 DM；
 单 AI + 多人、含外服成员、多个 AI 或成员未确认/查询失败均按群聊处理，不召回 DM 记忆。
 群聊仅显式提及 AI 完整 user ID 或回复其消息时开口，`@room` 广播不产生目标。
-AS 发送的 `M_FORBIDDEN` 自动 join 默认禁止，仅已确认 DM 的引擎回复允许一次 join/retry；
-HTTP 消息与主动发言不会凭发送失败自动加入群聊。
+AS 发送遇 `M_FORBIDDEN` 默认 join 后复核：仅 DM 继续发送，否则立即退出并报错；
+已确认 DM 的引擎回复跳过复核，join 后重试一次；HTTP 与主动发言走默认复核路径；
+HTTP 消息与主动发言复核为非 DM 后立即尝试退出，不重试发送。
 开启 memory 后，同群其他 AI 文本写入 group 记忆，trust=untrusted，以 role=assistant 和 sender
 保留 AI 来源，召回只进入不可信数据区；自身回声不重复记录。memory 关闭时 AI 入站不追加 ring buffer。

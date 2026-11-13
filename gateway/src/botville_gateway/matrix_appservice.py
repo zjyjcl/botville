@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 import time
@@ -330,6 +331,31 @@ class AppServiceMatrixTransport:
         )
         return resp.get("room_id") or room_id
 
+    def leave(self, room_id: str, user_id: str) -> None:
+        """Leave a room using the sender's AS masquerade identity."""
+        self._check_sender(user_id)
+        self._request(
+            "POST",
+            "/_matrix/client/v3/rooms/{}/leave".format(urllib.parse.quote(room_id, safe="")),
+            body={}, query={"user_id": user_id},
+        )
+
+    def _joined_room_is_dm(self, room: str, sender: str) -> bool:
+        try:
+            members = set(self.joined_members(room, (sender,)))
+        except (DeliveryError, OSError):
+            return False
+        if not self._server_name or len(members) != 2 or sender not in members:
+            return False
+        human = (members - {sender}).pop()
+        localpart, sep, domain = human.removeprefix("@").partition(":")
+        return bool(
+            human.startswith("@") and sep and localpart
+            and not localpart.lower().startswith("ai_")
+            and localpart.lower() != "botville-gateway"
+            and domain.lower() == self._server_name.lower()
+        )
+
     def send_text(
         self,
         *,
@@ -362,12 +388,18 @@ class AppServiceMatrixTransport:
         try:
             resp = self._request("PUT", path, body=content, query={"user_id": sender})
         except DeliveryError as exc:
-            # Only an already-confirmed DM may recover a missing membership.
-            # B2.8b may add an accepted group_rooms decision here; it must not
-            # broaden this transport default.
-            if exc.code != "M_FORBIDDEN" or not allow_auto_join:
+            if exc.code != "M_FORBIDDEN":
                 raise
             self.join(room, sender)
+            # B2.8b may allow accepted group_rooms here. Until then, only a
+            # confirmed DM may continue sending after automatic join.
+            if not allow_auto_join and not self._joined_room_is_dm(room, sender):
+                try:
+                    self.leave(room, sender)
+                except (DeliveryError, OSError):
+                    # Never log IDs, message text, or HS exception details.
+                    logging.getLogger(__name__).warning("Auto-join rollback leave failed")
+                raise
             resp = self._request("PUT", path, body=content, query={"user_id": sender})
 
         event_id = resp.get("event_id")

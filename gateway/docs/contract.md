@@ -786,7 +786,7 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 最近 **7×24 小时内（边界包含）**与该 persona 有确定性 DM 交互记录的本服人类账户。v1 的记录来源
 是同一 memory DB 中 `scope_kind=dm` 的 `memory_items.created_at`（本地接收/记录时间，不回读 AS 事务正文）；
 新记录按 B2.8a 严格 DM 定义写入，旧记录仍须重查完整成员，发送前再次核验 persona 与目标均已 joined。
-发送保持 `allow_auto_join=false`，已加入房间的正常发送不受该默认值影响。目标永远
+发送保持 `allow_auto_join=false`：若发送时遇 `M_FORBIDDEN`，按下述 join 后复核规则处理；已加入房间的正常发送不受影响。目标永远
 排除群组、`@ai_*`、网关 AS 账户、其他 persona 和跨服用户；不会创建 DM，找不到已有一对一房间则跳过并记不含
 正文或标识符的 INFO。
 
@@ -958,8 +958,12 @@ DM 不受此上限影响。`m.mentions.room=true`（`@room`）本身不产生目
 跟随重定向。完整成员未确认或查询失败均按**群聊**处理，只按结构化/正文 mentions 或回复关系判定并计
 `room_member_errors`；记忆作用域必须为 group，绝不召回 DM 记忆。单个成员事件不构成完整成员确认。
 
-发送遇 `M_FORBIDDEN` 时，只有已确认 DM 的引擎回复允许自动 join 后重试一次；群聊及未知房间
-直接上抛，不 join。HTTP `POST /conversations/{id}/messages` 与主动发言路径默认不获此许可；
+发送遇 `M_FORBIDDEN` 时，已确认 DM 的引擎回复（`allow_auto_join=true`）join 后直接重试一次。
+默认路径（包括 HTTP `POST /conversations/{id}/messages` 与主动发言）采用 **join 后复核：仅 DM 继续发送，否则立即退出并报错**。
+复核以发送者 masquerade 查询完整 joined 成员，必须恰好为 {发送者，一个本服人类}；人类 localpart
+不以 `ai_` 开头且不是 AS sender，domain 与配置的 `server_name` 大小写不敏感匹配；未配置 server_name
+或成员查询失败均视为非 DM。join 失败直接上抛；非 DM 尝试 leave 后上抛原 `M_FORBIDDEN`，
+leave 失败仅记无敏感信息 WARNING；非 `M_FORBIDDEN` 不 join。成功复核后仅重试一次；
 B2.8b 可在明确的许可钩子加入已接受的 `group_rooms`。
 
 **⑩ 四层记忆（B2.6：PR3a / PR3b / PR3c 已实现）**
@@ -1798,7 +1802,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 |---|---|---|
 | 0.5.0 | 2026-11-13 | [PR4c quasi-breaking] 新增默认关闭的主动发言部署/人设配置、DM-only 候选、持久化队列与 stable txnId 重放语义；`ProactiveSettings.enabled` 默认值由 true 改为 false。该默认值改变未显式设置旧部署的行为，按准破坏性变更公告。 |
 | 0.5.0 | 2026-11-13 | [#221 proactive 修正] 启用但无法启动 worker 记录 WARNING；owner 无 DM 日志每目标限频且缓存有界；过期且成员不匹配的队列转 abandoned，终态保留 30 天；跨午夜静默时段与严格 DM 协同验证。 |
-| 0.5.0 | 2026-11-13 | [B2.8a 行为修正，无 API 字段变化] 一个 AI + 多个人类的房间现在只在被 @ 或被回复时回复；严格两人本服 DM、成员失败按群、群回复者上限、忽略 @room 广播、群 AI 文本记忆 untrusted、自动 join 仅 DM。 |
+| 0.5.0 | 2026-11-13 | [B2.8a 行为修正，无 API 字段变化] 一个 AI + 多个人类的房间现在只在被 @ 或被回复时回复；严格两人本服 DM、成员失败按群、群回复者上限、忽略 @room 广播、群 AI 文本记忆 untrusted、join 后复核：仅 DM 继续发送，否则立即退出并报错。 |
 | 0.4.0 | 2026-11-13 | [PR4b] 新增 owner-only `GET/PATCH /personas/{id}/state` 与 memory.db persona_state；新增 `GATEWAY_MOOD_ENABLED` / `GATEWAY_MOOD_HALF_LIFE_MINUTES`、确定性窗口规则及读时半衰期衰减。PersonaMood 删除 `neutral`、`anxious`，最终为 calm/happy/sad/excited/tired；详情增加 mood，列表项不变；`mood_public` 默认 true，非 owner 仅在 mood 开启且 `mood_public` 为真时见标签。模块关闭时通过 owner 校验后 404 `mood.disabled`；`/state` 写限流返回 429，mood 存储不可用返回 503 `mood.unavailable`。 |
 | 0.3.0 | 2026-11-13 | [PR4d additive] owner 文件签名 bio（500 码点），列表扩展与分级 GET 详情；本服非 owner 最小视图，跨服/无 owner/未知或非法 id 统一 404 persona.not_found。mood 可缺省/null 枚举，当前 null；自身和他人 bio 均不注入 system。 |
 | 0.2.0 | 2026-11-13 | [PR4a] 修正 caller token 格式与 GET /personas 无 owner 的 403 文档；修复不可变向量召回、策略先行、worker 有界停止与退避、E6 caller 隔离和 owner 配额、鉴权失败日志、保留期边界与摘要索引、SQL keyset 分页；明确 capabilities 顺序不可依赖并以示例测试守护输出；加固并发与本地 HTTP 测试。自 #211 起，所有布尔环境变量非法值的错误信息仅含变量名、不再回显输入值。本次不升契约版本。 |
