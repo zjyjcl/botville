@@ -167,14 +167,13 @@ public final class PersonaGroupRoomsModel: ObservableObject {
     /// `preservingRoomsOnFailure` keeps the last list visible until a fresh first
     /// page arrives (409 conflict refresh). On failure the stale rows stay, and the
     /// next loadMore restarts from the first page instead of an old cursor.
-    /// The room list and persona settings refresh independently; each flag reports
-    /// only its own request so a settings failure never hides a fresh room page.
+    /// The room list and persona settings refresh independently; each field reports
+    /// only its own request (nil settingsError = settings refreshed), so a settings failure never hides a fresh room page.
     /// `settingsError` is the settings error captured by this reload, so the
     /// combined conflict message never needs its own fallback text.
     struct ReloadOutcome: Equatable {
         var roomsRefreshed = false
         var settingsError: String?
-        var settingsRefreshed: Bool { settingsError == nil }
     }
 
     static let conflictRefreshedMessage = "群状态已变化，已刷新"

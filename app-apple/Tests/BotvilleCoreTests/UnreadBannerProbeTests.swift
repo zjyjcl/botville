@@ -72,11 +72,11 @@ final class UnreadBannerProbeTests: XCTestCase {
         store.updateContext(isForeground: true, visibleRoomID: nil, isInputActive: false)
         store.receive(value)
         XCTAssertTrue(lines.last!.contains("reason=alreadyHandled"))
-        store.receive(ForegroundBannerCandidate(roomID: room, latestActivity: Date(), title: value.title,
+        store.receive(ForegroundBannerCandidate(roomID: room, eventID: "$own-event", latestActivity: Date(), title: value.title,
                                                preview: value.preview, isOwn: true))
         XCTAssertTrue(lines.last!.contains("reason=ownMessage"))
         for line in lines {
-            for raw in [room, value.eventID!, value.title, value.preview] { XCTAssertFalse(line.contains(raw)) }
+            for raw in [room, value.eventID, value.title, value.preview] { XCTAssertFalse(line.contains(raw)) }
         }
     }
 

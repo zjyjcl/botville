@@ -231,6 +231,10 @@ final class PersonaGroupRoomsModelTests: XCTestCase {
         XCTAssertEqual(sent, [.muted])
     }
 
+    /// Pins the exact combined text and that each fragment appears once. It does
+    /// not detect reintroducing the removed fallback: that branch was unreachable
+    /// (a failed settings refresh always sets settings.errorMessage), so the old
+    /// and new implementations produce the same text here.
     func testConflictCombinedMessageStatesSettingsErrorOnce() async {
         let client = RoomsScriptClient(
             pages: [.success(page([room("a")], nil, false)),
@@ -258,6 +262,11 @@ final class PersonaGroupRoomsModelTests: XCTestCase {
         await model.setMode(roomRef: ref("a"), mode: .muted)
         XCTAssertEqual(model.rooms.map(\.roomRef), [ref("b")])
         XCTAssertEqual(model.errorMessage, "群状态已变化，已刷新；群设置未能刷新：没有权限查看")
+        XCTAssertFalse(model.canEnableMentionOnly)
+        // Settings never reloaded, so mention_only must stay local: no PATCH.
+        await model.setMode(roomRef: ref("b"), mode: .mentionOnly)
+        let sent = await client.modeRequests()
+        XCTAssertEqual(sent, [.muted])
     }
 
     func testFailedPersonaRefreshKeepsRoomsButCannotEnableReplies() async {
