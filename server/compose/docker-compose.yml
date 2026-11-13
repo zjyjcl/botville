@@ -383,6 +383,12 @@ services:
       GATEWAY_EMBEDDING_API_KEY: ${GATEWAY_EMBEDDING_API_KEY:-}
       GATEWAY_EMBEDDING_DIM: ${GATEWAY_EMBEDDING_DIM:-0}
       GATEWAY_MEMORY_VECTOR_BACKEND: ${GATEWAY_MEMORY_VECTOR_BACKEND:-python}
+      # Owner may read the AI's DM memory (B line PR3d, #211): default false
+      # (owner manages metadata only; DM text / fact values stay redacted).
+      # Strict boolean in the gateway (1/true/yes/on, 0/false/no/off, empty =
+      # false); anything else refuses to start. When true, the App shows a
+      # disclosure to the AI's chat partners.
+      GATEWAY_MEMORY_OWNER_CAN_READ_DM: ${GATEWAY_MEMORY_OWNER_CAN_READ_DM:-false}
     ports:
       - "127.0.0.1:${BOTVILLE_GATEWAY_PORT:-8020}:8080"
     volumes:

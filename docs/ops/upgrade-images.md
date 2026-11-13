@@ -106,7 +106,8 @@ docker.io/library/python:3.12-slim@sha256:b18b261e1b4974b4f321451ad5251ded85abb2
    `generated/` 下的渲染物——`push-denylist.env` 等 compose 依赖的 env 文件；
    未跑过 init 的 checkout 上 `--env-file` 会直接报错），再三个 profile 各过一遍
    `docker compose -f server/compose/docker-compose.yml --env-file
-   server/compose/.env --profile <hs> config --quiet`；有疑虑再跑
+   server/compose/.env --profile <hs> config --quiet`（**一定带 `--quiet`**：不带会把
+   `.env` 里的密钥展开打印到终端）；有疑虑再跑
    `make smoke`（见 `server/README.md`）。
 5. **CI 全绿后提 PR**：lint 的「镜像必须 pin」「compose 默认值 = `.env.example`」
    与 allowlist 检查会兜底；smoke 会实际 pull 每个 profile 的全部镜像并走完

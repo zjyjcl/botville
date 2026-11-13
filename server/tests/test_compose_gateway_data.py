@@ -96,7 +96,8 @@ class ComposeGatewayServiceRenderTest(unittest.TestCase):
                 cwd=REPO_ROOT, capture_output=True, text=True,
             )
             if proc.returncode != 0:
-                self.fail(proc.stderr or proc.stdout or "compose failed")
+                # Never proc.stdout: rendered config holds interpolated values.
+                self.fail(proc.stderr or "compose failed (exit {})".format(proc.returncode))
             return proc.stdout
 
     def test_gateway_service_shape(self):
@@ -217,6 +218,7 @@ MODEL_KEYS = (
     "GATEWAY_EMBEDDING_API_KEY",
     "GATEWAY_EMBEDDING_DIM",
     "GATEWAY_MEMORY_VECTOR_BACKEND",
+    "GATEWAY_MEMORY_OWNER_CAN_READ_DM",
 )
 
 
@@ -235,6 +237,8 @@ class GatewayMemoryEnvStaticTest(unittest.TestCase):
         "GATEWAY_EMBEDDING_API_KEY": "",
         "GATEWAY_EMBEDDING_DIM": "0",
         "GATEWAY_MEMORY_VECTOR_BACKEND": "python",
+        # B line PR3d (#211).
+        "GATEWAY_MEMORY_OWNER_CAN_READ_DM": "false",
     }
 
     def test_compose_passes_through_with_defaults(self):
@@ -262,6 +266,39 @@ class GatewayMemoryEnvStaticTest(unittest.TestCase):
         self.assertRegex(src, r'_env_int\(\s*source,\s*"GATEWAY_EMBEDDING_DIM",\s*0\b')
         self.assertRegex(src, r'"GATEWAY_MEMORY_VECTOR_BACKEND",\s*"python"')
         self.assertIn('MEMORY_VECTOR_BACKENDS = frozenset({"none", "python", "sqlite-vec"})', src)
+        # PR3d: strict boolean via _env_bool, default False.
+        self.assertRegex(src, r'_env_bool\(\s*source,\s*"GATEWAY_MEMORY_OWNER_CAN_READ_DM",\s*False\s*\)')
+        self.assertRegex(src, r"memory_owner_can_read_dm:\s*bool\s*=\s*False")
+
+    def test_owner_can_read_dm_is_a_strict_boolean_in_gateway_src(self):
+        """Load _env_bool from config.py's source (no import of the package)
+        and check the strict parsing the docs promise: empty = default,
+        true/false (and 1/0, yes/no, on/off, any case) accepted, anything
+        else refused."""
+        import ast
+        src = (REPO_ROOT / "gateway" / "src" / "botville_gateway" / "config.py").read_text(
+            encoding="utf-8")
+        tree = ast.parse(src)
+        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_env_bool")
+
+        class ConfigError(Exception):
+            pass
+
+        ns = {"ConfigError": ConfigError, "Mapping": dict}
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), "config.py:_env_bool", "exec"), ns)
+        env_bool = ns["_env_bool"]
+        key = "GATEWAY_MEMORY_OWNER_CAN_READ_DM"
+        self.assertIs(env_bool({}, key, False), False)
+        self.assertIs(env_bool({key: ""}, key, False), False)
+        self.assertIs(env_bool({key: "  "}, key, False), False)
+        for raw in ("true", "TRUE", " True ", "1", "yes", "on"):
+            self.assertIs(env_bool({key: raw}, key, False), True, raw)
+        for raw in ("false", "False", "0", "no", "off"):
+            self.assertIs(env_bool({key: raw}, key, False), False, raw)
+        for raw in ("2", "enabled", "y", "t", "truee", "none"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ConfigError):
+                    env_bool({key: raw}, key, False)
         # Empty summary model / embedding URL / key fall back to the chat model's.
         self.assertRegex(src, r'"GATEWAY_MEMORY_SUMMARY_MODEL", ""\)\s*or _env_str\(source, "GATEWAY_MODEL_NAME"')
         self.assertRegex(src, r'"GATEWAY_EMBEDDING_BASE_URL", ""\)\s*or _env_str\(source, "GATEWAY_MODEL_BASE_URL"')
@@ -276,6 +313,11 @@ class GatewayMemoryEnvStaticTest(unittest.TestCase):
         # The privacy warning is in the fallback table and the memory section.
         self.assertGreaterEqual(doc.count("私聊正文会发给"), 1)
         self.assertIn("隐私：配置了 `GATEWAY_EMBEDDING_MODEL` 之后", doc)
+        # PR3d disclosure note in the table row and the memory section.
+        self.assertIn("App 会向聊天对方显示披露", doc)
+        self.assertIn("主人可读私聊记忆：`GATEWAY_MEMORY_OWNER_CAN_READ_DM` 默认 `false`", doc)
+        example = (REPO_ROOT / "server" / "compose" / ".env.example").read_text(encoding="utf-8")
+        self.assertIn("App shows a disclosure", example)
 
     def test_suggested_path_is_top_level_of_gateway_data(self):
         """The suggested path sits in the gateway-data volume, whose *.db files
@@ -367,6 +409,7 @@ class ComposeGatewayModelEnvTest(unittest.TestCase):
             self.assertEqual(env[key] or "", "", key)
         self.assertEqual(env["GATEWAY_EMBEDDING_DIM"], "0")
         self.assertEqual(env["GATEWAY_MEMORY_VECTOR_BACKEND"], "python")
+        self.assertEqual(env["GATEWAY_MEMORY_OWNER_CAN_READ_DM"], "false")
         binds = [v for v in svc["volumes"] if v["type"] == "bind"]
         self.assertEqual(len(binds), 1)
         self.assertEqual(binds[0]["target"], "/etc/botville-gateway")
@@ -390,6 +433,7 @@ class ComposeGatewayModelEnvTest(unittest.TestCase):
             "GATEWAY_EMBEDDING_API_KEY={1}\n"
             "GATEWAY_EMBEDDING_DIM=384\n"
             "GATEWAY_MEMORY_VECTOR_BACKEND=sqlite-vec\n"
+            "GATEWAY_MEMORY_OWNER_CAN_READ_DM=true\n"
         ).format(self.SENTINEL, self.EMB_SENTINEL))["environment"]
         self.assertEqual(env["GATEWAY_MEMORY_SUMMARY_MODEL"], "summary-model")
         self.assertEqual(env["GATEWAY_EMBEDDING_BASE_URL"], "http://embed.invalid/v1")
@@ -397,6 +441,7 @@ class ComposeGatewayModelEnvTest(unittest.TestCase):
         self.assertEqual(env["GATEWAY_EMBEDDING_API_KEY"], self.EMB_SENTINEL)
         self.assertEqual(env["GATEWAY_EMBEDDING_DIM"], "384")
         self.assertEqual(env["GATEWAY_MEMORY_VECTOR_BACKEND"], "sqlite-vec")
+        self.assertEqual(env["GATEWAY_MEMORY_OWNER_CAN_READ_DM"], "true")
         self.assertEqual(env["GATEWAY_MODEL_BASE_URL"], "http://model.invalid/v1")
         self.assertEqual(env["GATEWAY_MODEL_NAME"], "test-model")
         self.assertEqual(env["GATEWAY_MODEL_API_KEY"], self.SENTINEL)

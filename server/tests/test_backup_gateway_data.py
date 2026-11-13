@@ -179,7 +179,8 @@ class BackupGatewayDataTest(GatewayDataScriptsCase):
         proc = self.run_script("backup-gateway-data.sh")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         run = "\n".join(self.lines(self.compose_log))
-        self.assertIn('find /gateway-data -type f -name "*.db" | while IFS= read -r db; do', run)
+        self.assertIn('find /gateway-data -type f -name "*.db" -print0 | while IFS= read -r -d "" db; do', run)
+        self.assertIn("--entrypoint bash", run)
         self.assertIn("wal_checkpoint(TRUNCATE)", run)
         self.assertNotIn("for db in /gateway-data/*.db", run)
 
@@ -320,8 +321,10 @@ class GatewayUidConsistencyTest(unittest.TestCase):
 class GatewayArchiveRestoreScriptsRunTest(unittest.TestCase):
     """Run lib.sh's real in-container scripts against a sandbox directory
     (paths /gateway-data and /backup rewritten; owner = the test user):
-    the WAL checkpoint reaches *.db in subdirectories, and restore forces
-    every SQLite file to 0600 (#206 nits)."""
+    the WAL checkpoint reaches *.db in subdirectories, also with spaces or a
+    newline in the name (NUL-separated find, #208 nit), and restore forces
+    every SQLite file, -journal included, to 0600 (#206 / #208 nits). Run
+    with bash like the real runner (--entrypoint bash)."""
 
     def script(self, name):
         proc = subprocess.run(
@@ -341,7 +344,7 @@ class GatewayArchiveRestoreScriptsRunTest(unittest.TestCase):
 
     def run_sh(self, text):
         env = dict(os.environ, HOST_UID=str(os.getuid()), HOST_GID=str(os.getgid()))
-        return subprocess.run(["sh", "-c", text], env=env, stdin=subprocess.DEVNULL,
+        return subprocess.run(["bash", "-c", text], env=env, stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, timeout=60)
 
     def test_archive_checkpoints_nested_db_and_restore_chmods_600(self):
@@ -349,7 +352,9 @@ class GatewayArchiveRestoreScriptsRunTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             data, backup, live = tmp / "data", tmp / "backup", tmp / "live"
-            for d in (data / "sub", backup, live):
+            odd_dir = data / "sub dir"
+            odd = "we ird\nname.db"
+            for d in (data / "sub", odd_dir, backup, live):
                 d.mkdir(parents=True)
             # A WAL-mode db with rows still only in the -wal file: copy the
             # files while a connection is open (as if the process had stopped).
@@ -361,15 +366,22 @@ class GatewayArchiveRestoreScriptsRunTest(unittest.TestCase):
             conn.commit()
             for suffix in ("", "-wal"):
                 shutil.copy(str(live / ("nested.db" + suffix)), str(data / "sub" / ("nested.db" + suffix)))
+                shutil.copy(str(live / ("nested.db" + suffix)), str(odd_dir / (odd + suffix)))
             conn.close()
             (data / "top.db").write_bytes((data / "sub" / "nested.db").read_bytes())
             self.assertGreater((data / "sub" / "nested.db-wal").stat().st_size, 0)
+            self.assertGreater((odd_dir / (odd + "-wal")).stat().st_size, 0)
+            # A rollback-journal leftover must come back 0600 as well.
+            (data / "sub" / "legacy.db-journal").write_bytes(b"j")
 
             proc = self.run_sh(self.sandboxed(self.script("GATEWAY_ARCHIVE_SH"), data, backup))
             self.assertEqual(proc.returncode, 0, proc.stderr)
             wal = data / "sub" / "nested.db-wal"
             self.assertTrue(not wal.exists() or wal.stat().st_size == 0,
                             "nested db was not checkpointed")
+            odd_wal = odd_dir / (odd + "-wal")
+            self.assertTrue(not odd_wal.exists() or odd_wal.stat().st_size == 0,
+                            "db with a space/newline in its path was not checkpointed")
             archive = backup / "gateway-data.tar.gz"
             self.assertEqual(stat.S_IMODE(archive.stat().st_mode), 0o600)
 
@@ -388,15 +400,27 @@ class GatewayArchiveRestoreScriptsRunTest(unittest.TestCase):
             proc = self.run_sh(self.sandboxed(self.script("GATEWAY_RESTORE_SH"), data, backup))
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertFalse((data / "stale.db").exists())
-            for rel in ("top.db", "sub/nested.db"):
+            for rel in ("top.db", "sub/nested.db", "sub dir/" + odd, "sub/legacy.db-journal"):
                 self.assertEqual(stat.S_IMODE((data / rel).stat().st_mode), 0o600, rel)
-            for side in data.rglob("*.db-*"):
+            sides = list(data.rglob("*.db-*"))
+            self.assertIn(data / "sub" / "legacy.db-journal", sides)
+            for side in sides:
                 self.assertEqual(stat.S_IMODE(side.stat().st_mode), 0o600, side.name)
             self.assertEqual(stat.S_IMODE((data / "notes.txt").stat().st_mode), 0o644)
             # The checkpointed rows are in the main file alone.
-            check = sqlite3.connect(str(data / "sub" / "nested.db"))
-            self.assertEqual(check.execute("SELECT count(*) FROM t").fetchone()[0], 50)
-            check.close()
+            for path in (data / "sub" / "nested.db", odd_dir / odd):
+                check = sqlite3.connect(str(path))
+                self.assertEqual(check.execute("SELECT count(*) FROM t").fetchone()[0], 50)
+                check.close()
+
+    def test_runner_uses_bash_for_nul_separated_read(self):
+        lib = (SCRIPTS / "lib.sh").read_text(encoding="utf-8")
+        self.assertIn('-print0 | while IFS= read -r -d "" db; do', lib)
+        self.assertNotIn("--entrypoint sh", lib)
+        runs = [l for l in lib.splitlines() if l.strip().startswith("compose run ")]
+        self.assertEqual(len(runs), 2)
+        for line in runs:
+            self.assertIn("--entrypoint bash", line)
 
 if __name__ == "__main__":
     unittest.main()

@@ -473,6 +473,7 @@ class InitScriptTest(unittest.TestCase):
         "GATEWAY_EMBEDDING_API_KEY=\n"
         "GATEWAY_EMBEDDING_DIM=0\n"
         "GATEWAY_MEMORY_VECTOR_BACKEND=python\n"
+        "GATEWAY_MEMORY_OWNER_CAN_READ_DM=false\n"
     )
 
     def test_model_env_is_passed_through_never_generated_or_printed(self):
@@ -497,6 +498,7 @@ class InitScriptTest(unittest.TestCase):
             self.assertEqual(self.env_value(key), "", key)
         self.assertEqual(self.env_value("GATEWAY_EMBEDDING_DIM"), "0")
         self.assertEqual(self.env_value("GATEWAY_MEMORY_VECTOR_BACKEND"), "python")
+        self.assertEqual(self.env_value("GATEWAY_MEMORY_OWNER_CAN_READ_DM"), "false")
 
         sentinel = "sentinel-model-key-must-not-print-0123456789"
         emb_sentinel = "sentinel-embedding-key-must-not-print-0123456789"

@@ -177,14 +177,18 @@ gateway_running_containers() {
 # memory.db -- sit at the volume root, but a deployer may point a path at a
 # subdirectory; the gateway container is stopped meanwhile, so nothing else
 # holds them open). Uses the sqlite3 CLI if present, else python3's sqlite3
-# module (the gateway and synapse images both ship python3). `find | while
-# read` reads the whole list (no early-exit consumer). Any -wal/-shm left
+# module (the gateway and synapse images both ship python3). Names travel
+# NUL-separated (`find -print0 | while IFS= read -r -d ""`), so spaces or
+# newlines in a file name cannot split it; `while read` consumes the whole
+# list (no early-exit consumer). Needs bash (read -d): both runner images
+# (synapse, gateway; Debian-based) ship it and the runner is started with
+# --entrypoint bash. Any -wal/-shm left
 # behind is chowned back to the db's owner so the non-root gateway can reopen
 # it. Then a full-volume tar (everything under the root, not only
 # .db/-wal/-shm), chowned to the invoking user and chmod 600 inside the
 # container (it runs as root; a host-side chmod would fail).
 # shellcheck disable=SC2016  # expands inside the container shell
-GATEWAY_ARCHIVE_SH='find /gateway-data -type f -name "*.db" | while IFS= read -r db; do
+GATEWAY_ARCHIVE_SH='find /gateway-data -type f -name "*.db" -print0 | while IFS= read -r -d "" db; do
     [ -f "$db" ] || continue
     if command -v sqlite3 >/dev/null 2>&1; then
         sqlite3 "$db" "PRAGMA wal_checkpoint(TRUNCATE);" </dev/null || true
@@ -201,17 +205,19 @@ chmod 600 /backup/gateway-data.tar.gz'
 
 # Shell run inside the one-off container by restore_gateway_data: empty the
 # volume root, extract, hand everything to the gateway's uid, then force every
-# SQLite file (*.db and its -wal/-shm, any depth: memory.db, moments.db,
-# as_transactions.db, ...) to 0600 -- they hold chat text, profiles and
-# transactions, and the gateway is their only reader. Explicit, so a backup
-# taken from an older/looser volume cannot restore world-readable files.
+# SQLite file (*.db and its -wal/-shm/-journal, any depth: memory.db,
+# moments.db, as_transactions.db, ...) to 0600 -- they hold chat text,
+# profiles and transactions, and the gateway is their only reader. Explicit,
+# so a backup taken from an older/looser volume cannot restore world-readable
+# files. Both finds use -exec ... {} +, which hands names to rm/chmod as argv
+# (never re-parsed), so odd names (spaces, newlines) are already safe.
 # shellcheck disable=SC2016  # expands inside the container shell
-GATEWAY_RESTORE_SH='cd /gateway-data && find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + && tar -xzf /backup/gateway-data.tar.gz && chown -R "$GATEWAY_UID:$GATEWAY_UID" /gateway-data && find /gateway-data -type f \( -name "*.db" -o -name "*.db-wal" -o -name "*.db-shm" \) -exec chmod 600 {} +'
+GATEWAY_RESTORE_SH='cd /gateway-data && find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + && tar -xzf /backup/gateway-data.tar.gz && chown -R "$GATEWAY_UID:$GATEWAY_UID" /gateway-data && find /gateway-data -type f \( -name "*.db" -o -name "*.db-wal" -o -name "*.db-shm" -o -name "*.db-journal" \) -exec chmod 600 {} +'
 
 # archive_gateway_data <backup_dir> <runner_service>
 # Writes <backup_dir>/gateway-data.tar.gz from the existing gateway-data
 # volume via `compose run --rm --no-deps` on <runner_service> (any service of
-# the caller's COMPOSE whose image has sh + tar: synapse for the synapse
+# the caller's COMPOSE whose image has bash + tar: synapse for the synapse
 # profile, gateway otherwise -- tuwunel/continuwuity images are OS-less).
 # A running gateway container is stopped for the archive (it holds the
 # SQLite files open) and started again afterwards, also on failure.
@@ -223,7 +229,7 @@ archive_gateway_data() {
         # shellcheck disable=SC2086  # one id per word
         docker stop ${running} >/dev/null
     fi
-    compose run --rm --no-deps --user 0:0 --entrypoint sh \
+    compose run --rm --no-deps --user 0:0 --entrypoint bash \
         -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
         -v "$(cd "${dir}" && pwd):/backup" \
         -v "$(gateway_data_volume):/gateway-data" \
@@ -251,7 +257,7 @@ restore_gateway_data() {
         # shellcheck disable=SC2086
         docker stop ${running} >/dev/null
     fi
-    compose run --rm --no-deps --user 0:0 --entrypoint sh \
+    compose run --rm --no-deps --user 0:0 --entrypoint bash \
         -e "GATEWAY_UID=${GATEWAY_DATA_UID}" \
         -v "$(cd "${dir}" && pwd):/backup:ro" \
         -v "$(gateway_data_volume):/gateway-data" \

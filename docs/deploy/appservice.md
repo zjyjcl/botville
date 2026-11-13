@@ -254,6 +254,7 @@ B 线 PR2（角色引擎回复）读的变量，compose 原样透传给 `gateway
 | `GATEWAY_EMBEDDING_API_KEY` | `${GATEWAY_EMBEDDING_API_KEY:-}` | 空 → 用 `GATEWAY_MODEL_API_KEY` | **密钥**，规则同 `GATEWAY_MODEL_API_KEY`：只写在部署方自己的 `server/compose/.env` |
 | `GATEWAY_EMBEDDING_DIM` | `${GATEWAY_EMBEDDING_DIM:-0}` | `0` = 自动探测 | 正整数要求响应维度一致；负数拒绝启动 |
 | `GATEWAY_MEMORY_VECTOR_BACKEND` | `${GATEWAY_MEMORY_VECTOR_BACKEND:-python}` | `python` | `none` / `python` / `sqlite-vec`（扩展加载不了时回退 python）；其他值拒绝启动 |
+| `GATEWAY_MEMORY_OWNER_CAN_READ_DM` | `${GATEWAY_MEMORY_OWNER_CAN_READ_DM:-false}` | `false` | 主人能否读 AI 的私聊记忆（B 线 PR3d）。⚠️ **打开后主人能看到 AI 的私聊正文和事实值，App 会向聊天对方显示披露**；关闭时主人仍可管理元数据。严格布尔（`true`/`false`，也认 `1`/`0`、`yes`/`no`、`on`/`off`），其他值网关拒绝启动 |
 | `BOTVILLE_GATEWAY_PERSONAS_DIR` | 挂载源 `${BOTVILLE_GATEWAY_PERSONAS_DIR:-./gateway-personas}` | `server/compose/gateway-personas` | 只读挂到容器 `/etc/botville-gateway` |
 
 **记忆库（B 线 PR3a / PR3b）**
@@ -264,12 +265,17 @@ B 线 PR2（角色引擎回复）读的变量，compose 原样透传给 `gateway
 > `GATEWAY_MEMORY_SUMMARY_MODEL`，空则用 `GATEWAY_MODEL_NAME`）同样把聊天内容发给模型
 > 服务商。不想让正文出本机，就保持 `GATEWAY_EMBEDDING_MODEL` 为空（第④层关闭）。
 
+> ⚠️ **主人可读私聊记忆：`GATEWAY_MEMORY_OWNER_CAN_READ_DM` 默认 `false`。** 设为 `true`
+> 后，AI 的主人能通过记忆端点看到这个 AI 的私聊记忆（正文和事实值），App 会向和该 AI
+> 私聊的对方显示披露；保持 `false` 时主人只能管理元数据，私聊内容不出示。改完
+> `make up GATEWAY=1` 重建网关生效；写错（不是严格布尔）网关会拒绝启动。
+
 - `GATEWAY_MEMORY_DB_PATH` 默认空 = 记忆关闭（引擎只用进程内最近对话）。启用时写
   `/var/lib/botville-gateway/memory.db`：放在 gateway-data 卷**顶层**，和
   `moments.db` / `as_transactions.db` 一样。`make backup` 先对卷内所有 `*.db`（子目录
   也算）做 WAL checkpoint 再打包整个卷，`make restore` 整卷恢复；建议仍放顶层，路径简单。
 - 网关以 **0600** 创建这个文件；里面是聊天内容和长期档案，备份包同样只能本人可读
-  （备份脚本已 chmod 600）。恢复时卷内所有 SQLite 文件（`*.db` 和 `-wal`/`-shm`，
+  （备份脚本已 chmod 600）。恢复时卷内所有 SQLite 文件（`*.db` 和 `-wal`/`-shm`/`-journal`，
   任意深度）都会显式 `chmod 600`，旧备份里权限宽松的文件也不例外。
 - 保留期与清理间隔不合法（保留天数 <1、清理间隔非 0 且 <60）时网关拒绝启动。
 - PR3b 变量：`GATEWAY_EMBEDDING_API_KEY` 是密钥，和模型 key 一样只放本地 `.env`，
@@ -303,7 +309,10 @@ B 线 PR2（角色引擎回复）读的变量，compose 原样透传给 `gateway
   和 `make -n` 都不会出现它；init.sh 不生成、不打印（追加缺失键时只打印键名）；
   冒烟脚本不读它，也不打印任何 token。
 - **不要贴 `docker compose config` 的输出**：不带 `--quiet` 时它会把插值后的值
-  原样打印出来。CI 与文档一律用 `config --quiet`；CI 另有一步用哨兵值验证
+  原样打印出来——不只模型 key，`GATEWAY_EMBEDDING_API_KEY`、网关 token / HMAC 密钥、
+  AS/HS token 都会出现在终端或日志里。只用 `config --quiet`（或只列名字的
+  `--volumes` / `--services`）；仓库里的脚本、Makefile 和 CI 都由
+  `server/tests/test_compose_config_quiet.py` 守着，不会回退。CI 与文档一律用 `config --quiet`；CI 另有一步用哨兵值验证
   12 种 HS × profile 组合都不会打印它，`server/tests` 里也有对应断言。
 - 轮换：改 `.env` 后 `make up GATEWAY=1`。
 
