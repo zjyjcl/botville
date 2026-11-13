@@ -156,6 +156,8 @@ DEFAULT_MEMORY_RETENTION_DAYS = 90
 DEFAULT_MEMORY_PURGE_INTERVAL_SECONDS = 86_400
 MEMORY_VECTOR_BACKENDS = frozenset({"none", "python", "sqlite-vec"})
 DEFAULT_MOOD_HALF_LIFE_MINUTES = 240
+# KEEP IN SYNC: deploy-side RANGES in server/tests/test_compose_gateway_mood_proactive.py
+# (GATEWAY_MOOD_HALF_LIFE_MINUTES); change both together.
 MOOD_HALF_LIFE_MINUTES_MIN = 1
 MOOD_HALF_LIFE_MINUTES_MAX = 10_080
 
@@ -328,6 +330,8 @@ def _env_group_max_responders(env: Mapping[str, str]) -> int:
         value = int(raw.strip())
     except (TypeError, ValueError):
         raise ConfigError("GATEWAY_GROUP_MAX_RESPONDERS must be an integer in range") from None
+    # KEEP IN SYNC: deploy-side RANGES in server/tests/test_compose_gateway_mood_proactive.py
+    # (GATEWAY_GROUP_MAX_RESPONDERS); change both together.
     if not 1 <= value <= 20:
         raise ConfigError("GATEWAY_GROUP_MAX_RESPONDERS must be in range")
     return value
@@ -600,13 +604,19 @@ class Config:
     mood_half_life_minutes: int = DEFAULT_MOOD_HALF_LIFE_MINUTES
 
     def __post_init__(self) -> None:
+        # KEEP IN SYNC: GATEWAY_GROUP_FORGET_STALE_KEYS is not yet in deploy-side RANGES/BOOLS
+        # (server/tests/test_compose_gateway_mood_proactive.py); A line still needs to add them.
         if not isinstance(self.group_forget_stale_keys, bool):
             raise ConfigError("GATEWAY_GROUP_FORGET_STALE_KEYS must be a boolean")
         if not isinstance(self.groups_enabled, bool):
             raise ConfigError("GATEWAY_GROUPS_ENABLED must be a boolean")
+        # KEEP IN SYNC: deploy-side RANGES in server/tests/test_compose_gateway_mood_proactive.py
+        # (GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA); change both together.
         if (type(self.group_max_rooms_per_persona) is not int
                 or not 1 <= self.group_max_rooms_per_persona <= 200):
             raise ConfigError("GATEWAY_GROUP_MAX_ROOMS_PER_PERSONA must be within 1–200")
+        # KEEP IN SYNC: the four B2.8c group ranges below are not yet in deploy-side RANGES/BOOLS
+        # (server/tests/test_compose_gateway_mood_proactive.py); A line still needs to add them.
         for name, low, high in (
             ("group_cooldown_seconds", 0, 3600),
             ("group_max_replies_per_hour", 1, 200),
@@ -640,8 +650,13 @@ class Config:
             raise ConfigError("platform_token_budget must be >= 0")
         if self.platform_proactive_per_day < 0:
             raise ConfigError("platform_proactive_per_day must be >= 0")
+        # KEEP IN SYNC: deploy-side RANGES in server/tests/test_compose_gateway_mood_proactive.py
+        # (GATEWAY_GROUP_MAX_RESPONDERS); change both together.
         if not isinstance(self.group_max_responders, int) or isinstance(self.group_max_responders, bool) or not 1 <= self.group_max_responders <= 20:
             raise ConfigError("GATEWAY_GROUP_MAX_RESPONDERS must be between 1 and 20")
+        # KEEP IN SYNC: deploy-side RANGES in server/tests/test_compose_gateway_mood_proactive.py
+        # (GATEWAY_PROACTIVE_TICK_SECONDS, GATEWAY_PROACTIVE_MIN_IDLE_MINUTES,
+        # GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES, GATEWAY_PROACTIVE_PER_TARGET_PER_DAY); change both together.
         proactive_ranges = (
             (self.proactive_tick_seconds, 30, 86_400, "proactive_tick_seconds"),
             (self.proactive_min_idle_minutes, 0, 43_200, "proactive_min_idle_minutes"),

@@ -147,6 +147,51 @@ class GroupThrottleTests(unittest.TestCase):
         self.assertNotIn('ai_loop.per_hour', keys)
         self.assertNotIn('anti_spam.consecutive', keys)
 
+    def test_human_resets_consecutive_but_not_group_hour_breaker(self):
+        # Keep default group limits; a long anti-spam cooldown proves that the
+        # human message, rather than cooldown expiry, restores admission.
+        self.put('owner', 'persona', AIS[0], {'anti_spam': {
+            'max_consecutive_ai_messages': 3, 'cooldown_seconds': 600}})
+        for _ in range(3):
+            self.assertEqual(self.send()['outcome'], 'delivered')
+            self.advance(30)
+        receipt = self.send()
+        self.blocked(receipt, 'anti_spam.consecutive')
+        checks = {c['key']: c for c in receipt['decision']['checks']}
+        self.assertEqual(checks['anti_spam.consecutive']['used'], 3)
+        self.assertEqual(checks['ai_loop.per_hour']['used'], 3)
+        self.blocked(self.evaluate(), 'anti_spam.cooldown')
+
+        self.advance(1)
+        self.svc.record_human_message(ROOM)
+        checks = {c['key']: c for c in self.evaluate()['checks']}
+        self.assertEqual(checks['anti_spam.consecutive']['used'], 0)
+        self.assertEqual(checks['ai_loop.per_hour']['used'], 3)
+        self.assertEqual(self.send()['outcome'], 'delivered')
+        self.advance(30)
+
+        # Rotate personas to stay below 20 replies per persona per hour, and
+        # insert humans before each send to isolate the room-wide hard limit.
+        for used in range(4, 30):
+            p = AIS[used % len(AIS)]
+            before = {c['key']: c for c in self.evaluate(p)['checks']}
+            self.svc.record_human_message(ROOM)
+            after = {c['key']: c for c in self.evaluate(p)['checks']}
+            self.assertEqual(after['anti_spam.consecutive']['used'], 0)
+            self.assertEqual(before['ai_loop.per_hour']['used'], used)
+            self.assertEqual(after['ai_loop.per_hour']['used'], used)
+            self.assertEqual(self.send(p)['outcome'], 'delivered')
+            self.advance(30)
+
+        self.svc.record_human_message(ROOM)
+        decision = self.evaluate()
+        checks = {c['key']: c for c in decision['checks']}
+        self.assertEqual(checks['anti_spam.consecutive']['used'], 0)
+        self.assertEqual(checks['ai_loop.per_hour']['used'], 30)
+        self.blocked(decision, 'ai_loop.tripped')
+        self.blocked(self.send(), 'ai_loop.tripped')
+        self.assertEqual(len(self.tr.sent), 30)
+
     def test_existing_min_interval_coexists(self):
         self.put('owner', 'persona', AIS[0], {'min_seconds_between_messages': 60})
         self.send()

@@ -974,7 +974,9 @@ ephemeral 不在 AS 注册里开启，忽略。
 成功投递后通过现有 commit 路径入账，幂等重放不重复计数；在途预留暂占额度，失败回滚。
 群节流键为部署密钥 HMAC，最多 4096 个 (persona, room) 桶，每桶最多 200 个时间戳，
 进程内 LRU 有界存储，重启清空；容量淘汰可能使旧桶少算，部署应容纳活跃群规模。
-小时窗口为 `(now-3600s, now]`，到出窗时恢复。群 ai_loop 的完整小时口径及三层底线见 §6.3。
+小时窗口为 `(now-3600s, now]`，到出窗时恢复。群内 anti_spam 同 persona 连续计数
+在人类发言时归零（默认上限 3 条）；ai_loop 默认 30/h 为滚动一小时硬底线，人类发言不重置。
+三层底线及既有冷却语义见 §6.3。
 
 验收使用假时钟、假模型及假 transport，经 consumer → engine → policy 模拟 5 AI、1 人类、
 每 20 秒消息持续一小时；AI 文本回灌无链式回复，每人类事件最多 MAX_RESPONDERS 位回复者，
@@ -1895,7 +1897,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
-| 0.5.0 | 2026-11-13 | [B2.8c #228] accepted 群冷却与滚动小时回复限额、群 ai_loop / anti_spam 底线；schema 10→11 的 HMAC key_id 与轮换隔离/可选忘记旧行、上限只计当前键、发送层独立加密拦截；严格本服 room id、accepted 房间忽略不合格再邀请、拒绝 leave 的 M_FORBIDDEN 视为完成，以及 Synapse /sync invite 过滤说明修正。无 API 字段变化、契约仍 0.5.0。 |
+| 0.5.0 | 2026-11-13 | [B2.8c #228] accepted 群冷却与滚动小时回复限额、群 ai_loop / anti_spam 底线（群内连续计数在人类发言时归零；默认 30/h 为滚动一小时硬底线，人类发言不重置）；schema 10→11 的 HMAC key_id 与轮换隔离/可选忘记旧行、上限只计当前键、发送层独立加密拦截；严格本服 room id、accepted 房间忽略不合格再邀请、拒绝 leave 的 M_FORBIDDEN 视为完成，以及 Synapse /sync invite 过滤说明修正。无 API 字段变化、契约仍 0.5.0。 |
 | 0.5.0 | 2026-11-13 | [#226 评审 nit] `/sync` 权威确认改为仅邀请的一次性请求（set_presence=offline、无 since、不消费 to-device）；leave 遇 `M_FORBIDDEN` 视为已离开并移出清理队列；格式异常的成员事件只跳过该事件；邀请台账 TTL（`GATEWAY_INVITE_LEDGER_TTL_SECONDS`，默认 1 天）。无 API 字段变化。 |
 | 0.5.0 | 2026-11-13 | [M_FORBIDDEN 安全加固] 自动 join 需邀请台账命中或 /sync 权威确认，前后排除加密；已有成员不 join/leave；leave 有限重试与持久清理队列，无新增开关或 API 字段。 |
 | 0.5.0 | 2026-11-13 | [PR4c quasi-breaking] 新增默认关闭的主动发言部署/人设配置、DM-only 候选、持久化队列与 stable txnId 重放语义；`ProactiveSettings.enabled` 默认值由 true 改为 false。该默认值改变未显式设置旧部署的行为，按准破坏性变更公告。 |
@@ -2070,8 +2072,8 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 anti_spam 默认同 persona 连续 3 条；配置范围见 B2.8c 表。有效值为各层正值与群底线的最小值，
 现有 0/未设按无限参与该群计算（仅这两个群规则；API anti_spam 仍不接受 0，不修改验证范围）。
 非群规则、非群房间及 `PLATFORM_*` 的既有语义不变。
-群 ai_loop 使用完整滚动小时的任意 AI 计数，**人类消息不重置**，防止持续 @ 绕过房间小时底线；
-其余房间仍按下文的人类重置语义。群 anti_spam 仍按同 persona，沿用冷却、人类重置及在途预留。
+群 ai_loop 默认 30/h 为滚动一小时硬底线，统计同房间任意 AI，**人类发言不重置**，防止持续 @ 绕过房间小时底线；
+其余房间仍按下文的人类重置语义。群 anti_spam 仍按同 persona，**连续计数在人类发言时归零**，沿用既有冷却及在途预留语义。
 群限额与非群限额都使用同一 service 实发路径，外部运行时 messages / policy/evaluate 同样执行。
 下文 API 零值与人类重置规则除本段明确的群例外外保持原义。
 
