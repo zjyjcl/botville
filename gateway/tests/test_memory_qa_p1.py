@@ -11,7 +11,7 @@ from unittest.mock import Mock
 from test_memory_owner_http import MemoryHTTPServer, PERSONA, HUMAN
 from botville_gateway.capability_manifest import BASE_CAPABILITIES, DEFAULTS, MEMORY_MANAGE
 from botville_gateway.caller_identity import CallerAuthenticator
-from botville_gateway.config import Config
+from botville_gateway.config import Config, CONTRACT_VERSION
 from botville_gateway.memory.owner_http import capabilities
 from botville_gateway.memory.recall import assemble_recall
 from botville_gateway.memory.summary import StoreSummaryProvider
@@ -20,6 +20,18 @@ from botville_gateway.user_identity import VERIFY_SERVER_ERROR
 
 
 class ManifestTests(unittest.TestCase):
+    @unittest.skipUnless(
+        json.loads((__import__('pathlib').Path(__file__).parents[1] / 'openapi' / 'examples'
+                    / 'capability-manifest.json').read_text(encoding='utf-8')).get('contract_version')
+        == CONTRACT_VERSION,
+        'C 线同步示例 contract_version 后启用',
+    )
+    def test_example_contract_version_matches_runtime_contract(self):
+        example_path = (__import__('pathlib').Path(__file__).parents[1] / 'openapi' / 'examples'
+                        / 'capability-manifest.json')
+        self.assertEqual(json.loads(example_path.read_text(encoding='utf-8'))['contract_version'],
+                         CONTRACT_VERSION)
+
     def test_static_manifest_matches_example_in_order(self):
         import pathlib
         example_path = pathlib.Path(__file__).parents[1] / 'openapi' / 'examples' / 'capability-manifest.json'

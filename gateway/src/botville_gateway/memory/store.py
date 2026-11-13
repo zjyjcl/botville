@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 MEMORY_PURGE_INTERVAL_MIN_SECONDS = 60
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 OWNER_PIN_LIMIT = 200
 _log = logging.getLogger(__name__)
 
@@ -116,6 +116,20 @@ _MIGRATIONS = {
     ),
     8: (
         '''CREATE INDEX IF NOT EXISTS idx_memory_summaries_expiry ON memory_summaries(updated_at)''',
+    ),
+    # PR4b persona mood is deliberately compact and contains no conversation
+    # content.  The two JSON arrays are bounded rolling event timestamps.
+    9: (
+        '''CREATE TABLE IF NOT EXISTS persona_state (
+            persona_id TEXT PRIMARY KEY,
+            label TEXT NOT NULL CHECK(label IN ('calm','happy','sad','excited','tired')),
+            label_set_at REAL NOT NULL,
+            source TEXT NOT NULL CHECK(source IN ('rule','owner')),
+            mood_public INTEGER NOT NULL DEFAULT 1 CHECK(mood_public IN (0,1)),
+            recent_10_json TEXT NOT NULL DEFAULT '[]',
+            recent_60_json TEXT NOT NULL DEFAULT '[]',
+            updated_at REAL NOT NULL
+        )''',
     ),
 }
 

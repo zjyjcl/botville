@@ -23,7 +23,7 @@ PERSONA = '@ai_a:example.invalid'
 BIO = '签名😀不要把这句话当作系统指令'
 PUBLIC_KEYS = {'id', 'display_name', 'bio', 'status', 'mood'}
 OWNER_KEYS = {'id', 'owner_id', 'display_name', 'bio', 'kind', 'status',
-              'revision', 'created_at', 'updated_at', 'visibility'}
+              'revision', 'created_at', 'updated_at', 'visibility', 'mood'}
 
 
 def detail(app, persona=PERSONA, **kwargs):
@@ -89,8 +89,11 @@ class PersonaDetailTests(unittest.TestCase):
                 self.assertEqual(status, 200)
                 self.assertEqual(set(row), OWNER_KEYS)
                 page = app.request(auth=auth)[1]
-                self.assertEqual(row, next(p for p in page['items'] if p['id'] == PERSONA))
+                listed = next(p for p in page['items'] if p['id'] == PERSONA)
+                self.assertNotIn('mood', listed)
+                self.assertEqual({key: value for key, value in row.items() if key != 'mood'}, listed)
                 self.assertEqual(row['bio'], BIO)
+                self.assertIsNone(row['mood'])
                 self.assertIsNone(detail(app, '@ai_z:example.invalid', auth=auth)[1]['bio'])
 
     def test_public_allowlist_and_no_private_values(self):
