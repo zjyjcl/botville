@@ -380,13 +380,13 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 | 400 | `request.invalid` / `request.malformed_json` | 语法或参数错误 |
 | 401 | `auth.missing` / `auth.invalid_token` | 缺少或无效令牌（含一次性 code 重复使用） |
 | 403 | `persona.not_owned` / `relation.chat_denied` / `conversation.e2ee` / `card.step_up_required` / `card.assertion_invalid` | 身份有效但无权限 / 断言无效 |
-| 404 | `room.not_found` / `persona.not_found` / `conversation.not_found` / `capability.not_found` / `card.not_found` / `audit.not_found` / `moment.not_found` / `memory.disabled` / `memory.not_found` | 不存在或对调用方不可见；记忆模块关闭为 `memory.disabled` |
+| 404 | `room.not_found` / `persona.not_found` / `conversation.not_found` / `capability.not_found` / `card.not_found` / `audit.not_found` / `moment.not_found` / `memory.disabled` / `memory.not_found` / `mood.disabled` | 不存在或对调用方不可见；记忆模块关闭为 `memory.disabled`；mood 模块关闭为 `mood.disabled` |
 | 409 | `room.state_conflict` / `persona.state_conflict` / `persona.in_use` / `conversation.exists_conflict` / `persona.revision_conflict` / `card.revision_conflict` / `moment.revision_conflict` / `idempotency.conflict` / `card.already_decided` / `card.challenge_invalid` / `memory.pin_limit` | 状态冲突 |
 | 410 | `card.challenge_expired` | challenge 或一次性 code 已过期 |
 | 422 | `limit.out_of_range` / `card.invalid_block` / `card.missing_fallback_text` / `card.source_scope_mismatch` / `card.missing_event_id` / `card.missing_expires_at` / `state.invalid_value` / `request.invalid` / `memory.key_not_allowed` / `memory.counterpart_invalid` / `memory.not_pinnable` | 语义不合法 |
 | 429 | `rate_limited.transport` | 传输层限流（**不是**发言额度） |
 | 500 | `internal.error` | 网关内部错误 |
-| 503 | `memory.unavailable` / `room.unavailable` / `persona.unavailable` | 存储或外部依赖不可用；memory 错误带 `Retry-After` |
+| 503 | `memory.unavailable` / `room.unavailable` / `persona.unavailable` / `mood.unavailable` | 存储或外部依赖不可用；memory/mood 错误带 `Retry-After` |
 
 卡片操作相关错误码（C4 / D3）：
 
@@ -959,7 +959,7 @@ ephemeral 不在 AS 注册里开启，忽略。
 
 只适用于该 persona 在 `group_rooms` 中 state=accepted，且部署 `GATEWAY_GROUPS_ENABLED`
 与 persona `groups.enabled` 均开启的房间。
-群功能（部署或 persona）关闭时，内置引擎在群房间完全不发言（包括被 @/回复），DM 不受影响，不自动退群。
+群功能（部署或 persona）关闭时，内置引擎在群房间完全不发言（包括被 @/回复），DM 不受影响，不自动退群。仍按现有规则记录群记忆（group scope，含其他 AI 发言作为 untrusted）。
 只有成员已确认且 room_is_dm 的房间视为 DM；成员未确认按群处理。外部运行时 POST /messages 不受此限制。
 
 | 变量 | 默认 | 范围与含义 |
@@ -1409,7 +1409,7 @@ rooms 集合仅支持 GET/HEAD，单项仅支持 PATCH；其他方法在相同 o
   mode，否则 409 `room.state_conflict`。群功能（部署或 persona）关闭时仅接受 muted、leave 或两者组合；
   任何含 mention_only 的请求返回 409 `room.state_conflict`，不修改行。
   校验顺序为 400 参数、404 房间、409 状态/开关冲突，再执行；无 store 时仍为 404。
-- 群功能（部署或 persona）关闭时，内置引擎在群房间完全不发言（包括被 @/回复），DM 不受影响，不自动退群。
+- 群功能（部署或 persona）关闭时，内置引擎在群房间完全不发言（包括被 @/回复），DM 不受影响，不自动退群。仍按现有规则记录群记忆（group scope，含其他 AI 发言作为 untrusted）。
   只有成员已确认且 room_is_dm 的房间视为 DM；成员未确认按群处理。外部运行时 POST /messages 不受此限制。
 - mention_only 保持既有群触发语义。muted 即使被 @ 或被回复也不调模型、不发送；检查在 policy
   之前，不消耗回复限额，仍按现有规则写 group scope 记忆（含其他 AI 的 untrusted 发言）。
@@ -1963,8 +1963,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
-| 0.6.0 | 2026-11-13 | [B2.8d2 评审清理] evaluate 解析失败 404/400 替代 500；rooms 错误方法鉴权后 405 + Allow；record_group_send 复用已解析 id；示例 title 与 0.5.0 残留表述修正；群功能关闭时引擎群回复 fail-closed、PATCH 仅 muted/leave、有 DB 的 GET 仍列出现有房间；无字段变化、不升版本。 |
-| 0.6.0 | 2026-11-13 | [B2.8d] 新增 owner GET /personas/{id}/rooms 与 PATCH /personas/{id}/rooms/{room_ref}；owner 详情和 UpdatePersonaRequest 增加 groups；mention_only/muted 模式与退群、leave_pending 确认状态及 owner leave 持久清理；新增 room.not_found / room.state_conflict；group.replies_per_hour.exceeded 原因码正式纳入。汇总 B2.8 行为：严格双人 DM、群仅被提及/回复才发言、AI 不触发 AI、群节流与熔断、加密群 403 conversation.e2ee、HMAC 密钥轮换隔离及退出后禁止发送自动 rejoin；群节流/熔断计数以规范 persona 与规范 room 为键，别名与裸 id 不能绕过，key_id 回填先于 forget。 |
+| 0.6.0 | 2026-11-13 | [B2.8d] 新增 owner GET /personas/{id}/rooms 与 PATCH /personas/{id}/rooms/{room_ref}；owner 详情和 UpdatePersonaRequest 增加 groups；mention_only/muted 模式与退群、leave_pending 确认状态及 owner leave 持久清理；新增 room.not_found / room.state_conflict；group.replies_per_hour.exceeded 原因码正式纳入。汇总 B2.8 行为：严格双人 DM、群仅被提及/回复才发言、AI 不触发 AI、群节流与熔断、加密群 403 conversation.e2ee、HMAC 密钥轮换隔离及退出后禁止发送自动 rejoin；群节流/熔断计数以规范 persona 与规范 room 为键，别名与裸 id 不能绕过，key_id 回填先于 forget。 B2.8d2 评审清理：evaluate 解析失败 404/400 替代 500；rooms 错误方法鉴权后 405 + Allow；record_group_send 复用已解析 id；示例 title 与 0.5.0 残留表述修正；群功能关闭时引擎群回复 fail-closed、PATCH 仅 muted/leave、有 DB 的 GET 仍列出现有房间；无字段变化、不升版本。 B2.8d3：错误码表补 mood.unavailable/mood.disabled、/state 503 示例、rooms 405 响应、群关闭时仍记录群记忆说明、evaluate 404 示例 instance 修正；纯文档。 |
 | 0.5.0 | 2026-11-13 | [B2.8c #228] accepted 群冷却与滚动小时回复限额、群 ai_loop / anti_spam 底线（群内连续计数在人类发言时归零；默认 30/h 为滚动一小时硬底线，人类发言不重置）；schema 10→11 的 HMAC key_id 与轮换隔离/可选忘记旧行、上限只计当前键、发送层独立加密拦截；严格本服 room id、accepted 房间忽略不合格再邀请、拒绝 leave 的 M_FORBIDDEN 视为完成，以及 Synapse /sync invite 过滤说明修正。无 API 字段变化、契约仍 0.5.0。 |
 | 0.5.0 | 2026-11-13 | [#226 评审 nit] `/sync` 权威确认改为仅邀请的一次性请求（set_presence=offline、无 since、不消费 to-device）；leave 遇 `M_FORBIDDEN` 视为已离开并移出清理队列；格式异常的成员事件只跳过该事件；邀请台账 TTL（`GATEWAY_INVITE_LEDGER_TTL_SECONDS`，默认 1 天）。无 API 字段变化。 |
 | 0.5.0 | 2026-11-13 | [M_FORBIDDEN 安全加固] 自动 join 需邀请台账命中或 /sync 权威确认，前后排除加密；已有成员不 join/leave；leave 有限重试与持久清理队列，无新增开关或 API 字段。 |
