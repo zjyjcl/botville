@@ -74,3 +74,6 @@ BOTVILLE_AI_USER_ID_PREFIXES=[]
 本轮仅使用占位凭据与 fake SDK，排除真实 Keychain 往返和需要账号的 Synapse 集成。构建缓存及测试临时数据按任务边界留在本 worktree 的 `app-apple/.build/`，测试后清理临时数据；不改用工作树外的系统临时目录。
 
 仍需后续完成实际 iOS/macOS 界面、两个设备、Rust homeserver 及完整恢复流程验收；不把本地单元测试或模拟器无签名编译当作这些验收结果。
+
+资料页/活跃成员统计只计 `join`；加密安全策略同时检查 `join` 和 `invite`，
+以便在 AI 受邀但尚未加入时就阻止不兼容加密。安全判断取保守口径，两处不能共用展示计数。

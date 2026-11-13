@@ -605,6 +605,16 @@ public final class MatrixService: ObservableObject {
         return profile
     }
 
+    public func aiProfileDetails(_ profile: AIProfile) async throws -> AIProfile {
+        let session = sessionGeneration
+        guard isLoggedIn, !isLoggingOut,
+              profile.localServerName == userID.flatMap(MemoryPresentationPolicy.matrixServerName(in:))
+        else { throw CancellationError() }
+        let result = try await profile.fetchingDetails(using: confirmedGatewayClient())
+        guard session == sessionGeneration, !isLoggingOut, !Task.isCancelled else { throw CancellationError() }
+        return result
+    }
+
     /// The paired gateway is authoritative only for a local AI on the same
     /// Matrix server name as the signed-in account. Network or stale-session
     /// failures fail closed so the profile never infers owner access.

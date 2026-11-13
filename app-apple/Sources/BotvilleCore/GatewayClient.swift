@@ -9,6 +9,7 @@ public protocol GatewayClient: ModuleWebSessionProviding {
     func perform(card: GatewayCard, action: GatewayCardAction) async throws -> GatewayActionReceipt
     func exchangeSessionCookie(capabilityID: String, code: String) async throws -> GatewayCookieExchange
     func personas() async throws -> [MemoryPersona]
+    func persona(id: String) async throws -> PersonaDetail
     func memories(
         personaID: String, layers: [String], scopeKind: String?, counterpart: String?,
         roomID: String?, pinned: Bool?, cursor: String?, limit: Int?
@@ -22,6 +23,7 @@ public protocol GatewayClient: ModuleWebSessionProviding {
 
 public extension GatewayClient {
     func personas() async throws -> [MemoryPersona] { throw GatewayClientError.invalidResponse }
+    func persona(id: String) async throws -> PersonaDetail { throw GatewayClientError.invalidResponse }
     func memories(
         personaID: String, layers: [String] = [], scopeKind: String? = nil,
         counterpart: String? = nil, roomID: String? = nil, pinned: Bool? = nil,
@@ -60,6 +62,8 @@ public enum GatewayClientError: Error, Equatable, LocalizedError {
     }
 
     public var errorDescription: String? {
+        if httpStatus == 403 { return "没有权限查看" }
+        if httpStatus == 401, self != .serverAuthMisconfigured { return "会话已失效，请重新登录。" }
         switch self {
         case .serverAuthMisconfigured: return "服务器认证异常，请联系部署者"
         case .problem(_, let code):
@@ -70,6 +74,7 @@ public enum GatewayClientError: Error, Equatable, LocalizedError {
             case "memory.pin_limit": return "固定记忆数量已达上限。"
             case "memory.unavailable": return "记忆服务暂时不可用，请稍后重试。"
             case "persona.not_owned": return "你无权管理该 AI 的记忆。"
+            case "persona.not_found": return "不存在或不可见"
             case "rate_limited.transport": return "操作过于频繁，请稍后再试。"
             default: return "网关请求失败，请稍后重试。"
             }
@@ -217,6 +222,10 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
             cursor = next
         } while cursor != nil
         return result
+    }
+
+    public func persona(id: String) async throws -> PersonaDetail {
+        try await decode(request(["personas", id]), as: PersonaDetail.self)
     }
 
     public func memories(
@@ -371,9 +380,10 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
 
     private static func isOpenIDPath(_ segments: [String], method: String) -> Bool {
         guard let first = segments.first else { return false }
-        // #215 implements only the GET collection; persona subresources remain 404.
+        // Contract 0.3.0 authenticates GET collection and exactly one opaque ID.
         return first == "moments" || first == "memories"
-            || (segments == ["personas"] && method.caseInsensitiveCompare("GET") == .orderedSame)
+            || (first == "personas" && method.caseInsensitiveCompare("GET") == .orderedSame
+                && (segments.count == 1 || (segments.count == 2 && !segments[1].isEmpty)))
     }
 
     /// Minimal raw-data entry point. Resource models and UI are intentionally
@@ -387,7 +397,8 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
     }
 
     /// Match the first API path segment relative to this gateway's base prefix.
-    /// Personas is GET collection-only. Query strings and similar names never select credentials.
+    /// Split the encoded path before decoding segments, so an opaque ID containing
+    /// a slash stays one ID. Queries and lookalike resource names cannot select credentials.
     func isOpenIDRequest(_ request: URLRequest) throws -> Bool {
         guard let url = request.url,
             let candidate = URLComponents(url: url, resolvingAgainstBaseURL: false),
@@ -405,16 +416,19 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
                 .percentEncodedPath
         else { throw GatewayClientError.invalidResponse }
         let path = candidate.percentEncodedPath
+        let personaSegments: [String]
+        if path == personas {
+            personaSegments = ["personas"]
+        } else if path.hasPrefix(personas + "/") {
+            let suffix = path.dropFirst(personas.count + 1)
+            personaSegments = ["personas"] + suffix.split(separator: "/", omittingEmptySubsequences: false)
+                .map { String($0).removingPercentEncoding ?? "" }
+        } else {
+            personaSegments = []
+        }
         return path == moments || path.hasPrefix(moments + "/") || path == memories
             || path.hasPrefix(memories + "/")
-            || (path == personas && request.httpMethod?.caseInsensitiveCompare("GET") == .orderedSame)
-    }
-
-    /// Kept for existing callers; memory selection is handled by isOpenIDRequest.
-    func isMomentsRequest(_ request: URLRequest) throws -> Bool {
-        guard let root = try self.request(["moments"]).url?.path,
-              let path = request.url?.path else { throw GatewayClientError.invalidResponse }
-        return path == root || path.hasPrefix(root + "/")
+            || Self.isOpenIDPath(personaSegments, method: request.httpMethod ?? "GET")
     }
 
     func responseData(for request: URLRequest) async throws -> Data {
@@ -557,9 +571,15 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
     }
 
     public func personas() async throws -> [MemoryPersona] {
-        // #215 head 1d4fc06a41870420ae9cbdc2b01ad0bde421e1ab, PersonaSummary/PersonaPage.
+        // #218 head 391a248ee004fda5b57761bc607c662453af7f40, contract 0.3.0.
         try GatewayCoding.decoder.decode(MemoryPersonaPage.self,
             from: Self.resource("mock-persona-page")).items
+    }
+    public func persona(id: String) async throws -> PersonaDetail {
+        guard let persona = try await personas().first(where: { $0.id == id }) else {
+            throw GatewayClientError.problem(status: 404, code: "persona.not_found")
+        }
+        return .owner(persona)
     }
     public func memories(
         personaID: String, layers: [String] = [], scopeKind: String? = nil,

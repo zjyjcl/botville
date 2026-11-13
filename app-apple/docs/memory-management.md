@@ -23,8 +23,10 @@ E6 写事实只有客户端接口与测试，本轮没有编辑页面。
 部署覆盖规则继续生效。群聊、真人、成员不完整或身份不明确时不猜测 AI。
 
 名字与头像来自 Matrix 成员资料；头像通过已登录 SDK 的认证媒体通道读取，
-失败或无头像显示名字首字母/占位。当前 SDK 成员资料及网关 persona 契约没有签名字段，
-因此本轮不显示签名，不把房间主题、聊天正文或假 persona 当作签名。
+失败或无头像显示名字首字母/占位。网关契约 0.3.0 的 `bio` 映射到 `AIProfile.signature`，
+在名字下方用次要色展示，支持多行；null、缺失或去空白后为空时隐藏，不用聊天正文推断。
+详情成功后采用网关的名字和签名，保留 Matrix 头像。公开视图中的 mood 仅解码，不展示；
+缺失、null 及未知枚举值按 nil 处理。
 
 「该 AI 的主人可以查看和删除它与你的聊天记忆」仅显示在对方的 AI 资料页。
 只读取当前已确认配对网关的 capabilities，不使用动态页示例/手动网关状态。
@@ -36,26 +38,39 @@ E6 写事实只有客户端接口与测试，本轮没有编辑页面。
 主人 `PersonaMemoryView` 固定显示「私聊内容是否可见由服务端开关决定」。
 #211 已将 `owner_can_read_dm` 的 schema 默认值改为 `false`，已在 main
 `a7d5a7f` 的 `gateway/openapi/gateway.v1.yaml` 核对；App 缺失字段仍默认隐藏。
-新增能力使 manifest 从 1.2.0 升到 1.3.0（minor），契约版本为 0.2.0。
+新增 memory.manage 能力时 manifest 升到 1.3.0；本次契约元数据更新按
+`contract.md` §3.7 升 patch 到 1.3.1，contract_version 同步为 0.3.0。
 
 ## 集成边界
 
-GET `/v1/personas` 按 #215 HEAD `1d4fc06a41870420ae9cbdc2b01ad0bde421e1ab`
-的 `PersonaSummary` / `PersonaPage` 和 `examples/persona-page.json` 对齐：
-九字段摘要，Matrix user ID 作为 id，平铺的 `next_cursor` / `has_more`。
-App Mock 资源逐字节采用该示例，Mock 记忆同步使用对应 persona id；真实请求不注入示例。
+#215 已合入。列表和详情按 #218 head
+`391a248ee004fda5b57761bc607c662453af7f40` 的 0.3.0 契约对齐：
+`PersonaSummary` 为包含 nullable bio 的十字段摘要，Matrix user ID 作为 id，
+列表使用平铺的 `next_cursor` / `has_more`。App Mock persona 资源逐字节采用该 head
+的 persona-page 示例；双份 capability manifest 逐字节一致。真实请求不注入示例。
 
-只把 GET 集合精确路径加入 MatrixOpenID，移除站点 Bearer，复用令牌刷新、
-invalid_token 最多重试一次，以及 GET 或带幂等键写入的 500 重试策略。
-正常分页 query 不影响选择；其他路径 query 中的 personas、personasx、编码分隔符、
-`/personas/{id}` 子路径及非 GET 操作不纳入。#215 仅实现 GET 集合，其他操作保持 404。
-403 `persona.not_owned` 在「我的 AI」展示中文权限错误和重试入口，成功空列表展示「暂无 AI」。
-#215 尚未合入时，真实列表仍依赖网关合入并部署该实现；App 不推断或绕过所有权。
+GET `/v1/personas/{id}` 返回 `anyOf`：有 `owner_id` 时严格解码完整主人摘要，
+否则解码 id/display_name/bio/status/mood 公开视图，不把损坏的主人数据降级为公开视图。
+对方资料页使用已确认配对网关读取详情；会话切换或取消后的结果不更新页面。
+404 `persona.not_found` 显示「不存在或不可见」。跨服或本服身份域未知时同样按缺失处理，
+不发详情请求；判断沿用完整 Matrix server_name（包括端口），不猜测别名。
+没有可用配对网关或其他失败显示错误和重试。
+
+GET 集合与恰好一个非空 id 的详情路径使用 MatrixOpenID，移除站点 Bearer，
+复用 invalid_token 最多刷新一次和 GET 的 500 重试策略。id 按独立路径段编码；
+正常 query 不影响选择，query 里的 personas 不触发选择。personasx、空 id、额外子路径、
+编码到资源名中的分隔符及非 GET 操作不纳入。编码到不透明 id 内的特殊字符仍属于同一段。
+「我的 AI」403（含无 problem body）只显示「没有权限查看」，保留重试；401 才提示重新登录。
+首次成功前和请求进行中显示加载态，仅请求成功且列表为空时显示「暂无 AI」；
+失败清除旧行并显示错误及重试，不能当作成功空列表。
+
+依赖集成：#218 未合入前，main 的 YAML/网关 persona 示例仍为 0.2.0，
+须在合入 #218 后的 main 上验证最终契约和示例同步；不得为通过检查修改这些网关文件。
 
 AI 资料页仅将 join 计入活跃成员；invite 不作 AI 对方，也不增加活跃人数。
 跨服判断刻意按完整 server_name 精确比较，别名/多域名也按跨服隐藏披露。
 加密安全策略里的 join/invite 检查仍保留：它防止给已邀请的 AI 开启不兼容加密，
-不是资料页的活跃人数判定，不在本次 nit 中放宽。
+安全判断采用保守口径，因此与资料页活跃人数展示的口径不同。
 DEBUG 未读快照和安全状态合并索引对重复房间 ID 均取数组中最后值。
 全仓其余 `uniqueKeysWithValues` 仅在 GatewayTests 的固定 manifest 样本断言中，
 当前键唯一；保留测试的重复键失败语义，不用于 SDK/网络运行时输入。

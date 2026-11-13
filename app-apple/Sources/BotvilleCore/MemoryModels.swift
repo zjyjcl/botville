@@ -96,6 +96,7 @@ public struct MemoryFactWrite: Codable, Sendable, Equatable {
 public struct MemoryPersona: Codable, Sendable, Equatable, Identifiable {
     public let id: String
     public let displayName: String
+    public let bio: String?
     public let ownerID: String
     public let kind: String
     public let status: String
@@ -104,11 +105,84 @@ public struct MemoryPersona: Codable, Sendable, Equatable, Identifiable {
     public let updatedAt: Date
     public let visibility: String
     enum CodingKeys: String, CodingKey {
-        case id, kind, status, revision, visibility
+        case id, bio, kind, status, revision, visibility
         case displayName = "display_name"
         case ownerID = "owner_id"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
+    }
+
+    public func aiProfile(localServerName: String?) -> AIProfile {
+        AIProfile(userID: id, displayName: displayName, avatarData: nil,
+                  signature: bio, localServerName: localServerName)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(id, forKey: .id)
+        try values.encode(displayName, forKey: .displayName)
+        try values.encode(bio, forKey: .bio)
+        try values.encode(ownerID, forKey: .ownerID)
+        try values.encode(kind, forKey: .kind)
+        try values.encode(status, forKey: .status)
+        try values.encode(revision, forKey: .revision)
+        try values.encode(createdAt, forKey: .createdAt)
+        try values.encode(updatedAt, forKey: .updatedAt)
+        try values.encode(visibility, forKey: .visibility)
+    }
+}
+
+public enum PersonaMood: String, Sendable {
+    case neutral, happy, sad, excited, calm, anxious
+}
+
+public struct PersonaPublicView: Decodable, Sendable, Equatable, Identifiable {
+    public let id: String
+    public let displayName: String
+    public let bio: String?
+    public let status: String
+    public let mood: PersonaMood?
+
+    private enum CodingKeys: String, CodingKey {
+        case id, bio, status, mood
+        case displayName = "display_name"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        displayName = try values.decode(String.self, forKey: .displayName)
+        bio = try values.decodeIfPresent(String.self, forKey: .bio)
+        status = try values.decode(String.self, forKey: .status)
+        mood = try values.decodeIfPresent(String.self, forKey: .mood).flatMap(PersonaMood.init(rawValue:))
+    }
+}
+
+/// Contract 0.3.0 uses anyOf without a discriminator. An owner_id field selects
+/// the full summary; malformed owner data must not silently become a public view.
+public enum PersonaDetail: Decodable, Sendable, Equatable {
+    case owner(MemoryPersona)
+    case publicView(PersonaPublicView)
+
+    private enum CodingKeys: String, CodingKey { case ownerID = "owner_id" }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        if values.contains(.ownerID) {
+            self = .owner(try MemoryPersona(from: decoder))
+        } else {
+            self = .publicView(try PersonaPublicView(from: decoder))
+        }
+    }
+
+    public var id: String {
+        switch self { case .owner(let value): value.id; case .publicView(let value): value.id }
+    }
+    public var displayName: String {
+        switch self { case .owner(let value): value.displayName; case .publicView(let value): value.displayName }
+    }
+    public var bio: String? {
+        switch self { case .owner(let value): value.bio; case .publicView(let value): value.bio }
     }
 }
 struct MemoryPersonaPage: Decodable {
@@ -127,9 +201,11 @@ struct MemoryPersonaPage: Decodable {
 public final class PersonaListModel: ObservableObject {
     @Published public private(set) var personas: [MemoryPersona] = []
     @Published public private(set) var isLoading = false
+    @Published public private(set) var hasLoaded = false
     @Published public private(set) var errorMessage: String?
     public let client: any GatewayClient
-    public var isEmpty: Bool { !isLoading && errorMessage == nil && personas.isEmpty }
+    public var isEmpty: Bool { hasLoaded && !isLoading && errorMessage == nil && personas.isEmpty }
+    public var showsLoading: Bool { isLoading || (!hasLoaded && errorMessage == nil) }
 
     public init(client: any GatewayClient) { self.client = client }
 
@@ -138,12 +214,13 @@ public final class PersonaListModel: ObservableObject {
         isLoading = true
         errorMessage = nil
         defer { isLoading = false }
-        do { personas = try await client.personas() } catch {
+        do {
+            personas = try await client.personas()
+            hasLoaded = true
+        } catch {
             personas = []
             if let error = error as? GatewayClientError {
-                errorMessage = error == .problem(status: 403, code: "persona.not_owned")
-                    ? "当前身份无权查看我的 AI，请重新登录后重试。"
-                    : error.errorDescription
+                errorMessage = error.errorDescription
             }
             if errorMessage == nil { errorMessage = "暂时无法加载 AI，请稍后重试。" }
         }

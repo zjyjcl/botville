@@ -43,7 +43,7 @@ final class MatrixOpenIDTests: XCTestCase {
             let (client, recorder) = try transport(MatrixOpenIDTokenProvider { self.credential() }, base: base)
             for (path, expected) in [(["moments"], true), (["moments", "id", "comments"], true), (["momentsx"], false), (["capabilities"], false), (["cards"], false), (["context", "assemble"], false)] {
                 let request = try client.request(path, query: [URLQueryItem(name: "x", value: "moments")])
-                XCTAssertEqual(try client.isMomentsRequest(request), expected)
+                XCTAssertEqual(try client.isOpenIDRequest(request), expected)
                 _ = try await client.responseData(for: request)
                 let header = recorder.requests.last?.value(forHTTPHeaderField: "Authorization")
                 XCTAssertTrue(header == (expected ? "MatrixOpenID synthetic-openid-1" : "Bearer synthetic-site"))
