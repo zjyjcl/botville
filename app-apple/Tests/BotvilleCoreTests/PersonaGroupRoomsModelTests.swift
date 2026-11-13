@@ -74,6 +74,30 @@ final class PersonaGroupRoomsModelTests: XCTestCase {
         XCTAssertEqual(model.errorMessage, "网关请求失败，请稍后重试。")
     }
 
+    func testConflictRefreshFailureKeepsPreviousRoomsAndRestartsPagination() async {
+        let client = RoomsScriptClient(
+            pages: [
+                .success(page([room("a"), room("b")], "next", true)),
+                .failure(.httpStatus(500)),
+                .success(page([room("c")], nil, false)),
+            ],
+            modes: [.failure(.problem(status: 409, code: "room.state_conflict"))])
+        let model = roomsModel(client)
+        await model.load()
+        await model.setMode(roomRef: ref("a"), mode: .muted)
+        // The failed refresh must not blank the list that was already on screen.
+        XCTAssertEqual(model.rooms.map(\.roomRef), [ref("a"), ref("b")])
+        XCTAssertEqual(model.rooms.first?.mode, .mentionOnly)
+        XCTAssertEqual(model.errorMessage, "网关请求失败，请稍后重试。")
+        XCTAssertFalse(model.isLoading)
+        // The old cursor predates the conflict; the next page request starts over.
+        await model.loadMore()
+        XCTAssertEqual(model.rooms.map(\.roomRef), [ref("c")])
+        XCTAssertNil(model.errorMessage)
+        let calls = await client.calls()
+        XCTAssertEqual(calls, ["nil:false", "nil:false", "nil:false"])
+    }
+
     func testSharedErrorsAndDisabledEmptyPage() async {
         let client = RoomsScriptClient(pages: [
             .failure(.httpStatus(401)), .failure(.httpStatus(403)),
