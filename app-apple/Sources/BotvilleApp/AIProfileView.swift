@@ -33,6 +33,9 @@ struct AIProfileView: View {
                         .accessibilityHidden(true)
                     VStack(alignment: .leading, spacing: 8) {
                         Text(displayedProfile.displayName).font(.title2.weight(.semibold))
+                        if let mood = displayedProfile.mood {
+                            PersonaMoodBadge(mood: mood)
+                        }
                         if let signature = displayedProfile.signature {
                             Text(signature)
                                 .font(.subheadline).foregroundStyle(.secondary)
@@ -113,5 +116,16 @@ struct AIProfileView: View {
 #else
         return NSImage(data: data).map { Image(nsImage: $0) }
 #endif
+    }
+}
+
+private struct PersonaMoodBadge: View {
+    let mood: PersonaMood
+
+    var body: some View {
+        Label(mood.label, systemImage: mood.symbolName)
+            .font(.caption.weight(.medium))
+            .foregroundStyle(aiProfileAccent)
+            .accessibilityLabel("当前心情：\(mood.label)")
     }
 }
