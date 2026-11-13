@@ -92,22 +92,6 @@ class OwnerMemoryService:
              pinned: Optional[bool] = None, cursor: Optional[str] = None,
              limit: int = 20) -> Tuple[list[Dict[str, Any]], Optional[str]]:
         wanted = set(layers) or {'recent', 'summary', 'profile'}
-        result = []
-        for layer, row in self._rows(persona_id):
-            if layer not in wanted:
-                continue
-            item = self._memory(layer, row)
-            scope = item['scope']
-            if scope_kind and scope['kind'] != scope_kind:
-                continue
-            if counterpart and scope.get('counterpart') != counterpart:
-                continue
-            if room_id and scope.get('room_id') != room_id:
-                continue
-            if pinned is not None and item['pinned'] != pinned:
-                continue
-            result.append(item)
-        result.sort(key=lambda item: (item['updated_at'], item['id']), reverse=True)
         filter_tag = hashlib.sha256(json.dumps([persona_id, sorted(wanted), scope_kind, counterpart, room_id, pinned],
                                                 separators=(',', ':'), ensure_ascii=True).encode('utf-8')).hexdigest()[:16]
         decoded = None
@@ -124,8 +108,45 @@ class OwnerMemoryService:
                 decoded = tuple(value[1:])
             except (ValueError, UnicodeError, json.JSONDecodeError):
                 raise ValueError('invalid memory cursor')
-        if decoded:
-            result = [item for item in result if (item['updated_at'], item['id']) < (decoded[0], decoded[2])]
+        # Each layer has a different physical shape.  Query each one with its
+        # own scope projection, then merge only the bounded candidates.
+        def rows_for(table: str, layer: str):
+            where, args = ['persona_id=?'], [persona_id]
+            if layer == 'profile':
+                if scope_kind and scope_kind != 'dm': return []
+                if room_id: return []
+                if counterpart: where.append('counterpart=?'); args.append(counterpart)
+            else:
+                if scope_kind: where.append('scope_kind=?'); args.append(scope_kind)
+                if counterpart:
+                    projection = 'scope_key' if layer == 'summary' else "coalesce(nullif(counterpart,''),scope_key)"
+                    where.append("scope_kind='dm' AND " + projection + "=?")
+                    args.append(counterpart)
+                if room_id:
+                    projection = 'scope_key' if layer == 'summary' else "coalesce(nullif(room_id,''),scope_key)"
+                    where.append("scope_kind='group' AND " + projection + "=?")
+                    args.append(room_id)
+            if pinned is not None:
+                if layer == 'summary':
+                    if pinned:
+                        return []
+                else:
+                    where.append('pinned=?'); args.append(int(pinned))
+            timestamp = 'updated_at'
+            if decoded:
+                where.append("(" + timestamp + " < ? OR (" + timestamp + " = ? AND public_id < ?))")
+                args.extend((decoded[0], decoded[0], decoded[2]))
+            sql = ('SELECT * FROM ' + table + ' WHERE ' + ' AND '.join(where) +
+                   ' ORDER BY ' + timestamp + ' DESC, public_id DESC LIMIT ?')
+            args.append(limit + 1)
+            with self.store._lock:
+                return [self._memory(layer, dict(row)) for row in self.store._db.execute(sql, args)]
+
+        result = []
+        if 'recent' in wanted: result.extend(rows_for('memory_items', 'recent'))
+        if 'summary' in wanted: result.extend(rows_for('memory_summaries', 'summary'))
+        if 'profile' in wanted: result.extend(rows_for('memory_facts', 'profile'))
+        result.sort(key=lambda item: (item['updated_at'], item['id']), reverse=True)
         page = result[:limit]
         next_cursor: Optional[str] = None
         if len(result) > limit and page:

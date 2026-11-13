@@ -25,6 +25,7 @@ WRITES_PER_MINUTE = 20
 WINDOW_SECONDS = 60
 IDEMPOTENCY_TTL = 86400
 IDEMPOTENCY_MAX = 2000
+IDEMPOTENCY_PER_OWNER_MAX = 200
 PUBLIC_ID = re.compile(r"m[rsf]_[0-9a-f]{16}\Z")
 MEMORY_FIELDS = frozenset(('id', 'persona_id', 'layer', 'scope', 'visibility',
     'trust', 'source', 'pinned', 'text', 'key', 'value', 'dirty', 'redacted',
@@ -61,13 +62,33 @@ class MemoryHTTPState:
             queue.append(now)
 
 
+def _remember_idempotency(state, caller, key, value):
+    """Store a fact replay entry without letting one owner evict another."""
+    state.idempotency[key] = value
+    state.idempotency.move_to_end(key)
+    owner_keys = [entry_key for entry_key in state.idempotency if entry_key[0] == caller]
+    while len(owner_keys) > IDEMPOTENCY_PER_OWNER_MAX:
+        state.idempotency.pop(owner_keys.pop(0), None)
+    while len(state.idempotency) > IDEMPOTENCY_MAX:
+        state.idempotency.popitem(last=False)
+
+
+def _expire_idempotency(state, now):
+    """Remove expired entries even when replay has changed LRU order."""
+    for cached_key, cached in list(state.idempotency.items()):
+        if cached[0] <= now - IDEMPOTENCY_TTL:
+            state.idempotency.pop(cached_key, None)
+
+
 def capabilities(server, query):
     params = parse_qs(query)
     entries = deepcopy(BASE_CAPABILITIES)
     if server.memory_store is not None:
         manage = deepcopy(MEMORY_MANAGE)
         manage['owner_can_read_dm'] = server.config.memory_owner_can_read_dm
-        entries.append(manage)
+        # Keep the published manifest order stable (memory.manage follows
+        # memory.search); clients still must not depend on it.
+        entries.insert(2, manage)
     for name in ('module', 'status'):
         if name in params:
             entries = [entry for entry in entries if entry[name] == params[name][-1]]
@@ -211,13 +232,13 @@ def _route(handler, state, caller, params, rest, audit):
             raise HTTPError(422, 'request.invalid')
         idem = handler._idempotency_key()
         fingerprint = hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
-        idem_key = (caller, hashlib.sha256(idem.encode()).hexdigest()) if idem else None
+        idem_key = (caller, idem) if idem else None
         with state.lock:
             now = time.monotonic()
-            while state.idempotency and next(iter(state.idempotency.values()))[0] <= now - IDEMPOTENCY_TTL:
-                state.idempotency.popitem(last=False)
+            _expire_idempotency(state, now)
             previous = state.idempotency.get(idem_key) if idem_key else None
             if previous:
+                state.idempotency.move_to_end(idem_key)
                 if previous[1] != fingerprint:
                     raise HTTPError(409, 'idempotency.conflict')
                 item = service.get(previous[2])
@@ -228,9 +249,8 @@ def _route(handler, state, caller, params, rest, audit):
                 item, created = service.set_fact(persona, counterpart, key, value, visibility)
                 status = 201 if created else 200
                 if idem_key:
-                    state.idempotency[idem_key] = (now, fingerprint, item['id'], status)
-                    while len(state.idempotency) > IDEMPOTENCY_MAX:
-                        state.idempotency.popitem(last=False)
+                    _remember_idempotency(
+                        state, caller, idem_key, (now, fingerprint, item['id'], status))
         audit['memory_id'] = item['id']
         return status, _redact(server, caller, item)
     segments = rest.split('/')[1:]

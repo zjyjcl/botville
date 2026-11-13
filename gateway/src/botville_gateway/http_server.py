@@ -441,7 +441,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     def _auth_capabilities_ok(self) -> bool:
         """Accept site/caller or end-user identity without sending an early 401."""
         header = self.headers.get("Authorization")
-        outcome, identity = self.server.authenticator.authenticate(header)
+        outcome, identity = self.server.authenticator.authenticate(header, log_failure=False)
         if outcome in (AUTH_OK, AUTH_PASS_THROUGH):
             self._caller = identity
             return True
@@ -449,6 +449,10 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         if user_outcome == VERIFY_OK:
             self._user_id = user_id
             return True
+        # Both permitted authentication routes failed.  The authenticator's
+        # first, speculative check was deliberately silent so a valid Matrix
+        # bearer is not logged as a failed caller token.
+        self.server.authenticator._log("failed", None)
         if not header:
             self._send_problem(401, "auth.missing", "Authorization header required")
         elif user_outcome in (VERIFY_MISSING, VERIFY_INVALID):

@@ -21,11 +21,14 @@ import unittest
 import urllib.error
 import urllib.request
 from datetime import timedelta, timezone
+from unittest import mock
 
 GATEWAY_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SRC = os.path.join(GATEWAY_ROOT, "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
+
+_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 from botville_gateway import __main__ as gateway_main  # noqa: E402
 from botville_gateway.config import Config, ConfigError, load_config  # noqa: E402
@@ -245,7 +248,7 @@ def _raw_request(url, method, data=None, headers=None, timeout=5):
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _LOCAL_OPENER.open(req, timeout=timeout) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()
@@ -279,6 +282,21 @@ def _cfg(**overrides):
 
 
 class TestHttpEdgeCases(unittest.TestCase):
+    def test_loopback_helper_ignores_proxy_environment(self):
+        proxy_env = {
+            'HTTP_PROXY': 'http://127.0.0.1:1',
+            'HTTPS_PROXY': 'http://127.0.0.1:1',
+            'ALL_PROXY': 'http://127.0.0.1:1',
+            'http_proxy': 'http://127.0.0.1:1',
+            'https_proxy': 'http://127.0.0.1:1',
+            'all_proxy': 'http://127.0.0.1:1',
+        }
+        # clear=True also removes ambient NO_PROXY/no_proxy exemptions so this
+        # proves the helper's explicit ProxyHandler({}) is doing the bypass.
+        with mock.patch.dict(os.environ, proxy_env, clear=True), _Fixture(_cfg()) as fixture:
+            status, _ = _raw_request(f"{fixture.base}/health", "GET")
+        self.assertEqual(status, 200)
+
     def test_health_head_allowed(self):
         with _Fixture(_cfg()) as fixture:
             status, raw = _raw_request(f"{fixture.base}/health", "HEAD")
@@ -346,7 +364,7 @@ class TestHttpEdgeCases(unittest.TestCase):
             req.add_header("Content-Type", "application/json")
             req.add_header("Content-Length", "-5")
             try:
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with _LOCAL_OPENER.open(req, timeout=5) as resp:
                     status, body = resp.status, resp.read()
             except urllib.error.HTTPError as exc:
                 status, body = exc.code, exc.read()
@@ -360,7 +378,7 @@ class TestHttpEdgeCases(unittest.TestCase):
             req.add_header("Content-Type", "application/json")
             req.add_header("Content-Length", "abc")
             try:
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with _LOCAL_OPENER.open(req, timeout=5) as resp:
                     status, body = resp.status, resp.read()
             except urllib.error.HTTPError as exc:
                 status, body = exc.code, exc.read()
@@ -373,7 +391,7 @@ class TestHttpEdgeCases(unittest.TestCase):
             )
             req.add_header("Content-Type", "application/json")
             try:
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with _LOCAL_OPENER.open(req, timeout=5) as resp:
                     status, body = resp.status, resp.read()
             except urllib.error.HTTPError as exc:
                 status, body = exc.code, exc.read()
@@ -387,7 +405,7 @@ class TestHttpEdgeCases(unittest.TestCase):
             )
             req.add_header("Content-Type", "application/json")
             try:
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with _LOCAL_OPENER.open(req, timeout=5) as resp:
                     status, body = resp.status, resp.read()
             except urllib.error.HTTPError as exc:
                 status, body = exc.code, exc.read()
@@ -409,7 +427,7 @@ class TestHttpEdgeCases(unittest.TestCase):
             )
             req.add_header("Content-Type", "application/json")
             try:
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with _LOCAL_OPENER.open(req, timeout=5) as resp:
                     status, body = resp.status, resp.read()
             except urllib.error.HTTPError as exc:
                 status, body = exc.code, exc.read()
@@ -420,14 +438,14 @@ class TestHttpEdgeCases(unittest.TestCase):
         with _Fixture(_cfg()) as fixture:
             req = urllib.request.Request(f"{fixture.base}/health")
             req.add_header("X-Request-Id", "custom-id-1234")
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with _LOCAL_OPENER.open(req, timeout=5) as resp:
                 self.assertEqual(resp.headers["X-Request-Id"], "custom-id-1234")
 
     def test_invalid_x_request_id_replaced(self):
         with _Fixture(_cfg()) as fixture:
             req = urllib.request.Request(f"{fixture.base}/health")
             req.add_header("X-Request-Id", "bad value with spaces")
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with _LOCAL_OPENER.open(req, timeout=5) as resp:
                 rid = resp.headers["X-Request-Id"]
                 self.assertTrue(rid.startswith("req_"))
 
@@ -444,7 +462,7 @@ class TestHttpEdgeCases(unittest.TestCase):
             req.add_header("Content-Type", "application/json")
             req.add_header("Idempotency-Key", "k" * 200)
             try:
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with _LOCAL_OPENER.open(req, timeout=5) as resp:
                     status, body = resp.status, resp.read()
             except urllib.error.HTTPError as exc:
                 status, body = exc.code, exc.read()
@@ -459,7 +477,7 @@ class TestHttpEdgeCases(unittest.TestCase):
             )
             req.add_header("Content-Type", "application/json")
             try:
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with _LOCAL_OPENER.open(req, timeout=5) as resp:
                     status, body = resp.status, resp.read()
             except urllib.error.HTTPError as exc:
                 status, body = exc.code, exc.read()
@@ -475,7 +493,7 @@ class TestHttpEdgeCases(unittest.TestCase):
             )
             req.add_header("Content-Type", "application/json")
             try:
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with _LOCAL_OPENER.open(req, timeout=5) as resp:
                     status, body = resp.status, resp.read()
             except urllib.error.HTTPError as exc:
                 status, body = exc.code, exc.read()
@@ -499,7 +517,7 @@ class TestHttpEdgeCases(unittest.TestCase):
             )
             req.add_header("Content-Type", "application/json")
             try:
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with _LOCAL_OPENER.open(req, timeout=5) as resp:
                     status, body = resp.status, resp.read()
             except urllib.error.HTTPError as exc:
                 status, body = exc.code, exc.read()
@@ -515,7 +533,7 @@ class TestHttpEdgeCases(unittest.TestCase):
             )
             req.add_header("Content-Type", "application/json")
             try:
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with _LOCAL_OPENER.open(req, timeout=5) as resp:
                     status, body = resp.status, resp.read()
             except urllib.error.HTTPError as exc:
                 status, body = exc.code, exc.read()
@@ -562,7 +580,7 @@ class TestHttpEdgeCases(unittest.TestCase):
             )
             req.add_header("Content-Type", "application/json")
             try:
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with _LOCAL_OPENER.open(req, timeout=5) as resp:
                     status, body = resp.status, resp.read()
             except urllib.error.HTTPError as exc:
                 status, body = exc.code, exc.read()
@@ -591,7 +609,7 @@ class TestHttpEdgeCases(unittest.TestCase):
                 )
                 req.add_header("Content-Type", "application/json")
                 try:
-                    with urllib.request.urlopen(req, timeout=5) as resp:
+                    with _LOCAL_OPENER.open(req, timeout=5) as resp:
                         status = resp.status
                 except urllib.error.HTTPError as exc:
                     status = exc.code
@@ -609,7 +627,7 @@ class TestHttpEdgeCases(unittest.TestCase):
             )
             req.add_header("Content-Type", "application/json")
             try:
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with _LOCAL_OPENER.open(req, timeout=5) as resp:
                     status = resp.status
             except urllib.error.HTTPError as exc:
                 status = exc.code
@@ -627,7 +645,7 @@ class TestHttpEdgeCases(unittest.TestCase):
             )
             req.add_header("Content-Type", "application/json")
             try:
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with _LOCAL_OPENER.open(req, timeout=5) as resp:
                     status = resp.status
             except urllib.error.HTTPError as exc:
                 status = exc.code
@@ -641,7 +659,7 @@ class TestHttpEdgeCases(unittest.TestCase):
             )
             req.add_header("Content-Type", "text/plain")
             try:
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with _LOCAL_OPENER.open(req, timeout=5) as resp:
                     status = resp.status
             except urllib.error.HTTPError as exc:
                 status = exc.code

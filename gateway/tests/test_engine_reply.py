@@ -27,6 +27,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import List, Optional
 from unittest import mock
@@ -60,6 +61,8 @@ from botville_gateway.engine import (  # noqa: E402
 from botville_gateway.http_server import build_server  # noqa: E402
 from botville_gateway.service import GatewayService
 from botville_gateway.matrix import InMemoryMatrixTransport  # noqa: E402
+from botville_gateway.memory.store import MemoryStore  # noqa: E402
+from botville_gateway.memory.vector import PythonVectorStore  # noqa: E402
 
 SERVER_NAME = "example.test"
 AI_A = f"@ai_a:{SERVER_NAME}"
@@ -469,6 +472,93 @@ class TestEngineHooks(unittest.TestCase):
         client._post.assert_not_called()
         self.assertEqual(transport.sent, [])
         self.assertEqual(hooks.stats.snapshot()["precheck_blocked"], 1)
+
+    def test_rejected_policy_does_not_recall_or_reserve_embedding(self):
+        """Memory recall, including its query reservation, starts only after allow."""
+        client = _mock_client()
+        transport = InMemoryMatrixTransport()
+        service = GatewayService(_cfg(platform_token_budget=100), transport)
+        store = MemoryStore(":memory:")
+        self.addCleanup(store.close)
+        embedding = mock.Mock()
+        embedding.config = mock.Mock(model="test")
+        embedding.dimension = 2
+        hooks = EngineHooks(personas={AI_A: _make_persona()}, client=client, service=service,
+            memory_store=store, memory_embedding=embedding,
+            memory_vectors=PythonVectorStore(store))
+        ctx = self._make_ctx()
+        ctx = ctx.__class__(**dict(ctx.__dict__, room_members_confirmed=True,
+                                   room_ai_user_ids=(AI_A,)))
+        hooks.on_human_text(ctx)
+        embedding.embed.assert_not_called()
+        self.assertEqual(transport.sent, [])
+        self.assertEqual(service.get_usage(persona_id=AI_A)["totals"]["tokens_total"], 0)
+
+    def test_allowed_policy_reserves_embedding_after_preflight(self):
+        client = _mock_client()
+        client._post = mock.Mock(wraps=client._post)
+        transport = InMemoryMatrixTransport()
+        service = GatewayService(_cfg(platform_token_budget=100000), transport)
+        store = MemoryStore(":memory:")
+        self.addCleanup(store.close)
+        embedding = mock.Mock()
+        embedding.config = mock.Mock(model="test")
+        embedding.dimension = 2
+        embedding.embed.return_value = [1.0, 0.0]
+        hooks = EngineHooks(personas={AI_A: _make_persona()}, client=client, service=service,
+            memory_store=store, memory_embedding=embedding,
+            memory_vectors=PythonVectorStore(store))
+        ctx = self._make_ctx()
+        ctx = ctx.__class__(**dict(ctx.__dict__, room_members_confirmed=True,
+                                   room_ai_user_ids=(AI_A,)))
+        hooks.on_human_text(ctx)
+        embedding.embed.assert_called_once_with('hello')
+        self.assertGreater(service.get_usage(persona_id=AI_A)["totals"]["tokens_total"], 0)
+
+    def test_persistent_memory_quiet_hours_skips_embedding_budget(self):
+        """A real defer decision stops before the optional embedding call."""
+        client = _mock_client()
+        transport = InMemoryMatrixTransport()
+        service = GatewayService(_cfg(silent_hours_enabled=True), transport,
+            now_fn=lambda: datetime(2026, 11, 13, 15, 5, tzinfo=timezone.utc))
+        store = MemoryStore(":memory:")
+        self.addCleanup(store.close)
+        embedding = mock.Mock(config=mock.Mock(model="test"), dimension=2)
+        hooks = EngineHooks(personas={AI_A: _make_persona()}, client=client, service=service,
+            memory_store=store, memory_embedding=embedding,
+            memory_vectors=PythonVectorStore(store))
+        ctx = self._make_ctx()
+        ctx = ctx.__class__(**dict(ctx.__dict__, room_members_confirmed=True,
+                                   room_ai_user_ids=(AI_A,)))
+        with self.assertRaises(Exception) as deferred:
+            hooks.on_human_text(ctx)
+        self.assertEqual(type(deferred.exception).__name__, 'DeferredUntil')
+        embedding.embed.assert_not_called()
+        self.assertEqual(service.get_usage(persona_id=AI_A)["totals"]["tokens_total"], 0)
+
+    def test_recall_full_prompt_budget_blocks_completion(self):
+        """The post-recall policy evaluation still accounts for recalled text."""
+        client = _mock_client()
+        client._post = mock.Mock(wraps=client._post)
+        transport = InMemoryMatrixTransport()
+        service = GatewayService(_cfg(silent_hours_enabled=False, platform_token_budget=400), transport)
+        store = MemoryStore(":memory:")
+        self.addCleanup(store.close)
+        store.add_item(persona_id=AI_A, scope_kind='dm', scope_key='@alice:' + SERVER_NAME,
+            counterpart='@alice:' + SERVER_NAME, room_id='!r:example.test', event_id='$long',
+            sender='@alice:' + SERVER_NAME, role='user', trust='trusted', text='x' * 1800)
+        embedding = mock.Mock(config=mock.Mock(model="test"), dimension=2)
+        embedding.embed.return_value = [1.0, 0.0]
+        hooks = EngineHooks(personas={AI_A: _make_persona(max_reply_chars=100)}, client=client,
+            service=service, memory_store=store, memory_embedding=embedding,
+            memory_vectors=PythonVectorStore(store))
+        ctx = self._make_ctx()
+        ctx = ctx.__class__(**dict(ctx.__dict__, room_members_confirmed=True,
+                                   room_ai_user_ids=(AI_A,)))
+        hooks.on_human_text(ctx)
+        embedding.embed.assert_called_once()
+        client._post.assert_not_called()
+        self.assertEqual(transport.sent, [])
 
     def test_multiple_targets_replied_in_order(self):
         """群聊同时 @ 两个 AI → 两个都发言，顺序与 target_user_ids 一致。"""

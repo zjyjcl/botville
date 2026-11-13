@@ -15,6 +15,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 import urllib.error
 import urllib.parse
@@ -26,10 +27,12 @@ if os.path.join(ROOT, 'src') not in sys.path:
 
 from botville_gateway.config import Config
 from botville_gateway.http_server import build_server
+from botville_gateway.memory.owner_http import _expire_idempotency, _remember_idempotency
 from botville_gateway.user_identity import VERIFY_INVALID, VERIFY_MISSING, VERIFY_OK
 
 SERVER = 'example.test'
 PERSONA = '@ai_memory:' + SERVER
+OTHER_PERSONA = '@ai_memory_other:' + SERVER
 OWNER = '@owner:' + SERVER
 OTHER = '@other:' + SERVER
 HUMAN = '@human:' + SERVER
@@ -48,14 +51,17 @@ class Verifier:
 
 
 class MemoryHTTPServer:
-    def __init__(self, enabled=True, access_log=False, owner_can_read_dm=False):
+    def __init__(self, enabled=True, access_log=False, owner_can_read_dm=False, two_owners=False):
         self.tmp = tempfile.mkdtemp(prefix='memory-owner-http-')
         personas = os.path.join(self.tmp, 'personas.json')
-        with open(personas, 'w', encoding='utf-8') as handle:
-            json.dump({'personas': [
+        rows = [
                 {'user_id': PERSONA, 'system_prompt': 'test', 'owner_user_id': OWNER},
                 {'user_id': '@ai_no_owner:' + SERVER, 'system_prompt': 'test'},
-            ]}, handle)
+            ]
+        if two_owners:
+            rows.append({'user_id': OTHER_PERSONA, 'system_prompt': 'test', 'owner_user_id': OTHER})
+        with open(personas, 'w', encoding='utf-8') as handle:
+            json.dump({'personas': rows}, handle)
         values = dict(host='127.0.0.1', port=0, dev_mode=True, auth_token=None,
                       silent_hours_enabled=False, matrix_server_name=SERVER,
                       personas_file=personas,
@@ -112,6 +118,48 @@ class MemoryHTTPServer:
 
 
 class OwnerMemoryHTTPTests(unittest.TestCase):
+    def test_idempotency_key_is_independent_per_owner_over_http(self):
+        with MemoryHTTPServer(two_owners=True) as app:
+            common = {'Idempotency-Key': 'same-idempotency-key'}
+            first = {'persona_id': PERSONA, 'counterpart': HUMAN, 'key': 'likes', 'value': 'one'}
+            second = {'persona_id': OTHER_PERSONA, 'counterpart': HUMAN, 'key': 'likes', 'value': 'two'}
+            one = app.request('PUT', '/v1/memories/facts', token='owner-token', body=first, headers=common)
+            two = app.request('PUT', '/v1/memories/facts', token='other-token', body=second, headers=common)
+            one_replay = app.request('PUT', '/v1/memories/facts', token='owner-token', body=first, headers=common)
+            two_replay = app.request('PUT', '/v1/memories/facts', token='other-token', body=second, headers=common)
+        self.assertEqual((one[0], two[0], one_replay[0], two_replay[0]), (201, 201, 201, 201))
+        self.assertEqual(one[2]['id'], one_replay[2]['id'])
+        self.assertEqual(two[2]['id'], two_replay[2]['id'])
+        self.assertNotEqual(one[2]['id'], two[2]['id'])
+    def test_idempotency_cache_is_scoped_and_owner_bounded(self):
+        """Same header belongs to its caller; one owner preserves other LRU rows."""
+        import botville_gateway.memory.owner_http as owner_http
+        state = SimpleNamespace(idempotency=owner_http.OrderedDict())
+        previous = owner_http.IDEMPOTENCY_PER_OWNER_MAX
+        owner_http.IDEMPOTENCY_PER_OWNER_MAX = 2
+        try:
+            _remember_idempotency(state, 'alice', ('alice', 'shared-key'), (0, 'a', '1', 201))
+            _remember_idempotency(state, 'bob', ('bob', 'shared-key'), (0, 'b', '2', 201))
+            _remember_idempotency(state, 'alice', ('alice', 'key-two'), (0, 'a', '3', 201))
+            # A replay is an access, so it becomes Alice's newest cache row.
+            state.idempotency.move_to_end(('alice', 'shared-key'))
+            _remember_idempotency(state, 'alice', ('alice', 'key-three'), (0, 'a', '4', 201))
+        finally:
+            owner_http.IDEMPOTENCY_PER_OWNER_MAX = previous
+        self.assertIn(('bob', 'shared-key'), state.idempotency)
+        self.assertIn(('alice', 'shared-key'), state.idempotency)
+        self.assertIn(('alice', 'key-three'), state.idempotency)
+        self.assertNotIn(('alice', 'key-two'), state.idempotency)
+
+    def test_idempotency_expiry_survives_lru_replay_order(self):
+        """An expired replay entry can sit behind a live LRU entry."""
+        import botville_gateway.memory.owner_http as owner_http
+        state = SimpleNamespace(idempotency=owner_http.OrderedDict([
+            (('alice', 'live'), (101, 'x', '1', 201)),
+            (('bob', 'expired'), (0, 'x', '2', 201)),
+        ]))
+        _expire_idempotency(state, owner_http.IDEMPOTENCY_TTL + 1)
+        self.assertEqual(list(state.idempotency), [('alice', 'live')])
     def test_disabled_auth_and_owner_matrix(self):
         with MemoryHTTPServer(False) as app:
             status, headers, body = app.request('GET', '/v1/memories?persona_id=' + PERSONA)

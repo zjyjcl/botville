@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from array import array
+from dataclasses import dataclass
 import math
 from typing import Any, Dict, List, MutableMapping, Optional, Protocol, Sequence
 
@@ -119,6 +120,7 @@ class PythonVectorStore:
                 conditions.append('memory_vectors.dim=?'); args.append(dim)
             args.append(self.scan_limit)
             rows = self.store._db.execute('''SELECT memory_vectors.*, memory_items.text AS item_text, memory_items.trust AS item_trust,
+                memory_items.visibility AS item_visibility,
                 memory_items.created_at AS item_created_at, memory_summaries.text AS summary_text,
                 memory_summaries.trust AS summary_trust, memory_summaries.updated_at AS summary_updated_at
                 FROM memory_vectors
@@ -134,6 +136,7 @@ class PythonVectorStore:
         found.sort(key=lambda pair: pair[0], reverse=True)
         return [dict(row, text=row.get('item_text') or row.get('summary_text') or '',
                      trust=row.get('item_trust') or row.get('summary_trust') or 'untrusted',
+                     visibility=row.get('item_visibility') or ('dm_only' if row['scope_kind'] == 'dm' else 'shared'),
                      created_at=row.get('item_created_at') or row.get('summary_updated_at') or row['created_at'], score=score)
                 for score, row in found[:k]]
 
@@ -176,6 +179,7 @@ class SqliteVecStore(PythonVectorStore):
             args = [_blob(query)] + args + [kwargs.get('k', VECTOR_TOP_K)]
             with self.store._lock:
                 rows = self.store._db.execute('''SELECT memory_vectors.*, memory_items.text AS item_text, memory_items.trust AS item_trust,
+                    memory_items.visibility AS item_visibility,
                     memory_items.created_at AS item_created_at, memory_summaries.text AS summary_text,
                     memory_summaries.trust AS summary_trust, memory_summaries.updated_at AS summary_updated_at,
                     vec_distance_cosine(memory_vectors.vec, ?) AS distance
@@ -185,6 +189,7 @@ class SqliteVecStore(PythonVectorStore):
                     ORDER BY distance LIMIT ?''', args).fetchall()
             return [dict(row, text=row['item_text'] or row['summary_text'] or '',
                          trust=row['item_trust'] or row['summary_trust'] or 'untrusted',
+                         visibility=row['item_visibility'] or ('dm_only' if row['scope_kind'] == 'dm' else 'shared'),
                          created_at=row['item_created_at'] or row['summary_updated_at'] or row['created_at'], score=1.0-row['distance']) for row in rows]
         except Exception:
             return super().search(**kwargs)
@@ -208,17 +213,20 @@ def build_vector_store(store: MemoryStore, backend: str = 'python', *,
         return PythonVectorStore(store, scan_limit)
 
 
+@dataclass(frozen=True, init=False)
 class VectorRecall:
     """Adapter used by the worker/engine after it has embedded the live message."""
+    store: VectorStore
+    _query: Optional[tuple]
+    _model: str
+    _dim: int
+
     def __init__(self, store: VectorStore, query_vec: Optional[Sequence[float]] = None,
                  *, model: str = '', dim: int = 0) -> None:
-        self.store = store
-        self._query = tuple(query_vec) if query_vec is not None else None
-        self._model, self._dim = model, dim
-
-    def set_query(self, vector: Sequence[float]) -> None:
-        """Compatibility helper; construct a new adapter per live turn instead."""
-        self._query = vector
+        object.__setattr__(self, 'store', store)
+        object.__setattr__(self, '_query', tuple(query_vec) if query_vec is not None else None)
+        object.__setattr__(self, '_model', model)
+        object.__setattr__(self, '_dim', dim)
 
     def with_query(self, vector: Sequence[float]) -> 'VectorRecall':
         return VectorRecall(self.store, vector, model=self._model, dim=self._dim)
@@ -230,5 +238,6 @@ class VectorRecall:
                                      query_vec=self._query, model=self._model, dim=self._dim)
         except Exception:
             return []
-        return [dict(row, text=row.get('text', ''), persona_id=persona_id,
-                     scope_kind=scope_kind, scope_key=scope_key, visibility='dm_only' if scope_kind == 'dm' else 'shared') for row in rows]
+        return [dict(row, text=row.get('text', '')) for row in rows
+                if (row.get('persona_id') == persona_id and
+                    row.get('scope_kind') == scope_kind and row.get('scope_key') == scope_key)]

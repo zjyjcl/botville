@@ -212,9 +212,31 @@ class EngineHooks(ConsumerHooks):
         if self._dedupe is not None and self._dedupe.seen(idem_key):
             return
 
-        # 先拼装完整提示词，再估算提示词及最大回复的预算。
+        # Evaluate policy before reading or embedding memory.  In particular a
+        # rejected message must not reserve embedding budget or expose recall.
         system_text = SYSTEM_ZONE_DECLARATION + "\n" + persona.instruction_text()
         buf = self._get_buffer(room_id) if room_id and self._memory_store is None else None
+        def evaluate(messages):
+            return self._service.evaluate_policy({
+                "persona_id": persona.user_id,
+                "conversation_id": room_id,
+                "content": text,
+                "token_estimate": (estimate_tokens(system_text)
+                    + sum(estimate_tokens(m["content"]) for m in messages)
+                    + estimate_tokens("x" * persona.max_reply_chars)),
+                "kind": "message",
+            })
+
+        # Persistent recall can trigger an embedding budget reservation.  A
+        # cheap preflight prevents that work for any rejected user message.
+        if self._memory_store is not None and ctx is not None:
+            decision = evaluate(_build_messages([], text))
+            if decision["decision"] != DECISION_ALLOW:
+                if decision["decision"] == DECISION_DEFER:
+                    raise self._deferred_until(decision, persona, room_id)
+                self.stats.inc("precheck_blocked")
+                return
+
         if self._memory_store is not None and ctx is not None:
             scope_kind, scope_key, counterpart = self._memory_scope(persona, ctx)
             try:
@@ -252,16 +274,10 @@ class EngineHooks(ConsumerHooks):
         else:
             history = buf.snapshot() if buf else []
             messages = _build_messages(history, text)
-        token_estimate = (estimate_tokens(system_text)
-                          + sum(estimate_tokens(m["content"]) for m in messages)
-                          + estimate_tokens("x" * persona.max_reply_chars))
-        decision = self._service.evaluate_policy({
-            "persona_id": persona.user_id,
-            "conversation_id": room_id,
-            "content": text,
-            "token_estimate": token_estimate,
-            "kind": "message",
-        })
+
+        # Keep the normal full-prompt budget gate: recalled context and room
+        # history count towards the reply policy just as before.
+        decision = evaluate(messages)
         if decision["decision"] != DECISION_ALLOW:
             if decision["decision"] == DECISION_DEFER:
                 raise self._deferred_until(decision, persona, room_id)
