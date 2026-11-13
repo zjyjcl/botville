@@ -959,9 +959,11 @@ DM 不受此上限影响。`m.mentions.room=true`（`@room`）本身不产生目
 `room_member_errors`；记忆作用域必须为 group，绝不召回 DM 记忆。单个成员事件不构成完整成员确认。
 
 发送遇 `M_FORBIDDEN` 时，先以该 AI masquerade 查询 joined_members；若已加入，直接上抛原错误，绝不 join/leave。
-包括已确认 DM 的 `allow_auto_join=true` 在内，只有邀请台账存在该 persona/room 的待处理 invite 才可 join；无邀请绝不自行加入公开房间。
+包括已确认 DM 的 `allow_auto_join=true` 在内，邀请台账命中为快路径；未命中则以该 AI masquerade 向 homeserver 的 `/sync` 权威确认待处理邀请；无邀请绝不自行加入公开房间。
 消费者记录本服 persona 的 invite，join/leave/ban 清除邀请；事件哈希去重防止事务重试恢复旧邀请，清理待办未完成时拒绝再次自动 join；邀请表位于 AS 事务 SQLite，键为 SHA-256(persona, room)，不保存原始标识。
-未配置持久库时使用最多 1000 项的进程内邀请缓存，缺失/淘汰即拒绝；内存事件去重墓碑上限 1000，满后拒绝新邀请直至重启，避免淘汰墓碑后重放恢复旧邀请。邀请 stripped state 含 `m.room.encryption` 时拒绝 join。
+未配置持久库时使用最多 1000 项的进程内邀请缓存，缺失/淘汰转 `/sync` 权威确认；内存事件去重墓碑上限 1000，满后拒绝记录新邀请直至重启，避免淘汰墓碑后重放恢复旧邀请。
+权威确认使用 `GET /_matrix/client/v3/sync?user_id=...&timeout=0&filter=<内联 JSON>`，不带 since；filter 为 `{"room":{"rooms":[room],"timeline":{"limit":0},"state":{"lazy_load_members":true},"ephemeral":{"not_types":["*"]},"account_data":{"not_types":["*"]}},"presence":{"not_types":["*"]},"account_data":{"not_types":["*"]}}`。
+请求超时 5 秒，不跟随重定向；任何错误或结构异常均 fail-closed，上抛原 `M_FORBIDDEN`。`rooms.join` 含该房间时不 join/leave，直接上抛原错误；否则须在 `rooms.invite` 中确认该房间，并检查 `invite_state.events`。邀请 stripped state 含 `m.room.encryption` 时拒绝 join。
 join 后再次以该 AI GET `/_matrix/client/v3/rooms/{room}/state/m.room.encryption/`：仅 HTTP 404 视为未加密，其余响应/错误均按加密处理，不发送并退出。
 默认路径（包括 HTTP 发送与主动发言）还须复核完整 joined 成员恰好为 {发送者，一个本服人类}；人类 localpart
 不以 `ai_` 开头且不是 AS sender，domain 与配置 server_name 大小写不敏感匹配。缺少 server_name 或查询失败视为非 DM。
@@ -1806,7 +1808,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
-| 0.5.0 | 2026-11-13 | [M_FORBIDDEN 安全加固] 自动 join 需持久邀请，前后排除加密；已有成员不 join/leave；leave 有限重试与持久清理队列，无新增开关或 API 字段。 |
+| 0.5.0 | 2026-11-13 | [M_FORBIDDEN 安全加固] 自动 join 需邀请台账命中或 /sync 权威确认，前后排除加密；已有成员不 join/leave；leave 有限重试与持久清理队列，无新增开关或 API 字段。 |
 | 0.5.0 | 2026-11-13 | [PR4c quasi-breaking] 新增默认关闭的主动发言部署/人设配置、DM-only 候选、持久化队列与 stable txnId 重放语义；`ProactiveSettings.enabled` 默认值由 true 改为 false。该默认值改变未显式设置旧部署的行为，按准破坏性变更公告。 |
 | 0.5.0 | 2026-11-13 | [#221 proactive 修正] 启用但无法启动 worker 记录 WARNING；owner 无 DM 日志每目标限频且缓存有界；过期且成员不匹配的队列转 abandoned，终态保留 30 天；跨午夜静默时段与严格 DM 协同验证。 |
 | 0.5.0 | 2026-11-13 | [B2.8a 行为修正，无 API 字段变化] 一个 AI + 多个人类的房间现在只在被 @ 或被回复时回复；严格两人本服 DM、成员失败按群、群回复者上限、忽略 @room 广播、群 AI 文本记忆 untrusted、join 后复核：仅 DM 继续发送，否则立即退出并报错。 |

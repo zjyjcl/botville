@@ -486,7 +486,7 @@ class AsTransactionStore:
             if membership == "invite":
                 self._conn.execute("INSERT OR REPLACE INTO as_invitations VALUES (?, ?)",
                                    (key, int(encrypted)))
-                # Bound the fallback cache; eviction always denies auto-join.
+                # Bound the fallback cache; eviction requires authoritative sync confirmation.
                 if not self._conn.execute("PRAGMA database_list").fetchone()[2]:
                     self._conn.execute("DELETE FROM as_invitations WHERE rowid NOT IN "
                                        "(SELECT rowid FROM as_invitations ORDER BY rowid DESC LIMIT 1000)")

@@ -405,8 +405,12 @@ class AppServiceMatrixTransport:
                     already_joined = False
                 if already_joined:
                     raise exc
-                if (self.safety_store.cleanup_pending(sender, room)
-                        or self.safety_store.invitation(sender, room) is not False):
+                if self.safety_store.cleanup_pending(sender, room):
+                    raise exc
+                invitation = self.safety_store.invitation(sender, room)
+                if invitation is None:
+                    invitation = self._sync_invitation(room, sender)
+                if invitation is not False:
                     raise exc
                 self.join(room, sender)
                 self.safety_store.invitation_update(sender, room, "join")
@@ -432,6 +436,46 @@ class AppServiceMatrixTransport:
             content_type=content_type,
             txn_id=txn,
         )
+
+    def _sync_invitation(self, room: str, sender: str) -> Optional[bool]:
+        """Return invitation encryption status; unknown or joined fails closed."""
+        sync_filter = {
+            "room": {
+                "rooms": [room], "timeline": {"limit": 0},
+                "state": {"lazy_load_members": True},
+                "ephemeral": {"not_types": ["*"]},
+                "account_data": {"not_types": ["*"]},
+            },
+            "presence": {"not_types": ["*"]},
+            "account_data": {"not_types": ["*"]},
+        }
+        try:
+            response = self._request(
+                "GET", "/_matrix/client/v3/sync",
+                query={"user_id": sender, "timeout": "0",
+                       "filter": json.dumps(sync_filter, separators=(",", ":"))},
+                timeout=MEMBER_LOOKUP_TIMEOUT_SECONDS,
+            )
+            rooms = response.get("rooms")
+            if not isinstance(rooms, dict):
+                return None
+            joined, invited = rooms.get("join", {}), rooms.get("invite", {})
+            if not isinstance(joined, dict) or not isinstance(invited, dict) or room in joined:
+                return None
+            invitation = invited.get(room)
+            if not isinstance(invitation, dict):
+                return None
+            state = invitation.get("invite_state")
+            if not isinstance(state, dict) or not isinstance(state.get("events"), list):
+                return None
+            events = state["events"]
+            if any(not isinstance(event, dict) or not isinstance(event.get("type"), str)
+                   for event in events):
+                return None
+            return any(event["type"] == "m.room.encryption" for event in events)
+        except (DeliveryError, OSError, ValueError):
+            # Preserve the original send error; never log identifiers or response details.
+            return None
 
     def _room_encrypted(self, room: str, sender: str) -> bool:
         try:

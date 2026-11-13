@@ -365,6 +365,88 @@ class AppServiceTransportTest(unittest.TestCase):
                 self.assertEqual(caught.exception.detail, "original send denied")
                 self.assertEqual(self.hs.matching("POST", "/_matrix/client/v3/join/"), [])
 
+    def sync_recovery(self, payload, status=200):
+        self.recovery_routes((AI, "@alice:localhost"))
+        self.hs.route("GET", "/_matrix/client/v3/sync", [(status, payload)])
+        transport = self.make_transport()
+        transport.safety_store.invitation_update(AI, ROOM, "leave")
+        return transport
+
+    def test_sync_invitation_joins_and_sends_strict_dm(self):
+        transport = self.sync_recovery({"rooms": {"invite": {
+            ROOM: {"invite_state": {"events": [{"type": "m.room.member"}]}}
+        }}})
+        with mock.patch.object(transport._opener, "open", wraps=transport._opener.open) as opened:
+            event = transport.send_text(room_id=ROOM, sender_id=AI, text="hello")
+        self.assertEqual(event.event_id, "$after-join")
+        sync = self.hs.matching("GET", "/_matrix/client/v3/sync")
+        self.assertEqual(len(sync), 1)
+        self.assertEqual(set(sync[0]["query"]), {"user_id", "timeout", "filter"})
+        self.assertEqual(sync[0]["query"]["user_id"], [AI])
+        self.assertEqual(sync[0]["query"]["timeout"], ["0"])
+        self.assertEqual(sync[0]["authorization"], "Bearer " + AS_TOKEN)
+        self.assertEqual(json.loads(sync[0]["query"]["filter"][0]), {
+            "room": {"rooms": [ROOM], "timeline": {"limit": 0},
+                     "state": {"lazy_load_members": True},
+                     "ephemeral": {"not_types": ["*"]},
+                     "account_data": {"not_types": ["*"]}},
+            "presence": {"not_types": ["*"]}, "account_data": {"not_types": ["*"]},
+        })
+        sync_calls = [c for c in opened.call_args_list if "/sync?" in c.args[0].full_url]
+        self.assertEqual(sync_calls[0].kwargs["timeout"], 5.0)
+        self.assertEqual(len(self.hs.matching("POST", "/_matrix/client/v3/join/")), 1)
+        sends = self.hs.matching("PUT", "/_matrix/client/v3/rooms/")
+        self.assertEqual(len(sends), 2)
+        self.assertEqual(sends[0], sends[1])
+        self.assertEqual(self.hs.matching("POST", "/_matrix/client/v3/rooms/"), [])
+
+    def assert_sync_denied(self, payload, status=200):
+        transport = self.sync_recovery(payload, status)
+        with self.assertRaises(DeliveryError) as caught:
+            transport.send_text(room_id=ROOM, sender_id=AI, text="hello")
+        self.assertEqual(caught.exception.code, "M_FORBIDDEN")
+        self.assertEqual(caught.exception.detail, "original send denied")
+        self.assertEqual(len(self.hs.matching("GET", "/_matrix/client/v3/sync")), 1)
+        self.assertEqual(self.hs.matching("POST", "/_matrix/client/v3/join/"), [])
+        self.assertEqual(self.hs.matching("POST", "/_matrix/client/v3/rooms/"), [])
+        self.assertEqual(len(self.hs.matching("PUT", "/_matrix/client/v3/rooms/")), 1)
+
+    def test_sync_encrypted_invitation_denied(self):
+        self.assert_sync_denied({"rooms": {"invite": {
+            ROOM: {"invite_state": {"events": [{"type": "m.room.encryption"}]}}
+        }}})
+
+    def test_sync_no_invitation_denied(self):
+        self.assert_sync_denied({"rooms": {"invite": {}}})
+
+    def test_sync_error_denied(self):
+        self.assert_sync_denied({"errcode": "M_UNKNOWN"}, 500)
+
+    def test_sync_already_joined_denied_even_with_invitation(self):
+        self.assert_sync_denied({"rooms": {"join": {ROOM: {}}, "invite": {
+            ROOM: {"invite_state": {"events": []}}
+        }}})
+
+    def test_sync_malformed_response_denied(self):
+        for payload in (b"not-json", [], {}, {"rooms": []},
+                        {"rooms": {"join": [], "invite": {}}},
+                        {"rooms": {"invite": []}},
+                        {"rooms": {"invite": {ROOM: {}}}},
+                        {"rooms": {"invite": {ROOM: {"invite_state": {"events": {}}}}}},
+                        {"rooms": {"invite": {ROOM: {"invite_state": {"events": [None]}}}}}):
+            with self.subTest(payload=payload):
+                self.hs.requests.clear()
+                self.assert_sync_denied(payload)
+
+    def test_sync_redirect_not_followed(self):
+        self.assert_sync_denied({"__redirect__": self.hs.base_url + "/redirect-target"}, 302)
+        self.assertEqual(self.hs.matching("GET", "/redirect-target"), [])
+
+    def test_invitation_ledger_hit_skips_sync(self):
+        self.recovery_routes((AI, "@alice:localhost"))
+        self.make_transport().send_text(room_id=ROOM, sender_id=AI, text="hello")
+        self.assertEqual(self.hs.matching("GET", "/_matrix/client/v3/sync"), [])
+
     def test_already_joined_never_joins_or_leaves(self):
         for allowed in (False, True):
             self.hs.requests.clear()
