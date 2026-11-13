@@ -196,13 +196,14 @@ private struct NewConversationSheet: View {
     @State private var isLoadingCandidates = false
     @State private var candidateError: String?
 
-    private var invitees: [String] {
-        GroupInviteSelection.invitees(selectedIDs: isDirect ? [] : selectedIDs, manualText: inviteesText)
+    private var formState: NewConversationFormState {
+        NewConversationFormState(
+            isDirect: isDirect, roomName: roomName, selectedIDs: selectedIDs,
+            inviteesText: inviteesText, isCreating: isCreating)
     }
 
-    private var draft: RoomCreationDraft {
-        RoomCreationDraft(isDirect: isDirect, name: roomName, invitees: invitees)
-    }
+    private var invitees: [String] { formState.invitees }
+    private var draft: RoomCreationDraft { formState.draft }
 
     private var participantStatus: AIParticipantStatus {
         if GroupInviteSelection.containsAI(invitees: invitees, candidates: candidates,
@@ -230,12 +231,12 @@ private struct NewConversationSheet: View {
                         Text("群聊").tag(false)
                     }
                     .pickerStyle(.segmented)
-                    if !isDirect {
+                    if formState.showsGroupFields {
                         TextField("群聊名称（可选）", text: $roomName)
                     }
                 }
 
-                if !isDirect {
+                if formState.showsGroupFields {
                     Section("选择联系人和我的 AI") {
                         if isLoadingCandidates { ProgressView("正在加载联系人…") }
                         ForEach(candidates) { candidate in
@@ -268,13 +269,13 @@ private struct NewConversationSheet: View {
                     }
                 }
 
-                Section(isDirect ? "对方 Matrix ID" : "手填 Matrix ID（可选）") {
-                    TextField(isDirect ? "例如 @alice:example.org" : "每行或逗号分隔一个 MXID", text: $inviteesText, axis: .vertical)
+                Section(formState.inviteesTitle) {
+                    TextField(formState.inviteesPlaceholder, text: $inviteesText, axis: .vertical)
 #if os(iOS)
                         .textInputAutocapitalization(.never)
 #endif
                         .autocorrectionDisabled()
-                    Text(isDirect ? "私聊必须填写一个 MXID。" : "至少勾选一位联系人或手填一个 MXID；创建后会向这些账号发送邀请。")
+                    Text(formState.inviteesHelp)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -304,17 +305,16 @@ private struct NewConversationSheet: View {
                 }
             }
             .disabled(isCreating)
-            .navigationTitle(isDirect ? "新建会话" : "发起群聊")
+            .navigationTitle(formState.title)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("取消") { dismiss() }.disabled(isCreating)
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(isCreating ? "创建中…" : "创建") { prepareCreation() }
-                        .disabled(isCreating || invitees.isEmpty)
+                    NewConversationCreateButton(state: formState, action: prepareCreation)
                 }
             }
-            .task(id: isDirect) { if !isDirect { await loadCandidates() } }
+            .task(id: isDirect) { if formState.showsGroupFields { await loadCandidates() } }
             .alert("确认开启端对端加密？", isPresented: $isShowingEncryptionConfirmation) {
                 Button("开启并创建") { createAfterConfirmation() }
                 Button("返回", role: .cancel) { consent.cancel() }

@@ -209,6 +209,37 @@ final class PersonaGroupRoomsModelTests: XCTestCase {
         XCTAssertEqual(reads, 2)
     }
 
+    func testConflictReportsRoomsAndSettingsRefreshSeparately() async {
+        // Rooms refresh succeeds while the persona settings refresh fails.
+        let client = RoomsScriptClient(
+            pages: [.success(page([room("a")], nil, false)),
+                    .success(page([room("a", mode: "muted"), room("b")], nil, false))],
+            modes: [.failure(.problem(status: 409, code: "room.state_conflict"))],
+            personas: [.success(owner(groups(true, .owner))), .failure(.httpStatus(503))])
+        let model = roomsModel(client)
+        await model.load()
+        await model.setMode(roomRef: ref("a"), mode: .muted)
+        XCTAssertEqual(model.rooms.map(\.roomRef), [ref("a"), ref("b")])
+        XCTAssertEqual(model.rooms.first?.mode, .muted)
+        XCTAssertEqual(
+            model.errorMessage, "群状态已变化，已刷新；群设置未能刷新：网关请求失败，请稍后重试。")
+        XCTAssertFalse(model.settings.hasLoaded)
+        XCTAssertFalse(model.canEnableMentionOnly)
+    }
+
+    func testNotFoundRefreshWithFailedSettingsStillReportsRoomsRefreshed() async {
+        let client = RoomsScriptClient(
+            pages: [.success(page([room("a")], nil, false)),
+                    .success(page([room("b")], nil, false))],
+            modes: [.failure(.problem(status: 404, code: "room.not_found"))],
+            personas: [.success(owner(groups(true, .owner))), .failure(.httpStatus(403))])
+        let model = roomsModel(client)
+        await model.load()
+        await model.setMode(roomRef: ref("a"), mode: .muted)
+        XCTAssertEqual(model.rooms.map(\.roomRef), [ref("b")])
+        XCTAssertEqual(model.errorMessage, "群状态已变化，已刷新；群设置未能刷新：没有权限查看")
+    }
+
     func testFailedPersonaRefreshKeepsRoomsButCannotEnableReplies() async {
         let client = RoomsScriptClient(
             pages: [.success(page([room("a", mode: "muted")], nil, false))],

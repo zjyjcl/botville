@@ -167,8 +167,17 @@ public final class PersonaGroupRoomsModel: ObservableObject {
     /// `preservingRoomsOnFailure` keeps the last list visible until a fresh first
     /// page arrives (409 conflict refresh). On failure the stale rows stay, and the
     /// next loadMore restarts from the first page instead of an old cursor.
+    /// The room list and persona settings refresh independently; each flag reports
+    /// only its own request so a settings failure never hides a fresh room page.
+    struct ReloadOutcome: Equatable {
+        var roomsRefreshed = false
+        var settingsRefreshed = false
+    }
+
+    static let conflictRefreshedMessage = "群状态已变化，已刷新"
+
     @discardableResult
-    private func reload(preservingRoomsOnFailure: Bool = false) async -> Bool {
+    private func reload(preservingRoomsOnFailure: Bool = false) async -> ReloadOutcome {
         generation += 1
         let requestGeneration = generation
         isLoading = true
@@ -183,24 +192,25 @@ public final class PersonaGroupRoomsModel: ObservableObject {
         errorMessage = nil
         defer { if requestGeneration == generation { isLoading = false } }
         await settings.refresh()
-        guard !Task.isCancelled, requestGeneration == generation else { return false }
+        guard !Task.isCancelled, requestGeneration == generation else { return ReloadOutcome() }
+        var outcome = ReloadOutcome(settingsRefreshed: settings.errorMessage == nil)
         errorMessage = settings.errorMessage
         do {
             let page = try await client.groupRooms(
                 personaID: personaID, limit: 50,
                 cursor: nil, includeAll: includeAll)
-            guard !Task.isCancelled, requestGeneration == generation else { return false }
+            guard !Task.isCancelled, requestGeneration == generation else { return ReloadOutcome() }
             if preservingRoomsOnFailure {
                 seenCursors = []
                 paginationNeedsRefresh = false
             }
-            apply(page, replacing: true)
-            return errorMessage == nil
+            outcome.roomsRefreshed = apply(page, replacing: true)
+            return outcome
         } catch {
-            guard !Task.isCancelled, requestGeneration == generation else { return false }
+            guard !Task.isCancelled, requestGeneration == generation else { return ReloadOutcome() }
             if preservingRoomsOnFailure { paginationNeedsRefresh = true }
             errorMessage = message(for: error)
-            return false
+            return outcome
         }
     }
 
@@ -270,10 +280,10 @@ public final class PersonaGroupRoomsModel: ObservableObject {
             guard !Task.isCancelled else { return }
             if error.problemCode == "room.state_conflict" {
                 // Keep the old rows if the refresh fails; 409 does not invalidate references.
-                if await reload(preservingRoomsOnFailure: true) { errorMessage = "群状态已变化，已刷新" }
+                reportConflictRefresh(await reload(preservingRoomsOnFailure: true))
             } else if error.problemCode == "room.not_found" {
                 // 404 may mean the HMAC key rotated, so every cached room_ref is suspect.
-                if await reload() { errorMessage = "群状态已变化，已刷新" }
+                reportConflictRefresh(await reload())
             } else {
                 errorMessage = message(for: error)
             }
@@ -283,7 +293,20 @@ public final class PersonaGroupRoomsModel: ObservableObject {
         }
     }
 
-    private func apply(_ page: GroupRoomList, replacing: Bool) {
+    /// Rooms refreshed: always say so. Settings failed too: append that error, since
+    /// mention_only stays unavailable until settings load. Rooms failed: keep reload's error.
+    private func reportConflictRefresh(_ outcome: ReloadOutcome) {
+        guard outcome.roomsRefreshed else { return }
+        if outcome.settingsRefreshed {
+            errorMessage = Self.conflictRefreshedMessage
+        } else {
+            let detail = settings.errorMessage ?? "网关请求失败，请稍后重试。"
+            errorMessage = "\(Self.conflictRefreshedMessage)；群设置未能刷新：\(detail)"
+        }
+    }
+
+    @discardableResult
+    private func apply(_ page: GroupRoomList, replacing: Bool) -> Bool {
         deploymentGroupsEnabled = page.groupsEnabled
         if replacing { rooms = [] }
         for item in page.items { replace(item) }
@@ -292,7 +315,9 @@ public final class PersonaGroupRoomsModel: ObservableObject {
         if hasMore && (nextCursor == nil || seenCursors.contains(nextCursor!)) {
             hasMore = false
             errorMessage = "分页信息异常，请刷新后重试。"
+            return false
         }
+        return true
     }
 
     private func replace(_ room: GroupRoom) {

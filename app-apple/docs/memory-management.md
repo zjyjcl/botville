@@ -102,3 +102,7 @@ DEBUG 未读快照和安全状态合并索引对重复房间 ID 均取数组中�
 
 本轮验收范围是单元测试、示例校验、Release 隔离和无签名的 iOS 模拟器/macOS
 Debug、Release 构建，不包含真机、APNs、生产网关或实际聊天数据验收。
+
+心情 owner/对方页共用 `PersonaMoodPresentation` 的两个单一构造入口，
+`PersonaMoodBadge` 仅接受 presentation。私有标记等展示决策由 view state 测试覆盖，
+并有组件初始化类型守卫；渲染层未测，详见 [视图测试结构](view-testing.md)。

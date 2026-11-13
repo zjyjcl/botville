@@ -123,16 +123,3 @@ struct AIProfileView: View {
 }
 
 /// Shared rendering for the owner and counterpart presentation policies.
-struct PersonaMoodBadge: View {
-    let presentation: PersonaMoodPresentation
-
-    var body: some View {
-        HStack {
-            Label(presentation.mood?.label ?? "未设置",
-                  systemImage: presentation.mood?.symbolName ?? "face.dashed")
-            if let marker = presentation.privateMarkerText {
-                Text(marker).font(.caption2).foregroundStyle(.secondary)
-            }
-        }
-    }
-}
