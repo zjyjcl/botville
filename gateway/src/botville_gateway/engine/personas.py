@@ -35,6 +35,7 @@
 | `model` | 否 | 该人设的模型名覆盖；缺省用 `GATEWAY_MODEL_NAME` |
 | `credential_ref` | 否 | 只接受 `env:NAME` 形式，调用时读 `os.environ[NAME]`；覆盖全局 `GATEWAY_MODEL_API_KEY`。任何其他值一律拒绝 |
 | `max_reply_chars` | 否 | 该人设单条回复上限（正整数，且不超过平台 `MAX_MESSAGE_CHARS`） |
+| `groups` | 否 | `enabled` 默认 false；`invite_policy` 为 owner（默认）或 local_humans；未知字段/类型拒绝 |
 
 校验在**启动期**完成（`load_personas`）：文件读不到、JSON 非法、结构不对、
 `user_id` 不是本服 `@ai_*`、重复 `user_id`、`credential_ref` 不是 `env:NAME`、
@@ -68,6 +69,7 @@ _PERSONA_FIELDS = frozenset(
         "max_reply_chars",
         "owner_user_id",
         "proactive",
+        "groups",
     }
 )
 # 人设文件允许的顶层字段。
@@ -99,6 +101,7 @@ class Persona:
     owner_user_id: Optional[str] = None
     # Validated deployment-side values.  It remains data, never system text.
     proactive: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    groups: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
     # Owner-authored display data; never part of instructions or logs.
     bio: Optional[str] = field(default=None, repr=False)
@@ -142,6 +145,20 @@ def _is_local_owner(user_id: str, server_name: Optional[str]) -> bool:
         and not localpart.lower().startswith("ai_")
         and domain.lower() == server_name.strip().lower()
     )
+
+
+def _validate_groups(value: Any, where: str) -> Mapping[str, Any]:
+    if not isinstance(value, dict):
+        raise PersonaConfigError(f"{where}.groups must be an object")
+    if set(value) - {"enabled", "invite_policy"}:
+        raise PersonaConfigError(f"{where}.groups has unexpected field(s)")
+    enabled = value.get("enabled", False)
+    policy = value.get("invite_policy", "owner")
+    if not isinstance(enabled, bool):
+        raise PersonaConfigError(f"{where}.groups.enabled must be a boolean")
+    if not isinstance(policy, str) or policy not in ("owner", "local_humans"):
+        raise PersonaConfigError(f"{where}.groups.invite_policy is invalid")
+    return {"enabled": enabled, "invite_policy": policy}
 
 
 def _validate_proactive(value: Any, where: str) -> Mapping[str, Any]:
@@ -323,6 +340,7 @@ def load_personas(
             max_reply_chars=max_reply_chars,
             owner_user_id=owner_user_id,
             proactive=proactive,
+            groups=_validate_groups(entry.get("groups", {}), where),
             bio=bio,
         )
     return personas

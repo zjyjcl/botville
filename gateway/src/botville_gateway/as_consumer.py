@@ -311,6 +311,9 @@ class ConsumerContext:
     # group for routing and memory purposes.
     room_is_dm: bool = False
     mentioned_user_ids: Tuple[str, ...] = ()
+    invite_encrypted: bool = False
+    encryption_state: bool = False
+    membership: Optional[str] = None
 
 
 class ConsumerHooks:
@@ -675,7 +678,16 @@ class AsTransactionConsumer:
             return
         self._stats.inc(f"event.{category}")
         if event.get("type") == "m.room.member":
+            content = event.get("content")
             persona = event.get("state_key")
+            membership = content.get("membership") if isinstance(content, dict) else None
+            # A malformed member event (non-object content, non-string
+            # membership or state_key) skips only this event; it must not
+            # fail the whole transaction or touch the invite ledger.
+            if not isinstance(persona, str) or not isinstance(membership, str):
+                self._stats.inc("invalid_events")
+                self._stats.inc("invalid_member_events")
+                return
             room = fields.get("room_id")
             if isinstance(persona, str) and self._is_local_ai(persona) and isinstance(room, str) and room.startswith("!"):
                 unsigned = event.get("unsigned")
@@ -686,7 +698,7 @@ class AsTransactionConsumer:
                 )
                 # Storage failures must retry the transaction, not silently retain
                 # a stale invitation after leave/ban.
-                self._store.invitation_update(persona, room, event["content"].get("membership"), encrypted, event_id)
+                self._store.invitation_update(persona, room, membership, encrypted, event_id)
 
         if event.get("type") == "m.room.member" and self._room_member_observer is not None:
             try:
@@ -787,6 +799,7 @@ class AsTransactionConsumer:
                 sender=sender,
                 trust=trust,
                 persona_user_id=target,
+                invite_encrypted=fields.get("invite_encrypted", False),
                 idempotency_key=(
                     speech_idempotency_key(target, event_id)
                     if target and event_id
@@ -795,7 +808,7 @@ class AsTransactionConsumer:
                 should_reply=False,
             )
             self._stats.inc("invites")
-            # 关系策略尚未接入：on_invite_to_ai 是 no-op stub（不自动接受邀请）。
+            # Deployment opt-in is enforced by the invite hook.
             self._run_hook(self._hooks.on_invite_to_ai, ctx)
             return
 
@@ -819,8 +832,16 @@ class AsTransactionConsumer:
             room_id=room_id,
             sender=sender,
             trust=trust,
+            encryption_state=fields.get("encryption_state", False),
+            membership=fields.get("membership"),
+            persona_user_id=fields.get("target_user_id"),
         )
-        self._run_hook(self._hooks.on_other, ctx)
+        if ctx.encryption_state or ctx.membership:
+            # A failed durable disable must retry the transaction, not discard
+            # the only notification that this room became encrypted.
+            self._hooks.on_other(ctx)
+        else:
+            self._run_hook(self._hooks.on_other, ctx)
 
     def _classify_event(self, event: Any) -> Optional[Tuple[str, Dict[str, Any]]]:
         """把一条 Matrix 事件分类；格式不对返回 None（调用方计数并跳过）。
@@ -869,12 +890,23 @@ class AsTransactionConsumer:
                 fields["redacts_event_id"] = redacts
             return EVENT_REDACTION, fields
         if event_type == "m.room.member":
+            if content.get("membership") in ("leave", "ban") and self._is_local_ai(event.get("state_key")):
+                fields["membership"] = content["membership"]
+                fields["target_user_id"] = event["state_key"]
             if content.get("membership") == "invite":
                 state_key = event.get("state_key")
                 if self._is_local_ai(state_key):
                     fields["target_user_id"] = state_key
+                    unsigned = event.get("unsigned")
+                    stripped = unsigned.get("invite_room_state", []) if isinstance(unsigned, dict) else []
+                    fields["invite_encrypted"] = (
+                        not isinstance(stripped, list) or any(
+                            isinstance(item, dict) and item.get("type") == "m.room.encryption"
+                            for item in stripped))
                     return EVENT_INVITE_TO_AI, fields
             return EVENT_OTHER_STATE, fields
+        if event_type == "m.room.encryption" and event.get("state_key") == "":
+            fields["encryption_state"] = True
         if event_type.startswith("m.room."):
             return EVENT_OTHER_STATE, fields
         return EVENT_OTHER, fields

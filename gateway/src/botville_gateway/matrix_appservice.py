@@ -41,7 +41,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Set, Tuple
 
 from .as_txn_store import AsTransactionStore, connect
 from .matrix import DeliveryError, SentEvent, resolve_txn_id
@@ -101,12 +101,18 @@ class AppServiceMatrixTransport:
         health_cache_seconds: float = 5.0,
         safety_store: Optional[AsTransactionStore] = None,
         sleep=time.sleep,
+        accepted_group: Optional[Callable[[str, str], bool]] = None,
+        disabled_group: Optional[Callable[[str, str], bool]] = None,
+        left_group: Optional[Callable[[str, str], bool]] = None,
     ) -> None:
         if room_cache_ttl_seconds < 0:
             raise ValueError(
                 "room_cache_ttl_seconds must be >= 0 (0 disables the "
                 "alias->room cache), got {!r}".format(room_cache_ttl_seconds)
             )
+        self.left_group = left_group
+        self.accepted_group = accepted_group
+        self.disabled_group = disabled_group
         self.safety_store = safety_store if safety_store is not None else AsTransactionStore(connect(":memory:"))
         self._sleep = sleep
         self._recovery_lock = threading.Lock()
@@ -172,7 +178,9 @@ class AppServiceMatrixTransport:
             errcode = parsed.get("errcode") or f"http.{exc.code}"
             # detail 只含 HS 的错误摘要与路径；不含 URL query（无敏感值）与 token。
             detail = parsed.get("error") or f"HTTP {exc.code} from {method} {path}"
-            raise DeliveryError(errcode, str(detail)) from exc
+            error = DeliveryError(errcode, str(detail))
+            error.http_status = exc.code
+            raise error from exc
         except urllib.error.URLError as exc:
             raise DeliveryError(
                 "matrix.unreachable", f"{method} {path}: {exc.reason}"
@@ -348,6 +356,24 @@ class AppServiceMatrixTransport:
             body={}, query={"user_id": user_id}, timeout=MEMBER_LOOKUP_TIMEOUT_SECONDS,
         )
 
+    def room_is_encrypted(self, room_id: str, user_id: str) -> bool:
+        """Only an actual HTTP 404 confirms absence; all other failures close."""
+        self._check_sender(user_id)
+        try:
+            self._request("GET", "/_matrix/client/v3/rooms/{}/state/m.room.encryption/".format(
+                urllib.parse.quote(room_id, safe="")), query={"user_id": user_id},
+                timeout=MEMBER_LOOKUP_TIMEOUT_SECONDS)
+        except DeliveryError as exc:
+            # Only an actual HTTP 404 proves that the state is absent.
+            return getattr(exc, "http_status", None) != 404
+        except Exception:
+            return True
+        return True
+
+    def _check_group_send(self, room: str, sender: str) -> None:
+        if self.disabled_group is not None and self.disabled_group(sender, room):
+            raise DeliveryError("conversation.e2ee", "Encrypted room participation is disabled")
+
     def _joined_room_is_dm(self, room: str, sender: str) -> bool:
         try:
             members = set(self.joined_members(room, (sender,)))
@@ -377,6 +403,7 @@ class AppServiceMatrixTransport:
     ) -> SentEvent:
         sender = self.resolve_sender(sender_id)
         room = self.resolve_room(room_id)
+        self._check_group_send(room, sender)
         self.ensure_user(sender)
 
         content: Dict[str, Any] = {"msgtype": "m.text", "body": text}
@@ -393,10 +420,14 @@ class AppServiceMatrixTransport:
         path = "/_matrix/client/v3/rooms/{}/send/m.room.message/{}".format(
             urllib.parse.quote(room, safe=""), urllib.parse.quote(txn, safe="")
         )
+        self._check_group_send(room, sender)
         try:
             resp = self._request("PUT", path, body=content, query={"user_id": sender})
         except DeliveryError as exc:
             if exc.code != "M_FORBIDDEN":
+                raise
+            if self.left_group is not None and self.left_group(sender, room):
+                # B2.8b: left/kicked/banned group rooms never auto-rejoin.
                 raise
             with self._recovery_lock:
                 try:
@@ -407,6 +438,8 @@ class AppServiceMatrixTransport:
                     raise exc
                 if self.safety_store.cleanup_pending(sender, room):
                     raise exc
+                # Accepted group rooms still need a pending, unencrypted invite
+                # (ledger or authoritative /sync): never self-join public rooms.
                 invitation = self.safety_store.invitation(sender, room)
                 if invitation is None:
                     invitation = self._sync_invitation(room, sender)
@@ -414,11 +447,14 @@ class AppServiceMatrixTransport:
                     raise exc
                 self.join(room, sender)
                 self.safety_store.invitation_update(sender, room, "join")
+                accepted = self.accepted_group is not None and self.accepted_group(sender, room)
                 if self._room_encrypted(room, sender) or (
-                    not allow_auto_join and not self._joined_room_is_dm(room, sender)
+                    not accepted and not allow_auto_join
+                    and not self._joined_room_is_dm(room, sender)
                 ):
                     self._rollback_join(room, sender)
                     raise exc
+                self._check_group_send(room, sender)
                 resp = self._request("PUT", path, body=content, query={"user_id": sender})
 
         event_id = resp.get("event_id")
@@ -439,10 +475,20 @@ class AppServiceMatrixTransport:
 
     def _sync_invitation(self, room: str, sender: str) -> Optional[bool]:
         """Return invitation encryption status; unknown or joined fails closed."""
+        # Throwaway authoritative check, never an ongoing sync loop: no
+        # `since` is sent and `next_batch` is never stored, so to-device
+        # messages are delivered but not acknowledged (the homeserver only
+        # deletes them once a later request presents the returned token).
+        # The filter narrows the response to this room's invite and drops
+        # timeline, state, ephemeral, account data and presence; the joined
+        # section is kept only so an existing membership is still detected.
         sync_filter = {
+            "event_fields": ["type"],
             "room": {
-                "rooms": [room], "timeline": {"limit": 0},
-                "state": {"lazy_load_members": True},
+                "rooms": [room],
+                "include_leave": False,
+                "timeline": {"limit": 0, "not_types": ["*"]},
+                "state": {"not_types": ["*"]},
                 "ephemeral": {"not_types": ["*"]},
                 "account_data": {"not_types": ["*"]},
             },
@@ -452,7 +498,8 @@ class AppServiceMatrixTransport:
         try:
             response = self._request(
                 "GET", "/_matrix/client/v3/sync",
-                query={"user_id": sender, "timeout": "0",
+                query={"user_id": sender, "timeout": "0", "set_presence": "offline",
+                       "full_state": "false",
                        "filter": json.dumps(sync_filter, separators=(",", ":"))},
                 timeout=MEMBER_LOOKUP_TIMEOUT_SECONDS,
             )
@@ -478,16 +525,21 @@ class AppServiceMatrixTransport:
             return None
 
     def _room_encrypted(self, room: str, sender: str) -> bool:
+        return self.room_is_encrypted(room, sender)
+
+    def _leave_for_cleanup(self, room: str, sender: str) -> None:
+        """Leave; M_FORBIDDEN means the AI is no longer in the room (done).
+
+        A member may always leave, so the homeserver only refuses a leave
+        when there is no membership left to end (already left, kicked or
+        banned). Treating it as done stops a stale queue entry from blocking
+        future invite-gated joins forever.
+        """
         try:
-            self._request("GET", "/_matrix/client/v3/rooms/{}/state/m.room.encryption/".format(
-                urllib.parse.quote(room, safe="")), query={"user_id": sender},
-                timeout=MEMBER_LOOKUP_TIMEOUT_SECONDS)
+            self.leave(room, sender)
         except DeliveryError as exc:
-            # Only an actual HTTP 404 proves that the state is absent.
-            return not (isinstance(exc.__cause__, urllib.error.HTTPError) and exc.__cause__.code == 404)
-        except OSError:
-            return True
-        return True
+            if exc.code != "M_FORBIDDEN":
+                raise
 
     def _rollback_join(self, room: str, sender: str) -> None:
         store = self.safety_store
@@ -496,7 +548,7 @@ class AppServiceMatrixTransport:
         store.cleanup_enqueue(sender, room)
         for attempt in range(3):
             try:
-                self.leave(room, sender)
+                self._leave_for_cleanup(room, sender)
             except (DeliveryError, OSError):
                 store.cleanup_failed(key, time.time())
                 if attempt < 2:
@@ -512,7 +564,7 @@ class AppServiceMatrixTransport:
                 if self._cleanup_stop.is_set():
                     return
                 try:
-                    self.leave(row["room"], row["persona"])
+                    self._leave_for_cleanup(row["room"], row["persona"])
                 except (DeliveryError, OSError):
                     self.safety_store.cleanup_failed(row["key"], time.time())
                 else:

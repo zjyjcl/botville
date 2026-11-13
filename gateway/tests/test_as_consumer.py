@@ -326,6 +326,9 @@ class TestQ5Routing(_TmpDb):
             ([self.AI_A, self.AI_B, "@human:" + SERVER_NAME], False, ()),
             ([self.AI_A, self.AI_B, "@human:" + SERVER_NAME], True, (self.AI_A,)),
             ([self.AI_A], False, ()),
+            # #226 nit e: exactly two AIs and no human in the room.
+            ([self.AI_A, self.AI_B], False, ()),
+            ([self.AI_A, self.AI_B], True, (self.AI_A,)),
         )):
             with self.subTest(index=index):
                 seen = []
@@ -362,7 +365,52 @@ class TestQ5Routing(_TmpDb):
         consumer._dispatch_event(event("invite", persona="@ai_foreign:elsewhere"))
         self.assertIsNone(self.store.invitation("@ai_foreign:elsewhere", room))
         columns = self.store._conn.execute("SELECT * FROM as_invitations").description
-        self.assertEqual([column[0] for column in columns], ["key", "encrypted"])
+        self.assertEqual([column[0] for column in columns], ["key", "encrypted", "created_at"])
+
+    def test_two_ai_room_without_human_ai_text_is_group(self):
+        seen = []
+        class Hooks(ConsumerHooks):
+            def on_ai_text(self, ctx): seen.append(ctx)
+        event = {"type": "m.room.message", "event_id": "$ai-pair", "room_id": "!pair:" + SERVER_NAME,
+                 "sender": self.AI_B, "content": {"msgtype": "m.text", "body": "hi"}}
+        self.store.store_transaction("pair", json.dumps({"events": [event]}))
+        self._make_consumer(hooks=Hooks(), persona_user_ids=(self.AI_A, self.AI_B),
+                            room_members=lambda _: [self.AI_A, self.AI_B]).run_once()
+        self.assertEqual(len(seen), 1)
+        self.assertFalse(seen[0].room_is_dm)
+        self.assertEqual(seen[0].target_user_ids, ())
+
+    def test_malformed_member_event_skips_only_that_event(self):
+        room = "!malformed:" + SERVER_NAME
+        seen = []
+        class Hooks(ConsumerHooks):
+            def on_human_text(self, ctx): seen.append(ctx)
+        base = {"type": "m.room.member", "room_id": room, "sender": "@human:" + SERVER_NAME}
+        malformed = [
+            dict(base, event_id="$m1", state_key=self.AI_A, content=["invite"]),
+            dict(base, event_id="$m2", state_key=self.AI_A, content={"membership": 5}),
+            dict(base, event_id="$m3", state_key=None, content={"membership": "invite"}),
+            dict(base, event_id="$m4", state_key=self.AI_A, content={"membership": ["invite"]}),
+            dict(base, event_id="$m5", state_key=self.AI_A, content={}),
+            dict(base, event_id="$m6", state_key=self.AI_A, content={"membership": "invite"},
+                 unsigned="not-an-object"),
+        ]
+        message = {"type": "m.room.message", "event_id": "$after-malformed", "room_id": room,
+                   "sender": "@human:" + SERVER_NAME, "content": {"msgtype": "m.text", "body": "still here"}}
+        self.store.store_transaction("malformed", json.dumps({"events": malformed + [message]}))
+        consumer = self._make_consumer(hooks=Hooks(), persona_user_ids=(self.AI_A,),
+                                       room_members=lambda _: [self.AI_A, "@human:" + SERVER_NAME])
+        consumer.run_once()
+        self.assertEqual([ctx.event_id for ctx in seen], ["$after-malformed"])
+        self.assertEqual(self.store.get_unprocessed_transactions(), [])
+        row = self.store._conn.execute(
+            "SELECT processed_at, failed_at FROM as_transactions WHERE txn_id = 'malformed'").fetchone()
+        self.assertIsNotNone(row["processed_at"])
+        self.assertIsNone(row["failed_at"])
+        # Only the well-formed invite reached the ledger; post-join encryption check still applies.
+        self.assertIsNone(self.store.invitation(self.AI_A, "!other:" + SERVER_NAME))
+        self.assertIs(self.store.invitation(self.AI_A, room), False)
+
 
     def test_multi_human_room_ordinary_text_does_not_reply(self):
         seen = []
@@ -393,6 +441,59 @@ class TestQ5Routing(_TmpDb):
             room_members=lambda _room: (_ for _ in ()).throw(RuntimeError())).run_once()
         self.assertFalse(seen[0].room_is_dm)
         self.assertEqual(seen[0].target_user_ids, (self.AI_A,))
+
+
+class TestInvitationLedgerTtl(unittest.TestCase):
+    """#226 nit d: stale invites expire and fall back to the /sync check."""
+
+    AI = "@ai_a:" + SERVER_NAME
+    ROOM = "!ttl:" + SERVER_NAME
+
+    def setUp(self):
+        self.now = 1_000_000.0
+        self.store = AsTransactionStore(connect(":memory:"), invite_ttl_seconds=600,
+                                        _clock=lambda: self.now)
+        self.addCleanup(self.store._conn.close)
+
+    def test_fresh_invite_hits_and_stale_invite_expires(self):
+        self.store.invitation_update(self.AI, self.ROOM, "invite", True)
+        self.now += 600
+        self.assertIs(self.store.invitation(self.AI, self.ROOM), True)
+        self.now += 1
+        self.assertIsNone(self.store.invitation(self.AI, self.ROOM))
+        self.assertEqual(self.store._conn.execute("SELECT COUNT(*) FROM as_invitations").fetchone()[0], 0)
+
+    def test_new_invite_refreshes_and_purges_other_stale_rows(self):
+        self.store.invitation_update(self.AI, "!old:" + SERVER_NAME, "invite")
+        self.now += 700
+        self.store.invitation_update(self.AI, self.ROOM, "invite")
+        self.assertEqual(self.store._conn.execute("SELECT COUNT(*) FROM as_invitations").fetchone()[0], 1)
+        self.assertIs(self.store.invitation(self.AI, self.ROOM), False)
+
+    def test_setter_and_default(self):
+        from botville_gateway.as_txn_store import DEFAULT_INVITE_LEDGER_TTL_SECONDS
+        self.assertEqual(DEFAULT_INVITE_LEDGER_TTL_SECONDS, 86400)
+        self.store.invitation_update(self.AI, self.ROOM, "invite")
+        self.now += 120
+        self.store.set_invite_ttl(60)
+        self.assertIsNone(self.store.invitation(self.AI, self.ROOM))
+
+    def test_pre_ttl_ledger_migrates_and_old_rows_are_expired(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "legacy.db")
+            legacy = sqlite3.connect(path)
+            legacy.execute("CREATE TABLE as_invitations (key TEXT PRIMARY KEY, encrypted INTEGER NOT NULL)")
+            legacy.execute("INSERT INTO as_invitations VALUES (?, 0)",
+                           (AsTransactionStore.room_persona_key(self.AI, self.ROOM),))
+            legacy.commit()
+            legacy.close()
+            conn = connect(path)
+            self.addCleanup(conn.close)
+            store = AsTransactionStore(conn, _clock=lambda: self.now)
+            self.assertIsNone(store.invitation(self.AI, self.ROOM))
+            store.invitation_update(self.AI, self.ROOM, "invite")
+            self.assertIs(store.invitation(self.AI, self.ROOM), False)
 
 
 # ---------------------------------------------------------------------------

@@ -1414,10 +1414,15 @@ class GatewayServer(http.server.ThreadingHTTPServer):
                 else None
             ),
             purge_interval_seconds=config.as_txn_purge_interval_seconds,
+            invite_ttl_seconds=config.invite_ledger_ttl_seconds,
         )
         from .matrix_appservice import AppServiceMatrixTransport
-        if isinstance(transport, AppServiceMatrixTransport) and self.as_txn_store is not None:
-            transport.safety_store = self.as_txn_store
+        if isinstance(transport, AppServiceMatrixTransport):
+            if self.as_txn_store is not None:
+                transport.safety_store = self.as_txn_store
+            else:
+                # The bounded in-memory fallback ledger honours the same TTL.
+                transport.safety_store.set_invite_ttl(config.invite_ledger_ttl_seconds)
         # B2.6 PR3a: local persistent memory is opt-in.  This is deliberately
         # independent of the AS transaction database and never affects health.
         self.memory_store: Optional[MemoryStore] = None
@@ -1456,6 +1461,15 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         self.memory_personas = load_personas(
             config.personas_file, server_name=config.matrix_server_name,
             max_message_chars=config.max_message_chars)
+        from .groups import GroupInvites
+        self.group_invites = GroupInvites(
+            self.memory_store, transport, self.memory_personas,
+            enabled=config.groups_enabled, server_name=config.matrix_server_name,
+            max_rooms=config.group_max_rooms_per_persona)
+        if hasattr(transport, "accepted_group"):
+            transport.accepted_group = self.group_invites.is_accepted
+            transport.disabled_group = self.group_invites.is_disabled
+            transport.left_group = self.group_invites.is_left
         self.personas_timestamp = iso_utc(service.started_at)
         if config.personas_file:
             try:
@@ -1650,6 +1664,7 @@ class GatewayServer(http.server.ThreadingHTTPServer):
             service=service,
             dedupe=PersistentSpeechDedupe(self.as_txn_store),
             mood_service=self.mood_service,
+            group_invites=self.group_invites,
             memory_store=self.memory_store,
             memory_embedding=self.memory_embedding,
             memory_vectors=self.memory_vectors,

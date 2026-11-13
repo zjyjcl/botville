@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 MEMORY_PURGE_INTERVAL_MIN_SECONDS = 60
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 OWNER_PIN_LIMIT = 200
 _log = logging.getLogger(__name__)
 
@@ -130,6 +130,17 @@ _MIGRATIONS = {
             recent_60_json TEXT NOT NULL DEFAULT '[]',
             updated_at REAL NOT NULL
         )''',
+    ),
+    # B2.8b durable group permissions and invite replay claims.
+    10: (
+        """CREATE TABLE IF NOT EXISTS group_rooms (
+            persona_id TEXT NOT NULL, room_key TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('accepted','rejected_encrypted','left','encrypted_disabled')),
+            mode TEXT NOT NULL DEFAULT 'mention_only' CHECK(mode IN ('mention_only','muted')),
+            inviter TEXT NOT NULL, joined_at REAL, updated_at REAL NOT NULL,
+            PRIMARY KEY(persona_id,room_key))""",
+        """CREATE TABLE IF NOT EXISTS group_invites (
+            invite_key TEXT PRIMARY KEY, processed_at REAL NOT NULL)""",
     ),
 }
 
@@ -244,6 +255,13 @@ class MemoryStore:
                         AND scope_key=OLD.scope_key AND covers_until_item_id>=OLD.id;
                     END''')
                 self._db.execute('UPDATE memory_schema SET version=?', (next_version,))
+
+            # Additive B2.8b repair, including existing schema-10 databases.
+            columns = {row[1] for row in self._db.execute('PRAGMA table_info(group_invites)')}
+            if 'status' not in columns:
+                self._db.execute("ALTER TABLE group_invites ADD COLUMN status TEXT NOT NULL DEFAULT 'done' CHECK(status IN ('pending','done'))")
+            if 'attempt_owner' not in columns:
+                self._db.execute("ALTER TABLE group_invites ADD COLUMN attempt_owner TEXT")
 
             columns = {row[1] for row in self._db.execute('PRAGMA table_info(memory_tombstones)')}
             if 'permanent' not in columns:
