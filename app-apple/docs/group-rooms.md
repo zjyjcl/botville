@@ -4,6 +4,8 @@
 
 依据 [网关契约 §2.4](../../gateway/docs/contract.md)、[OpenAPI](../../gateway/openapi/gateway.v1.yaml) 与 [#232 同步清单](https://github.com/zjyjcl/botville/pull/232)。本次仅覆盖 #40 的多 AI 拉群及群管理，不涵盖 AI 关系审批、撤销等其余验收。
 
+#232 清单 1 的既有版本断言调整已由上游 #234 处理；本分支独立实现后仅用普通 merge 同步 main，本 PR 不修改那些断言，也不新增硬编码的契约版本断言。
+
 ## 使用路径
 
 - 「我的 AI → 某个 AI」读取 owner 详情，仅当响应包含 `groups` 时显示群设置与群聊入口；对方资料页不显示。
@@ -43,8 +45,7 @@ GET 保持现有有限退避重试；三个新 PATCH 均不携带 Idempotency-Ke
 3. leave_pending 仅属于本次 leave 响应，刷新后不保留确认提示；joined_rooms 查询失败可能无法入清理队列，不能保证后台恢复。因此 UI 不承诺一定自动退出 Matrix 成员资格，也不对 left 提供自动重复提交。
 4. PATCH 没有幂等键/版本条件，500 后结果可能不确定；不自动重试，用户可刷新核对，设置失败按要求回滚本地显示。
 5. 分页无快照，更新会移动记录；客户端去重并允许刷新，不声称一次遍历取得原子快照。
-6. #232 清单 1 的既有版本断言调整由独立 #234 负责，本分支不改那些行，也不依赖其改动。新测试不硬编码契约版本。
-7. #232 清单 7：App 当前通过 Matrix 发文本，尚无 Gateway 发言预检/发送入口；共享错误支持 conversation.e2ee。group.replies_per_hour.exceeded / min_interval.too_soon 是 HTTP 200 blocked 策略原因，当前没有对应 Gateway policy 响应 UI，本次不伪造发送成功/失败或另建链路，待接入该链路时沿用通用 blocked 展示。
+6. #232 清单 7：App 当前通过 Matrix 发文本，尚无 Gateway 发言预检/发送入口；共享错误支持 conversation.e2ee。group.replies_per_hour.exceeded / min_interval.too_soon 是 HTTP 200 blocked 策略原因，当前没有对应 Gateway policy 响应 UI，本次不伪造发送成功/失败或另建链路，待接入该链路时沿用通用 blocked 展示。
 
 ## 验证边界
 
