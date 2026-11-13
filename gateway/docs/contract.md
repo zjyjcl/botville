@@ -998,13 +998,22 @@ DM 不受此上限影响。`m.mentions.room=true`（`@room`）本身不产生目
 跟随重定向。完整成员未确认或查询失败均按**群聊**处理，只按结构化/正文 mentions 或回复关系判定并计
 `room_member_errors`；记忆作用域必须为 group，绝不召回 DM 记忆。单个成员事件不构成完整成员确认。
 
-发送遇 `M_FORBIDDEN` 时，已确认 DM 的引擎回复（`allow_auto_join=true`）join 后直接重试一次。
-默认路径（包括 HTTP `POST /conversations/{id}/messages` 与主动发言）采用 **join 后复核：仅 DM 继续发送，否则立即退出并报错**。
-复核以发送者 masquerade 查询完整 joined 成员，必须恰好为 {发送者，一个本服人类}；人类 localpart
-不以 `ai_` 开头且不是 AS sender，domain 与配置的 `server_name` 大小写不敏感匹配；未配置 server_name
-或成员查询失败均视为非 DM。join 失败直接上抛；非 DM 尝试 leave 后上抛原 `M_FORBIDDEN`，
-leave 失败仅记无敏感信息 WARNING；非 `M_FORBIDDEN` 不 join。成功复核后仅重试一次；
-B2.8b 首先通过 left 回调阻止退群/被踢/封禁后的任何自动 rejoin；再通过注入回调允许 `group_rooms.state=accepted` 的房间 join 后重试，无需 DM 复核；其他房间保持上述 B2.8a 行为。
+发送遇 `M_FORBIDDEN` 时，先以该 AI masquerade 查询 joined_members；若已加入，直接上抛原错误，绝不 join/leave。
+包括已确认 DM 的 `allow_auto_join=true` 在内，邀请台账命中为快路径；未命中则以该 AI masquerade 向 homeserver 的 `/sync` 权威确认待处理邀请；无邀请绝不自行加入公开房间。
+消费者记录本服 persona 的 invite，join/leave/ban 清除邀请；事件哈希去重防止事务重试恢复旧邀请，清理待办未完成时拒绝再次自动 join；邀请表位于 AS 事务 SQLite，键为 SHA-256(persona, room)，不保存原始标识。
+未配置持久库时使用最多 1000 项的进程内邀请缓存，缺失/淘汰转 `/sync` 权威确认；内存事件去重墓碑上限 1000，满后拒绝记录新邀请直至重启，避免淘汰墓碑后重放恢复旧邀请。
+权威确认使用 `GET /_matrix/client/v3/sync?user_id=...&timeout=0&filter=<内联 JSON>`，不带 since；filter 为 `{"room":{"rooms":[room],"timeline":{"limit":0},"state":{"lazy_load_members":true},"ephemeral":{"not_types":["*"]},"account_data":{"not_types":["*"]}},"presence":{"not_types":["*"]},"account_data":{"not_types":["*"]}}`。
+请求超时 5 秒，不跟随重定向；任何错误或结构异常均 fail-closed，上抛原 `M_FORBIDDEN`。`rooms.join` 含该房间时不 join/leave，直接上抛原错误；否则须在 `rooms.invite` 中确认该房间，并检查 `invite_state.events`。邀请 stripped state 含 `m.room.encryption` 时拒绝 join。
+join 后再次以该 AI GET `/_matrix/client/v3/rooms/{room}/state/m.room.encryption/`：仅 HTTP 404 视为未加密，其余响应/错误均按加密处理，不发送并退出。
+默认路径（包括 HTTP 发送与主动发言）还须复核完整 joined 成员恰好为 {发送者，一个本服人类}；人类 localpart
+不以 `ai_` 开头且不是 AS sender，domain 与配置 server_name 大小写不敏感匹配。缺少 server_name 或查询失败视为非 DM。
+引擎已确认 DM 可跳过重复 DM 分类，但不能跳过邀请门禁、已有成员检查和加密检查。join 失败上抛，复核失败退出后上抛原 `M_FORBIDDEN`；仅通过检查才重试发送一次。
+退出前先写 pending-cleanup，leave 最多立即尝试 3 次，短退避 0.05/0.1 秒；成功删除，失败保留队列。
+同库清理队列以 persona/room 的 SHA-256 为键，另存执行 leave 必需的原始 persona/room（明文敏感数据，沿用事务库新建 0600、WAL 权限保护，不保存密钥）。
+哈希不可逆，故仅存哈希无法重启后执行 leave；日志不含这些原值、正文或异常详情。每次失败累加次数，按 min(5×2^(n−1), 3600) 秒退避。
+后台每 5 秒处理最多 20 项，与网关启动/停止，独立于消费者开关；单次 leave 超时 5 秒，stop 等待最多 5 秒，未完成队列重启后续办。
+非 `M_FORBIDDEN` 不 join；契约仍为 0.5.0。
+B2.8b：上述检查之前先通过 left 回调阻止退群/被踢/封禁后的任何自动 rejoin；`group_rooms.state=accepted` 的房间仍须通过邀请门禁（台账或 `/sync` 权威确认）、已有成员检查与 join 前后加密检查，仅免除 DM 复核；其他房间保持上述行为。
 
 **⑩ 四层记忆（B2.6：PR3a / PR3b / PR3c 已实现）**
 
@@ -1840,6 +1849,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.5.0 | 2026-11-13 | [M_FORBIDDEN 安全加固] 自动 join 需邀请台账命中或 /sync 权威确认，前后排除加密；已有成员不 join/leave；leave 有限重试与持久清理队列，无新增开关或 API 字段。 |
 | 0.5.0 | 2026-11-13 | [PR4c quasi-breaking] 新增默认关闭的主动发言部署/人设配置、DM-only 候选、持久化队列与 stable txnId 重放语义；`ProactiveSettings.enabled` 默认值由 true 改为 false。该默认值改变未显式设置旧部署的行为，按准破坏性变更公告。 |
 | 0.5.0 | 2026-11-13 | [#221 proactive 修正] 启用但无法启动 worker 记录 WARNING；owner 无 DM 日志每目标限频且缓存有界；过期且成员不匹配的队列转 abandoned，终态保留 30 天；跨午夜静默时段与严格 DM 协同验证。 |
 | 0.5.0 | 2026-11-13 | [B2.8b] 默认关闭的本服群邀请自动接受、owner/local_humans 策略、持久去重与群数上限；加密邀请拒绝、中途加密停用、accepted 群自动 rejoin。无版本升级。 |

@@ -47,6 +47,8 @@ make down            # 停止（不传 -v，不删任何卷）。清卷：docker
 （只读挂载，真实文件不进仓库；自定义目录用 `BOTVILLE_GATEWAY_PERSONAS_DIR`，不存在时
 `make up GATEWAY=1` / `make config` 预检就报错）。详见
 [docs/deploy/appservice.md](../docs/deploy/appservice.md#角色引擎模型与人设)。
+群聊回复上限 `GATEWAY_GROUP_MAX_RESPONDERS`（B 线 B2.8a，默认 `3`，整数 1–20，私聊不受影响）
+同样原样透传，init.sh 不生成；超出范围网关拒绝启动。
 
 记忆（B 线 PR3a）：`GATEWAY_MEMORY_DB_PATH` 默认空 = 关闭；启用时写
 `/var/lib/botville-gateway/memory.db`（gateway-data 卷顶层，`make backup` /

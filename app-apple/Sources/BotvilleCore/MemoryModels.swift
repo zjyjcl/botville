@@ -93,6 +93,47 @@ public struct MemoryFactWrite: Codable, Sendable, Equatable {
         case personaID = "persona_id"
     }
 }
+/// Contract 0.5.0 persona configuration. Missing enabled never opts into sending.
+/// Other optional fields preserve absence so the server can apply its defaults.
+public struct ProactiveSettings: Codable, Sendable, Equatable {
+    public let enabled: Bool
+    public let maxPerDay: Int?
+    public let requireReply: Bool?
+    public let quietHours: SilentHours?
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled
+        case maxPerDay = "max_per_day"
+        case requireReply = "require_reply"
+        case quietHours = "quiet_hours"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try values.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        maxPerDay = try values.decodeIfPresent(Int.self, forKey: .maxPerDay)
+        requireReply = try values.decodeIfPresent(Bool.self, forKey: .requireReply)
+        quietHours = try values.decodeIfPresent(SilentHours.self, forKey: .quietHours)
+    }
+}
+
+public struct SilentHours: Codable, Sendable, Equatable {
+    public let enabled: Bool
+    public let start: String
+    public let end: String
+    public let timezone: String
+
+    private enum CodingKeys: String, CodingKey { case enabled, start, end, timezone }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try values.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        start = try values.decode(String.self, forKey: .start)
+        end = try values.decode(String.self, forKey: .end)
+        timezone = try values.decode(String.self, forKey: .timezone)
+    }
+}
+
 public struct MemoryPersona: Codable, Sendable, Equatable, Identifiable {
     public let id: String
     public let displayName: String
@@ -104,12 +145,33 @@ public struct MemoryPersona: Codable, Sendable, Equatable, Identifiable {
     public let createdAt: Date
     public let updatedAt: Date
     public let visibility: String
+    /// Owner detail responses add this field; list summaries intentionally omit it.
+    /// Unknown response values are treated as absent for forward compatibility.
+    public let mood: PersonaMood?
+    /// Full Persona configuration only; summaries and detail views omit it.
+    public let proactive: ProactiveSettings?
     enum CodingKeys: String, CodingKey {
-        case id, bio, kind, status, revision, visibility
+        case id, bio, kind, status, revision, visibility, mood, proactive
         case displayName = "display_name"
         case ownerID = "owner_id"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        displayName = try values.decode(String.self, forKey: .displayName)
+        bio = try values.decodeIfPresent(String.self, forKey: .bio)
+        ownerID = try values.decode(String.self, forKey: .ownerID)
+        kind = try values.decode(String.self, forKey: .kind)
+        status = try values.decode(String.self, forKey: .status)
+        revision = try values.decode(Int.self, forKey: .revision)
+        createdAt = try values.decode(Date.self, forKey: .createdAt)
+        updatedAt = try values.decode(Date.self, forKey: .updatedAt)
+        visibility = try values.decode(String.self, forKey: .visibility)
+        mood = try values.decodeIfPresent(String.self, forKey: .mood).flatMap(PersonaMood.init(rawValue:))
+        proactive = try values.decodeIfPresent(ProactiveSettings.self, forKey: .proactive)
     }
 
     public func aiProfile(localServerName: String?) -> AIProfile {
@@ -129,11 +191,85 @@ public struct MemoryPersona: Codable, Sendable, Equatable, Identifiable {
         try values.encode(createdAt, forKey: .createdAt)
         try values.encode(updatedAt, forKey: .updatedAt)
         try values.encode(visibility, forKey: .visibility)
+        try values.encodeIfPresent(mood, forKey: .mood)
+        try values.encodeIfPresent(proactive, forKey: .proactive)
     }
 }
 
-public enum PersonaMood: String, Sendable {
-    case neutral, happy, sad, excited, calm, anxious
+public enum PersonaMood: String, Codable, Sendable, CaseIterable {
+    case calm, happy, sad, excited, tired
+
+    public var label: String {
+        switch self {
+        case .calm: "平静"
+        case .happy: "愉快"
+        case .sad: "低落"
+        case .excited: "兴奋"
+        case .tired: "疲惫"
+        }
+    }
+
+    public var symbolName: String {
+        switch self {
+        case .calm: "leaf"
+        case .happy: "face.smiling"
+        case .sad: "cloud.rain"
+        case .excited: "sparkles"
+        case .tired: "bed.double"
+        }
+    }
+}
+
+/// Owner-only `/personas/{id}/state` response. The response mood is an object,
+/// whereas public persona details expose the label as a string.
+public struct PersonaState: Decodable, Sendable, Equatable {
+    public let personaID: String
+    public let mood: PersonaMood?
+    public let moodPublic: Bool
+    public let updatedAt: Date?
+
+    /// Owner-only decoration; private moods remain visible to their owner.
+    public var showsPrivateMoodMarker: Bool { mood != nil && !moodPublic }
+
+    private enum CodingKeys: String, CodingKey {
+        case personaID = "persona_id"
+        case mood
+        case moodPublic = "mood_public"
+        case updatedAt = "updated_at"
+    }
+    private enum MoodKeys: String, CodingKey { case label }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        personaID = try values.decode(String.self, forKey: .personaID)
+        moodPublic = try values.decode(Bool.self, forKey: .moodPublic)
+        updatedAt = try values.decodeIfPresent(Date.self, forKey: .updatedAt)
+        guard values.contains(.mood), !(try values.decodeNil(forKey: .mood)) else {
+            mood = nil
+            return
+        }
+        let moodValues = try values.nestedContainer(keyedBy: MoodKeys.self, forKey: .mood)
+        mood = try moodValues.decodeIfPresent(String.self, forKey: .label).flatMap(PersonaMood.init(rawValue:))
+    }
+
+    public init(personaID: String, mood: PersonaMood?, moodPublic: Bool, updatedAt: Date? = nil) {
+        self.personaID = personaID
+        self.mood = mood
+        self.moodPublic = moodPublic
+        self.updatedAt = updatedAt
+    }
+}
+
+public struct PersonaStatePatch: Encodable, Sendable, Equatable {
+    public let mood: PersonaMood?
+    public let moodPublic: Bool?
+
+    public init(mood: PersonaMood? = nil, moodPublic: Bool? = nil) {
+        self.mood = mood
+        self.moodPublic = moodPublic
+    }
+
+    enum CodingKeys: String, CodingKey { case mood; case moodPublic = "mood_public" }
 }
 
 public struct PersonaPublicView: Decodable, Sendable, Equatable, Identifiable {
@@ -158,7 +294,7 @@ public struct PersonaPublicView: Decodable, Sendable, Equatable, Identifiable {
     }
 }
 
-/// Contract 0.3.0 uses anyOf without a discriminator. An owner_id field selects
+/// Contract 0.5.0 uses anyOf without a discriminator. An owner_id field selects
 /// the full summary; malformed owner data must not silently become a public view.
 public enum PersonaDetail: Decodable, Sendable, Equatable {
     case owner(MemoryPersona)
@@ -183,6 +319,9 @@ public enum PersonaDetail: Decodable, Sendable, Equatable {
     }
     public var bio: String? {
         switch self { case .owner(let value): value.bio; case .publicView(let value): value.bio }
+    }
+    public var mood: PersonaMood? {
+        switch self { case .owner(let value): value.mood; case .publicView(let value): value.mood }
     }
 }
 struct MemoryPersonaPage: Decodable {

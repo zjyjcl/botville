@@ -197,7 +197,7 @@ sender → **400 `request.invalid`**；房间别名不存在 → **404
     | `GATEWAY_AS_TOKEN` | `${APPSERVICE_AS_TOKEN:-}` | 空（appservice 模式会拒绝启动） |
     | `GATEWAY_HS_TOKEN` | `${APPSERVICE_HS_TOKEN:-}` | 空（AS 回调一律 403） |
     | `GATEWAY_AS_TXN_DB_PATH` | 固定 | `/var/lib/botville-gateway/as_transactions.db` |
-    | `GATEWAY_MODEL_*` / `GATEWAY_PERSONAS_FILE` / `GATEWAY_CONSUMER_ENABLED` / `GATEWAY_MEMORY_*` / `GATEWAY_EMBEDDING_*` / `GATEWAY_MOOD_*` / `GATEWAY_PROACTIVE_*` | 透传 | 见[角色引擎](#角色引擎模型与人设)的回退值表 |
+    | `GATEWAY_MODEL_*` / `GATEWAY_PERSONAS_FILE` / `GATEWAY_CONSUMER_ENABLED` / `GATEWAY_GROUP_MAX_RESPONDERS` / `GATEWAY_MEMORY_*` / `GATEWAY_EMBEDDING_*` / `GATEWAY_MOOD_*` / `GATEWAY_PROACTIVE_*` | 透传 | 见[角色引擎](#角色引擎模型与人设)的回退值表 |
 
   - **只通过 `make up` 重建网关**：`BOTVILLE_HOMESERVER` / `GATEWAY_MATRIX_TRANSPORT`
     只在 `make up` 里导出（`HS=` 可能与 `.env` 不同），注册 url 也只在
@@ -240,6 +240,7 @@ B 线 PR2（角色引擎回复）读的变量，compose 原样透传给 `gateway
 | 变量 | compose 写法 | 回退值 | 说明 |
 | --- | --- | --- | --- |
 | `GATEWAY_CONSUMER_ENABLED` | `${GATEWAY_CONSUMER_ENABLED:-false}` | `false` | 事务消费者总开关，默认关 |
+| `GATEWAY_GROUP_MAX_RESPONDERS` | `${GATEWAY_GROUP_MAX_RESPONDERS:-3}` | `3` | 每条群聊人类消息最多几个 AI 回复（B 线 B2.8a）；整数 1–20，私聊不受影响；超出范围或不是整数时网关拒绝启动（报错不回显取值） |
 | `GATEWAY_MODEL_BASE_URL` | `${GATEWAY_MODEL_BASE_URL:-}` | 空 | OpenAI 兼容接口地址；空 = 未配模型，只记录不发言 |
 | `GATEWAY_MODEL_NAME` | `${GATEWAY_MODEL_NAME:-}` | 空 | 模型名 |
 | `GATEWAY_MODEL_API_KEY` | `${GATEWAY_MODEL_API_KEY:-}` | 空 | 密钥，只写在部署方自己的 `server/compose/.env` |

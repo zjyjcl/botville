@@ -44,6 +44,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import sqlite3
@@ -201,6 +203,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.execute(_CONSUMABLE_INDEX_DDL)
     # B 线 PR2 发言去重账本（幂等，不影响既有行）。
     conn.execute(_SPEECH_DEDUPE_DDL)
+    conn.execute("CREATE TABLE IF NOT EXISTS as_invitation_events (key TEXT PRIMARY KEY)")
+    conn.execute("CREATE TABLE IF NOT EXISTS as_invitations ("
+                 "key TEXT PRIMARY KEY, encrypted INTEGER NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS as_pending_cleanup ("
+                 "key TEXT PRIMARY KEY, persona TEXT NOT NULL, room TEXT NOT NULL,"
+                 " attempts INTEGER NOT NULL, next_at REAL NOT NULL)")
 
 
 def connect(db_path: str) -> sqlite3.Connection:
@@ -451,6 +459,75 @@ class AsTransactionStore:
                     " WHERE txn_id = ? AND processed_at IS NULL",
                     (ts, txn_id),
                 )
+
+    @staticmethod
+    def room_persona_key(persona: str, room: str) -> str:
+        return hashlib.sha256(json.dumps([persona, room], separators=(",", ":")).encode()).hexdigest()
+
+    def invitation_update(self, persona: str, room: str, membership: str,
+                          encrypted: bool = False, event_id: Optional[str] = None) -> None:
+        key = self.room_persona_key(persona, room)
+        with self._lock, self._conn:
+            if event_id is not None:
+                memory_full = (
+                    not self._conn.execute("PRAGMA database_list").fetchone()[2]
+                    and self._conn.execute("SELECT COUNT(*) FROM as_invitation_events").fetchone()[0] >= 1000
+                )
+                # Do not evict replay tombstones and accidentally revive invites.
+                # A saturated in-memory observer rejects new invites until restart.
+                if memory_full:
+                    if membership != "invite":
+                        self._conn.execute("DELETE FROM as_invitations WHERE key = ?", (key,))
+                    return
+                event_key = self.room_persona_key(key, event_id)
+                inserted = self._conn.execute("INSERT OR IGNORE INTO as_invitation_events VALUES (?)", (event_key,))
+                if not inserted.rowcount:
+                    return
+            if membership == "invite":
+                self._conn.execute("INSERT OR REPLACE INTO as_invitations VALUES (?, ?)",
+                                   (key, int(encrypted)))
+                # Bound the fallback cache; eviction requires authoritative sync confirmation.
+                if not self._conn.execute("PRAGMA database_list").fetchone()[2]:
+                    self._conn.execute("DELETE FROM as_invitations WHERE rowid NOT IN "
+                                       "(SELECT rowid FROM as_invitations ORDER BY rowid DESC LIMIT 1000)")
+            elif membership in ("join", "leave", "ban"):
+                self._conn.execute("DELETE FROM as_invitations WHERE key = ?", (key,))
+
+    def invitation(self, persona: str, room: str) -> Optional[bool]:
+        """None means no pending invite; bool reports stripped encryption state."""
+        with self._lock:
+            row = self._conn.execute("SELECT encrypted FROM as_invitations WHERE key = ?",
+                                     (self.room_persona_key(persona, room),)).fetchone()
+            return None if row is None else bool(row[0])
+
+    def cleanup_enqueue(self, persona: str, room: str) -> None:
+        # Raw routing IDs are necessary for leave after restart. Like transaction
+        # bodies, these are private SQLite data, never log fields. No token stored.
+        with self._lock, self._conn:
+            self._conn.execute("INSERT OR IGNORE INTO as_pending_cleanup VALUES (?, ?, ?, 0, 0)",
+                               (self.room_persona_key(persona, room), persona, room))
+
+    def cleanup_pending(self, persona: str, room: str) -> bool:
+        with self._lock:
+            return self._conn.execute("SELECT 1 FROM as_pending_cleanup WHERE key = ?",
+                                      (self.room_persona_key(persona, room),)).fetchone() is not None
+
+    def cleanup_due(self, now: float, limit: int = 20):
+        with self._lock:
+            return self._conn.execute("SELECT * FROM as_pending_cleanup WHERE next_at <= ? "
+                                      "ORDER BY next_at LIMIT ?", (now, limit)).fetchall()
+
+    def cleanup_done(self, key: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM as_pending_cleanup WHERE key = ?", (key,))
+
+    def cleanup_failed(self, key: str, now: float) -> None:
+        with self._lock, self._conn:
+            row = self._conn.execute("SELECT attempts FROM as_pending_cleanup WHERE key = ?", (key,)).fetchone()
+            if row is not None:
+                attempts = row[0] + 1
+                self._conn.execute("UPDATE as_pending_cleanup SET attempts = ?, next_at = ? WHERE key = ?",
+                                   (attempts, now + min(5 * 2 ** min(attempts - 1, 10), 3600), key))
 
     # ------------------------------------------------------- retention
     def purge(

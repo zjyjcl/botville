@@ -11,31 +11,42 @@ public struct AIProfile: Equatable, Sendable {
     public let avatarData: Data?
     /// Gateway persona bio, trimmed for presentation; absent or blank is hidden.
     public let signature: String?
+    /// Only the gateway's disclosed mood is shown on the counterpart profile.
+    public let mood: PersonaMood?
     /// The signed-in account's Matrix server name, used for disclosure policy.
     public let localServerName: String?
 
-    public init(userID: String, displayName: String, avatarData: Data?, signature: String?, localServerName: String?) {
+    public init(userID: String, displayName: String, avatarData: Data?, signature: String?, localServerName: String?, mood: PersonaMood? = nil) {
         self.userID = userID
         self.displayName = displayName
         self.avatarData = avatarData
         let trimmed = signature?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.signature = trimmed?.isEmpty == false ? trimmed : nil
+        self.mood = mood
         self.localServerName = localServerName
+    }
+
+    var canFetchGatewayDetails: Bool {
+        guard let localServerName, !localServerName.isEmpty,
+              let server = MemoryPresentationPolicy.matrixServerName(in: userID) else { return false }
+        return server.lowercased() == localServerName.lowercased()
+    }
+
+    var withoutGatewayDetails: AIProfile {
+        AIProfile(userID: userID, displayName: displayName, avatarData: avatarData,
+                  signature: nil, localServerName: localServerName)
     }
 
     /// The local gateway cannot resolve identities on another Matrix server.
     /// Check this before even requesting a detail, including unknown local names.
     public func fetchingDetails(using client: (any GatewayClient)?) async throws -> AIProfile {
-        guard let localServerName, !localServerName.isEmpty,
-              MemoryPresentationPolicy.matrixServerName(in: userID) == localServerName else {
-            throw GatewayClientError.problem(status: 404, code: "persona.not_found")
-        }
+        guard canFetchGatewayDetails else { return withoutGatewayDetails }
         guard let client else { throw GatewayClientError.invalidResponse }
         let detail = try await client.persona(id: userID)
         try Task.checkCancellation()
         guard detail.id == userID else { throw GatewayClientError.invalidResponse }
         return AIProfile(userID: userID, displayName: detail.displayName, avatarData: avatarData,
-                         signature: detail.bio, localServerName: localServerName)
+                         signature: detail.bio, localServerName: localServerName, mood: detail.mood)
     }
 }
 

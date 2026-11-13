@@ -15,13 +15,26 @@ final class MockContractConsistencyTests: XCTestCase {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
-        for name in ["capability-manifest", "card"] {
+        for name in ["capability-manifest", "card", "persona-page", "persona-state"] {
             let bundled = root.appendingPathComponent(
                 "app-apple/Sources/BotvilleCore/Resources/mock-\(name).json")
             let contract = root.appendingPathComponent("gateway/openapi/examples/\(name).json")
             XCTAssertEqual(
                 try Data(contentsOf: bundled), try Data(contentsOf: contract),
                 "Keep the App mock and the gateway \(name) example synchronized")
+        }
+    }
+
+    func testManifestVersionsMatchCurrentContractAndRuntimeManifest() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        for path in ["gateway/openapi/examples/capability-manifest.json",
+                     "app-apple/Sources/BotvilleCore/Resources/mock-capability-manifest.json"] {
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(
+                with: Data(contentsOf: root.appendingPathComponent(path))) as? [String: Any])
+            XCTAssertEqual(object["contract_version"] as? String, "0.5.0")
+            XCTAssertEqual(object["manifest_version"] as? String, "1.3.0")
         }
     }
 

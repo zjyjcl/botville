@@ -610,6 +610,7 @@ public final class MatrixService: ObservableObject {
         guard isLoggedIn, !isLoggingOut,
               profile.localServerName == userID.flatMap(MemoryPresentationPolicy.matrixServerName(in:))
         else { throw CancellationError() }
+        guard profile.canFetchGatewayDetails else { return profile.withoutGatewayDetails }
         let result = try await profile.fetchingDetails(using: confirmedGatewayClient())
         guard session == sessionGeneration, !isLoggingOut, !Task.isCancelled else { throw CancellationError() }
         return result
@@ -621,6 +622,9 @@ public final class MatrixService: ObservableObject {
     public func aiProfileDisclosure(aiUserID: String) async -> Bool {
         let session = sessionGeneration
         let localServerName = userID.flatMap(MemoryPresentationPolicy.matrixServerName(in:))
+        guard let localServerName, !localServerName.isEmpty,
+              MemoryPresentationPolicy.matrixServerName(in: aiUserID)?.lowercased()
+                == localServerName.lowercased() else { return false }
         do {
             guard let gateway = try confirmedGatewayClient() else { return false }
             let manifest = try await gateway.capabilities()

@@ -335,14 +335,55 @@ class TransportTests(unittest.TestCase):
 
     def test_accepted_group_forbidden_retry(self):
         tr = self.transport(accepted_group=lambda p, r: (p, r) == (AI, ROOM))
+        tr.joined_members = Mock(return_value=(OWNER, '@other:local.test'))
+        tr.safety_store.invitation_update(AI, ROOM, 'invite')
+        tr._room_encrypted = Mock(return_value=False)
         tr._request = Mock(side_effect=[DeliveryError('M_FORBIDDEN', 'private'), {'event_id': '$sent'}])
         tr.send_text(room_id=ROOM, sender_id=AI, text='body')
         tr.join.assert_called_once_with(ROOM, AI)
-        tr.joined_members.assert_not_called()
+        # Only the already-member check; accepted rooms skip the DM recheck.
+        tr.joined_members.assert_called_once()
+        tr._room_encrypted.assert_called_once_with(ROOM, AI)
         tr.leave.assert_not_called()
+
+    def test_accepted_group_without_pending_invite_never_joins(self):
+        tr = self.transport(accepted_group=lambda p, r: True)
+        tr.joined_members = Mock(return_value=(OWNER,))
+        tr._sync_invitation = Mock(return_value=None)
+        tr._request = Mock(side_effect=DeliveryError('M_FORBIDDEN', 'private'))
+        with self.assertRaises(DeliveryError):
+            tr.send_text(room_id=ROOM, sender_id=AI, text='body')
+        tr._sync_invitation.assert_called_once_with(ROOM, AI)
+        tr.join.assert_not_called()
+
+    def test_accepted_group_encrypted_after_join_leaves(self):
+        tr = self.transport(accepted_group=lambda p, r: True)
+        tr.joined_members = Mock(return_value=(OWNER,))
+        tr.safety_store.invitation_update(AI, ROOM, 'invite')
+        tr._room_encrypted = Mock(return_value=True)
+        tr._request = Mock(side_effect=DeliveryError('M_FORBIDDEN', 'private'))
+        with self.assertRaises(DeliveryError):
+            tr.send_text(room_id=ROOM, sender_id=AI, text='body')
+        tr.join.assert_called_once()
+        tr.leave.assert_called_once_with(ROOM, AI)
+        self.assertEqual(tr._request.call_count, 1)
+
+    def test_left_group_never_rejoins_even_with_invite(self):
+        tr = self.transport(left_group=lambda p, r: True, accepted_group=lambda p, r: True)
+        tr.safety_store.invitation_update(AI, ROOM, 'invite')
+        tr._sync_invitation = Mock()
+        tr._request = Mock(side_effect=DeliveryError('M_FORBIDDEN', 'private'))
+        with self.assertRaises(DeliveryError):
+            tr.send_text(room_id=ROOM, sender_id=AI, text='body')
+        tr.join.assert_not_called()
+        tr._sync_invitation.assert_not_called()
 
     def test_unaccepted_group_keeps_b28a(self):
         tr = self.transport(accepted_group=lambda p, r: False)
+        tr.joined_members = Mock(side_effect=[(OWNER, '@other:local.test'),
+                                              (AI, OWNER, '@other:local.test')])
+        tr.safety_store.invitation_update(AI, ROOM, 'invite')
+        tr._room_encrypted = Mock(return_value=False)
         tr._request = Mock(side_effect=DeliveryError('M_FORBIDDEN', 'private'))
         with self.assertRaises(DeliveryError):
             tr.send_text(room_id=ROOM, sender_id=AI, text='body')

@@ -8,7 +8,7 @@
 - m.login.application_service 注册（Bearer as_token + inhibit_login）与进程内缓存；
   200 响应的 user_id 必须与请求一致（缺失/不符 → appservice.namespace）；
 - M_USER_IN_USE 视为已存在（幂等）；
-- M_FORBIDDEN 默认 join 后复核 DM；非 DM 退出，已确认 DM 直接重试一次；
+- M_FORBIDDEN 邀请门禁、成员与加密检查、DM 复核、退出重试及持久清理；
 - 身份/房间映射（PR #99 阻塞项 1）：persona_id → @ai_<persona>:<server>；
   conversation_id → 房间别名 directory/room 解析 + TTL 缓存（命中/过期/0=不缓存，
   #107）；别名不存在 → conversation.not_found；非法字符集 → 客户端侧拒绝（零请求）；
@@ -148,6 +148,10 @@ class AppServiceTransportTest(unittest.TestCase):
         )
         self.hs.route("POST", "/_matrix/client/v3/register", [(200, {"user_id": AI})])
         self.hs.route("POST", "/_matrix/client/v3/join/", [(200, {"room_id": ROOM})])
+        self.hs.route("GET", "/_matrix/client/v3/rooms/", [
+            (403, {"errcode": "M_FORBIDDEN"}),
+            (404, {"errcode": "M_NOT_FOUND"}),
+        ])
         self.hs.route(
             "PUT", "/_matrix/client/v3/rooms/", [(200, {"event_id": "$e1"}), (200, {"event_id": "$e2"})]
         )
@@ -157,7 +161,9 @@ class AppServiceTransportTest(unittest.TestCase):
             homeserver_url=self.hs.base_url, as_token=AS_TOKEN, server_name=SERVER_NAME
         )
         kwargs.update(overrides)
-        return AppServiceMatrixTransport(**kwargs)
+        transport = AppServiceMatrixTransport(**kwargs)
+        transport.safety_store.invitation_update(AI, ROOM, "invite")
+        return transport
 
     def test_satisfies_matrix_transport_protocol(self):
         self.assertIsInstance(self.make_transport(), MatrixTransport)
@@ -227,7 +233,7 @@ class AppServiceTransportTest(unittest.TestCase):
         joins = self.hs.matching("POST", "/_matrix/client/v3/join/")
         self.assertEqual(len(joins), 1)
         self.assertEqual(joins[0]["query"].get("user_id"), [AI])
-        self.assertEqual(self.hs.matching("GET", "/_matrix/client/v3/rooms/"), [])
+        self.assertEqual(len(self.hs.matching("GET", "/_matrix/client/v3/rooms/")), 2)
         # join 的路径是 URL 编码后的 room id。
         self.assertIn(
             urllib.parse.quote(ROOM, safe=""), joins[0]["path"]
@@ -243,18 +249,20 @@ class AppServiceTransportTest(unittest.TestCase):
             (200, {"event_id": "$after-join"}),
         ])
         self.hs.route("GET", "/_matrix/client/v3/rooms/", [
+            (403, {"errcode": "M_FORBIDDEN"}),
+            (404, {"errcode": "M_NOT_FOUND"}),
             (lookup_status, {"joined": {uid: {} for uid in members}}),
         ])
 
-    def assert_recovery_requests(self, *, retry=False, leave=True):
+    def assert_recovery_requests(self, *, retry=False, leave=True, leave_attempts=1):
         requests = [r for r in self.hs.requests if not r["path"].endswith("/register")]
         self.assertEqual([r["method"] for r in requests],
-                         ["PUT", "POST", "GET"] + (["POST"] if leave else [])
+                         ["PUT", "GET", "POST", "GET", "GET"] + (["POST"] * leave_attempts if leave else [])
                          + (["PUT"] if retry else []))
         for request in requests:
             self.assertEqual(request["query"].get("user_id"), [AI])
         if leave:
-            self.assertEqual(requests[3]["path"],
+            self.assertEqual(requests[5]["path"],
                 "/_matrix/client/v3/rooms/" + urllib.parse.quote(ROOM, safe="") + "/leave")
         if retry:
             self.assertEqual(requests[0], requests[-1])
@@ -302,7 +310,7 @@ class AppServiceTransportTest(unittest.TestCase):
         with self.assertRaises(DeliveryError) as ctx:
             self.make_transport().send_text(room_id=ROOM, sender_id=AI, text="hello")
         self.assertEqual(ctx.exception.detail, "not invited")
-        self.assertEqual([r["method"] for r in self.hs.requests], ["POST", "PUT", "POST"])
+        self.assertEqual([r["method"] for r in self.hs.requests], ["POST", "PUT", "GET", "POST"])
 
     def test_default_lookup_failure_leaves(self):
         self.recovery_routes((), lookup_status=403)
@@ -322,7 +330,7 @@ class AppServiceTransportTest(unittest.TestCase):
     def test_leave_failure_preserves_send_error_and_logs_no_sensitive_data(self):
         self.recovery_routes((AI, "@alice:remote"))
         self.hs.route("POST", "/_matrix/client/v3/rooms/", [
-            (500, {"error": ROOM + AI + "secret message"})])
+            (500, {"error": ROOM + AI + "secret message"})] * 3)
         with self.assertLogs("botville_gateway.matrix_appservice", level="WARNING") as logs:
             with self.assertRaises(DeliveryError) as ctx:
                 self.make_transport().send_text(room_id=ROOM, sender_id=AI, text="secret message")
@@ -330,7 +338,7 @@ class AppServiceTransportTest(unittest.TestCase):
         self.assertEqual(len(logs.records), 1)
         for sensitive in (ROOM, AI, "secret message", AS_TOKEN):
             self.assertNotIn(sensitive, str(logs.output))
-        self.assert_recovery_requests()
+        self.assert_recovery_requests(leave_attempts=3)
 
     def test_forbidden_auto_join_retries_only_once(self):
         self.hs.route(
@@ -344,6 +352,209 @@ class AppServiceTransportTest(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "M_FORBIDDEN")
         self.assertEqual(len(self.hs.matching("POST", "/_matrix/client/v3/join/")), 1)
         self.assertEqual(len(self.hs.matching("PUT", "/_matrix/client/v3/rooms/")), 2)
+
+    def test_no_invite_never_joins_even_engine_dm(self):
+        for allowed in (False, True):
+            with self.subTest(allowed=allowed):
+                self.hs.requests.clear()
+                self.recovery_routes((AI, "@alice:localhost"))
+                transport = self.make_transport()
+                transport.safety_store.invitation_update(AI, ROOM, "leave")
+                with self.assertRaises(DeliveryError) as caught:
+                    transport.send_text(room_id=ROOM, sender_id=AI, text="private", allow_auto_join=allowed)
+                self.assertEqual(caught.exception.detail, "original send denied")
+                self.assertEqual(self.hs.matching("POST", "/_matrix/client/v3/join/"), [])
+
+    def sync_recovery(self, payload, status=200):
+        self.recovery_routes((AI, "@alice:localhost"))
+        self.hs.route("GET", "/_matrix/client/v3/sync", [(status, payload)])
+        transport = self.make_transport()
+        transport.safety_store.invitation_update(AI, ROOM, "leave")
+        return transport
+
+    def test_sync_invitation_joins_and_sends_strict_dm(self):
+        transport = self.sync_recovery({"rooms": {"invite": {
+            ROOM: {"invite_state": {"events": [{"type": "m.room.member"}]}}
+        }}})
+        with mock.patch.object(transport._opener, "open", wraps=transport._opener.open) as opened:
+            event = transport.send_text(room_id=ROOM, sender_id=AI, text="hello")
+        self.assertEqual(event.event_id, "$after-join")
+        sync = self.hs.matching("GET", "/_matrix/client/v3/sync")
+        self.assertEqual(len(sync), 1)
+        self.assertEqual(set(sync[0]["query"]), {"user_id", "timeout", "filter"})
+        self.assertEqual(sync[0]["query"]["user_id"], [AI])
+        self.assertEqual(sync[0]["query"]["timeout"], ["0"])
+        self.assertEqual(sync[0]["authorization"], "Bearer " + AS_TOKEN)
+        self.assertEqual(json.loads(sync[0]["query"]["filter"][0]), {
+            "room": {"rooms": [ROOM], "timeline": {"limit": 0},
+                     "state": {"lazy_load_members": True},
+                     "ephemeral": {"not_types": ["*"]},
+                     "account_data": {"not_types": ["*"]}},
+            "presence": {"not_types": ["*"]}, "account_data": {"not_types": ["*"]},
+        })
+        sync_calls = [c for c in opened.call_args_list if "/sync?" in c.args[0].full_url]
+        self.assertEqual(sync_calls[0].kwargs["timeout"], 5.0)
+        self.assertEqual(len(self.hs.matching("POST", "/_matrix/client/v3/join/")), 1)
+        sends = self.hs.matching("PUT", "/_matrix/client/v3/rooms/")
+        self.assertEqual(len(sends), 2)
+        self.assertEqual(sends[0], sends[1])
+        self.assertEqual(self.hs.matching("POST", "/_matrix/client/v3/rooms/"), [])
+
+    def assert_sync_denied(self, payload, status=200):
+        transport = self.sync_recovery(payload, status)
+        with self.assertRaises(DeliveryError) as caught:
+            transport.send_text(room_id=ROOM, sender_id=AI, text="hello")
+        self.assertEqual(caught.exception.code, "M_FORBIDDEN")
+        self.assertEqual(caught.exception.detail, "original send denied")
+        self.assertEqual(len(self.hs.matching("GET", "/_matrix/client/v3/sync")), 1)
+        self.assertEqual(self.hs.matching("POST", "/_matrix/client/v3/join/"), [])
+        self.assertEqual(self.hs.matching("POST", "/_matrix/client/v3/rooms/"), [])
+        self.assertEqual(len(self.hs.matching("PUT", "/_matrix/client/v3/rooms/")), 1)
+
+    def test_sync_encrypted_invitation_denied(self):
+        self.assert_sync_denied({"rooms": {"invite": {
+            ROOM: {"invite_state": {"events": [{"type": "m.room.encryption"}]}}
+        }}})
+
+    def test_sync_no_invitation_denied(self):
+        self.assert_sync_denied({"rooms": {"invite": {}}})
+
+    def test_sync_error_denied(self):
+        self.assert_sync_denied({"errcode": "M_UNKNOWN"}, 500)
+
+    def test_sync_already_joined_denied_even_with_invitation(self):
+        self.assert_sync_denied({"rooms": {"join": {ROOM: {}}, "invite": {
+            ROOM: {"invite_state": {"events": []}}
+        }}})
+
+    def test_sync_malformed_response_denied(self):
+        for payload in (b"not-json", [], {}, {"rooms": []},
+                        {"rooms": {"join": [], "invite": {}}},
+                        {"rooms": {"invite": []}},
+                        {"rooms": {"invite": {ROOM: {}}}},
+                        {"rooms": {"invite": {ROOM: {"invite_state": {"events": {}}}}}},
+                        {"rooms": {"invite": {ROOM: {"invite_state": {"events": [None]}}}}}):
+            with self.subTest(payload=payload):
+                self.hs.requests.clear()
+                self.assert_sync_denied(payload)
+
+    def test_sync_redirect_not_followed(self):
+        self.assert_sync_denied({"__redirect__": self.hs.base_url + "/redirect-target"}, 302)
+        self.assertEqual(self.hs.matching("GET", "/redirect-target"), [])
+
+    def test_invitation_ledger_hit_skips_sync(self):
+        self.recovery_routes((AI, "@alice:localhost"))
+        self.make_transport().send_text(room_id=ROOM, sender_id=AI, text="hello")
+        self.assertEqual(self.hs.matching("GET", "/_matrix/client/v3/sync"), [])
+
+    def test_already_joined_never_joins_or_leaves(self):
+        for allowed in (False, True):
+            self.hs.requests.clear()
+            self.recovery_routes(())
+            self.hs.route("GET", "/_matrix/client/v3/rooms/", [(200, {"joined": {AI: {}}})])
+            with self.assertRaises(DeliveryError):
+                self.make_transport().send_text(room_id=ROOM, sender_id=AI, text="x", allow_auto_join=allowed)
+            self.assertEqual([r["method"] for r in self.hs.requests], ["POST", "PUT", "GET"])
+
+    def test_encrypted_invite_never_joins(self):
+        self.recovery_routes(())
+        transport = self.make_transport()
+        transport.safety_store.invitation_update(AI, ROOM, "invite", True)
+        with self.assertRaises(DeliveryError):
+            transport.send_text(room_id=ROOM, sender_id=AI, text="x", allow_auto_join=True)
+        self.assertEqual(self.hs.matching("POST", "/_matrix/client/v3/join/"), [])
+
+    def test_post_join_encryption_and_errors_leave_without_send(self):
+        for status in (200, 403, 500):
+            with self.subTest(status=status):
+                self.hs.requests.clear()
+                self.recovery_routes(())
+                self.hs.route("GET", "/_matrix/client/v3/rooms/", [
+                    (403, {"errcode": "M_FORBIDDEN"}),
+                    (status, {"errcode": "M_NOT_FOUND"}),
+                ])
+                with self.assertRaises(DeliveryError):
+                    self.make_transport().send_text(room_id=ROOM, sender_id=AI, text="x", allow_auto_join=True)
+                self.assertEqual(len(self.hs.matching("PUT", "/_matrix/client/v3/rooms/")), 1)
+                self.assertEqual(len(self.hs.matching("POST", "/_matrix/client/v3/rooms/")), 1)
+                checks = self.hs.matching("GET", "/_matrix/client/v3/rooms/")
+                self.assertTrue(checks[-1]["path"].endswith("/state/m.room.encryption/"))
+                self.assertEqual(checks[-1]["query"]["user_id"], [AI])
+
+    def test_leave_first_failure_retries_and_clears_queue(self):
+        self.recovery_routes((AI,))
+        self.hs.route("POST", "/_matrix/client/v3/rooms/", [(500, {}), (200, {})])
+        sleep = mock.Mock()
+        transport = self.make_transport(sleep=sleep)
+        with self.assertRaises(DeliveryError):
+            transport.send_text(room_id=ROOM, sender_id=AI, text="x")
+        self.assert_recovery_requests(leave_attempts=2)
+        sleep.assert_called_once_with(0.05)
+        self.assertEqual(transport.safety_store.cleanup_due(float("inf")), [])
+
+    def test_cleanup_survives_restart_and_background_drains(self):
+        import tempfile
+        import time
+        from botville_gateway.as_txn_store import AsTransactionStore, connect
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "as.sqlite")
+            store = AsTransactionStore(connect(path))
+            self.recovery_routes((AI,))
+            self.hs.route("POST", "/_matrix/client/v3/rooms/", [(500, {})] * 3)
+            transport = self.make_transport(safety_store=store, sleep=lambda _: None)
+            with self.assertRaises(DeliveryError):
+                transport.send_text(room_id=ROOM, sender_id=AI, text="x")
+            row = store.cleanup_due(float("inf"))[0]
+            self.assertEqual(row["attempts"], 3)
+            self.assertGreater(row["next_at"], time.time())
+            store._conn.close()
+            reopened = AsTransactionStore(connect(path))
+            self.addCleanup(reopened._conn.close)
+            self.assertEqual(reopened.cleanup_due(float("inf"))[0]["key"], row["key"])
+            transport = self.make_transport(safety_store=reopened)
+            self.hs.route("POST", "/_matrix/client/v3/rooms/", [(200, {})])
+            with mock.patch("botville_gateway.matrix_appservice.time.time", return_value=row["next_at"] + 1):
+                transport.start_cleanup(interval=0.01)
+                try:
+                    deadline = time.monotonic() + 2
+                    while reopened.cleanup_due(float("inf")) and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertEqual(reopened.cleanup_due(float("inf")), [])
+                finally:
+                    transport.stop_cleanup()
+                self.assertFalse(transport._cleanup_thread.is_alive())
+
+    def test_pending_cleanup_prevents_rejoin(self):
+        self.recovery_routes(())
+        transport = self.make_transport()
+        transport.safety_store.cleanup_enqueue(AI, ROOM)
+        with self.assertRaises(DeliveryError):
+            transport.send_text(room_id=ROOM, sender_id=AI, text="x", allow_auto_join=True)
+        self.assertEqual(self.hs.matching("POST", "/_matrix/client/v3/join/"), [])
+
+    def test_cleanup_stop_bounded_during_blocked_leave(self):
+        transport = self.make_transport()
+        transport.safety_store.cleanup_enqueue(AI, ROOM)
+        entered, release = threading.Event(), threading.Event()
+        def blocked_leave(*_):
+            entered.set()
+            release.wait(2)
+        with mock.patch.object(transport, "leave", side_effect=blocked_leave):
+            transport.start_cleanup()
+            try:
+                self.assertTrue(entered.wait(1))
+                with self.assertLogs("botville_gateway.matrix_appservice", level="WARNING"):
+                    transport.stop_cleanup(timeout=0.001)
+                self.assertTrue(transport._cleanup_thread.is_alive())
+            finally:
+                release.set()
+                transport.stop_cleanup()
+            self.assertFalse(transport._cleanup_thread.is_alive())
+
+    def test_encryption_network_failure_is_closed(self):
+        transport = self.make_transport()
+        with mock.patch.object(transport, "_request", side_effect=DeliveryError("matrix.unreachable", "private")):
+            self.assertTrue(transport._room_encrypted(ROOM, AI))
 
     def test_other_errors_are_not_retried(self):
         self.hs.route(

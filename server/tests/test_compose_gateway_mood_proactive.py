@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Gateway mood (B line PR4b) / proactive speech (B line PR4c) pass-through.
+"""Gateway mood (B line PR4b) / proactive speech (B line PR4c) / group reply
+cap (B line B2.8a, GATEWAY_GROUP_MAX_RESPONDERS) pass-through.
 
 The names and defaults must agree across the compose file, both deployment
 .env.example files, gateway/.env.example, the CI allowlist, the docs and what
@@ -41,7 +42,21 @@ EXPECTED = {
     "GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES": (
         "240", "proactive_min_interval_minutes", 240),
     "GATEWAY_PROACTIVE_PER_TARGET_PER_DAY": ("1", "proactive_per_target_per_day", 1),
+    # B line B2.8a: max AIs answering one human group message, 1-20.
+    "GATEWAY_GROUP_MAX_RESPONDERS": ("3", "group_max_responders", 3),
 }
+# Supported ranges (config.py): name -> (minimum, maximum).
+RANGES = {
+    "GATEWAY_MOOD_HALF_LIFE_MINUTES": (1, 10_080),
+    "GATEWAY_PROACTIVE_TICK_SECONDS": (30, 86_400),
+    "GATEWAY_PROACTIVE_MIN_IDLE_MINUTES": (0, 43_200),
+    "GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES": (0, 43_200),
+    "GATEWAY_PROACTIVE_PER_TARGET_PER_DAY": (0, 24),
+    "GATEWAY_GROUP_MAX_RESPONDERS": (1, 20),
+}
+# Distinctive invalid values: if one shows up in an error message, the
+# gateway echoed deployment input. None of them can occur in a fixed message.
+SENTINEL = "873461"
 BOOLS = ("GATEWAY_MOOD_ENABLED", "GATEWAY_PROACTIVE_ENABLED",
          "GATEWAY_PROACTIVE_RECENT_CONTACTS_ENABLED")
 
@@ -122,34 +137,59 @@ class MoodProactiveEnvStaticTest(unittest.TestCase):
         for key, (_, field, parsed) in EXPECTED.items():
             self.assertEqual(got.get(field), parsed, key)
 
+    def assert_rejected_without_echo(self, key, value):
+        got = run_gateway_config({"GATEWAY_DEV_MODE": "true", key: value})
+        self.assertIn("error", got, "{}={} accepted".format(key, value))
+        message = got["error"]
+        self.assertNotIn(value.strip(), message)
+        if SENTINEL in value:
+            self.assertNotIn(SENTINEL, message)
+        # A plain number must not appear as a standalone number either.
+        digits = value.strip().lstrip("+-")
+        if digits.isdigit():
+            self.assertNotRegex(message, r"(?<![0-9]){}(?![0-9])".format(re.escape(digits)))
+
     def test_gateway_src_rejects_invalid_values_without_echoing_them(self):
-        bad = [(key, "maybe-7319") for key in BOOLS] + [
-            ("GATEWAY_MOOD_HALF_LIFE_MINUTES", "0"),
-            ("GATEWAY_MOOD_HALF_LIFE_MINUTES", "10081"),
-            ("GATEWAY_MOOD_HALF_LIFE_MINUTES", "abc7319"),
-            ("GATEWAY_PROACTIVE_TICK_SECONDS", "29"),
-            ("GATEWAY_PROACTIVE_TICK_SECONDS", "86401"),
-            ("GATEWAY_PROACTIVE_MIN_IDLE_MINUTES", "-1"),
-            ("GATEWAY_PROACTIVE_MIN_IDLE_MINUTES", "43201"),
-            ("GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES", "43201"),
-            ("GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES", "x7319"),
-            ("GATEWAY_PROACTIVE_PER_TARGET_PER_DAY", "25"),
-            ("GATEWAY_PROACTIVE_PER_TARGET_PER_DAY", "-3"),
-        ]
+        """Every invalid value is refused at startup and never reflected in
+        the error: booleans, non-integers and both sides of every range, with
+        distinctive sentinel numbers wherever the range allows one."""
+        bad = []
+        for key in BOOLS:
+            bad += [(key, "maybe-" + SENTINEL), (key, SENTINEL), (key, "-" + SENTINEL)]
+        for key, (minimum, maximum) in RANGES.items():
+            bad += [
+                (key, str(minimum - 1)),            # just below
+                (key, str(maximum + 1)),            # just above
+                (key, SENTINEL + "0"),              # far above (sentinel)
+                (key, "-" + SENTINEL),              # negative (sentinel)
+                (key, "x" + SENTINEL),              # not a number (sentinel)
+                (key, SENTINEL + ".5"),             # not an integer (sentinel)
+                (key, "1e" + SENTINEL),             # float syntax (sentinel)
+                (key, " " + SENTINEL + "0 "),       # padded, still out of range
+            ]
         for key, value in bad:
             with self.subTest(key=key, value=value):
-                got = run_gateway_config({"GATEWAY_DEV_MODE": "true", key: value})
-                self.assertIn("error", got)
-                if "7319" in value:
-                    self.assertNotIn(value, got["error"])
-        # Range edges are accepted.
-        edges = {"GATEWAY_MOOD_HALF_LIFE_MINUTES": "10080",
-                 "GATEWAY_PROACTIVE_TICK_SECONDS": "30",
-                 "GATEWAY_PROACTIVE_MIN_IDLE_MINUTES": "0",
-                 "GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES": "43200",
-                 "GATEWAY_PROACTIVE_PER_TARGET_PER_DAY": "0"}
-        got = run_gateway_config(dict(edges, GATEWAY_DEV_MODE="true"))
-        self.assertNotIn("error", got)
+                self.assert_rejected_without_echo(key, value)
+
+    def test_gateway_src_accepts_both_range_edges(self):
+        for side in (0, 1):
+            env = {key: str(edges[side]) for key, edges in RANGES.items()}
+            with self.subTest(side="min" if side == 0 else "max", env=env):
+                got = run_gateway_config(dict(env, GATEWAY_DEV_MODE="true"))
+                self.assertNotIn("error", got)
+                for key, value in env.items():
+                    self.assertEqual(got[EXPECTED[key][1]], int(value), key)
+
+    def test_group_max_responders_bounds(self):
+        """GATEWAY_GROUP_MAX_RESPONDERS: 1 and 20 start, 0 and 21 refuse to
+        start, and the error does not echo the value."""
+        key = "GATEWAY_GROUP_MAX_RESPONDERS"
+        for value in ("1", "20"):
+            got = run_gateway_config({"GATEWAY_DEV_MODE": "true", key: value})
+            self.assertEqual(got.get("group_max_responders"), int(value), value)
+        for value in ("0", "21", "-" + SENTINEL, SENTINEL, "x" + SENTINEL):
+            with self.subTest(value=value):
+                self.assert_rejected_without_echo(key, value)
 
     def test_proactive_requires_a_persistent_hmac_secret(self):
         """Even in dev mode the gateway refuses GATEWAY_PROACTIVE_ENABLED=true
@@ -235,6 +275,7 @@ class MoodProactiveEnvRenderTest(unittest.TestCase):
             "GATEWAY_PROACTIVE_MIN_IDLE_MINUTES": "0",
             "GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES": "30",
             "GATEWAY_PROACTIVE_PER_TARGET_PER_DAY": "3",
+            "GATEWAY_GROUP_MAX_RESPONDERS": "7",
         }
         self.assertEqual(set(values), set(EXPECTED))
         env = self.gateway_env("".join("{}={}\n".format(k, v) for k, v in values.items()))

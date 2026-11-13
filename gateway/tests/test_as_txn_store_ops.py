@@ -78,6 +78,64 @@ class _TmpDb(unittest.TestCase):
         self._tmp.cleanup()
 
 
+class TestJoinSafetyStore(_TmpDb):
+    def test_legacy_migration_restart_and_hashed_invitation(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(_LEGACY_DDL)
+        conn.close()
+        store = AsTransactionStore(connect(self.db_path))
+        store.invitation_update("@ai_test:local", "!private:local", "invite", True, "$private")
+        store.cleanup_enqueue("@ai_test:local", "!private:local")
+        store._conn.close()
+        store = AsTransactionStore(connect(self.db_path))
+        self.addCleanup(store._conn.close)
+        self.assertIs(store.invitation("@ai_test:local", "!private:local"), True)
+        self.assertEqual(len(store.cleanup_due(0)), 1)
+        row = tuple(store._conn.execute("SELECT * FROM as_invitations").fetchone())
+        self.assertEqual(len(row[0]), 64)
+        self.assertNotIn("private", str(row))
+        self.assertNotIn("ai_test", str(row))
+        store.invitation_update("@ai_test:local", "!private:local", "leave", event_id="$leave")
+        store.invitation_update("@ai_test:local", "!private:local", "invite", event_id="$private")
+        self.assertIsNone(store.invitation("@ai_test:local", "!private:local"))
+
+    def test_memory_invites_bounded_and_unknown_denied(self):
+        store = AsTransactionStore(connect(":memory:"))
+        self.addCleanup(store._conn.close)
+        for index in range(1001):
+            store.invitation_update("@ai_test:local", "!" + str(index), "invite")
+        self.assertIsNone(store.invitation("@ai_test:local", "!0"))
+        self.assertIsNone(store.invitation("@ai_unknown:local", "!1000"))
+        self.assertIs(store.invitation("@ai_test:local", "!1000"), False)
+        self.assertEqual(store._conn.execute("SELECT COUNT(*) FROM as_invitations").fetchone()[0], 1000)
+
+    def test_memory_observer_saturation_is_fail_closed(self):
+        store = AsTransactionStore(connect(":memory:"))
+        self.addCleanup(store._conn.close)
+        for index in range(1001):
+            store.invitation_update("p", "!" + str(index), "invite", event_id="$" + str(index))
+        self.assertIsNone(store.invitation("p", "!1000"))
+        self.assertEqual(store._conn.execute("SELECT COUNT(*) FROM as_invitation_events").fetchone()[0], 1000)
+        store.invitation_update("p", "!0", "leave", event_id="$leave")
+        store.invitation_update("p", "!0", "invite", event_id="$0")
+        self.assertIsNone(store.invitation("p", "!0"))
+
+    def test_cleanup_backoff_is_capped_and_enqueue_idempotent(self):
+        store = AsTransactionStore(connect(self.db_path))
+        self.addCleanup(store._conn.close)
+        store.cleanup_enqueue("p", "r")
+        key = store.room_persona_key("p", "r")
+        for _ in range(20):
+            store.cleanup_failed(key, 100)
+        store.cleanup_enqueue("p", "r")
+        self.assertEqual(store.cleanup_due(3699), [])
+        row = store.cleanup_due(3700)[0]
+        self.assertEqual(row["attempts"], 20)
+        self.assertEqual(row["next_at"], 3700)
+        store.cleanup_done(key)
+        self.assertFalse(store.cleanup_pending("p", "r"))
+
+
 # ---------------------------------------------------------------------------
 # 1. 文件权限
 # ---------------------------------------------------------------------------

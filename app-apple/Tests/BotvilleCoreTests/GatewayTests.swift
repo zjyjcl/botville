@@ -10,7 +10,7 @@ final class GatewayTests: XCTestCase {
     func testManifestKeepsUnknownWebAndCardListButResolvesNativeAndDependencies() throws {
         let manifest = try decodeManifest(
             """
-            {"manifest_version":"1.0.0","contract_version":"0.1.0","generated_at":"2026-11-03T12:00:00Z",
+            {"manifest_version":"1.0.0","contract_version":"0.5.0","generated_at":"2026-11-03T12:00:00Z",
              "defaults":{"unknown_capability":"hidden"},"capabilities":[
               {"id":"native.unknown","module":"other","version":"1","title":"N","summary":"","status":"enabled","entry":{"type":"native","deep_link":"botville://new"},"scopes":[]},
               {"id":"web.future","module":"future","version":"1","title":"W","summary":"","status":"enabled","entry":{"type":"web","web_url":"https://example.test/"},"scopes":[]},
@@ -35,7 +35,7 @@ final class GatewayTests: XCTestCase {
     func testUnknownNativeDisabledRemainsVisibleButUnavailableAndUnknownEntryIsHidden() throws {
         let manifest = try decodeManifest(
             """
-            {"manifest_version":"1","contract_version":"0","generated_at":"2026-11-03T12:00:00Z","defaults":{"unknown_capability":"disabled"},"capabilities":[
+            {"manifest_version":"1","contract_version":"0.5.0","generated_at":"2026-11-03T12:00:00Z","defaults":{"unknown_capability":"disabled"},"capabilities":[
             {"id":"native.unknown","module":"x","version":"1","title":"N","summary":"","status":"enabled","entry":{"type":"native","deep_link":"botville://x"},"scopes":[]},
             {"id":"entry.future","module":"x","version":"1","title":"F","summary":"","status":"enabled","entry":{"type":"spatial"},"scopes":[]}]}
             """)
@@ -388,7 +388,7 @@ private func XCTAssertGatewayError(
 }
 
 private let manifestJSON = """
-    {"manifest_version":"1","contract_version":"0","generated_at":"2026-11-03T12:00:00Z","capabilities":[]}
+    {"manifest_version":"1","contract_version":"0.5.0","generated_at":"2026-11-03T12:00:00Z","capabilities":[]}
     """
 private let cardJSON = """
     {"id":"c","card_schema_version":"1.0.0","type":"approval","title":"x","fallback_text":"f","priority":"normal","risk":"low","status":"active","blocks":[],"actions":[{"id":"deny","label":"Deny","kind":"deny","style":"secondary"},{"id":"approve","label":"Approve","kind":"approve","style":"primary","risk":"high"}],"source":{"module":"x"},"expires_at":"2099-01-01T00:00:00Z","revision":7}

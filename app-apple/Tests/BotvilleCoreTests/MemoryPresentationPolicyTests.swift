@@ -12,7 +12,7 @@ final class MemoryPresentationPolicyTests: XCTestCase {
             GatewayCapabilityManifest.self,
             from: JSONSerialization.data(
                 withJSONObject: [
-                    "manifest_version": "1.3.0", "contract_version": "0.2.0",
+                    "manifest_version": "1.3.0", "contract_version": "0.5.0",
                     "generated_at": "2026-11-13T00:00:00Z", "capabilities": capabilities,
                 ]))
     }
@@ -179,7 +179,7 @@ final class MemoryPresentationPolicyTests: XCTestCase {
     func testMockManifestVersionCapabilityAndDisclosure() async throws {
         let value = try await MockGatewayClient().capabilities()
         XCTAssertEqual(value.manifestVersion, "1.3.0")
-        XCTAssertEqual(value.contractVersion, "0.3.0")
+        XCTAssertEqual(value.contractVersion, "0.5.0")
         XCTAssertTrue(MemoryPresentationPolicy.isMemoryManagementAvailable(in: value))
         XCTAssertEqual(
             value.capabilities.first(where: { $0.id == "memory.manage" })?.ownerCanReadDM, false)
