@@ -63,6 +63,78 @@ class ProactiveTests(unittest.TestCase):
             self.store._db.execute("UPDATE memory_items SET created_at=? WHERE persona_id=? AND counterpart=?",
                 (at.isoformat().replace("+00:00", "Z"), self.persona.user_id, target))
 
+    def _assembled_mood_worker(self, enabled):
+        from botville_gateway.http_server import build_server
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        config = replace(self.config, host="127.0.0.1", port=0,
+            mood_enabled=enabled, memory_db_path=os.path.join(temp.name, "memory.db"),
+            memory_purge_interval_seconds=0, model_base_url="https://model.invalid/v1",
+            model_name="test", model_api_key="TEST_KEY_SENTINEL")
+        self.transport.joined_members = lambda room, _: self.members.get(room, ())
+        with patch.object(ProactiveWorker, "start"), patch(
+                "botville_gateway.memory.worker.MemoryIdleWorker.start"):
+            server = build_server(config, self.transport)
+        self.addCleanup(server.server_close)
+        worker = server.proactive_worker
+        self.assertIsNotNone(worker)
+        worker.personas = {self.persona.user_id: self.persona}
+        worker.client = self.client
+        worker.clock = self.clock
+        worker.service = self.service
+        self.store = worker.store
+        self.contact()
+        return server, worker
+
+    def _assert_mood_prompt(self, expected_label):
+        from botville_gateway.isolation import build_untrusted_segment, SYSTEM_ZONE_DECLARATION
+        from botville_gateway.proactive import INSTRUCTION
+        self.assertEqual(len(self.client.calls), 1)
+        request = self.client.calls[0]
+        self.assertEqual(request["system_text"], SYSTEM_ZONE_DECLARATION + "\n" +
+                         self.persona.instruction_text() + "\n" + INSTRUCTION)
+        data = "现在可以发送一条简短的主动问候。"
+        if expected_label is not None:
+            data += "\nmood: " + expected_label
+        with patch("botville_gateway.isolation.generate_nonce", return_value="a" * 64):
+            wrapped, _ = build_untrusted_segment(data)
+        self.assertEqual(request["messages"], [{"role": "user", "content": wrapped}])
+
+    def test_assembled_mood_enabled_uses_decayed_untrusted_label(self):
+        server, worker = self._assembled_mood_worker(True)
+        now = [self.now.timestamp()]
+        server.mood_service._clock = lambda: now[0]
+        server.mood_service.patch(self.persona.user_id, mood="happy")
+        self.assertEqual(worker.mood_label_provider(self.persona.user_id), "happy")
+        now[0] += self.config.mood_half_life_minutes * 60 + 1
+        with patch("botville_gateway.isolation.generate_nonce", return_value="a" * 64):
+            self.assertEqual(worker.run_once(), 1)
+        self._assert_mood_prompt("calm")
+
+    def test_assembled_mood_disabled_omits_provider_and_prompt(self):
+        server, worker = self._assembled_mood_worker(False)
+        self.assertIsNone(server.mood_service)
+        self.assertIsNone(worker.mood_label_provider)
+        with patch("botville_gateway.isolation.generate_nonce", return_value="a" * 64):
+            self.assertEqual(worker.run_once(), 1)
+        self._assert_mood_prompt(None)
+
+    def test_assembled_mood_failure_preserves_decision_and_send(self):
+        server, worker = self._assembled_mood_worker(True)
+        candidates = list(worker.candidates(self.persona, self.now))
+        with patch.object(server.mood_service, "get", side_effect=RuntimeError(
+                "TEST_KEY_SENTINEL BODY_SENTINEL BIO_SENTINEL")), patch.object(
+                self.service, "send_ai_message", wraps=self.service.send_ai_message) as send:
+            self.assertEqual(list(worker.candidates(self.persona, self.now)), candidates)
+            self.assertTrue(candidates)
+            with self.assertLogs("botville_gateway.http_server", level="WARNING") as logs, patch(
+                    "botville_gateway.isolation.generate_nonce", return_value="a" * 64):
+                self.assertEqual(worker.run_once(), 1)
+            self.assertEqual(send.call_count, 1)
+        self.assertEqual(logs.output, ["WARNING:botville_gateway.http_server:"
+                                     "Proactive mood unavailable; omitting label"])
+        self._assert_mood_prompt(None)
+
     def test_default_deployment_and_persona_are_off(self):
         self.contact()
         self.config = Config(dev_mode=True, matrix_server_name="example.test", proactive_enabled=False)

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import logging
 import re
 from urllib.parse import parse_qs
 
@@ -84,7 +85,11 @@ def persona_detail(server, caller, persona_id):
     persona = owned_persona_candidate(server, caller, persona_id)
     summary = persona_summary(server, persona)
     mood_service = getattr(server, "mood_service", None)
-    state = mood_service.get(persona_id) if mood_service is not None else None
+    try:
+        state = mood_service.get(persona_id) if mood_service is not None else None
+    except Exception:
+        logging.getLogger(__name__).warning("Persona detail mood unavailable; returning null")
+        state = None
     label = state['label'] if state else None
     if persona.owner_user_id == caller:
         return dict(summary, mood=label)

@@ -799,8 +799,8 @@ hours 复用静默时段逻辑。主动发言不创建通知卡片。启用部�
 `GATEWAY_PROACTIVE_MIN_IDLE_MINUTES`、每日剩余额度（per_day：persona `max_per_day`、
 每目标上限及 policy `proactive_per_day`）、`quiet_hours`、`require_reply`（上一条主动消息未被回复则不再发）
 和最小间隔 `GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES`。
-mood 采用契约 R8 的半衰期与五枚举标签模型（calm/happy/sad/excited/tired），无 valence/arousal 数值，
-不存在 needs/社交需求；mood 不参与候选选择或发/不发决策，只作为 untrusted prompt 上下文。
+mood 采用契约 R8 的半衰期与五标签模型（calm/happy/sad/excited/tired）；
+mood 不参与候选选择或发/不发决策，只作为 untrusted prompt 上下文。
 为避免标签长度间接影响预算准入，所有标签（含不可用时）统一按最长标签估算并预留 token 预算。
 
 `quiet_hours.timezone` 同时定义 persona `max_per_day` 和每目标日上限的日界；未给 quiet_hours 时回退
@@ -1183,7 +1183,7 @@ token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，�
 
 `GET /personas` 返回摘要视图，仅含 `id`（Matrix user_id，与记忆 persona_id 一致）、`owner_id`（owner_user_id）、`display_name`（为空回退 localpart）、`bio`（缺省 null）、`kind=custom`、`status=active`、`revision=1`、`created_at`、`updated_at`、`visibility=private`。时间取启动时文件 mtime（UTC RFC3339 Z），不可得则取网关启动时间，是文件型人设的近似时间。配置及其他扩展字段均省略，无 owner 的人设永不列出。
 
-`GET /personas/{persona_id}`（实际路径 `/v1/personas/{id}`）复用 §1.2.2 调用方鉴权与 /capabilities 的用户鉴权 helper。owner 返回列表十字段摘要加 `mood`（列表项本身不增加该字段）；已认证本服（server name 大小写不敏感，可含端口）非 owner 仅返回 `id, display_name, bio, status, mood`。`mood` 是 `calm` / `happy` / `sad` / `excited` / `tired` 或 null 的开放响应枚举，客户端遇到未知值按 null/缺省处理。mood 模块关闭时均为 null；非 owner 还要求 `mood_public=true`。不得暴露 owner_id、model_binding、密钥、visibility 或时间戳。
+`GET /personas/{persona_id}`（实际路径 `/v1/personas/{id}`）复用 §1.2.2 调用方鉴权与 /capabilities 的用户鉴权 helper。owner 返回列表十字段摘要加 `mood`（列表项本身不增加该字段）；已认证本服（server name 大小写不敏感，可含端口）非 owner 仅返回 `id, display_name, bio, status, mood`。`mood` 是 `calm` / `happy` / `sad` / `excited` / `tired` 或 null。服务端只会输出这五个值；客户端必须容忍未知值（按缺省处理）。mood 模块关闭时均为 null；非 owner 还要求 `mood_public=true`。不得暴露 owner_id、model_binding、密钥、visibility 或时间戳。
 
 跨服已验证调用方、未知/非法路径 id、无 owner 的 persona 均返回相同 `404 persona.not_found`，不泄露存在性；不因联邦配对放行。legacy/空 owner/dev 无身份与列表一致为 `403 persona.not_owned`；未认证为既有 401。详情专用用户验证器仅保留可信 homeserver 返回的跨服身份以作 404 拒绝，使用独立缓存；其他端点仍按原规则拒绝跨服用户（401）。bearer caller 的 owner_id 受现有配置格式限制，非 Matrix ID 无法访问详情（404），本 PR 不放宽 token 配置格式。`/state` 对非 owner（含跨服）、未知/非法 id 或无 owner persona 同样返回 `404 persona.not_found`；站点 token 或无 owner 身份为 `403 persona.not_owned`。其它未实现子路径返回 `404 not_found`。
 
@@ -1773,7 +1773,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 | 版本 | 日期 | 变更 |
 |---|---|---|
 | 0.5.0 | 2026-11-13 | [PR4c quasi-breaking] 新增默认关闭的主动发言部署/人设配置、DM-only 候选、持久化队列与 stable txnId 重放语义；`ProactiveSettings.enabled` 默认值由 true 改为 false。该默认值改变未显式设置旧部署的行为，按准破坏性变更公告。 |
-| 0.4.0 | 2026-11-13 | [PR4b] 新增 owner-only `GET/PATCH /personas/{id}/state` 与 memory.db persona_state；新增 `GATEWAY_MOOD_ENABLED` / `GATEWAY_MOOD_HALF_LIFE_MINUTES`、确定性窗口规则及读时半衰期衰减。PersonaMood 删除 `neutral`、`anxious`，最终为 calm/happy/sad/excited/tired；详情增加 mood，列表项不变。模块关闭时通过 owner 校验后 404 `mood.disabled`。 |
+| 0.4.0 | 2026-11-13 | [PR4b] 新增 owner-only `GET/PATCH /personas/{id}/state` 与 memory.db persona_state；新增 `GATEWAY_MOOD_ENABLED` / `GATEWAY_MOOD_HALF_LIFE_MINUTES`、确定性窗口规则及读时半衰期衰减。PersonaMood 删除 `neutral`、`anxious`，最终为 calm/happy/sad/excited/tired；详情增加 mood，列表项不变；`mood_public` 默认 true，非 owner 仅在 mood 开启且 `mood_public` 为真时见标签。模块关闭时通过 owner 校验后 404 `mood.disabled`；`/state` 写限流返回 429，mood 存储不可用返回 503 `mood.unavailable`。 |
 | 0.3.0 | 2026-11-13 | [PR4d additive] owner 文件签名 bio（500 码点），列表扩展与分级 GET 详情；本服非 owner 最小视图，跨服/无 owner/未知或非法 id 统一 404 persona.not_found。mood 可缺省/null 枚举，当前 null；自身和他人 bio 均不注入 system。 |
 | 0.2.0 | 2026-11-13 | [PR4a] 修正 caller token 格式与 GET /personas 无 owner 的 403 文档；修复不可变向量召回、策略先行、worker 有界停止与退避、E6 caller 隔离和 owner 配额、鉴权失败日志、保留期边界与摘要索引、SQL keyset 分页；明确 capabilities 顺序不可依赖并以示例测试守护输出；加固并发与本地 HTTP 测试。自 #211 起，所有布尔环境变量非法值的错误信息仅含变量名、不再回显输入值。本次不升契约版本。 |
 | 0.2.0 | 2026-11-13 | [additive] 新增实现 `GET /personas` owner 摘要列表及 keyset 分页；其他人设操作尚未实现。 |

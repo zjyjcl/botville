@@ -329,7 +329,7 @@ paths:
           description: 调用方 App 版本，用于按 min_app_version 过滤。
           schema:
             type: string
-            example: 0.3.0
+            example: 0.4.0
       responses:
         '200':
           description: 功能清单。
@@ -2617,8 +2617,8 @@ components:
         GATEWAY_PROACTIVE_MIN_IDLE_MINUTES、每日剩余额度（per_day：persona max_per_day、
         每目标上限、proactive_per_day）、quiet_hours、require_reply（上一条主动消息未被回复则不再发）
         及最小间隔 GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES。
-        mood 为契约 R8 的半衰期与五枚举标签模型（calm/happy/sad/excited/tired），无 valence/arousal 数值，
-        不存在 needs/社交需求；mood 不参与候选或发送决策，仅作 untrusted prompt 上下文。
+        mood 为契约 R8 的半衰期与五标签模型（calm/happy/sad/excited/tired）；
+        mood 不参与候选或发送决策，仅作 untrusted prompt 上下文。
         所有标签（含不可用时）统一按最长标签估算并预留 token 预算，避免标签长度影响准入。
         worker 有界停止，超时保留连接，线程退出后关闭；单部署仅一个 scheduler。
         `quiet_hours` 的时区也定义本地日上限的日界；未设置时使用部署静默时区。
@@ -2749,7 +2749,7 @@ components:
         visibility: {type: string, enum: [private]}
 
     PersonaMood:
-      description: 可选公开情绪标签。响应侧为开放枚举；客户端遇到未知值须按 null/缺省处理。
+      description: 可选公开情绪标签，可为 null。服务端只会输出这五个值（calm/happy/sad/excited/tired）；客户端必须容忍未知值（按缺省处理）。
       type: [string, "null"]
       enum: [calm, happy, sad, excited, tired, null]
 

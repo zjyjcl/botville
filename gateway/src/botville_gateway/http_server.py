@@ -1531,7 +1531,9 @@ class GatewayServer(http.server.ThreadingHTTPServer):
                     hmac_secret=config.hmac_secret)
                 self.proactive_worker = ProactiveWorker(
                     proactive_store, service, self.memory_personas,
-                    ModelClient(model_config), config, members=members, close_store=True)
+                    ModelClient(model_config), config, members=members, close_store=True,
+                    mood_label_provider=(self._proactive_mood_label
+                                         if self.mood_service is not None else None))
             else:
                 logging.getLogger(__name__).info(
                     'Proactive inactive: requires memory DB, model and membership transport')
@@ -1546,6 +1548,15 @@ class GatewayServer(http.server.ThreadingHTTPServer):
             self.memory_worker.start()
         if self.proactive_worker is not None:
             self.proactive_worker.start()
+
+    def _proactive_mood_label(self, persona_id: str) -> Optional[str]:
+        """Read the decayed label without making mood availability a send gate."""
+        try:
+            return self.mood_service.get(persona_id)["label"]
+        except Exception:
+            # Exception text may contain private data; log only a fixed message.
+            logging.getLogger(__name__).warning("Proactive mood unavailable; omitting label")
+            return None
 
     def _build_memory_worker(self, config, service):
         if self.memory_store is None:
