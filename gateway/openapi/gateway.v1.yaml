@@ -9,7 +9,7 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: botville AI Gateway API
-  version: 0.4.0
+  version: 0.5.0
   summary: AI 网关契约初稿：对话与消息、角色、功能清单、卡片、用量与限额。
   description: |
     botville 自部署 AI 网关的开放 HTTP API。网关位于 Matrix homeserver 与 AI 运行时之间：
@@ -17,7 +17,7 @@ info:
     负责消息传输；本契约只覆盖网关自己的控制面（角色、会话登记、发言裁决、三层限额、
     用量账单、功能清单与通用卡片），不重复定义 Matrix 协议。
 
-    当前为 **0.4.0 草案**（M0），供 C 线（App）与 D 线（通知 / 开放 API）评审。
+    当前为 **0.5.0 草案**（M0），供 C 线（App）与 D 线（通知 / 开放 API）评审。
     版本规则见 `gateway/docs/contract.md#版本规则`：`/v1` 路径、只增不删、破坏性变更升主版本。
 
     所有示例、令牌与密钥均为占位符（`<change-me>`），本契约不含任何真实凭据。
@@ -329,7 +329,7 @@ paths:
           description: 调用方 App 版本，用于按 min_app_version 过滤。
           schema:
             type: string
-            example: 0.3.0
+            example: 0.4.0
       responses:
         '200':
           description: 功能清单。
@@ -2595,18 +2595,46 @@ components:
 
     ProactiveSettings:
       type: object
+      description: |
+        人设级主动发言设置。运行必须同时满足部署总开关
+        `GATEWAY_PROACTIVE_ENABLED=true` 和 `enabled=true`；默认关闭。
+        worker 每 `GATEWAY_PROACTIVE_TICK_SECONDS`（默认 300，30–86400）调度一次；
+        `GATEWAY_PROACTIVE_MIN_IDLE_MINUTES` 与 `GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES`
+        均默认 180/240、范围 0–43200，`GATEWAY_PROACTIVE_PER_TARGET_PER_DAY` 默认 1、范围 0–24。
+        `GATEWAY_PROACTIVE_RECENT_CONTACTS_ENABLED` 默认 false；仅向已有一对一 DM 的本服人类
+        owner 发送，启用此独立开关才扩展到七日内（恰好 7×24h 包含）有 DM 人类交互记录的
+        本服用户。来源为 memory_items 的本地记录时间；发送前确认完整成员恰好为 persona 与目标。
+        绝不创建房间、发送群消息或联系 AI / 跨服账户；无已知 DM 跳过并记录无敏感内容的 INFO。
+        不发通知卡片。运行依赖 memory DB、模型、成员查询 transport 及持久 GATEWAY_HMAC_SECRET。
+        非法配置拒绝启动且不回显值。
+        顺序为候选→policy kind=proactive 预检及预留→allow 后模型→既有发送路径→成功标记。
+        队列以 `(persona_id,target_user_id,floor(UTC epoch/tick_seconds))` 的 SHA-256 键持久化；
+        proactive_queue 位于 memory DB，幂等建表，queued→sending→done；只有发送成功才 done。
+        sending 保存待重放正文，done 清除正文。同键经既有 HMAC txnId 路径重放，使“已发送未标记”
+        的重启重试由 homeserver 去重。计入 token window 与 proactive_per_day；非 allow 不调模型。
+        system 仅人设与固定说明，mood 可选且仅以 mood: label 放入 untrusted 数据区。
+        在部署/persona 开关、目标资格及既有发送安全策略满足后，主动调度仅依据空闲时间
+        GATEWAY_PROACTIVE_MIN_IDLE_MINUTES、每日剩余额度（per_day：persona max_per_day、
+        每目标上限、proactive_per_day）、quiet_hours、require_reply（上一条主动消息未被回复则不再发）
+        及最小间隔 GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES。
+        mood 为契约 R8 的半衰期与五标签模型（calm/happy/sad/excited/tired）；
+        mood 不参与候选或发送决策，仅作 untrusted prompt 上下文。
+        所有标签（含不可用时）统一按最长标签估算并预留 token 预算，避免标签长度影响准入。
+        worker 有界停止，超时保留连接，线程退出后关闭；单部署仅一个 scheduler。
+        `quiet_hours` 的时区也定义本地日上限的日界；未设置时使用部署静默时区。
       properties:
         enabled:
           type: boolean
-          default: true
+          default: false
         max_per_day:
           type: integer
           minimum: 0
           maximum: 100
           default: 6
+          description: 每 persona 的本地日上限；日界按 quiet_hours.timezone，未设置时按部署静默时区。
         require_reply:
           type: boolean
-          description: 对方未回复时是否允许继续主动发言。
+          description: true 时，目标必须在该 persona 上次主动发言后有新的 DM 人类消息才可再次主动发言。
           default: true
         quiet_hours:
           $ref: '#/components/schemas/SilentHours'
@@ -2721,7 +2749,7 @@ components:
         visibility: {type: string, enum: [private]}
 
     PersonaMood:
-      description: 可选公开情绪标签。响应侧为开放枚举；客户端遇到未知值须按 null/缺省处理。
+      description: 可选公开情绪标签，可为 null。服务端只会输出这五个值（calm/happy/sad/excited/tired）；客户端必须容忍未知值（按缺省处理）。
       type: [string, "null"]
       enum: [calm, happy, sad, excited, tired, null]
 

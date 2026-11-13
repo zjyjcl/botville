@@ -70,6 +70,27 @@ CODE_ANTI_SPAM_COOLDOWN = "anti_spam.cooldown"
 CODE_AI_LOOP_TRIPPED = "ai_loop.tripped"
 CODE_MESSAGE_LENGTH = "message.length"
 
+
+def silent_hours_active(window: Dict[str, Any], now: datetime) -> bool:
+    """Return whether a validated quiet-hours mapping is active at ``now``.
+
+    This deliberately contains no policy-layer selection: persona proactive
+    settings and regular limits can share the same wall-clock semantics.
+    """
+    if not isinstance(window, dict) or not window.get("enabled"):
+        return False
+    try:
+        start = parse_hhmm(window["start"])
+        end = parse_hhmm(window["end"])
+        tz = ZoneInfo(window["timezone"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if start == end:
+        return False
+    local = now.astimezone(tz)
+    minute = local.hour * 60 + local.minute
+    return start <= minute < end if start < end else minute >= start or minute < end
+
 DECISION_ALLOW = "allow"
 DECISION_DEFER = "defer"
 DECISION_BLOCK = "block"
@@ -187,6 +208,8 @@ class Reservation:
     at: datetime
     conversation_id: Optional[str] = None
     peer_id: Optional[str] = None
+    # Only proactive reservations consume the separate daily proactive budget.
+    kind: str = "message"
     expires_at: Optional[float] = None
 
 
@@ -240,6 +263,7 @@ class ReservationBook:
         at: datetime,
         conversation_id: Optional[str] = None,
         peer_id: Optional[str] = None,
+        kind: str = "message",
     ) -> Reservation:
         reservation = Reservation(
             id=f"res_{uuid.uuid4().hex}",
@@ -249,6 +273,7 @@ class ReservationBook:
             expires_at=time.monotonic() + self._ttl,
             conversation_id=conversation_id,
             peer_id=peer_id,
+            kind=kind,
         )
         with self._lock:
             self._purge_expired_locked()
@@ -259,7 +284,18 @@ class ReservationBook:
         """回滚预留；返回该预留是否仍在账上（重复回滚返回 False）。"""
         with self._lock:
             self._purge_expired_locked()
-            return self._items.pop(reservation.id, None) is not None
+            # Do not let a reconstructed Reservation with a copied ID release
+            # the live slot owned by another caller.
+            if self._items.get(reservation.id) is not reservation:
+                return False
+            del self._items[reservation.id]
+            return True
+
+    def contains(self, reservation: Reservation) -> bool:
+        """Whether this exact, unexpired reservation is still owned by us."""
+        with self._lock:
+            self._purge_expired_locked()
+            return self._items.get(reservation.id) is reservation
 
     def for_persona(self, persona_id: str) -> List[Reservation]:
         with self._lock:
@@ -640,12 +676,10 @@ class PolicyEngine:
         # B2.2 §6.4: peer 层按 (persona, peer_id) 计数；其他层仍为 persona 全局。
         use_peer_filter = (layer == LAYER_PEER and peer_id is not None)
         events = sorted(
-            self._store.events_in_window(
-                persona_id=persona_id,
-                kind=EventKind.SENT,
-                since=since,
+            (event for event in self._store.events_in_window(
+                persona_id=persona_id, since=since,
                 peer_id=peer_id if use_peer_filter else None,
-            ),
+            ) if event.kind in (EventKind.SENT, EventKind.PROACTIVE)),
             key=lambda e: e.recorded_at,
         )
         used = len(events)
@@ -716,7 +750,7 @@ class PolicyEngine:
                 persona_id=persona_id,
                 since=since,
                 peer_id=peer_id if use_peer_filter else None,
-            ) if e.kind in (EventKind.SENT, EventKind.MEMORY)],
+            ) if e.kind in (EventKind.SENT, EventKind.PROACTIVE, EventKind.MEMORY)],
             key=lambda e: e.recorded_at,
         )
         used = sum(e.tokens_in + e.tokens_out for e in events)
@@ -799,12 +833,10 @@ class PolicyEngine:
             )
         since = now - timedelta(seconds=min_seconds)
         use_peer_filter = (layer == LAYER_PEER and peer_id is not None)
-        events = self._store.events_in_window(
-            persona_id=persona_id,
-            kind=EventKind.SENT,
-            since=since,
+        events = [event for event in self._store.events_in_window(
+            persona_id=persona_id, since=since,
             peer_id=peer_id if use_peer_filter else None,
-        )
+        ) if event.kind in (EventKind.SENT, EventKind.PROACTIVE)]
         # 在途预留同样算「最近一次发言」：并发请求不能在间隔窗口内同时放行。
         latest_at: Optional[datetime] = None
         if events:
@@ -862,9 +894,17 @@ class PolicyEngine:
         limit, layer, source_id = item
         day_start, day_end, _ = self._day_bounds(now, effective)
         events = self._store.events_in_window(
-            persona_id=persona_id, kind=EventKind.PROACTIVE, since=day_start
+            persona_id=persona_id, kind=EventKind.PROACTIVE,
+            since=day_start - timedelta(microseconds=1)
         )
         used = len(events)
+        if self._reservations is not None:
+            # Pre-model proactive reservations are included so concurrent ticks
+            # cannot both pass a single daily slot.
+            used += sum(
+                1 for reservation in self._reservations.for_persona(persona_id)
+                if reservation.kind == "proactive" and reservation.at >= day_start
+            )
         allowed = used < limit
         return PolicyCheck(
             key="proactive.per_day",
@@ -934,11 +974,10 @@ class PolicyEngine:
             layer, source_id = LAYER_PLATFORM, SOURCE_PLATFORM
 
         local_now = now.astimezone(tz)
-        minute_of_day = local_now.hour * 60 + local_now.minute
-        if start < end:
-            active = start <= minute_of_day < end
-        else:  # 跨午夜
-            active = minute_of_day >= start or minute_of_day < end
+        active = silent_hours_active(
+            {"enabled": True, "start": f"{start // 60:02d}:{start % 60:02d}",
+             "end": f"{end // 60:02d}:{end % 60:02d}", "timezone": str(tz)}, now
+        )
         if not active:
             return _SilentView(False, None, layer, source_id)
         return _SilentView(True, self._next_local_time(local_now, end), layer, source_id)
@@ -1152,7 +1191,7 @@ class PolicyEngine:
                     conversation_id=conversation_id,
                     since=count_since,
                 )
-                if e.kind in (EventKind.SENT, EventKind.DEFERRED)
+                if e.kind in (EventKind.SENT, EventKind.PROACTIVE, EventKind.DEFERRED)
             ),
             key=lambda e: e.recorded_at,
         )
@@ -1242,7 +1281,7 @@ class PolicyEngine:
                     conversation_id=conversation_id,
                     since=count_since,
                 )
-                if e.kind in (EventKind.SENT, EventKind.DEFERRED)
+                if e.kind in (EventKind.SENT, EventKind.PROACTIVE, EventKind.DEFERRED)
             ),
             key=lambda e: e.recorded_at,
         )

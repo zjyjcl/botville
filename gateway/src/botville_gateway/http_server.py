@@ -1515,6 +1515,28 @@ class GatewayServer(http.server.ThreadingHTTPServer):
                 fetcher=joined_members if callable(joined_members) else None,
                 personas=tuple(self.memory_personas),
                 is_local_ai=lambda uid: uid in self.memory_personas)
+        self.proactive_worker = None
+        if config.proactive_enabled:
+            from .proactive import ProactiveWorker
+            model_config = ModelConfig(
+                base_url=(config.model_base_url or '').rstrip('/'),
+                model=config.model_name or '', _api_key=config.model_api_key,
+                timeout_seconds=config.model_timeout_seconds)
+            members = getattr(transport, 'joined_members', None)
+            if config.memory_db_path and model_config.configured and callable(members):
+                # Own connection: a timed-out proactive thread must not lose its
+                # DB when the independent memory worker finishes shutdown.
+                proactive_store = MemoryStore(
+                    config.memory_db_path, retention_days=config.memory_retention_days,
+                    hmac_secret=config.hmac_secret)
+                self.proactive_worker = ProactiveWorker(
+                    proactive_store, service, self.memory_personas,
+                    ModelClient(model_config), config, members=members, close_store=True,
+                    mood_label_provider=(self._proactive_mood_label
+                                         if self.mood_service is not None else None))
+            else:
+                logging.getLogger(__name__).info(
+                    'Proactive inactive: requires memory DB, model and membership transport')
         log_startup_warnings(config)
         super().__init__((config.host, config.port), GatewayHandler)
         # 监听端口绑定成功后才起消费线程：绑定失败（OSError）时不留下孤儿线程。
@@ -1524,6 +1546,17 @@ class GatewayServer(http.server.ThreadingHTTPServer):
             self.memory_purger.start()
         if self.memory_worker is not None:
             self.memory_worker.start()
+        if self.proactive_worker is not None:
+            self.proactive_worker.start()
+
+    def _proactive_mood_label(self, persona_id: str) -> Optional[str]:
+        """Read the decayed label without making mood availability a send gate."""
+        try:
+            return self.mood_service.get(persona_id)["label"]
+        except Exception:
+            # Exception text may contain private data; log only a fixed message.
+            logging.getLogger(__name__).warning("Proactive mood unavailable; omitting label")
+            return None
 
     def _build_memory_worker(self, config, service):
         if self.memory_store is None:
@@ -1627,6 +1660,9 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         store = getattr(self, "as_txn_store", None)
         if store is not None:
             store.stop_purge_scheduler()
+        proactive_worker = getattr(self, "proactive_worker", None)
+        if proactive_worker is not None:
+            proactive_worker.stop()
         memory_worker = getattr(self, "memory_worker", None)
         memory_worker_stopped = memory_worker is None or memory_worker.stop()
         memory_purger = getattr(self, "memory_purger", None)
