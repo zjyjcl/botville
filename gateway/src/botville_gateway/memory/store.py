@@ -562,10 +562,15 @@ class MemoryStore:
         now = now or datetime.now(timezone.utc)
         cutoff = (now - timedelta(days=self.retention_days)).strftime('%Y-%m-%dT%H:%M:%SZ')
         with self._lock, self._db:
-            count = 0
+            # Count summary vectors before the atomic delete trigger removes them.
+            count = self._db.execute('''SELECT count(*) FROM memory_vectors
+                WHERE summary_id IN (SELECT id FROM memory_summaries WHERE updated_at < ?)''',
+                (cutoff,)).fetchone()[0]
             for table, timestamp, pin_filter in (
                     ('memory_items', 'created_at', ' AND pinned=0'),
                     ('memory_facts', 'updated_at', ' AND pinned=0'),
+                    # Summaries cannot be pinned; deletion also triggers vector cleanup.
+                    ('memory_summaries', 'updated_at', ''),
                     ('memory_tombstones', 'created_at', ' AND permanent=0'),
                     ('memory_audit', 'occurred_at', '')):
                 count += self._db.execute(

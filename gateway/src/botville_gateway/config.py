@@ -200,7 +200,7 @@ def _env_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
         return True
     if value in ("0", "false", "no", "off"):
         return False
-    raise ConfigError(f"{name} must be a boolean (true/false), got {raw!r}")
+    raise ConfigError(f"{name} must be a boolean (true/false)")
 
 
 def _env_str(env: Mapping[str, str], name: str, default: str) -> str:
@@ -515,6 +515,7 @@ class Config:
     model_timeout_seconds: float = 30.0
     # B2.6 PR3a: persistent conversation memory is opt-in.  Paths are never
     # emitted by request logs or health output.
+    memory_owner_can_read_dm: bool = False
     memory_db_path: Optional[str] = None
     memory_retention_days: int = DEFAULT_MEMORY_RETENTION_DAYS
     memory_purge_interval_seconds: int = DEFAULT_MEMORY_PURGE_INTERVAL_SECONDS
@@ -1286,6 +1287,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         model_timeout_seconds=_env_float(
             source, "GATEWAY_MODEL_TIMEOUT_SECONDS", float(DEFAULT_MODEL_TIMEOUT_SECONDS)
         ),
+        memory_owner_can_read_dm=_env_bool(source, "GATEWAY_MEMORY_OWNER_CAN_READ_DM", False),
         memory_db_path=(_env_str(source, "GATEWAY_MEMORY_DB_PATH", "") or None),
         memory_retention_days=_env_int(
             source, "GATEWAY_MEMORY_RETENTION_DAYS", DEFAULT_MEMORY_RETENTION_DAYS,

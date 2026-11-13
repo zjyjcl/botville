@@ -17,7 +17,7 @@ info:
     负责消息传输；本契约只覆盖网关自己的控制面（角色、会话登记、发言裁决、三层限额、
     用量账单、功能清单与通用卡片），不重复定义 Matrix 协议。
 
-    当前为 **0.1.0 草案**（M0），供 C 线（App）与 D 线（通知 / 开放 API）评审。
+    当前为 **0.2.0 草案**（M0），供 C 线（App）与 D 线（通知 / 开放 API）评审。
     版本规则见 `gateway/docs/contract.md#版本规则`：`/v1` 路径、只增不删、破坏性变更升主版本。
 
     所有示例、令牌与密钥均为占位符（`<change-me>`），本契约不含任何真实凭据。
@@ -87,8 +87,11 @@ tags:
   - name: Memory
     description: |
       角色主人查看、删除、固定与显式设置的记忆（B2.6 PR3c，contract §1.7.8 ⑩）。
-      **该 AI 的主人可以查看和删除它与你的聊天记忆**（`/capabilities` 中 `memory.manage` 的
-      `owner_can_read_dm`，默认 true）。仅 persona 的 `owner_user_id` 可调用；身份为
+      仅当 `/capabilities` 中 `memory.manage.owner_can_read_dm=true` 时向聊天对象展示
+      「该 AI 的主人可以查看和删除它与你的聊天记忆」。该值反映
+      `GATEWAY_MEMORY_OWNER_CAN_READ_DM`，默认 false；关闭时主人只能看到 DM 元数据并删除/取消固定，
+      固定与显式写入也仍可用。DM recent、summary 和 profile counterpart scope（含 shared fact）
+      的 `text`、fact `value` 为 null，`redacted=true`。仅 persona 的 `owner_user_id` 可调用；身份为
       matrixOpenIdToken 或 matrixUserToken，不接受 bearerAuth。
       群组记忆正文仅在 owner 当前是该 room 成员时返回；否则（含成员查询失败）只返回元数据，
       `text: null`、`redacted: true`，删除与取消固定仍可用。
@@ -115,7 +118,8 @@ paths:
       operationId: listOwnerMemories
       summary: 列出主人名下角色的记忆
       description: |
-        仅 persona 的 owner 可读。群组范围文本只在 owner 当前仍是该 room 的 joined 成员时返回；
+        仅 persona 的 owner 可读。owner_can_read_dm=false 时 DM recent、summary、profile fact
+        （含 shared counterpart scope）的 text/value 为 null、redacted=true。群组范围文本只在 owner 当前仍是该 room 的 joined 成员时返回；
         成员查询失败也按非成员处理，返回元数据且 `text`（及适用时 `value`）为 null、`redacted=true`。
         按 `updated_at desc, id desc` 返回；cursor 不透明，limit 默认 20、最大 100。
         响应一律 `Cache-Control: no-store`。每 caller 60 次/分钟。
@@ -160,8 +164,10 @@ paths:
       description: |
         仅 owner。`key` 必须是服务端允许的 FACT_KEYS；counterpart 必须为本服真实人类用户。
         owner 写入覆盖 extracted 同 key，并清除该 key 的 suppression。profile 的 `shared` 仍属于
-        DM counterpart scope，不使用群成员门禁。可选 `Idempotency-Key` 使用有界、进程内 24 小时
-        （最多 2000 key）缓存：同 key 同请求重放返回当前同一事实；目标已经删除则 404
+        DM counterpart scope，不使用群成员门禁。owner_can_read_dm=false 不阻止写入，但创建、更新及
+        重放响应的 text/value 为 null、redacted=true，不回显事实值。可选 `Idempotency-Key` 使用有界、进程内 24 小时
+        （最多 2000 key）内存缓存；网关重启后丢失，重启后同 key 重放按新请求处理。
+        缓存有效时同 key 同请求重放返回当前同一事实；目标已经删除则 404
         `memory.not_found`；同 key 异请求为 409 `idempotency.conflict`。响应 `Cache-Control: no-store`。
       security: [{matrixOpenIdToken: []}, {matrixUserToken: []}]
       parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
@@ -189,7 +195,7 @@ paths:
       tags: [Memory]
       operationId: getOwnerMemory
       summary: 读取单条记忆
-      description: "群组文本的成员门禁与列表相同；响应 `Cache-Control: no-store`。每 caller 60 次/分钟。"
+      description: "DM recent、summary 和 profile fact（含 shared counterpart scope）在 owner_can_read_dm=false 时 text/value 为 null、redacted=true；群组文本的成员门禁与列表相同；响应 `Cache-Control: no-store`。每 caller 60 次/分钟。"
       security: [{matrixOpenIdToken: []}, {matrixUserToken: []}]
       responses:
         '200': {description: 记忆。, headers: {Cache-Control: {$ref: '#/components/headers/CacheControl'}}, content: {application/json: {schema: {$ref: '#/components/schemas/Memory'}}}}
@@ -284,9 +290,15 @@ paths:
     get:
       tags: [Capabilities]
       operationId: listCapabilities
+      security:
+        - bearerAuth: []
+        - matrixOpenIdToken: []
+        - matrixUserToken: []
       summary: 获取功能清单
       description: |
-        返回当前网关切片的 capability manifest。App 必须以此渲染模块入口，不得硬编码模块列表。
+        返回完整基础清单，记忆模块启用时额外发布 memory.manage，manifest_version 为 1.3.0。
+        接受站点/调用方 bearer 或 MatrixOpenID / Matrix 用户 Bearer 身份，任一通过即可。
+        memory.manage 的原生入口为 botville://memories。App 必须以清单渲染模块入口，不得硬编码模块列表。
         `app_version` 用于服务端过滤不满足 `min_app_version` 的能力；App 仍需忽略未知能力 ID
         与未知字段。清单可缓存（参考 `cache_ttl_seconds`），版本变化通过 `manifest_version` 感知。
       parameters:
@@ -3985,7 +3997,9 @@ components:
         key: {type: string}
         value: {type: [string, 'null']}
         dirty: {type: boolean}
-        redacted: {type: boolean}
+        redacted:
+          type: boolean
+          description: DM 可读开关关闭或群成员门禁未通过时为 true，text 和适用的 fact value 为 null；E6 响应同样适用。
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
         expires_at: {type: [string, 'null'], format: date-time}
@@ -4151,8 +4165,8 @@ components:
           format: date-time
         owner_can_read_dm:
           type: boolean
-          default: true
-          description: memory.manage 的披露：AI 主人可查看与其聊天的记忆。
+          default: false
+          description: memory.manage 的 DM 可读状态，反映 GATEWAY_MEMORY_OWNER_CAN_READ_DM；仅 true 时展示主人可查看和删除聊天记忆的披露，false 时仅可见元数据，管理及写入仍可用。
 
     CapabilityManifest:
       type: object
@@ -4161,11 +4175,11 @@ components:
         manifest_version:
           type: string
           pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
-          example: 1.2.0
+          example: 1.3.0
         contract_version:
           type: string
           description: 生成该清单的网关契约版本。
-          example: 0.1.0
+          example: 0.2.0
         generated_at:
           type: string
           format: date-time
@@ -4935,7 +4949,7 @@ components:
         contract_version:
           type: string
           description: 本响应遵循的契约版本。
-          example: 0.1.0
+          example: 0.2.0
         started_at:
           type: string
           format: date-time
