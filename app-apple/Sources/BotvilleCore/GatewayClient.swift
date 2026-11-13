@@ -8,6 +8,32 @@ public protocol GatewayClient: ModuleWebSessionProviding {
     func cards(capabilityID: String?, cardTypes: [String]?) async throws -> [GatewayCard]
     func perform(card: GatewayCard, action: GatewayCardAction) async throws -> GatewayActionReceipt
     func exchangeSessionCookie(capabilityID: String, code: String) async throws -> GatewayCookieExchange
+    func personas() async throws -> [MemoryPersona]
+    func memories(
+        personaID: String, layers: [String], scopeKind: String?, counterpart: String?,
+        roomID: String?, pinned: Bool?, cursor: String?, limit: Int?
+    ) async throws -> MemoryPage
+    func memory(id: String) async throws -> Memory
+    func deleteMemory(id: String) async throws
+    func pinMemory(id: String) async throws -> Memory
+    func unpinMemory(id: String) async throws -> Memory
+    func writeMemoryFact(_ fact: MemoryFactWrite, idempotencyKey: String?) async throws -> Memory
+}
+
+public extension GatewayClient {
+    func personas() async throws -> [MemoryPersona] { throw GatewayClientError.invalidResponse }
+    func memories(
+        personaID: String, layers: [String] = [], scopeKind: String? = nil,
+        counterpart: String? = nil, roomID: String? = nil, pinned: Bool? = nil,
+        cursor: String? = nil, limit: Int? = nil
+    ) async throws -> MemoryPage { throw GatewayClientError.invalidResponse }
+    func memory(id: String) async throws -> Memory { throw GatewayClientError.invalidResponse }
+    func deleteMemory(id: String) async throws { throw GatewayClientError.invalidResponse }
+    func pinMemory(id: String) async throws -> Memory { throw GatewayClientError.invalidResponse }
+    func unpinMemory(id: String) async throws -> Memory { throw GatewayClientError.invalidResponse }
+    func writeMemoryFact(_ fact: MemoryFactWrite, idempotencyKey: String? = nil) async throws
+        -> Memory
+    { throw GatewayClientError.invalidResponse }
 }
 
 public enum GatewayClientError: Error, Equatable, LocalizedError {
@@ -36,7 +62,18 @@ public enum GatewayClientError: Error, Equatable, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .serverAuthMisconfigured: return "服务器认证异常，请联系部署者"
-        case .problem, .httpStatus: return "网关请求失败，请稍后重试。"
+        case .problem(_, let code):
+            switch code {
+            case "memory.disabled": return "记忆管理暂未启用。"
+            case "memory.not_found": return "这条记忆已不存在。"
+            case "memory.not_pinnable": return "这条记忆不能固定。"
+            case "memory.pin_limit": return "固定记忆数量已达上限。"
+            case "memory.unavailable": return "记忆服务暂时不可用，请稍后重试。"
+            case "persona.not_owned": return "你无权管理该 AI 的记忆。"
+            case "rate_limited.transport": return "操作过于频繁，请稍后再试。"
+            default: return "网关请求失败，请稍后重试。"
+            }
+        case .httpStatus: return "网关请求失败，请稍后重试。"
         default: return nil
         }
     }
@@ -74,7 +111,7 @@ private func validateAction(card: GatewayCard, action: GatewayCardAction) async 
 
 /// Transport skeleton for the v1 contract. No credentials are read from the
 /// environment, persisted, or logged. Site and end-user credentials are
-/// injected separately; moments always requires the OpenID provider.
+/// injected separately; moments and memories require the OpenID provider.
 public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
     public let baseURL: URL
     private let token: String?
@@ -164,6 +201,60 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         // OpenAPI's `type` is a single enum, so multiple requested types are
         // filtered locally instead of inventing a repeated query parameter.
         return result.filter { cardTypes.contains($0.type) }
+    }
+
+    public func personas() async throws -> [MemoryPersona] {
+        var result: [MemoryPersona] = [], cursor: String?, seen: Set<String> = []
+        repeat {
+            let query = cursor.map { [URLQueryItem(name: "cursor", value: $0)] } ?? []
+            let page = try await decode(
+                request(["personas"], query: query), as: MemoryPersonaPage.self)
+            result.append(contentsOf: page.items)
+            guard page.hasMore else { break }
+            guard let next = page.nextCursor, seen.insert(next).inserted, seen.count <= 100 else {
+                throw GatewayClientError.invalidResponse
+            }
+            cursor = next
+        } while cursor != nil
+        return result
+    }
+
+    public func memories(
+        personaID: String, layers: [String] = [], scopeKind: String? = nil,
+        counterpart: String? = nil, roomID: String? = nil, pinned: Bool? = nil,
+        cursor: String? = nil, limit: Int? = nil
+    ) async throws -> MemoryPage {
+        var query = [URLQueryItem(name: "persona_id", value: personaID)]
+        query += layers.map { URLQueryItem(name: "layer", value: $0) }
+        query += [
+            scopeKind.map { URLQueryItem(name: "scope_kind", value: $0) },
+            counterpart.map { URLQueryItem(name: "counterpart", value: $0) },
+            roomID.map { URLQueryItem(name: "room_id", value: $0) },
+            pinned.map { URLQueryItem(name: "pinned", value: $0 ? "true" : "false") },
+            cursor.map { URLQueryItem(name: "cursor", value: $0) },
+            limit.map { URLQueryItem(name: "limit", value: String($0)) },
+        ].compactMap { $0 }
+        return try await decode(request(["memories"], query: query), as: MemoryPage.self)
+    }
+    public func memory(id: String) async throws -> Memory {
+        try await decode(request(["memories", id]), as: Memory.self)
+    }
+    public func deleteMemory(id: String) async throws {
+        _ = try await responseData(for: request(["memories", id], method: "DELETE"))
+    }
+    public func pinMemory(id: String) async throws -> Memory {
+        try await decode(request(["memories", id, "pin"], method: "PUT"), as: Memory.self)
+    }
+    public func unpinMemory(id: String) async throws -> Memory {
+        try await decode(request(["memories", id, "pin"], method: "DELETE"), as: Memory.self)
+    }
+    public func writeMemoryFact(_ fact: MemoryFactWrite, idempotencyKey: String? = nil) async throws
+        -> Memory
+    {
+        try await decode(
+            request(
+                ["memories", "facts"], method: "PUT", body: JSONEncoder().encode(fact),
+                idempotencyKey: idempotencyKey), as: Memory.self)
     }
 
     public func perform(card: GatewayCard, action: GatewayCardAction) async throws -> GatewayActionReceipt {
@@ -272,8 +363,15 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         }
         if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         if let idempotencyKey { request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key") }
-        if authorize, segments.first != "moments", let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        if authorize, !Self.isOpenIDPath(segments), let token {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         return request
+    }
+
+    private static func isOpenIDPath(_ segments: [String]) -> Bool {
+        guard let first = segments.first else { return false }
+        return first == "moments" || first == "memories"
     }
 
     /// Minimal raw-data entry point. Resource models and UI are intentionally
@@ -288,6 +386,25 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
 
     /// Match the first API path segment relative to this gateway's base prefix.
     /// Query strings and similar names (momentsx) never select credentials.
+    func isOpenIDRequest(_ request: URLRequest) throws -> Bool {
+        guard let url = request.url,
+            let candidate = URLComponents(url: url, resolvingAgainstBaseURL: false),
+            let base = URLComponents(url: baseURL, resolvingAgainstBaseURL: false),
+            candidate.scheme == base.scheme, candidate.host == base.host,
+            candidate.port == base.port,
+            let momentsURL = try self.request(["moments"]).url,
+            let memoriesURL = try self.request(["memories"]).url,
+            let moments = URLComponents(url: momentsURL, resolvingAgainstBaseURL: false)?
+                .percentEncodedPath,
+            let memories = URLComponents(url: memoriesURL, resolvingAgainstBaseURL: false)?
+                .percentEncodedPath
+        else { throw GatewayClientError.invalidResponse }
+        let path = candidate.percentEncodedPath
+        return path == moments || path.hasPrefix(moments + "/") || path == memories
+            || path.hasPrefix(memories + "/")
+    }
+
+    /// Kept for existing callers; memory selection is handled by isOpenIDRequest.
     func isMomentsRequest(_ request: URLRequest) throws -> Bool {
         guard let root = try self.request(["moments"]).url?.path,
               let path = request.url?.path else { throw GatewayClientError.invalidResponse }
@@ -297,8 +414,8 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
     func responseData(for request: URLRequest) async throws -> Data {
         var outgoing = request
         var usedToken: MatrixOpenIDToken?
-        let isMoments = try isMomentsRequest(request)
-        if isMoments {
+        let isOpenID = try isOpenIDRequest(request)
+        if isOpenID {
             guard let openIDProvider else { throw MatrixOpenIDError.providerUnavailable }
             let token = try await openIDProvider.token()
             usedToken = token
@@ -328,7 +445,7 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
                 outgoing.setValue("MatrixOpenID \(refreshed.accessToken)", forHTTPHeaderField: "Authorization")
                 continue
             }
-            if isMoments, response.statusCode == 500, code == "internal.error",
+            if isOpenID, response.statusCode == 500, code == "internal.error",
                canRetryServerError, serverRetries < 3 {
                 let delay = TimeInterval(1 << serverRetries) // 1s, 2s, 4s; total budget per operation.
                 serverRetries += 1
@@ -367,6 +484,7 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
     private var receipts: [ActionIntent: GatewayActionReceipt] = [:]
     private var issuedCodes: [String: IssuedCode] = [:]
     private let now: @Sendable () -> Date
+    private var mockMemories: [Memory] = []
 
     private struct IssuedCode {
         let capabilityID: String
@@ -392,6 +510,30 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
                     GatewayCard.self, from: JSONSerialization.data(withJSONObject: object))
             ]
         } catch { mockCards = [] }
+        let date = now()
+        let owner = MemorySource(kind: "owner", eventID: nil, sender: nil, role: nil, model: nil)
+        mockMemories = [
+            Memory(
+                id: "mf_0123456789abcdef", personaID: "persona_demo", layer: "profile",
+                scope: MemoryScope(kind: "dm", counterpart: "@human:example.invalid", roomID: nil),
+                visibility: "dm_only", trust: "owner", source: owner, pinned: true, text: nil,
+                key: "likes", value: "示例值", dirty: false, redacted: false, createdAt: date,
+                updatedAt: date, expiresAt: nil),
+            Memory(
+                id: "mr_0123456789abcdef", personaID: "persona_demo", layer: "recent",
+                scope: MemoryScope(kind: "dm", counterpart: "@human:example.invalid", roomID: nil),
+                visibility: "dm_only", trust: "trusted", source: owner, pinned: false,
+                text: "示例近期记忆", key: nil, value: nil, dirty: false, redacted: false,
+                createdAt: date, updatedAt: date, expiresAt: nil),
+            Memory(
+                id: "ms_0123456789abcdef", personaID: "persona_demo", layer: "summary",
+                scope: MemoryScope(kind: "group", counterpart: nil, roomID: "!example:invalid"),
+                visibility: "scope_only", trust: "derived",
+                source: MemorySource(
+                    kind: "summary", eventID: nil, sender: nil, role: nil, model: nil),
+                pinned: false, text: nil, key: nil, value: nil, dirty: false, redacted: true,
+                createdAt: date, updatedAt: date, expiresAt: nil),
+        ]
     }
 
     public func capabilities(locale: String? = nil, appVersion: String? = nil) async throws
@@ -406,6 +548,83 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
             (capabilityID == nil || $0.source.capabilityID == capabilityID)
                 && (cardTypes == nil || cardTypes!.isEmpty || cardTypes!.contains($0.type))
         }
+    }
+
+    public func personas() async throws -> [MemoryPersona] {
+        [MemoryPersona(id: "persona_demo", displayName: "示例 AI")]
+    }
+    public func memories(
+        personaID: String, layers: [String] = [], scopeKind: String? = nil,
+        counterpart: String? = nil, roomID: String? = nil, pinned: Bool? = nil,
+        cursor: String? = nil, limit: Int? = nil
+    ) async throws -> MemoryPage {
+        var values = mockMemories.filter { $0.personaID == personaID }
+        if !layers.isEmpty { values = values.filter { layers.contains($0.layer) } }
+        if let scopeKind { values = values.filter { $0.scope.kind == scopeKind } }
+        if let counterpart { values = values.filter { $0.scope.counterpart == counterpart } }
+        if let roomID { values = values.filter { $0.scope.roomID == roomID } }
+        if let pinned { values = values.filter { $0.pinned == pinned } }
+        let start = Int(cursor ?? "0") ?? 0
+        let count = min(max(limit ?? 20, 1), 100)
+        guard start >= 0, start <= values.count else { throw GatewayClientError.invalidResponse }
+        let end = min(start + count, values.count)
+        return MemoryPage(
+            items: Array(values[start..<end]), nextCursor: end < values.count ? String(end) : nil,
+            hasMore: end < values.count)
+    }
+    public func memory(id: String) async throws -> Memory {
+        guard let value = mockMemories.first(where: { $0.id == id }) else {
+            throw GatewayClientError.problem(status: 404, code: "memory.not_found")
+        }
+        return value
+    }
+    public func deleteMemory(id: String) async throws {
+        guard let index = mockMemories.firstIndex(where: { $0.id == id }) else {
+            throw GatewayClientError.problem(status: 404, code: "memory.not_found")
+        }
+        mockMemories.remove(at: index)
+    }
+    public func pinMemory(id: String) async throws -> Memory { try setPin(id: id, pinned: true) }
+    public func unpinMemory(id: String) async throws -> Memory { try setPin(id: id, pinned: false) }
+    private func setPin(id: String, pinned: Bool) throws -> Memory {
+        guard let index = mockMemories.firstIndex(where: { $0.id == id }) else {
+            throw GatewayClientError.problem(status: 404, code: "memory.not_found")
+        }
+        let old = mockMemories[index]
+        guard !pinned || old.canPin else {
+            throw GatewayClientError.problem(status: 422, code: "memory.not_pinnable")
+        }
+        let value = Memory(
+            id: old.id, personaID: old.personaID, layer: old.layer, scope: old.scope,
+            visibility: old.visibility, trust: old.trust, source: old.source, pinned: pinned,
+            text: old.text, key: old.key, value: old.value, dirty: old.dirty,
+            redacted: old.redacted, createdAt: old.createdAt, updatedAt: now(),
+            expiresAt: old.expiresAt)
+        mockMemories[index] = value
+        return value
+    }
+    public func writeMemoryFact(_ fact: MemoryFactWrite, idempotencyKey: String? = nil) async throws
+        -> Memory
+    {
+        let date = now()
+        let value = Memory(
+            id: "mf_"
+                + String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(16))
+                .lowercased(), personaID: fact.personaID, layer: "profile",
+            scope: MemoryScope(kind: "dm", counterpart: fact.counterpart, roomID: nil),
+            visibility: fact.visibility ?? "dm_only", trust: "owner",
+            source: MemorySource(kind: "owner", eventID: nil, sender: nil, role: nil, model: nil),
+            pinned: false, text: nil, key: fact.key, value: fact.value, dirty: false,
+            redacted: false, createdAt: date, updatedAt: date, expiresAt: nil)
+        if let index = mockMemories.firstIndex(where: {
+            $0.personaID == fact.personaID && $0.scope.counterpart == fact.counterpart
+                && $0.key == fact.key
+        }) {
+            mockMemories[index] = value
+        } else {
+            mockMemories.append(value)
+        }
+        return value
     }
 
     public func perform(card: GatewayCard, action: GatewayCardAction) async throws -> GatewayActionReceipt {

@@ -1,7 +1,7 @@
 {
-  "manifest_version": "1.2.0",
-  "contract_version": "0.1.0",
-  "generated_at": "2026-11-03T12:00:00Z",
+  "manifest_version": "1.3.0",
+  "contract_version": "0.2.0",
+  "generated_at": "2026-11-13T00:00:00Z",
   "cache_ttl_seconds": 300,
   "defaults": {
     "unknown_capability": "hidden",
@@ -45,6 +45,19 @@
         }
       },
       "updated_at": "2026-11-01T08:00:00Z"
+    },
+    {
+      "id": "memory.manage",
+      "module": "memory",
+      "version": "0.2.0",
+      "title": "记忆",
+      "summary": "查看、删除和固定我的 AI 记忆。",
+      "icon": { "type": "sf_symbol", "value": "brain" },
+      "status": "enabled",
+      "entry": { "type": "native", "deep_link": "botville://memories" },
+      "scopes": ["memory.read", "memory.write"],
+      "owner_can_read_dm": false,
+      "updated_at": "2026-11-13T00:00:00Z"
     },
     {
       "id": "notify.approvals",

@@ -12,6 +12,9 @@ final class DynamicUIModel: ObservableObject {
     @Published var notice: String?
     @Published var selectedCapability: GatewayCapability?
     @Published var busyCardIDs: Set<String> = []
+    /// Changes only when a transport/account boundary changes, so child sheets
+    /// never retain a client created for a previous gateway session.
+    @Published private(set) var clientIdentity = UUID()
     private(set) var client: any GatewayClient = MockGatewayClient()
     private(set) var isMock = true
     private var generation = 0
@@ -29,6 +32,7 @@ final class DynamicUIModel: ObservableObject {
                 : try HTTPGatewayClient(baseURL: baseURL, allowLocalHTTP: allowLocalHTTP)
             generation += 1
             client = replacement
+            clientIdentity = UUID()
             isMock = mock
             manifest = nil
             cards = []
@@ -45,6 +49,7 @@ final class DynamicUIModel: ObservableObject {
     func configureConfirmedGateway(_ replacement: HTTPGatewayClient) async {
         generation += 1
         client = replacement
+        clientIdentity = UUID()
         isMock = false
         manifest = nil
         cards = []
@@ -113,12 +118,19 @@ struct DynamicUIView: View {
     @State private var pendingAction: ActionSelection?
     @State private var externalURL: URL?
     @State private var highRiskMessage = false
+    @State private var showMyAI = false
     @Environment(\.openURL) private var openURL
 
     private var visibleCapabilities: [GatewayCapability] {
         guard let manifest = model.manifest else { return [] }
         return manifest.capabilityProjections(knownNativeRoutes: ["chat.direct": "botville://chat"])
+            .filter { $0.capability.id != "memory.manage" }
             .filter(\.isVisible).map(\.capability)
+    }
+
+    private var canManageMemories: Bool {
+        guard let manifest = model.manifest else { return false }
+        return MemoryPresentationPolicy.isMemoryManagementAvailable(in: manifest)
     }
 
     var body: some View {
@@ -184,6 +196,31 @@ struct DynamicUIView: View {
                         }
                     }
 
+                    if canManageMemories {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("我的 AI").font(.headline)
+                            Button {
+                                showMyAI = true
+                            } label: {
+                                HStack(spacing: 14) {
+                                    Image(systemName: "person.2.fill")
+                                        .font(.title3)
+                                        .foregroundStyle(Color(red: 26 / 255, green: 173 / 255, blue: 142 / 255))
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text("我的 AI").font(.headline)
+                                        Text("查看和管理 AI 记忆").font(.caption).foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Image(systemName: "chevron.right").foregroundStyle(.tertiary)
+                                }
+                                .padding(14)
+                                .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 14))
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityHint("打开 AI 与聊天记忆管理")
+                        }
+                    }
+
                     HStack {
                         Text(model.selectedCapability?.title ?? "最新卡片").font(.headline)
                         Spacer()
@@ -237,9 +274,14 @@ struct DynamicUIView: View {
             .onChange(of: matrixService.isLoggedIn) { _, loggedIn in
                 Task {
                     if loggedIn { await activateConfirmedGatewayIfAvailable() }
-                    else { usesPairedGateway = false; useMock = true; await model.configure(mock: true, baseURL: baseURL, allowLocalHTTP: false) }
+                    else {
+                        showMyAI = false
+                        usesPairedGateway = false; useMock = true
+                        await model.configure(mock: true, baseURL: baseURL, allowLocalHTTP: false)
+                    }
                 }
             }
+            .onChange(of: model.clientIdentity) { _, _ in showMyAI = false }
             .sheet(isPresented: $showSettings) { settings }
             .sheet(item: $webDestination) { destination in
                 ModuleWebSheet(
@@ -247,6 +289,20 @@ struct DynamicUIView: View {
                     allowedOrigins: [], scopes: destination.capability.scopes,
                     ttlSeconds: min(3600, max(60, destination.capability.sessionToken?.ttlSeconds ?? 300)),
                     provider: model.client)
+            }
+            .sheet(isPresented: $showMyAI) {
+                NavigationStack {
+                    MyAIListView(client: model.client, manifest: model.manifest)
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("完成") { showMyAI = false }
+                            }
+                        }
+                }
+                .tint(Color(red: 26 / 255, green: 173 / 255, blue: 142 / 255))
+                #if os(macOS)
+                    .frame(minWidth: 460, minHeight: 560)
+                #endif
             }
             .alert("需在后续版本授权", isPresented: $highRiskMessage) {
                 Button("知道了", role: .cancel) {}
