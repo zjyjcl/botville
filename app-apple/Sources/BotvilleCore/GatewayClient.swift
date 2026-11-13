@@ -12,6 +12,10 @@ public protocol GatewayClient: ModuleWebSessionProviding {
     func persona(id: String) async throws -> PersonaDetail
     func personaState(id: String) async throws -> PersonaState
     func updatePersonaState(id: String, patch: PersonaStatePatch) async throws -> PersonaState
+    func groupRooms(personaID: String, limit: Int?, cursor: String?, includeAll: Bool) async throws -> GroupRoomList
+    func updateGroupRoomMode(personaID: String, roomRef: String, mode: GroupRoomMode) async throws -> GroupRoom
+    func leaveGroupRoom(personaID: String, roomRef: String) async throws -> GroupRoom
+    func updatePersonaGroups(id: String, groups: PersonaGroupsSettings) async throws -> PersonaDetail
     func memories(
         personaID: String, layers: [String], scopeKind: String?, counterpart: String?,
         roomID: String?, pinned: Bool?, cursor: String?, limit: Int?
@@ -30,6 +34,10 @@ public extension GatewayClient {
     func updatePersonaState(id: String, patch: PersonaStatePatch) async throws -> PersonaState {
         throw GatewayClientError.invalidResponse
     }
+    func groupRooms(personaID: String, limit: Int? = nil, cursor: String? = nil, includeAll: Bool = false) async throws -> GroupRoomList { throw GatewayClientError.invalidResponse }
+    func updateGroupRoomMode(personaID: String, roomRef: String, mode: GroupRoomMode) async throws -> GroupRoom { throw GatewayClientError.invalidResponse }
+    func leaveGroupRoom(personaID: String, roomRef: String) async throws -> GroupRoom { throw GatewayClientError.invalidResponse }
+    func updatePersonaGroups(id: String, groups: PersonaGroupsSettings) async throws -> PersonaDetail { throw GatewayClientError.invalidResponse }
     func memories(
         personaID: String, layers: [String] = [], scopeKind: String? = nil,
         counterpart: String? = nil, roomID: String? = nil, pinned: Bool? = nil,
@@ -68,8 +76,10 @@ public enum GatewayClientError: Error, Equatable, LocalizedError {
     }
 
     public var errorDescription: String? {
-        if httpStatus == 403 { return "没有权限查看" }
         if httpStatus == 401, self != .serverAuthMisconfigured { return "会话已失效，请重新登录。" }
+        if httpStatus == 403 {
+            return problemCode == "conversation.e2ee" ? "加密群不支持 AI 发言" : "没有权限查看"
+        }
         switch self {
         case .serverAuthMisconfigured: return "服务器认证异常，请联系部署者"
         case .problem(_, let code):
@@ -81,6 +91,9 @@ public enum GatewayClientError: Error, Equatable, LocalizedError {
             case "memory.unavailable": return "记忆服务暂时不可用，请稍后重试。"
             case "persona.not_owned": return "你无权管理该 AI 的记忆。"
             case "persona.not_found": return "不存在或不可见"
+            case "room.not_found", "room.state_conflict": return "群状态已变化，请刷新后重试。"
+            case "room.unavailable", "persona.unavailable": return "服务暂时不可用，请稍后重试。"
+            case "persona.state_conflict": return "状态已变化，请刷新后重试。"
             case "rate_limited.transport": return "操作过于频繁，请稍后再试。"
             default: return "网关请求失败，请稍后重试。"
             }
@@ -244,6 +257,41 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
             request(["personas", id, "state"], method: "PATCH", body: JSONEncoder().encode(patch)),
             as: PersonaState.self)
     }
+    public func groupRooms(
+        personaID: String, limit: Int? = nil, cursor: String? = nil, includeAll: Bool = false
+    ) async throws -> GroupRoomList {
+        let query = [
+            limit.map { URLQueryItem(name: "limit", value: String($0)) },
+            cursor.map { URLQueryItem(name: "cursor", value: $0) },
+            URLQueryItem(name: "include", value: includeAll ? "all" : "active"),
+        ].compactMap { $0 }
+        return try await decode(
+            request(["personas", personaID, "rooms"], query: query), as: GroupRoomList.self)
+    }
+    public func updateGroupRoomMode(personaID: String, roomRef: String, mode: GroupRoomMode)
+        async throws -> GroupRoom
+    {
+        try await decode(
+            request(
+                ["personas", personaID, "rooms", roomRef], method: "PATCH",
+                body: JSONEncoder().encode(["mode": mode.rawValue])), as: GroupRoom.self)
+    }
+    public func leaveGroupRoom(personaID: String, roomRef: String) async throws -> GroupRoom {
+        try await decode(
+            request(
+                ["personas", personaID, "rooms", roomRef], method: "PATCH",
+                body: JSONEncoder().encode(["action": "leave"])), as: GroupRoom.self)
+    }
+    public func updatePersonaGroups(id: String, groups: PersonaGroupsSettings) async throws
+        -> PersonaDetail
+    {
+        struct Body: Encodable { let groups: PersonaGroupsSettings }
+        return try await decode(
+            request(
+                ["personas", id], method: "PATCH", body: JSONEncoder().encode(Body(groups: groups))),
+            as: PersonaDetail.self)
+    }
+
 
     public func memories(
         personaID: String, layers: [String] = [], scopeKind: String? = nil,
@@ -397,13 +445,18 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
 
     private static func isOpenIDPath(_ segments: [String], method: String) -> Bool {
         guard let first = segments.first else { return false }
-        // Contract 0.5.0 authenticates GET collection/detail and owner state reads/writes.
+        // Contract 0.6.0 authenticates owner reads/writes and group-room management.
         return first == "moments" || first == "memories"
             || (first == "personas" && method.caseInsensitiveCompare("GET") == .orderedSame
                 && (segments.count == 1 || (segments.count == 2 && !segments[1].isEmpty)))
             || (first == "personas" && (method.caseInsensitiveCompare("GET") == .orderedSame
                 || method.caseInsensitiveCompare("PATCH") == .orderedSame)
                 && segments.count == 3 && !segments[1].isEmpty && segments[2] == "state")
+            || (first == "personas" && method.caseInsensitiveCompare("GET") == .orderedSame
+                && segments.count == 3 && !segments[1].isEmpty && segments[2] == "rooms")
+            || (first == "personas" && method.caseInsensitiveCompare("PATCH") == .orderedSame
+                && ((segments.count == 2 && !segments[1].isEmpty)
+                    || (segments.count == 4 && !segments[1].isEmpty && segments[2] == "rooms" && !segments[3].isEmpty)))
     }
 
     /// Minimal raw-data entry point. Resource models and UI are intentionally
@@ -526,6 +579,9 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
     private let now: @Sendable () -> Date
     private var mockMemories: [Memory] = []
     private var mockPersonaState: PersonaState?
+    private var mockGroupRooms: [GroupRoom] = []
+    private var mockGroups = PersonaGroupsSettings()
+    private var mockLeavePending = false
 
     private struct IssuedCode {
         let capabilityID: String
@@ -577,6 +633,16 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
         ]
         mockPersonaState = try? GatewayCoding.decoder.decode(
             PersonaState.self, from: Self.resource("mock-persona-state"))
+        let groupExample = try? GatewayCoding.decoder.decode(
+            GroupRoomList.self, from: Self.resource("mock-group-room-list"))
+        mockGroupRooms = (groupExample?.items ?? []) + [
+            GroupRoom(roomRef: String(repeating: "b", count: 64), state: .encryptedDisabled,
+                      mode: .mentionOnly, joinedAt: date, updatedAt: date, leavePending: nil),
+            GroupRoom(roomRef: String(repeating: "c", count: 64), state: .left, mode: .muted,
+                      joinedAt: date, updatedAt: date, leavePending: nil),
+            GroupRoom(roomRef: String(repeating: "d", count: 64), state: .rejectedEncrypted,
+                      mode: .mentionOnly, joinedAt: nil, updatedAt: date, leavePending: nil),
+        ]
     }
 
     public func capabilities(locale: String? = nil, appVersion: String? = nil) async throws
@@ -602,7 +668,7 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
         guard let persona = try await personas().first(where: { $0.id == id }) else {
             throw GatewayClientError.problem(status: 404, code: "persona.not_found")
         }
-        return .owner(persona)
+        return .owner(try personaWithGroups(persona))
     }
     public func personaState(id: String) async throws -> PersonaState {
         guard let state = mockPersonaState, state.personaID == id else {
@@ -621,6 +687,95 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
         mockPersonaState = updated
         return updated
     }
+    public func groupRooms(
+        personaID: String, limit: Int? = nil, cursor: String? = nil, includeAll: Bool = false
+    ) async throws -> GroupRoomList {
+        guard (try await personas()).contains(where: { $0.id == personaID }) else {
+            throw GatewayClientError.problem(status: 404, code: "persona.not_found")
+        }
+        let source =
+            includeAll
+            ? mockGroupRooms
+            : mockGroupRooms.filter {
+                $0.state == .accepted || $0.state == .encryptedDisabled
+            }
+        let requestedLimit = limit ?? 50
+        guard (1...200).contains(requestedLimit),
+            let start = Int(cursor ?? "0"), start >= 0, start <= source.count
+        else {
+            throw GatewayClientError.problem(status: 400, code: "request.invalid")
+        }
+        // Mock acts as the server; small pages make the real pagination visible.
+        let end = min(start + min(requestedLimit, 2), source.count)
+        let items = source[start..<end].map {
+            GroupRoom(
+                roomRef: $0.roomRef, state: $0.state, mode: $0.mode,
+                joinedAt: $0.joinedAt, updatedAt: $0.updatedAt, leavePending: nil)
+        }
+        return GroupRoomList(
+            items: items, nextCursor: end < source.count ? String(end) : nil,
+            hasMore: end < source.count, groupsEnabled: true)
+    }
+    public func updateGroupRoomMode(personaID: String, roomRef: String, mode: GroupRoomMode)
+        async throws -> GroupRoom
+    {
+        guard (try await personas()).contains(where: { $0.id == personaID }) else {
+            throw GatewayClientError.problem(status: 404, code: "persona.not_found")
+        }
+        guard mode == .muted || mode == .mentionOnly else {
+            throw GatewayClientError.problem(status: 400, code: "request.invalid")
+        }
+        guard let index = mockGroupRooms.firstIndex(where: { $0.roomRef == roomRef }) else {
+            throw GatewayClientError.problem(status: 404, code: "room.not_found")
+        }
+        guard GroupRoomPresentation.canChangeMode(mockGroupRooms[index]) else {
+            throw GatewayClientError.problem(status: 409, code: "room.state_conflict")
+        }
+        let old = mockGroupRooms[index]
+        let updated = GroupRoom(
+            roomRef: old.roomRef, state: old.state, mode: mode, joinedAt: old.joinedAt,
+            updatedAt: now(), leavePending: nil)
+        mockGroupRooms[index] = updated
+        return updated
+    }
+    public func leaveGroupRoom(personaID: String, roomRef: String) async throws -> GroupRoom {
+        guard (try await personas()).contains(where: { $0.id == personaID }) else {
+            throw GatewayClientError.problem(status: 404, code: "persona.not_found")
+        }
+        guard let index = mockGroupRooms.firstIndex(where: { $0.roomRef == roomRef }) else {
+            throw GatewayClientError.problem(status: 404, code: "room.not_found")
+        }
+        let old = mockGroupRooms[index]
+        let updated = GroupRoom(
+            roomRef: old.roomRef, state: .left, mode: old.mode, joinedAt: old.joinedAt,
+            updatedAt: now(), leavePending: mockLeavePending)
+        mockGroupRooms[index] = updated
+        return updated
+    }
+    public func setMockLeavePending(_ value: Bool) { mockLeavePending = value }
+    public func updatePersonaGroups(id: String, groups: PersonaGroupsSettings) async throws
+        -> PersonaDetail
+    {
+        guard let persona = try await personas().first(where: { $0.id == id }) else {
+            throw GatewayClientError.problem(status: 404, code: "persona.not_found")
+        }
+        mockGroups = groups
+        return .owner(try personaWithGroups(persona))
+    }
+    private func personaWithGroups(_ persona: MemoryPersona) throws -> MemoryPersona {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard
+            var object = try JSONSerialization.jsonObject(with: encoder.encode(persona))
+                as? [String: Any]
+        else { throw GatewayClientError.invalidResponse }
+        object["groups"] = [
+            "enabled": mockGroups.enabled, "invite_policy": mockGroups.invitePolicy.rawValue,
+        ]
+        return try GatewayCoding.decoder.decode(
+            MemoryPersona.self, from: JSONSerialization.data(withJSONObject: object))
+    }
+
     public func memories(
         personaID: String, layers: [String] = [], scopeKind: String? = nil,
         counterpart: String? = nil, roomID: String? = nil, pinned: Bool? = nil,

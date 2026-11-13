@@ -174,7 +174,11 @@ struct RoomView: View {
         .onChange(of: isInputFocused) { _, _ in updateInputActivity() }
         .onChange(of: draft) { _, _ in updateInputActivity() }
         .sheet(isPresented: $isPresentingSettings) {
-            RoomNotificationSettingsSheet(service: service, controller: service.roomNotifications, room: currentRoom)
+            if currentRoom.isDirect {
+                RoomNotificationSettingsSheet(service: service, controller: service.roomNotifications, room: currentRoom)
+            } else {
+                GroupRoomInfoSheet(service: service, room: currentRoom)
+            }
         }
         .sheet(isPresented: $isPresentingInvite) {
             InviteMemberSheet(service: service, room: currentRoom)
@@ -838,6 +842,147 @@ private struct TimelineLastRowTrace: Equatable {
     let visible: Bool
 }
 #endif
+
+@MainActor
+private struct GroupRoomInfoSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var service: MatrixService
+    let room: MatrixRoom
+
+    @State private var members: [MatrixRoomMember] = []
+    @State private var isLoadingMembers = true
+    @State private var memberError: String?
+    @State private var isPresentingInvite = false
+    @State private var isPresentingNotifications = false
+    @State private var isPresentingLeaveConfirmation = false
+    @State private var isLeaving = false
+    @State private var leaveError: String?
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("成员") {
+                    if isLoadingMembers {
+                        ProgressView("正在读取成员…")
+                    } else if let memberError {
+                        Text(memberError).foregroundStyle(.secondary)
+                        Button("重试读取成员") { Task { await loadMembers() } }
+                    } else {
+                        ForEach(members) { member in
+                            GroupRoomMemberRow(member: member)
+                        }
+                    }
+                }
+
+                Section {
+                    Button { isPresentingInvite = true } label: {
+                        Label("邀请成员", systemImage: "person.badge.plus")
+                    }
+                    .disabled(isLeaving)
+                    Button { isPresentingNotifications = true } label: {
+                        Label("消息免打扰", systemImage: "bell.slash")
+                    }
+                    .disabled(isLeaving)
+                }
+
+                Section {
+                    Button("退出群聊", role: .destructive) {
+                        isPresentingLeaveConfirmation = true
+                    }
+                    .disabled(isLeaving)
+                    if isLeaving { ProgressView("正在退出…") }
+                    if let leaveError {
+                        Text(leaveError).foregroundStyle(.red)
+                    }
+                }
+            }
+            .navigationTitle("聊天信息")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完成") { dismiss() }.disabled(isLeaving)
+                }
+            }
+            .task(id: room.id) { await loadMembers() }
+            .sheet(isPresented: $isPresentingInvite) {
+                InviteMemberSheet(service: service, room: room)
+            }
+            .onChange(of: isPresentingInvite) { _, presented in
+                if !presented { Task { await loadMembers() } }
+            }
+            .sheet(isPresented: $isPresentingNotifications) {
+                RoomNotificationSettingsSheet(service: service, controller: service.roomNotifications, room: room)
+            }
+            .alert("确认退出群聊？", isPresented: $isPresentingLeaveConfirmation) {
+                Button("退出群聊", role: .destructive) { leave() }
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text("退出后将不再收到这个群的消息；如需回来，请让成员重新邀请你。")
+            }
+            .onChange(of: service.userID) { _, _ in dismiss() }
+            .onChange(of: service.isLoggedIn) { _, loggedIn in if !loggedIn { dismiss() } }
+        }
+    }
+
+    private func loadMembers() async {
+        guard !isLeaving else { return }
+        isLoadingMembers = true
+        memberError = nil
+        defer { isLoadingMembers = false }
+        do {
+            let snapshot = try await service.groupMembers(roomID: room.id)
+            guard !Task.isCancelled else { return }
+            members = snapshot
+        } catch is CancellationError {
+            // Session changed or the sheet closed; stale data must not publish.
+        } catch {
+            memberError = "暂时无法读取成员。"
+        }
+    }
+
+    private func leave() {
+        guard !isLeaving else { return }
+        isLeaving = true
+        leaveError = nil
+        Task {
+            defer { isLeaving = false }
+            do {
+                try await service.leaveRoom(room.id)
+                dismiss()
+            } catch is CancellationError {
+                // Logout or session replacement owns the transition.
+            } catch {
+                leaveError = error.localizedDescription
+            }
+        }
+    }
+}
+
+@MainActor
+private struct GroupRoomMemberRow: View {
+    let member: MatrixRoomMember
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if member.isAI {
+                Image(systemName: "sparkles").foregroundStyle(.tint)
+            } else {
+                Image(systemName: "person.crop.circle").foregroundStyle(.secondary)
+            }
+            Text(member.displayName)
+            Spacer()
+            if member.isAI {
+                Text("AI")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .accessibilityLabel(accessibilityText)
+    }
+
+    private var accessibilityText: String {
+        member.isAI ? member.displayName + "，AI" : member.displayName
+    }
+}
 
 @MainActor
 private struct RoomNotificationSettingsSheet: View {
