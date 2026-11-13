@@ -33,6 +33,7 @@ ROOM = '!room-private:' + SERVER
 def seed(app, state='accepted', room=ROOM):
     groups = app.server.group_invites
     groups.enabled = True
+    groups.personas[PERSONA].groups['enabled'] = True
     groups._record(PERSONA, room, OWNER, state)
     return groups._key('room', room)
 
@@ -147,6 +148,29 @@ class RoomsAPITests(unittest.TestCase):
                 event_id='$new-invite'))
             transport.join.assert_not_called()
             self.assertTrue(app.server.group_invites.is_left(PERSONA, ROOM))
+
+    def test_unsupported_methods_authenticate_before_405(self):
+        with MemoryHTTPServer() as app:
+            ref = seed(app)
+            for suffix, methods, allow in (
+                    ('/rooms', ('PATCH', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'TRACE'), 'GET, HEAD'),
+                    ('/rooms/' + ref, ('GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'TRACE'), 'PATCH')):
+                for method in methods:
+                    with self.subTest(method=method, suffix=suffix):
+                        status, headers, result = app.request(method, PATH + suffix)
+                        self.assertEqual(status, 405)
+                        self.assertEqual(headers['Allow'], allow)
+                        if method != 'HEAD':
+                            self.assertEqual(result['code'], 'request.invalid')
+                            self.assertEqual(result['title'], 'Method Not Allowed')
+                            self.assertNotIn(ref, json.dumps(result))
+                        for token, expected in (('other-token', 404), ('bad', 401), ('x' * 32, 403)):
+                            status, headers, result = app.request(method, PATH + suffix,
+                                token=token, scheme='Bearer' if expected == 403 else 'MatrixOpenID')
+                            self.assertEqual(status, expected)
+                            self.assertNotIn('Allow', headers)
+                            if expected == 404 and method != 'HEAD':
+                                self.assertEqual(result['code'], 'persona.not_found')
 
     def test_identity_matrix(self):
         with MemoryHTTPServer() as app:

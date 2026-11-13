@@ -278,6 +278,41 @@ class GroupThrottleTests(unittest.TestCase):
                                 'GET', '/_matrix/client/v3/directory/room/' +
                                 urllib.parse.quote('#botville_conv_group:local.test', safe=''))
 
+    def test_commit_reuses_normalized_target_and_counts_alias_send(self):
+        self.make(group_cooldown_seconds=0, group_max_replies_per_hour=1)
+        self.tr.resolve_room = Mock(return_value=ROOM)
+        record = self.svc._engine.record_group_send
+        def commit(persona, room, at):
+            before = self.tr.resolve_room.call_count
+            self.assertEqual((persona, room), (AIS[0], ROOM))
+            record(persona, room, at)
+            self.assertEqual(self.tr.resolve_room.call_count, before)
+        with patch.object(self.svc._engine, 'record_group_send', side_effect=commit) as tracked:
+            self.assertEqual(self.send('0', 'private-alias')['outcome'], 'delivered')
+            tracked.assert_called_once()
+        self.assertEqual(self.tr.resolve_room.call_args_list[0].args, ('private-alias',))
+        for room in ('private-alias', ROOM):
+            self.blocked(self.evaluate(AIS[0], room), 'group.replies_per_hour.exceeded')
+
+    def test_evaluate_resolution_errors_are_private(self):
+        self.start_http()
+        for code, status, expected in (
+                ('conversation.not_found', 404, 'conversation.not_found'),
+                ('conversation.invalid', 400, 'request.invalid'),
+                ('matrix.unavailable', 500, 'internal.error')):
+            with self.subTest(code=code):
+                self.tr.resolve_room = Mock(side_effect=DeliveryError(code, 'private-alias !private:local.test'))
+                actual, result = self.post('policy/evaluate',
+                    {'persona_id': AIS[0], 'conversation_id': 'private-alias'})
+                self.assertEqual((actual, result['code']), (status, expected))
+                self.assertNotIn('private-alias', json.dumps(result))
+                self.assertNotIn('!private:local.test', json.dumps(result))
+                if status == 404:
+                    self.assertEqual(result['title'], 'Conversation not found')
+                if status == 400:
+                    self.assertEqual(result['errors'][0]['field'], 'conversation_id')
+                    self.assertEqual(result['errors'][0]['code'], 'conversation.invalid')
+
     def test_unresolved_alias_fails_closed(self):
         self.tr.resolve_room = Mock(side_effect=DeliveryError('conversation.not_found', 'private'))
         for action in (self.evaluate, self.send):

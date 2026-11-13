@@ -66,7 +66,7 @@ def room_page(groups, persona_id, query):
         except (ValueError, OverflowError, UnicodeError, binascii.Error):
             raise RoomError() from None
     empty = dict(items=[], next_cursor=None, has_more=False, groups_enabled=False)
-    if not groups.enabled or groups.store is None:
+    if groups.store is None:
         return empty
     where = 'persona_id=? AND key_id=?'
     args = [persona_id, groups.store.group_key_id()]
@@ -84,7 +84,7 @@ def room_page(groups, persona_id, query):
     cursor = (base64.urlsafe_b64encode(json.dumps([rows[-1]['updated_at'], rows[-1]['room_key']],
                 separators=(',', ':')).encode()).decode().rstrip('=') if more else None)
     return dict(items=[room_item(row) for row in rows], next_cursor=cursor,
-                has_more=more, groups_enabled=True)
+                has_more=more, groups_enabled=bool(groups.enabled))
 
 
 def handle(handler, encoded_id, encoded_ref=None):
