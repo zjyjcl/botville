@@ -360,6 +360,10 @@ services:
       # (read-only bind mount below) once that file exists.
       GATEWAY_PERSONAS_FILE: ${GATEWAY_PERSONAS_FILE:-}
       GATEWAY_CONSUMER_ENABLED: ${GATEWAY_CONSUMER_ENABLED:-false}
+      # Max AIs answering one human group message (B line B2.8a); integer
+      # 1-20, default 3 as in gateway/src config.py; DMs unaffected; out of
+      # range refuses to start.
+      GATEWAY_GROUP_MAX_RESPONDERS: ${GATEWAY_GROUP_MAX_RESPONDERS:-3}
       # Four-layer memory (B line PR3a). Empty path = memory off (PR2 ring
       # buffer). To enable, keep it at the TOP LEVEL of the gateway-data
       # volume, e.g. /var/lib/botville-gateway/memory.db: backups checkpoint

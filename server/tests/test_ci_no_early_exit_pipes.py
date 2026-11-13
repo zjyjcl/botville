@@ -10,10 +10,12 @@ output to a file or variable and grep that instead (or read the whole stream).
 
 Early-exit consumers caught (any path prefix, e.g. /usr/bin/head, quoted or
 backslash-escaped names such as "grep", 'head', \\grep or g"rep", and behind
-wrappers: env assignments, `env [-i] [-u NAME]`, `sudo [-u user] [-E] [--]`,
-`doas -u user`, `command`, `exec`, `nohup`, `time`, and multi-call
-binaries `busybox grep` / `toybox head` are checked as the command that
-follows):
+wrappers: env assignments, `env [-i] [-u NAME]`, `env -S 'cmd args'` (the
+string is split and checked as the command), `sudo [-u user] [-E] [--]`
+including clustered short options (`sudo -Eu bob`, `-nu bob`, `-ubob`),
+`doas -u user`, `timeout [-s SIG] [-k DUR] [--foreground] DURATION`,
+`command`, `exec`, `nohup`, `time`, `nice`, and multi-call binaries
+`busybox grep` / `toybox head` are checked as the command that follows):
   - head / ghead (always);
   - any of these run by xargs (`xargs -0 -n1 grep -q`, `xargs -I {} ggrep
     -m1 ... {}`, `busybox xargs grep -q`): xargs' own options are skipped
@@ -27,6 +29,19 @@ follows):
 A consumer is the command right after a single `|` or `|&` (not `||`),
 anywhere in an `&&` / `||` / `;` chain, including the first command of a
 line whose previous line ends in `|`.
+
+Splitting is quote-aware: a `|` (or `;`, `&`, `)`) inside '...' or "..." is
+not a pipe (`grep -E 'a|b'`, `grep 'x| head' f`), while one inside `$(...)` /
+backticks still is, even within double quotes (`out="$(a | grep -q y)"`).
+Words are split with shlex.
+
+Known limitations (conservative: they only ever cut more segments, never fewer):
+  - quotes are tracked per line. A line whose quotes do not balance (prose
+    with an apostrophe in docs, a string continued on the next line) falls
+    back to splitting on every `|`, so a `|` inside such a quote IS cut into
+    a new segment; that segment is then split on whitespace with quotes
+    removed (shlex cannot parse it);
+  - heredoc bodies are scanned like any other line.
 
 Docs are scanned too (whole lines, comments included: readers copy them). If
 a doc ever genuinely needs such a pipe, add it to ALLOWED with the reason.
@@ -76,6 +91,8 @@ PREFIX_ARG_SHORT = {
     "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T", "-R"},
     "doas": {"-u", "-C"},
     "env": {"-u", "-C", "-S"},
+    "timeout": {"-s", "-k"},
+    "gtimeout": {"-s", "-k"},
     "exec": {"-a"},
     "command": set(),
     "nohup": set(),
@@ -86,15 +103,107 @@ PREFIX_ARG_LONG = {
     "sudo": {"--user", "--group", "--host", "--prompt", "--close-from", "--chdir",
              "--role", "--type", "--other-user", "--command-timeout", "--chroot"},
     "env": {"--unset", "--chdir", "--split-string"},
+    "timeout": {"--signal", "--kill-after"},
+    "gtimeout": {"--signal", "--kill-after"},
     "time": {"--format", "--output"},
     "nice": {"--adjustment"},
 }
+# env -S STRING: STRING is itself the command line.
+PREFIX_SPLIT_STRING = {"env": {"-S", "--split-string"}}
+# Words after the options before the command (timeout DURATION cmd ...).
+PREFIX_POSITIONAL = {"timeout": 1, "gtimeout": 1}
 
 
 def _unquote(tok):
     """Shell-level name of a word: quotes removed ("grep", g"rep", 'head')
     and a leading backslash (\\grep bypasses aliases) dropped."""
     return re.sub(r"[\"']", "", tok).lstrip("\\")
+
+
+def _shell_cuts(text, stop_at_terminator):
+    """Positions of unquoted pipes (`|` / `|&`, not `||`) in `text`, or -- with
+    stop_at_terminator -- the index of the first unquoted `;`, `&`, `||`,
+    unmatched `)` or backtick. Quotes nest inside $(...) / backticks.
+    Returns None when the quotes on the line do not balance."""
+    stack = []  # "'", '"', "(" or "`"
+    cuts = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        top = stack[-1] if stack else ""
+        if top == "'":
+            if c == "'":
+                stack.pop()
+            i += 1
+            continue
+        if c == "\\":
+            i += 2
+            continue
+        if top == '"':
+            if c == '"':
+                stack.pop()
+            elif text.startswith("$(", i):
+                stack.append("(")
+                i += 1
+            elif c == "`":
+                stack.append("`")
+            i += 1
+            continue
+        # Unquoted (top level, or inside $( ) / backticks).
+        if c in "'\"":
+            stack.append(c)
+        elif text.startswith("$(", i) or c == "(":
+            stack.append("(")
+            i += 0 if c == "(" else 1
+        elif c == ")":
+            if top == "(":
+                stack.pop()
+            elif stop_at_terminator:
+                return i
+        elif c == "`":
+            if top == "`":
+                stack.pop()
+            elif stop_at_terminator:
+                return i
+            else:
+                stack.append("`")
+        elif c == "|":
+            if text.startswith("||", i):
+                if stop_at_terminator and not stack:
+                    return i
+                i += 2
+                continue
+            if not stop_at_terminator:
+                cuts.append((i, 2 if text.startswith("|&", i) else 1))
+                i += cuts[-1][1]
+                continue
+        elif c in ";&" and stop_at_terminator and not stack:
+            return i
+        i += 1
+    if any(q in stack for q in "'\""):
+        return None
+    return len(text) if stop_at_terminator else cuts
+
+
+def split_pipes(line):
+    """Pipe segments of `line`, quote-aware; per-`|` fallback (see Known
+    limitations) when the line's quotes do not balance."""
+    cuts = _shell_cuts(line, stop_at_terminator=False)
+    if cuts is None:
+        return PIPE_SPLIT.split(line)
+    parts, start = [], 0
+    for pos, width in cuts:
+        parts.append(line[start:pos])
+        start = pos + width
+    parts.append(line[start:])
+    return parts
+
+
+def _cut_segment(segment):
+    end = _shell_cuts(segment, stop_at_terminator=True)
+    if end is None:
+        return SEGMENT_END.split(segment, 1)[0]
+    return segment[:end]
 
 
 def _words(segment):
@@ -106,16 +215,37 @@ def _words(segment):
         return [_unquote(t) for t in segment.split()]
 
 
-def _skip_options(rest, short_arg, long_arg):
-    """Drop leading options (and their separate arguments) plus a `--`."""
-    while rest and rest[0].startswith("-"):
+def _skip_options(rest, short_arg, long_arg, split_string=(), positional=0):
+    """Drop leading options (and their separate arguments) plus a `--`.
+
+    Short options may be clustered (`-Eu bob`, `-nu bob`, `-ubob`, `-0n1`):
+    the first letter that takes an argument ends the cluster, consuming the
+    rest of the word or, when it is last, the next word. Options in
+    `split_string` (env -S / --split-string) carry a command line that is
+    split and put back in front. `positional` words (timeout's DURATION)
+    follow the options."""
+    while rest and rest[0].startswith("-") and rest[0] != "-":
         opt = rest.pop(0)
         if opt == "--":
             break
-        if opt in short_arg or ("=" not in opt and opt in long_arg):
-            if rest:
-                rest.pop(0)
-    return rest
+        if opt.startswith("--"):
+            key, eq, value = opt.partition("=")
+            if key in long_arg:
+                if not eq:
+                    value = rest.pop(0) if rest else ""
+                if key in split_string:
+                    return _words(value) + rest
+            continue
+        for k, letter in enumerate(opt[1:], 1):
+            flag = "-" + letter
+            if flag in short_arg:
+                value = opt[k + 1:]
+                if not value:
+                    value = rest.pop(0) if rest else ""
+                if flag in split_string:
+                    return _words(value) + rest
+                break
+    return rest[positional:]
 
 
 def _command_name(tokens):
@@ -136,7 +266,9 @@ def _command_name(tokens):
                 short_arg, long_arg = XARGS_ARG_SHORT, XARGS_ARG_LONG
             else:
                 short_arg, long_arg = PREFIX_ARG_SHORT[name], PREFIX_ARG_LONG.get(name, set())
-            tokens = _skip_options(tokens[1:], short_arg, long_arg)
+            tokens = _skip_options(tokens[1:], short_arg, long_arg,
+                                   PREFIX_SPLIT_STRING.get(name, ()),
+                                   PREFIX_POSITIONAL.get(name, 0))
             if not tokens:
                 return "", []
             continue
@@ -144,7 +276,7 @@ def _command_name(tokens):
 
 
 def _consumer_is_early_exit(segment):
-    segment = SEGMENT_END.split(segment, 1)[0]
+    segment = _cut_segment(segment)
     name, tokens = _command_name(_words(segment.strip().lstrip("!{(")))
     if not name:
         return False
@@ -168,7 +300,7 @@ def _consumer_is_early_exit(segment):
 def early_exit_in(line, continued=False):
     """True if `line` pipes into an early-exit consumer. `continued`: the
     previous line ended in a single `|`, so the first command is a consumer."""
-    parts = PIPE_SPLIT.split(line)
+    parts = split_pipes(line)
     consumers = parts[1:] if not continued else parts
     return any(_consumer_is_early_exit(p) for p in consumers)
 
@@ -303,6 +435,41 @@ class NoEarlyExitPipesTest(unittest.TestCase):
             "find . | xargs --max-lines grep -q foo",
             "find . | xargs --max-lines=1 head -n1",
             "find . | xargs -0 -i -l1 -e grep -q foo {}",
+            # Clustered short options with an argument (#223 nit).
+            "a | sudo -Eu bob grep -q foo",
+            "a | sudo -nu bob head -1",
+            "a | sudo -ubob grep -q foo",
+            "a | sudo -Eu bob -- grep --quiet foo",
+            "a | sudo -En -g staff -u bob grep -q foo",
+            "find . | xargs -0n1 grep -q foo",
+            "find . | xargs -0I{} grep -q foo {}",
+            "find . | xargs -0I {} grep -q foo {}",
+            # timeout DURATION [options] (#223 nit).
+            "a | timeout 5 grep -q foo",
+            "a | timeout 5s head -n1",
+            "a | timeout -s KILL 5 grep -q foo",
+            "a | timeout -k 2 10 grep -q foo",
+            "a | timeout -sKILL -k2 10 grep -q foo",
+            "a | timeout --signal=TERM --kill-after 3 1m grep -q foo",
+            "a | timeout --foreground --preserve-status 5 head -1",
+            "a | timeout -v 5 sudo -Eu bob grep -q foo",
+            "a | gtimeout 5 grep -q foo",
+            "a | sudo -u bob timeout 5 grep -q foo",
+            # env -S 'command line' (#223 nit).
+            "a | env -S 'grep -q foo'",
+            'a | env -S"grep -q foo"',
+            "a | env -S 'LC_ALL=C grep -q foo'",
+            "a | env --split-string='head -n1'",
+            "a | env --split-string 'grep -m1 foo'",
+            "a | env -i -S 'grep -q foo'",
+            "a | env -S grep -q foo",
+            # Quote-aware splitting keeps real pipes.
+            'out="$(a | grep -q y)"',
+            "out=`a | head -1`",
+            "echo 'x|y' | grep -q y",
+            'a | grep -q "x|y"',
+            "a | grep -q 'x;y'",
+            "printf '%s|' a | head -c1",
         )
         for line in bad:
             with self.subTest(line=line):
@@ -310,6 +477,44 @@ class NoEarlyExitPipesTest(unittest.TestCase):
         self.assertTrue(early_exit_in("  grep -q foo", continued=True))
         self.assertTrue(early_exit_in("  sudo -u bob grep -q foo", continued=True))
         self.assertTrue(early_exit_in("  grep -q foo && echo ok", continued=True))
+
+    def test_unbalanced_quotes_fall_back_to_plain_splitting(self):
+        """shlex cannot parse a segment with an unclosed quote: the line is
+        split on every `|` and words on whitespace with quotes removed. Known
+        limitation: a `|` inside such a quote is cut into a new segment (more
+        segments, never fewer)."""
+        self.assertIsNone(_shell_cuts("echo it's | grep -q x", False))
+        self.assertEqual(split_pipes("echo it's | grep -q x"), ["echo it's ", " grep -q x"])
+        self.assertEqual(_words(" 'grep -q x"), ["grep", "-q", "x"])
+        self.assertEqual(_words(' "head -n1'), ["head", "-n1"])
+        self.assertEqual(_words(" g\"rep -q x"), ["grep", "-q", "x"])
+        fallback_bad = (
+            "echo it's | grep -q x",            # apostrophe in prose
+            "printf 'a | grep -q x",            # unclosed quote, cut anyway
+            'a | "grep -q x',                   # unclosed quote around the name
+            "a | 'head -n1",
+            "a | env -S 'grep -q x",
+            "don't do this: tar -tzf x | grep -qx f",
+        )
+        for line in fallback_bad:
+            with self.subTest(line=line):
+                self.assertTrue(early_exit_in(line), line)
+        fallback_good = (
+            "echo it's | grep -c x",
+            "printf 'a | wc -l",
+            'a | "sort -u',
+        )
+        for line in fallback_good:
+            with self.subTest(line=line):
+                self.assertFalse(early_exit_in(line), line)
+
+    def test_split_pipes_is_quote_aware(self):
+        self.assertEqual(split_pipes("grep -E 'a|b' f"), ["grep -E 'a|b' f"])
+        self.assertEqual(split_pipes('a | grep "x|y" | wc -l'), ["a ", ' grep "x|y" ', " wc -l"])
+        self.assertEqual(split_pipes("a |& b || c"), ["a ", " b || c"])
+        self.assertEqual(split_pipes('o="$(a | b)"'), ['o="$(a ', ' b)"'])
+        self.assertEqual(_cut_segment(" grep -q 'a;b' && c"), " grep -q 'a;b' ")
+        self.assertEqual(_cut_segment(' grep -q y)"'), " grep -q y")
 
     def test_scan_follows_line_continuations_and_chains(self):
         import tempfile
@@ -376,6 +581,28 @@ class NoEarlyExitPipesTest(unittest.TestCase):
             "find . | xargs -e grep -c foo",
             "find . | xargs --replace echo {} -q",
             "find . | xargs --max-lines wc -l",
+            # Clustered sudo options, timeout and env -S with full readers.
+            "a | sudo -Eu grep cat",
+            "a | sudo -Eu bob grep -c foo",
+            "a | sudo -nu head tee x",
+            "find . | xargs -0n1 grep foo",
+            "a | timeout 5 sort",
+            "a | timeout 5 grep foo",
+            "a | timeout -s KILL 5 cat",
+            "a | timeout -k 2 10 wc -l",
+            "a | timeout --signal head 5 cat",
+            "a | timeout -s head 5 tee x",
+            "a | env -S 'sort -u'",
+            'a | env -S"wc -l"',
+            "a | env --split-string='grep -c foo'",
+            "a | env -u head cat",
+            # Quoted pipes are not pipes.
+            "grep -E 'a|b' f",
+            "grep 'x| head' f",
+            'grep "x| grep -q y" f',
+            "awk -F'|' '{print $1}' f",
+            "grep -q 'x;y | head' f",
+            'out="$(a | grep -c y)"',
         )
         for line in good:
             with self.subTest(line=line):

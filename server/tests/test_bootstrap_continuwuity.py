@@ -459,6 +459,7 @@ class InitScriptTest(unittest.TestCase):
 
     MODEL_BLOCK = (
         "GATEWAY_CONSUMER_ENABLED=false\n"
+        "GATEWAY_GROUP_MAX_RESPONDERS=3\n"
         "GATEWAY_MODEL_BASE_URL=\n"
         "GATEWAY_MODEL_NAME=\n"
         "GATEWAY_MODEL_API_KEY=\n"
@@ -514,7 +515,8 @@ class InitScriptTest(unittest.TestCase):
                            ("GATEWAY_PROACTIVE_TICK_SECONDS", "300"),
                            ("GATEWAY_PROACTIVE_MIN_IDLE_MINUTES", "180"),
                            ("GATEWAY_PROACTIVE_MIN_INTERVAL_MINUTES", "240"),
-                           ("GATEWAY_PROACTIVE_PER_TARGET_PER_DAY", "1")):
+                           ("GATEWAY_PROACTIVE_PER_TARGET_PER_DAY", "1"),
+                           ("GATEWAY_GROUP_MAX_RESPONDERS", "3")):
             self.assertEqual(self.env_value(key), value, key)
 
         sentinel = "sentinel-model-key-must-not-print-0123456789"
