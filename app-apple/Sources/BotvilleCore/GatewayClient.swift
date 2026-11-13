@@ -10,6 +10,8 @@ public protocol GatewayClient: ModuleWebSessionProviding {
     func exchangeSessionCookie(capabilityID: String, code: String) async throws -> GatewayCookieExchange
     func personas() async throws -> [MemoryPersona]
     func persona(id: String) async throws -> PersonaDetail
+    func personaState(id: String) async throws -> PersonaState
+    func updatePersonaState(id: String, patch: PersonaStatePatch) async throws -> PersonaState
     func memories(
         personaID: String, layers: [String], scopeKind: String?, counterpart: String?,
         roomID: String?, pinned: Bool?, cursor: String?, limit: Int?
@@ -24,6 +26,10 @@ public protocol GatewayClient: ModuleWebSessionProviding {
 public extension GatewayClient {
     func personas() async throws -> [MemoryPersona] { throw GatewayClientError.invalidResponse }
     func persona(id: String) async throws -> PersonaDetail { throw GatewayClientError.invalidResponse }
+    func personaState(id: String) async throws -> PersonaState { throw GatewayClientError.invalidResponse }
+    func updatePersonaState(id: String, patch: PersonaStatePatch) async throws -> PersonaState {
+        throw GatewayClientError.invalidResponse
+    }
     func memories(
         personaID: String, layers: [String] = [], scopeKind: String? = nil,
         counterpart: String? = nil, roomID: String? = nil, pinned: Bool? = nil,
@@ -228,6 +234,17 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         try await decode(request(["personas", id]), as: PersonaDetail.self)
     }
 
+    public func personaState(id: String) async throws -> PersonaState {
+        try await decode(request(["personas", id, "state"]), as: PersonaState.self)
+    }
+
+    public func updatePersonaState(id: String, patch: PersonaStatePatch) async throws -> PersonaState {
+        guard patch.mood != nil || patch.moodPublic != nil else { throw GatewayClientError.invalidResponse }
+        return try await decode(
+            request(["personas", id, "state"], method: "PATCH", body: JSONEncoder().encode(patch)),
+            as: PersonaState.self)
+    }
+
     public func memories(
         personaID: String, layers: [String] = [], scopeKind: String? = nil,
         counterpart: String? = nil, roomID: String? = nil, pinned: Bool? = nil,
@@ -380,10 +397,13 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
 
     private static func isOpenIDPath(_ segments: [String], method: String) -> Bool {
         guard let first = segments.first else { return false }
-        // Contract 0.3.0 authenticates GET collection and exactly one opaque ID.
+        // Contract 0.4.0 authenticates GET collection/detail and owner state reads/writes.
         return first == "moments" || first == "memories"
             || (first == "personas" && method.caseInsensitiveCompare("GET") == .orderedSame
                 && (segments.count == 1 || (segments.count == 2 && !segments[1].isEmpty)))
+            || (first == "personas" && (method.caseInsensitiveCompare("GET") == .orderedSame
+                || method.caseInsensitiveCompare("PATCH") == .orderedSame)
+                && segments.count == 3 && !segments[1].isEmpty && segments[2] == "state")
     }
 
     /// Minimal raw-data entry point. Resource models and UI are intentionally
@@ -505,6 +525,7 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
     private var issuedCodes: [String: IssuedCode] = [:]
     private let now: @Sendable () -> Date
     private var mockMemories: [Memory] = []
+    private var mockPersonaState: PersonaState?
 
     private struct IssuedCode {
         let capabilityID: String
@@ -554,6 +575,8 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
                 pinned: false, text: nil, key: nil, value: nil, dirty: false, redacted: true,
                 createdAt: date, updatedAt: date, expiresAt: nil),
         ]
+        mockPersonaState = try? GatewayCoding.decoder.decode(
+            PersonaState.self, from: Self.resource("mock-persona-state"))
     }
 
     public func capabilities(locale: String? = nil, appVersion: String? = nil) async throws
@@ -571,7 +594,7 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
     }
 
     public func personas() async throws -> [MemoryPersona] {
-        // #218 head 391a248ee004fda5b57761bc607c662453af7f40, contract 0.3.0.
+        // Contract 0.4.0 list summary; detailed state is loaded separately.
         try GatewayCoding.decoder.decode(MemoryPersonaPage.self,
             from: Self.resource("mock-persona-page")).items
     }
@@ -580,6 +603,23 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
             throw GatewayClientError.problem(status: 404, code: "persona.not_found")
         }
         return .owner(persona)
+    }
+    public func personaState(id: String) async throws -> PersonaState {
+        guard let state = mockPersonaState, state.personaID == id else {
+            throw GatewayClientError.problem(status: 404, code: "persona.not_found")
+        }
+        return state
+    }
+    public func updatePersonaState(id: String, patch: PersonaStatePatch) async throws -> PersonaState {
+        guard patch.mood != nil || patch.moodPublic != nil, let current = mockPersonaState,
+              current.personaID == id else {
+            throw GatewayClientError.problem(status: 404, code: "persona.not_found")
+        }
+        let updated = PersonaState(
+            personaID: id, mood: patch.mood ?? current.mood,
+            moodPublic: patch.moodPublic ?? current.moodPublic, updatedAt: now())
+        mockPersonaState = updated
+        return updated
     }
     public func memories(
         personaID: String, layers: [String] = [], scopeKind: String? = nil,

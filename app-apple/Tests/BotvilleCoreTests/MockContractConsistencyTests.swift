@@ -15,7 +15,7 @@ final class MockContractConsistencyTests: XCTestCase {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
-        for name in ["capability-manifest", "card"] {
+        for name in ["capability-manifest", "card", "persona-page", "persona-state"] {
             let bundled = root.appendingPathComponent(
                 "app-apple/Sources/BotvilleCore/Resources/mock-\(name).json")
             let contract = root.appendingPathComponent("gateway/openapi/examples/\(name).json")

@@ -162,12 +162,14 @@ private struct PersonaMemoryView: View {
     let persona: MemoryPersona
     let client: any GatewayClient
     @StateObject private var model: MemoryListModel
+    @StateObject private var mood: PersonaMoodController
     @State private var pendingDeletion: Memory?
 
     init(persona: MemoryPersona, client: any GatewayClient) {
         self.persona = persona
         self.client = client
         _model = StateObject(wrappedValue: MemoryListModel(personaID: persona.id, client: client))
+        _mood = StateObject(wrappedValue: PersonaMoodController(personaID: persona.id, client: client))
     }
 
     var body: some View {
@@ -178,6 +180,38 @@ private struct PersonaMemoryView: View {
                 }
                 Label(MemoryPresentationPolicy.ownerExplanationText, systemImage: "info.circle")
                     .font(.footnote).foregroundStyle(.secondary)
+            }
+            if !mood.isUnavailable {
+                Section("当前心情") {
+                    if mood.isLoading && mood.state == nil {
+                        ProgressView("正在加载…")
+                    } else if let state = mood.state {
+                        HStack {
+                            Label(state.mood?.label ?? "未设置", systemImage: state.mood?.symbolName ?? "face.dashed")
+                                .foregroundStyle(state.mood == nil ? .secondary : memoryAccent)
+                            Spacer()
+                            Menu("手动设置心情") {
+                                ForEach(PersonaMood.allCases, id: \.self) { value in
+                                    Button {
+                                        Task { await mood.setMood(value) }
+                                    } label: {
+                                        Label(value.label, systemImage: value.symbolName)
+                                    }
+                                }
+                            }
+                            .disabled(mood.isUpdating || mood.isLoading)
+                        }
+                        Toggle("对他人显示心情", isOn: Binding(
+                            get: { state.moodPublic },
+                            set: { value in Task { await mood.setMoodPublic(value) } }
+                        ))
+                        .disabled(mood.isUpdating || mood.isLoading)
+                    }
+                    if let message = mood.errorMessage {
+                        Label(message, systemImage: "exclamationmark.triangle")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
             }
             if let message = model.errorMessage {
                 Section {
@@ -244,8 +278,16 @@ private struct PersonaMemoryView: View {
             }
         }
         .navigationTitle(persona.displayName)
-        .task { await model.load(reset: true) }
-        .refreshable { await model.load(reset: true) }
+        .task {
+            async let memories: () = model.load(reset: true)
+            async let state: () = mood.load()
+            _ = await (memories, state)
+        }
+        .refreshable {
+            async let memories: () = model.load(reset: true)
+            async let state: () = mood.load()
+            _ = await (memories, state)
+        }
         .confirmationDialog(
             pendingDeletion?.layer == "summary" ? "重置这份摘要？" : "删除这条记忆？",
             isPresented: Binding(
