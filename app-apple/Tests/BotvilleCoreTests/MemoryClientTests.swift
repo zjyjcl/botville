@@ -51,7 +51,7 @@ final class MemoryClientTests: XCTestCase {
         XCTAssertNil(page.items[0].value)
         XCTAssertTrue(page.items[0].redacted)
         XCTAssertFalse(page.items[0].canMutate)
-        XCTAssertFalse(page.items[0].canPin)
+        XCTAssertFalse(page.items[0].actions.canTogglePin)
     }
 
     func testDecodedRedactedMemoryOffersDeleteAndExistingPinRemovalOnly() throws {
@@ -65,7 +65,7 @@ final class MemoryClientTests: XCTestCase {
             XCTAssertTrue(memory.actions.canDelete)
             XCTAssertFalse(memory.actions.canPin)
             XCTAssertEqual(memory.actions.canUnpin, pinned)
-            XCTAssertEqual(memory.canPin, pinned)
+            XCTAssertEqual(memory.actions.canTogglePin, pinned)
         }
     }
 
@@ -282,17 +282,17 @@ final class MemoryClientTests: XCTestCase {
     func testMockMemorySupportsPreviewPaginationFiltersAndSummaryGuard() async throws {
         let client = MockGatewayClient()
         let first = try await client.memories(
-            personaID: "persona_demo", layers: [], scopeKind: nil, counterpart: nil, roomID: nil,
+            personaID: "@ai_demo:example.invalid", layers: [], scopeKind: nil, counterpart: nil, roomID: nil,
             pinned: nil, cursor: nil, limit: 1)
         XCTAssertEqual(first.items.count, 1)
         XCTAssertTrue(first.hasMore)
         let group = try await client.memories(
-            personaID: "persona_demo", layers: ["summary"], scopeKind: "group", counterpart: nil,
+            personaID: "@ai_demo:example.invalid", layers: ["summary"], scopeKind: "group", counterpart: nil,
             roomID: "!example:invalid", pinned: nil, cursor: nil, limit: nil)
         let summary = try XCTUnwrap(group.items.first)
         XCTAssertTrue(summary.redacted)
         XCTAssertNil(summary.text)
-        XCTAssertFalse(summary.canPin)
+        XCTAssertFalse(summary.actions.canTogglePin)
         do {
             _ = try await client.pinMemory(id: summary.id)
             XCTFail("summary cannot pin")
@@ -325,23 +325,127 @@ final class MemoryClientTests: XCTestCase {
         }
     }
 
-    func testPersonasFollowFlatContractPagination() async throws {
-        let first = Data(
-            "{\"items\":[{\"id\":\"one\",\"display_name\":\"第一个 AI\"}],\"has_more\":true,\"next_cursor\":\"next\"}"
-                .utf8)
-        let last = Data(
-            "{\"items\":[{\"id\":\"two\",\"display_name\":\"第二个 AI\"}],\"has_more\":false,\"next_cursor\":null}"
-                .utf8)
+    // Pinned #215 schema/example: 1d4fc06a41870420ae9cbdc2b01ad0bde421e1ab.
+    private func personaPageData(id: String = "@ai_demo:example.invalid", next: String? = nil,
+                                 empty: Bool = false) throws -> Data {
+        let resources = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/BotvilleCore/Resources/mock-persona-page.json")
+        var page = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: resources)) as? [String: Any])
+        var items = try XCTUnwrap(page["items"] as? [[String: Any]])
+        items[0]["id"] = id
+        page["items"] = empty ? [] : items
+        page["next_cursor"] = next.map { $0 as Any } ?? NSNull()
+        page["has_more"] = next != nil
+        return try JSONSerialization.data(withJSONObject: page)
+    }
+
+    func testPersonasFollowFlatContractPaginationWithOpenIDOnly() async throws {
+        let first = try personaPageData(id: "@ai_one:example.invalid", next: "next")
+        let last = try personaPageData(id: "@ai_two:example.invalid")
         let (client, recorder, source) = try self.client(bodies: [first, last])
         let values = try await client.personas()
-        XCTAssertEqual(values.map(\.id), ["one", "two"])
+        XCTAssertEqual(values.map(\.id), ["@ai_one:example.invalid", "@ai_two:example.invalid"])
         XCTAssertEqual(recorder.requests.map { $0.url?.path }, ["/v1/personas", "/v1/personas"])
         let query = URLComponents(
-            url: try XCTUnwrap(recorder.requests.last?.url), resolvingAgainstBaseURL: false)?
-            .queryItems
+            url: try XCTUnwrap(recorder.requests.last?.url), resolvingAgainstBaseURL: false)?.queryItems
         XCTAssertEqual(query, [URLQueryItem(name: "cursor", value: "next")])
+        XCTAssertTrue(recorder.requests.allSatisfy {
+            $0.value(forHTTPHeaderField: "Authorization")?.hasPrefix("MatrixOpenID ") == true
+                && !($0.value(forHTTPHeaderField: "Authorization")?.contains("Bearer") ?? true)
+        })
         let issued = await source.count
-        XCTAssertEqual(issued, 0)
+        XCTAssertEqual(issued, 1)
+    }
+
+    func testPersonasRouteSelectionIsExactAndGETOnly() throws {
+        for base in ["https://gateway.example.invalid", "https://gateway.example.invalid/prefix/v1/"] {
+            let client = try HTTPGatewayClient(baseURL: base, token: "synthetic-site")
+            let list = try client.request(["personas"], query: [URLQueryItem(name: "cursor", value: "next")])
+            XCTAssertTrue(try client.isOpenIDRequest(list))
+            XCTAssertNil(list.value(forHTTPHeaderField: "Authorization"))
+            for segments in [["personasx"], ["personas", "id"], ["personas/id"], ["personas?x"], ["other", "personas"], ["cards"]] {
+                let request = try client.request(segments, query: [URLQueryItem(name: "path", value: "/v1/personas")])
+                XCTAssertFalse(try client.isOpenIDRequest(request))
+                XCTAssertTrue(request.value(forHTTPHeaderField: "Authorization")?.hasPrefix("Bearer ") == true)
+            }
+            for method in ["POST", "PUT", "DELETE", "HEAD"] {
+                let request = try client.request(["personas"], method: method)
+                XCTAssertFalse(try client.isOpenIDRequest(request))
+                XCTAssertTrue(request.value(forHTTPHeaderField: "Authorization")?.hasPrefix("Bearer ") == true)
+            }
+            XCTAssertThrowsError(try client.isOpenIDRequest(URLRequest(url: URL(string: "https://other.invalid/v1/personas")!)))
+        }
+    }
+
+    func testPersonasRefreshOnceAndReuseGETServerRetry() async throws {
+        let invalid = Data("{\"code\":\"auth.invalid_token\"}".utf8)
+        let waits = MemoryWaits()
+        let (client, recorder, source) = try self.client(statuses: [401, 500, 500, 500, 200],
+            bodies: [invalid, MemoryRecorder.internalError, MemoryRecorder.internalError,
+                     MemoryRecorder.internalError, try personaPageData()], sleep: { await waits.record($0) })
+        _ = try await client.personas()
+        XCTAssertEqual(recorder.requests.count, 5)
+        let issued = await source.count
+        let delays = await waits.values
+        XCTAssertEqual(issued, 2)
+        XCTAssertEqual(delays, [1, 2, 4])
+        XCTAssertTrue(recorder.requests.allSatisfy { $0.httpMethod == "GET" && $0.url == recorder.requests.first?.url })
+        XCTAssertTrue(recorder.requests.allSatisfy { $0.value(forHTTPHeaderField: "Authorization")?.hasPrefix("MatrixOpenID ") == true })
+        let (broken, failed, _) = try self.client(statuses: [401, 401], bodies: [invalid, invalid])
+        do { _ = try await broken.personas(); XCTFail("only one auth refresh") }
+        catch { XCTAssertEqual(error as? GatewayClientError, .serverAuthMisconfigured) }
+        XCTAssertEqual(failed.requests.count, 2)
+    }
+
+    func testPersonasMissingProviderDoesNotFallBackToSiteBearer() async throws {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MemoryURLProtocol.self]
+        let recorder = MemoryRecorder(statuses: [200], bodies: [try personaPageData()])
+        MemoryURLProtocol.recorder = recorder
+        let client = try HTTPGatewayClient(baseURL: "https://gateway.example.invalid", token: "synthetic-site",
+            session: URLSession(configuration: config))
+        do { _ = try await client.personas(); XCTFail("identity required") }
+        catch { XCTAssertEqual(error as? MatrixOpenIDError, .providerUnavailable) }
+        XCTAssertTrue(recorder.requests.isEmpty)
+    }
+
+    @MainActor
+    func testPersonaListDistinguishesForbiddenFromEmptyAndClearsStaleRows() async throws {
+        let denied = Data("{\"code\":\"persona.not_owned\"}".utf8)
+        let (client, recorder, _) = try self.client(statuses: [200, 403, 200],
+            bodies: [try personaPageData(), denied, try personaPageData(empty: true)])
+        let model = PersonaListModel(client: client)
+        await model.load()
+        XCTAssertEqual(model.personas.count, 1)
+        XCTAssertFalse(model.isEmpty)
+        await model.load()
+        XCTAssertEqual(model.errorMessage, "当前身份无权查看我的 AI，请重新登录后重试。")
+        XCTAssertTrue(model.personas.isEmpty)
+        XCTAssertFalse(model.isEmpty, "permission denial must remain an error, not a successful empty list")
+        XCTAssertEqual(recorder.requests.count, 2, "403 must not refresh/retry")
+        await model.load()
+        XCTAssertNil(model.errorMessage)
+        XCTAssertTrue(model.isEmpty)
+        XCTAssertFalse(model.isLoading)
+    }
+
+    func testMockPersonaMatchesNineFieldSummaryAndMemoryIDs() async throws {
+        let client = MockGatewayClient()
+        let personas = try await client.personas()
+        let persona = try XCTUnwrap(personas.first)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let encoded = try encoder.encode(persona)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertEqual(Set(object.keys), ["id", "owner_id", "display_name", "kind", "status", "revision", "created_at", "updated_at", "visibility"])
+        XCTAssertEqual(persona.kind, "custom")
+        XCTAssertEqual(persona.status, "active")
+        XCTAssertEqual(persona.revision, 1)
+        XCTAssertEqual(persona.visibility, "private")
+        let page = try await client.memories(personaID: persona.id)
+        XCTAssertFalse(page.items.isEmpty)
+        XCTAssertTrue(page.items.allSatisfy { $0.personaID == persona.id })
     }
 
     func testContractMemoryExamplesDecode() throws {

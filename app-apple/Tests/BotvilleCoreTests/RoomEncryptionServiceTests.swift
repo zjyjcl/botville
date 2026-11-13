@@ -227,6 +227,17 @@ final class RoomEncryptionServiceTests: XCTestCase {
         XCTAssertTrue(room.invitedUsers.isEmpty)
     }
 
+    func testDuplicateCurrentRoomIDsKeepLastSecurityPublication() {
+        let first = MatrixRoom(id: "!room:matrix.test", name: "first", encryption: .unencrypted, participants: .humanOnly)
+        let latest = MatrixRoom(id: first.id, name: "latest", encryption: .encrypted, participants: .unknown)
+        let merged = MatrixService.mergingSecurityUpdates(refreshed: [first], current: [first, latest],
+            revisionsAtStart: [:], currentRevisions: [first.id: UUID()], observedEncryptedRooms: [])
+        XCTAssertEqual(merged.count, 1)
+        XCTAssertEqual(merged.first?.encryption, .encrypted)
+        XCTAssertEqual(merged.first?.participants, .unknown)
+        XCTAssertEqual(merged.first?.name, first.name)
+    }
+
     func testSecurityPublicationDuringRoomRefreshWinsOverStaleSnapshot() {
         let stale = MatrixRoom(id: "!room:matrix.test", name: "Fresh metadata", unreadCount: 4,
                                encryption: .unencrypted, participants: .humanOnly)

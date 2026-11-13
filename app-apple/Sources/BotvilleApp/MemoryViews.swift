@@ -6,32 +6,10 @@ import SwiftUI
 
 private let memoryAccent = Color(red: 26 / 255, green: 173 / 255, blue: 142 / 255)
 
-@MainActor
-private final class PersonaListModel: ObservableObject {
-    @Published var personas: [MemoryPersona] = []
-    @Published var isLoading = false
-    @Published var errorMessage: String?
-    fileprivate let client: any GatewayClient
-
-    init(client: any GatewayClient) { self.client = client }
-
-    func load() async {
-        guard !isLoading else { return }
-        isLoading = true
-        errorMessage = nil
-        defer { isLoading = false }
-        do { personas = try await client.personas() } catch {
-            errorMessage = userFacingMemoryError(error, fallback: "暂时无法加载 AI，请稍后重试。")
-        }
-    }
-}
-
 struct MyAIListView: View {
-    private let manifest: GatewayCapabilityManifest?
     @StateObject private var model: PersonaListModel
 
-    init(client: any GatewayClient, manifest: GatewayCapabilityManifest?) {
-        self.manifest = manifest
+    init(client: any GatewayClient) {
         _model = StateObject(wrappedValue: PersonaListModel(client: client))
     }
 
@@ -47,7 +25,7 @@ struct MyAIListView: View {
                     ProgressView("正在加载…")
                     Spacer()
                 }
-            } else if model.personas.isEmpty {
+            } else if model.isEmpty {
                 ContentUnavailableView(
                     "暂无 AI", systemImage: "person.2", description: Text("可管理记忆的 AI 将显示在这里。"))
             } else {

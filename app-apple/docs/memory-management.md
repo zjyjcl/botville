@@ -34,17 +34,31 @@ E6 写事实只有客户端接口与测试，本轮没有编辑页面。
 规范身份域；尚无可信别名清单，因此其他身份域一律按跨服/未知处理。
 缺失、`false`、读取失败、跨服或无法确定本服时均不显示；会话切换后的旧结果丢弃。
 主人 `PersonaMemoryView` 固定显示「私聊内容是否可见由服务端开关决定」。
-当前 schema 的 `default: true` 与 App 的默认隐藏存在差异：
-**待网关线开关落地后对齐**。本轮不修改 schema；示例和 App mock 都显式为 `false`。
+#211 已将 `owner_can_read_dm` 的 schema 默认值改为 `false`，已在 main
+`a7d5a7f` 的 `gateway/openapi/gateway.v1.yaml` 核对；App 缺失字段仍默认隐藏。
 新增能力使 manifest 从 1.2.0 升到 1.3.0（minor），契约版本为 0.2.0。
 
 ## 集成边界
 
-基线 #209 已提供主人记忆端点，但当前 `http_server.py` 尚未实现契约中的
-`/personas` 路由。契约规定默认仅返回自己拥有的角色，`owner_id` 仅对本服所有者生效；
-客户端不传 owner_id，仍沿用普通网关凭据选路。这里保留契约客户端和错误提示；
-线上 AI 列表、终端用户发现自己角色的
-完整路径仍需网关后续提供。所有权最终由记忆端点校验，App 不推断或绕过权限。
+GET `/v1/personas` 按 #215 HEAD `1d4fc06a41870420ae9cbdc2b01ad0bde421e1ab`
+的 `PersonaSummary` / `PersonaPage` 和 `examples/persona-page.json` 对齐：
+九字段摘要，Matrix user ID 作为 id，平铺的 `next_cursor` / `has_more`。
+App Mock 资源逐字节采用该示例，Mock 记忆同步使用对应 persona id；真实请求不注入示例。
+
+只把 GET 集合精确路径加入 MatrixOpenID，移除站点 Bearer，复用令牌刷新、
+invalid_token 最多重试一次，以及 GET 或带幂等键写入的 500 重试策略。
+正常分页 query 不影响选择；其他路径 query 中的 personas、personasx、编码分隔符、
+`/personas/{id}` 子路径及非 GET 操作不纳入。#215 仅实现 GET 集合，其他操作保持 404。
+403 `persona.not_owned` 在「我的 AI」展示中文权限错误和重试入口，成功空列表展示「暂无 AI」。
+#215 尚未合入时，真实列表仍依赖网关合入并部署该实现；App 不推断或绕过所有权。
+
+AI 资料页仅将 join 计入活跃成员；invite 不作 AI 对方，也不增加活跃人数。
+跨服判断刻意按完整 server_name 精确比较，别名/多域名也按跨服隐藏披露。
+加密安全策略里的 join/invite 检查仍保留：它防止给已邀请的 AI 开启不兼容加密，
+不是资料页的活跃人数判定，不在本次 nit 中放宽。
+DEBUG 未读快照和安全状态合并索引对重复房间 ID 均取数组中最后值。
+全仓其余 `uniqueKeysWithValues` 仅在 GatewayTests 的固定 manifest 样本断言中，
+当前键唯一；保留测试的重复键失败语义，不用于 SDK/网络运行时输入。
 
 本轮验收范围是单元测试、示例校验、Release 隔离和无签名的 iOS 模拟器/macOS
 Debug、Release 构建，不包含真机、APNs、生产网关或实际聊天数据验收。

@@ -23,6 +23,8 @@ public enum MemoryPresentationPolicy {
     /// Only a capability from the paired local gateway can describe a local AI.
     /// Compare complete Matrix server names (including any port), not URL hosts
     /// or suffixes. The caller obtains the local name from the signed-in MXID.
+    /// Aliases/multiple domains intentionally count as cross-server and hide
+    /// disclosure: without a trusted alias mapping we deliberately err on caution.
     public static func shouldShowOwnerDisclosure(
         in manifest: GatewayCapabilityManifest?, aiUserID: String, localServerName: String?
     ) -> Bool {

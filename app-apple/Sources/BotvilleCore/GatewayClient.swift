@@ -363,15 +363,17 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         }
         if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         if let idempotencyKey { request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key") }
-        if authorize, !Self.isOpenIDPath(segments), let token {
+        if authorize, !Self.isOpenIDPath(segments, method: method), let token {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
         return request
     }
 
-    private static func isOpenIDPath(_ segments: [String]) -> Bool {
+    private static func isOpenIDPath(_ segments: [String], method: String) -> Bool {
         guard let first = segments.first else { return false }
+        // #215 implements only the GET collection; persona subresources remain 404.
         return first == "moments" || first == "memories"
+            || (segments == ["personas"] && method.caseInsensitiveCompare("GET") == .orderedSame)
     }
 
     /// Minimal raw-data entry point. Resource models and UI are intentionally
@@ -385,7 +387,7 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
     }
 
     /// Match the first API path segment relative to this gateway's base prefix.
-    /// Query strings and similar names (momentsx) never select credentials.
+    /// Personas is GET collection-only. Query strings and similar names never select credentials.
     func isOpenIDRequest(_ request: URLRequest) throws -> Bool {
         guard let url = request.url,
             let candidate = URLComponents(url: url, resolvingAgainstBaseURL: false),
@@ -394,6 +396,9 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
             candidate.port == base.port,
             let momentsURL = try self.request(["moments"]).url,
             let memoriesURL = try self.request(["memories"]).url,
+            let personasURL = try self.request(["personas"]).url,
+            let personas = URLComponents(url: personasURL, resolvingAgainstBaseURL: false)?
+                .percentEncodedPath,
             let moments = URLComponents(url: momentsURL, resolvingAgainstBaseURL: false)?
                 .percentEncodedPath,
             let memories = URLComponents(url: memoriesURL, resolvingAgainstBaseURL: false)?
@@ -402,6 +407,7 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         let path = candidate.percentEncodedPath
         return path == moments || path.hasPrefix(moments + "/") || path == memories
             || path.hasPrefix(memories + "/")
+            || (path == personas && request.httpMethod?.caseInsensitiveCompare("GET") == .orderedSame)
     }
 
     /// Kept for existing callers; memory selection is handled by isOpenIDRequest.
@@ -514,19 +520,19 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
         let owner = MemorySource(kind: "owner", eventID: nil, sender: nil, role: nil, model: nil)
         mockMemories = [
             Memory(
-                id: "mf_0123456789abcdef", personaID: "persona_demo", layer: "profile",
+                id: "mf_0123456789abcdef", personaID: "@ai_demo:example.invalid", layer: "profile",
                 scope: MemoryScope(kind: "dm", counterpart: "@human:example.invalid", roomID: nil),
                 visibility: "dm_only", trust: "owner", source: owner, pinned: true, text: nil,
                 key: "likes", value: "示例值", dirty: false, redacted: false, createdAt: date,
                 updatedAt: date, expiresAt: nil),
             Memory(
-                id: "mr_0123456789abcdef", personaID: "persona_demo", layer: "recent",
+                id: "mr_0123456789abcdef", personaID: "@ai_demo:example.invalid", layer: "recent",
                 scope: MemoryScope(kind: "dm", counterpart: "@human:example.invalid", roomID: nil),
                 visibility: "dm_only", trust: "trusted", source: owner, pinned: false,
                 text: "示例近期记忆", key: nil, value: nil, dirty: false, redacted: false,
                 createdAt: date, updatedAt: date, expiresAt: nil),
             Memory(
-                id: "ms_0123456789abcdef", personaID: "persona_demo", layer: "summary",
+                id: "ms_0123456789abcdef", personaID: "@ai_demo:example.invalid", layer: "summary",
                 scope: MemoryScope(kind: "group", counterpart: nil, roomID: "!example:invalid"),
                 visibility: "scope_only", trust: "derived",
                 source: MemorySource(
@@ -551,7 +557,9 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
     }
 
     public func personas() async throws -> [MemoryPersona] {
-        [MemoryPersona(id: "persona_demo", displayName: "示例 AI")]
+        // #215 head 1d4fc06a41870420ae9cbdc2b01ad0bde421e1ab, PersonaSummary/PersonaPage.
+        try GatewayCoding.decoder.decode(MemoryPersonaPage.self,
+            from: Self.resource("mock-persona-page")).items
     }
     public func memories(
         personaID: String, layers: [String] = [], scopeKind: String? = nil,
@@ -591,7 +599,7 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
             throw GatewayClientError.problem(status: 404, code: "memory.not_found")
         }
         let old = mockMemories[index]
-        guard !pinned || old.canPin else {
+        guard !pinned || old.actions.canTogglePin else {
             throw GatewayClientError.problem(status: 422, code: "memory.not_pinnable")
         }
         let value = Memory(

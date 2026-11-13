@@ -56,6 +56,22 @@ final class AIProfileTests: XCTestCase {
         ))
     }
 
+    func testInvitesDoNotCountAsActiveCounterpartsOrExtraMembers() {
+        let joined: [AIProfileMember] = [.init(userID: local, isJoined: true), .init(userID: ai, isJoined: true)]
+        XCTAssertEqual(AIProfileEligibility.aiCounterpartID(
+            isDirect: true, localUserID: local,
+            members: joined + [.init(userID: "@invited:matrix.test", isJoined: false)], policy: policy
+        ), ai)
+        XCTAssertNil(AIProfileEligibility.aiCounterpartID(
+            isDirect: true, localUserID: local,
+            members: [.init(userID: local, isJoined: true), .init(userID: ai, isJoined: false)], policy: policy
+        ))
+        XCTAssertNil(AIProfileEligibility.aiCounterpartID(
+            isDirect: true, localUserID: local,
+            members: [.init(userID: local, isJoined: false), .init(userID: ai, isJoined: true)], policy: policy
+        ))
+    }
+
     func testDefaultAndOverrideRulesRecognizeCrossServerAI() {
         let federatedAI = "@ai_helper:other.test"
         let members: [AIProfileMember] = [.init(userID: local, isJoined: true), .init(userID: federatedAI, isJoined: true)]
