@@ -755,6 +755,8 @@ jobs:
               # default; init.sh generates none of them (the API key is
               # deployer-supplied and must never ship a value).
               "GATEWAY_CONSUMER_ENABLED": "false",
+              # Group reply cap (B line B2.8a): 1-20, default 3.
+              "GATEWAY_GROUP_MAX_RESPONDERS": "3",
               "GATEWAY_MODEL_BASE_URL": "",
               "GATEWAY_MODEL_NAME": "",
               "GATEWAY_MODEL_API_KEY": "",
