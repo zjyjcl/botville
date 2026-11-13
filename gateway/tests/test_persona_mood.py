@@ -7,6 +7,7 @@ import os
 import tempfile
 import traceback
 import unittest
+from unittest.mock import patch
 from types import SimpleNamespace
 import json
 import urllib.error
@@ -134,6 +135,29 @@ class MoodHTTPTests(unittest.TestCase):
             response = exc
         with response:
             return response.status, dict(response.headers), json.load(response)
+
+    def test_detail_storage_failure_returns_null_for_owner_and_public(self):
+        with PersonaHTTP() as app:
+            store = MemoryStore(":memory:")
+            self.addCleanup(store.close)
+            app.server.mood_service = MoodService(store, 240)
+            app.server.mood_service.patch(self.PERSONA, mood="happy")
+            for caller in (OWNER, OTHER):
+                with self.subTest(caller=caller):
+                    app.server.persona_detail_verifier.verify = lambda header: ('ok', caller)
+                    path = '/v1/personas/%40ai_a%3Aexample.invalid'
+                    status, _, expected = self._request(app, path)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(expected['mood'], 'happy')
+                    expected['mood'] = None
+                    with patch.object(app.server.mood_service, '_row', side_effect=RuntimeError(
+                            'KEY_SENTINEL BODY_SENTINEL BIO_SENTINEL')), self.assertLogs(
+                            'botville_gateway.personas_list', level='WARNING') as logs:
+                        status, _, body = self._request(app, path)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(body, expected)
+                    self.assertEqual(logs.output, ['WARNING:botville_gateway.personas_list:'
+                                                  'Persona detail mood unavailable; returning null'])
 
     def test_disabled_owner_state_and_unknown_subpath(self):
         with PersonaHTTP() as app:
