@@ -191,7 +191,7 @@ App                          网关                        模块网页（WKWebV
   已在本实现落地（`caller_identity.log_startup_warnings`，随 PR-D）。
 - **重复 `caller_id`**：拒绝启动，dev 模式也不例外；错误信息不含 token。
 - **caller token 与 legacy token 冲突**：某个 caller token **等于** `GATEWAY_AUTH_TOKEN`
-  → **拒绝启动**（dev 模式也不例外；错误信息不含 token；否则无法判定该请求的身份边界）。
+  → **拒绝启动**（dev 模式也不例外；错误信息不含 token；否则无法判定该请求的身份边界；两套语义不可重载同一值）。
 - **legacy 关闭且 caller token 为空**：`GATEWAY_LEGACY_TOKEN_ENABLED=false` 而
   `GATEWAY_CALLER_TOKENS` 为空时，**所有需要鉴权的请求一律 `401 auth.invalid_token`**
   （部署不提供任何可用凭据），启动打一条 **WARNING**（不拒绝启动：可能是刻意的封闭部署）。
