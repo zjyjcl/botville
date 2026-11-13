@@ -1,0 +1,1 @@
+{"type":"urn:botville:error:memory.disabled","title":"Memory disabled","status":404,"detail":"Memory module is disabled.","instance":"/v1/memories","code":"memory.disabled","request_id":"req_memory_disabled","retry_after_seconds":0}

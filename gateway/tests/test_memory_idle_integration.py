@@ -19,7 +19,7 @@ from botville_gateway.memory.worker import IdleSignal, MemoryIdleWorker
 
 class Service:
     def __init__(self): self.authorized = []; self.used = []
-    def authorize_memory_call(self, persona, tokens):
+    def authorize_memory_call(self, persona, tokens, conversation_id=None):
         self.authorized.append((persona, tokens)); return True
     def record_memory_usage(self, **kwargs): self.used.append(kwargs)
 

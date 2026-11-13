@@ -106,6 +106,10 @@ continuwuity 仍用 `memory`（尚无文件注册）。运维注意见
 | PUT | `/v1/limits` | `putLimits` | 写入 owner / peer 层（平台层只读） |
 | GET | `/v1/usage` | `getUsage` | 用量汇总、预算与分桶 |
 | GET | `/v1/usage/events` | `listUsageEvents` | 用量账单明细分页（不含正文） |
+| GET | `/v1/memories` | `listOwnerMemories` | owner 查看角色记忆（分页、筛选，`no-store`） |
+| GET/DELETE | `/v1/memories/{memory_id}` | `getOwnerMemory` / `deleteOwnerMemory` | 读取或删除一条记忆 |
+| PUT/DELETE | `/v1/memories/{memory_id}/pin` | `pinOwnerMemory` / `unpinOwnerMemory` | 固定或取消固定（幂等） |
+| PUT | `/v1/memories/facts` | `putOwnerMemoryFact` | owner 设置允许的长期事实 |
 | PUT | `/_matrix/app/v1/transactions/{txnId}` | *（不在 OpenAPI）* | Matrix AS 事务接收（幂等落库）。**根路径**，不带 `GATEWAY_HTTP_PATH_PREFIX`；鉴权只用 `Authorization: Bearer <GATEWAY_HS_TOKEN>` 请求头（不认 `?access_token=`）；错误体为 Matrix `{"errcode","error"}`。见 [contract.md](docs/contract.md) §1.7 |
 | POST | `/_matrix/app/v1/ping` | *（不在 OpenAPI）* | Matrix AS 连通性探测，返回 `{}`。同样**根路径**、`Authorization: Bearer <GATEWAY_HS_TOKEN>`、Matrix 错误格式。见 [contract.md](docs/contract.md) §1.7 |
 
@@ -307,7 +311,7 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_MEMORY_RETENTION_DAYS` | `90` | 保留天数 ≥1；pinned 不到期，撤回仍删除 |
 | `GATEWAY_MEMORY_PURGE_INTERVAL_SECONDS` | `86400` | 启动清理及后台间隔（秒）；0 关闭清理，非零 ≥60；模块关闭也校验 |
 | `GATEWAY_MEMORY_SUMMARY_MODEL` | `GATEWAY_MODEL_NAME` | 空闲滚动摘要/事实抽取所用模型名；空时复用聊天模型名。仅模型已配置时启用这些整理任务 |
-| `GATEWAY_EMBEDDING_BASE_URL` | `GATEWAY_MODEL_BASE_URL` | OpenAI 兼容 embeddings 基址；embedding 模型已配置但有效基址为空，拒绝启动 |
+| `GATEWAY_EMBEDDING_BASE_URL` | `GATEWAY_MODEL_BASE_URL` | OpenAI 兼容 embeddings 基址；embedding 模型已配置但有效基址为空，拒绝启动。**警告：配置独立 embedding 提供方时，DM 和群聊文本会发送给该提供方；复用模型端点时发送给同一个模型提供方。** |
 | `GATEWAY_EMBEDDING_MODEL` | 空 | embedding 模型名；空 = 第④层向量检索关闭 |
 | `GATEWAY_EMBEDDING_API_KEY` | `GATEWAY_MODEL_API_KEY` | 可选 embedding 密钥；空时复用聊天模型密钥；不进日志、`/health`、错误体或 `repr` |
 | `GATEWAY_EMBEDDING_DIM` | `0` | `0` 接受首个响应维度并固定；正整数要求响应维度匹配；负数拒绝启动 |
@@ -353,12 +357,27 @@ Schema 版本表为 `memory_schema`；已有 v1/v2 后的加法迁移建立 `mem
 既有策略预算预检。记忆读写失败会重试，不回退到可能混合作用域的房间历史。
 
 PR3b 仍不在回复热路径调用档案抽取模型：独立 `memory-idle-worker` 仅在消费者 120 秒没有
-新事务、且消费者无待处理事务时整理，每轮最多 8 个 scope；瞬态模型、embedding 或 memory DB
-错误从 30 秒指数退避到 1 小时。整理先走内部 `memory` 策略评估并记录 token 用量；该内部事件
+新事务、且消费者无当前可处理事务时整理（未来重试的事务不阻塞），每轮最多 8 个 scope；瞬态模型、embedding 或 memory DB
+错误全局从 30 秒指数退避到 1 小时；永久错误仅对失败 scope 按同样规则退避。整理先走内部 `memory` 策略评估并记录 token 用量；该内部事件
 不出现在公开事件列表，仍计入 token 窗口。为真人回复保留有效 token-window 上限的 20%，quiet
-hours 或 block/defer 时静默延期。无 embedding 不影响 health。embedding 若复用模型端点与密钥，**DM 原文将发送到
-同一个模型提供方**；当前启用模型回复时，召回的 DM 内容也随上下文发送给配置的模型
-提供方。PR3c 才增加主人 HTTP 端点，需先获总管批准。Compose 透传由 A 线后续完成。
+hours 或 block/defer 时静默延期。无 embedding 不影响 health。
+
+> **警告：配置独立 embedding 提供方时，DM 和群聊文本会发送给该提供方；若复用模型端点与密钥，则发送给同一个模型提供方。**
+
+纯 Python 向量后端每个 scope 只扫描最新 500 条记录（不是先选「最相关」500 条）；启用 sqlite-vec
+后检索覆盖该 scope 的全部向量。当前启用模型回复时，召回的 DM 内容也随上下文发送给配置的模型
+提供方。PR3c 已增加主人 HTTP 端点；Compose 透传由 A 线后续完成。
+
+### 主人记忆管理（PR3c）
+
+记忆模块启用时，owner 可用 Matrix OpenID 或 Matrix user token 管理自己 AI 的记忆；站点 bearer
+不能调用这些端点。**该 AI 的主人可以查看和删除它与你的聊天记忆**。群组记忆正文仅在 owner
+当前仍 joined 到对应房间时返回，查询失败同样脱敏；响应一律 `Cache-Control: no-store`。删除
+extracted 事实会抑制模型为同一 counterpart/key 重写，owner 显式设置可解除该抑制。审计行不含
+记忆正文、事实值、消息体、原始 txn ID 或密钥。
+counterpart 只以 HMAC 存储；审计表在 memory.db（0600）中，随记忆保留期一同清理。
+`GET /v1/capabilities` 的 `memory.manage` 条目带布尔 `owner_can_read_dm`（默认 true），供客户端
+向聊天对象披露上述事实（App 文案由 C 线负责）。端点、错误码与限流见 contract §1.7.8 ⑩。
 
 ### 测试
 

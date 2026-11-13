@@ -30,6 +30,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import hmac
 import http.server
 import json
@@ -47,6 +49,7 @@ from .as_txn_store import (
     build_as_txn_store,
 )
 from .memory.store import MemoryPurger, MemoryStore
+from .memory.owner_http import handle as handle_memory, MemoryHTTPState, capabilities
 from .engine import (
     EngineHooks,
     ModelClient,
@@ -167,6 +170,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         return self.server_version
 
     def log_message(self, fmt: str, *args: Any) -> None:
+        # Memory URLs can contain private counterpart filters. Never access-log them.
+        if "/memories" in unquote(getattr(self, "path", "")):
+            return
         if self.server.config.access_log:  # type: ignore[attr-defined]
             super().log_message(fmt, *_redact_args(args))
 
@@ -776,12 +782,17 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             if path in ("/health", "/v1/health"):
                 self._handle_health()
                 return
+            if path == "/v1/memories" or path.startswith("/v1/memories/"):
+                handle_memory(self)
+                return
             if _is_moments_path(path):
                 self._handle_moments()
                 return
             if not self._auth_ok():
                 return
-            if path == "/v1/limits":
+            if path == "/v1/capabilities":
+                self._send_json(200, capabilities(self.server, query))
+            elif path == "/v1/limits":
                 self._handle_get_limits(query)
             elif path == "/v1/usage":
                 self._handle_get_usage(query)
@@ -804,6 +815,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             _raw_path, _query, path = self._route_path()
             if _is_matrix_app_path(path):
                 self._handle_as_matrix_path(path)
+                return
+            if path == "/v1/memories" or path.startswith("/v1/memories/"):
+                handle_memory(self)
                 return
             if _is_moments_path(path):
                 self._handle_moments()
@@ -841,6 +855,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             if _is_matrix_app_path(path):
                 self._handle_as_matrix_path(path)
                 return
+            if path == "/v1/memories" or path.startswith("/v1/memories/"):
+                handle_memory(self)
+                return
             if _is_moments_path(path):
                 self._handle_moments()
                 return
@@ -873,6 +890,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 # AS 路径上的 PATCH/DELETE：legacy / 未知路径 404，
                 # 已知 v1 路径错误方法 405（都是 Matrix JSON、不做鉴权）。
                 self._handle_as_matrix_path(path)
+                return
+            if path == "/v1/memories" or path.startswith("/v1/memories/"):
+                handle_memory(self)
                 return
             if _is_moments_path(path):
                 # 先校验用户身份；鉴权失败已在 _auth_user_ok 里发响应。
@@ -1294,7 +1314,8 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         self.memory_purger: Optional[MemoryPurger] = None
         if config.memory_db_path:
             self.memory_store = MemoryStore(
-                config.memory_db_path, retention_days=config.memory_retention_days
+                config.memory_db_path, retention_days=config.memory_retention_days,
+                hmac_secret=config.hmac_secret,
             )
             self.memory_purger = MemoryPurger(
                 self.memory_store, config.memory_purge_interval_seconds
@@ -1316,11 +1337,9 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         self.engine_hooks: Optional[EngineHooks] = None
         # Persona ownership is a startup-time security boundary, independent
         # of whether this process currently starts the consumer/model engine.
-        if config.personas_file:
-            load_personas(
-                config.personas_file, server_name=config.matrix_server_name,
-                max_message_chars=config.max_message_chars,
-            )
+        self.memory_personas = load_personas(
+            config.personas_file, server_name=config.matrix_server_name,
+            max_message_chars=config.max_message_chars)
         if config.consumer_enabled:
             if self.as_txn_store is None:
                 logging.getLogger(__name__).warning(
@@ -1369,6 +1388,13 @@ class GatewayServer(http.server.ThreadingHTTPServer):
                     consumer.wake()
                 self.as_txn_store.set_on_new_transaction(wake_consumers)
                 self.as_consumer = consumer
+        self.memory_http = MemoryHTTPState(self.memory_store, config.hmac_secret)
+        if self.room_member_source is None and self.memory_store is not None:
+            joined_members = getattr(transport, "joined_members", None)
+            self.room_member_source = RoomMemberSource(
+                fetcher=joined_members if callable(joined_members) else None,
+                personas=tuple(self.memory_personas),
+                is_local_ai=lambda uid: uid in self.memory_personas)
         log_startup_warnings(config)
         super().__init__((config.host, config.port), GatewayHandler)
         # 监听端口绑定成功后才起消费线程：绑定失败（OSError）时不留下孤儿线程。
@@ -1399,7 +1425,7 @@ class GatewayServer(http.server.ThreadingHTTPServer):
                                  max_message_chars=config.max_message_chars)
         self.memory_idle = IdleSignal(pending=lambda: bool(
             self.as_txn_store is not None and
-            self.as_txn_store.oldest_unprocessed_received_at() is not None))
+            self.as_txn_store.has_processable_transactions(datetime.now(timezone.utc))))
         if self.as_txn_store is not None:
             self.as_txn_store.set_on_new_transaction(self.memory_idle.notify)
         if embedding_config.configured and config.memory_vector_backend != 'none':

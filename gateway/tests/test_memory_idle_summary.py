@@ -7,7 +7,9 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'src'))
 from botville_gateway.memory.profile import ModelExtractor
 from botville_gateway.memory.store import MemoryStore
-from botville_gateway.memory.summary import StoreSummaryProvider, generate_summary, summary_input
+from botville_gateway.memory.summary import (SUMMARY_INPUT_TOKEN_CAP,
+    StoreSummaryProvider, generate_summary, summary_input)
+from botville_gateway.engine.engine import estimate_tokens
 
 
 class FakeModel:
@@ -66,5 +68,35 @@ class IdleSummaryTests(unittest.TestCase):
         self.assertEqual(result, [{'key': 'name', 'value': 'Ana'}])
         self.assertIn('<untrusted id=', model.calls[0]['messages'][0]['content'])
         self.assertNotIn('inject me', model.calls[0]['system_text'])
+
+    def test_large_backlog_summarizes_oldest_input_cap_chunk_then_advances(self):
+        # CJK is one token per character (plus the estimator's nonempty
+        # constant).  The first request fits five source items, then the next round moves
+        # forward from its persisted covers_until_item_id.
+        for number in range(41):
+            self.add(text=chr(0x4e00 + number) * 1000)
+        request = summary_input(self.store, persona_id='p', scope_kind='dm', scope_key='@u:local')
+        self.assertLess(sum(estimate_tokens(message['content']) for message in request['messages']),
+                        SUMMARY_INPUT_TOKEN_CAP + 1)
+        self.assertGreater(len(request['items']), 0)
+        self.assertEqual(request['items'][0]['id'], 1)
+        model = FakeModel('first rolling summary')
+        self.assertTrue(generate_summary(self.store, model, persona_id='p', scope_kind='dm', scope_key='@u:local'))
+        self.assertEqual(self.store.summary('p', 'dm', '@u:local')['covers_until_item_id'],
+                         request['items'][-1]['id'])
+        next_request = summary_input(self.store, persona_id='p', scope_kind='dm', scope_key='@u:local')
+        self.assertEqual(next_request['items'][0]['id'], request['items'][-1]['id'] + 1)
+
+    def test_oversized_oldest_item_uses_bounded_prefix_and_advances(self):
+        for _ in range(41):
+            self.add(text='一' * 8000)
+        request = summary_input(self.store, persona_id='p', scope_kind='dm', scope_key='@u:local')
+        self.assertEqual(request['items'][0]['id'], 1)
+        self.assertLessEqual(sum(estimate_tokens(message['content']) for message in request['messages']),
+                             SUMMARY_INPUT_TOKEN_CAP)
+        self.assertIn('[truncated]', ''.join(message['content'] for message in request['messages']))
+        self.assertTrue(generate_summary(self.store, FakeModel('bounded'), persona_id='p',
+                                         scope_kind='dm', scope_key='@u:local'))
+        self.assertEqual(self.store.summary('p', 'dm', '@u:local')['covers_until_item_id'], 1)
 
 if __name__ == '__main__': unittest.main()

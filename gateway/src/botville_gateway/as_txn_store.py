@@ -299,6 +299,16 @@ class AsTransactionStore:
     # 消费侧单次拉取的默认条数上限：消费侧按批处理，避免把整个积压一次读进内存。
     DEFAULT_UNPROCESSED_LIMIT = 100
 
+    def has_processable_transactions(self, now: datetime) -> bool:
+        """Whether work is due now, excluding future retries and terminal rows."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT 1 FROM as_transactions WHERE processed_at IS NULL"
+                " AND purged_at IS NULL AND failed_at IS NULL"
+                " AND (next_attempt_at IS NULL OR next_attempt_at <= ?) LIMIT 1",
+                (iso_utc(now),),
+            ).fetchone() is not None
+
     def get_consumable_batch(
         self,
         now: datetime,

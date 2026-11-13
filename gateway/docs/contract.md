@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# AI 网关契约 v1（草案 0.1.0）
+# AI 网关契约 v1（草案 0.2.0）
 
 > 任务：B0.1 · 里程碑 M0 · 评审：C 线（App）/ D 线（通知与开放 API）
 > 机器可读规范：[`gateway/openapi/gateway.v1.yaml`](../openapi/gateway.v1.yaml)
@@ -373,12 +373,13 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 | 400 | `request.invalid` / `request.malformed_json` | 语法或参数错误 |
 | 401 | `auth.missing` / `auth.invalid_token` | 缺少或无效令牌（含一次性 code 重复使用） |
 | 403 | `persona.not_owned` / `relation.chat_denied` / `conversation.e2ee` / `card.step_up_required` / `card.assertion_invalid` | 身份有效但无权限 / 断言无效 |
-| 404 | `persona.not_found` / `conversation.not_found` / `capability.not_found` / `card.not_found` / `audit.not_found` / `moment.not_found` | 不存在或对调用方不可见 |
-| 409 | `persona.in_use` / `conversation.exists_conflict` / `persona.revision_conflict` / `card.revision_conflict` / `moment.revision_conflict` / `idempotency.conflict` / `card.already_decided` / `card.challenge_invalid` | 状态冲突 |
+| 404 | `persona.not_found` / `conversation.not_found` / `capability.not_found` / `card.not_found` / `audit.not_found` / `moment.not_found` / `memory.disabled` / `memory.not_found` | 不存在或对调用方不可见；记忆模块关闭为 `memory.disabled` |
+| 409 | `persona.in_use` / `conversation.exists_conflict` / `persona.revision_conflict` / `card.revision_conflict` / `moment.revision_conflict` / `idempotency.conflict` / `card.already_decided` / `card.challenge_invalid` / `memory.pin_limit` | 状态冲突 |
 | 410 | `card.challenge_expired` | challenge 或一次性 code 已过期 |
-| 422 | `limit.out_of_range` / `card.invalid_block` / `card.missing_fallback_text` / `card.source_scope_mismatch` / `card.missing_event_id` / `card.missing_expires_at` / `state.invalid_value` / `request.invalid`（createConversation 语义不合法 + peer_id 校验 + 动态评论 `reply_to_comment_id` 目标不存在/不可见） | 语义不合法 |
+| 422 | `limit.out_of_range` / `card.invalid_block` / `card.missing_fallback_text` / `card.source_scope_mismatch` / `card.missing_event_id` / `card.missing_expires_at` / `state.invalid_value` / `request.invalid` / `memory.key_not_allowed` / `memory.counterpart_invalid` / `memory.not_pinnable` | 语义不合法 |
 | 429 | `rate_limited.transport` | 传输层限流（**不是**发言额度） |
 | 500 | `internal.error` | 网关内部错误 |
+| 503 | `memory.unavailable` | 记忆存储或成员依赖不可用；带 `Retry-After` |
 
 卡片操作相关错误码（C4 / D3）：
 
@@ -894,10 +895,10 @@ ephemeral 不在 AS 注册里开启，忽略。
 跟随重定向。任何成员缓存或查询失败均 fail-closed，只按结构化/正文 mentions 判定并计
 `room_member_errors`，不会把群聊误判为单聊。
 
-**⑩ 四层记忆（B2.6：PR3a / PR3b 已实现；PR3c 待实现）**
+**⑩ 四层记忆（B2.6：PR3a / PR3b / PR3c 已实现）**
 
 四层为①最近对话、②滚动摘要、③长期档案、④向量检索。以下为完整批准规则；
-PR3c 的 HTTP 主人端点当前不启用。
+PR3c 的 HTTP 主人端点已启用。
 
 - **R1 Embedding（PR3b，已实现）**：OpenAI 兼容 `{BASE}/embeddings`；配置
   `GATEWAY_EMBEDDING_BASE_URL`（空 = 复用 `GATEWAY_MODEL_BASE_URL`）、
@@ -906,15 +907,22 @@ PR3c 的 HTTP 主人端点当前不启用。
   接受第一条返回维度并固定；正整数要求匹配）。
   无 embedding 模型时降级为① + ② + ③ + pinned，/health 不 degraded。
   模型或维度改变后，旧向量标记待重建，由空闲批处理重建。
-  **当 embedding 复用模型端点和密钥时，DM 原文会发送给同一个模型提供方。**
+
+  > **警告：配置独立 embedding 提供方时，DM 和群聊文本会发送给该 embedding 提供方；
+  > 当 embedding 复用模型端点和密钥时，则发送给同一个模型提供方。**
 - **R2 滚动摘要（PR3b，已实现）**：某会话未摘要原文超过 40 条或 4000 tokens 时排队，
-  仅空闲批处理执行；
-  空闲 = 消费者 120 秒没有新事务且无待处理事务，每批最多 8 个 scope。配置 `GATEWAY_MEMORY_SUMMARY_MODEL`
+  单次输入另以 6000 tokens 封顶；超出时按最早完整条目分块，后续空闲轮次继续推进覆盖水位。
+  单条本身超过该上限时仅输入其有界前缀后推进水位，以避免永久停滞。仅空闲批处理执行；
+  空闲 = 消费者 120 秒没有新事务且无**当前可处理**事务（`next_attempt_at IS NULL OR <= now`，已 failed/purged/processed
+  的行不计），每批最多 8 个 scope。配置 `GATEWAY_MEMORY_SUMMARY_MODEL`
   （空 = `GATEWAY_MODEL_NAME`）。摘要与抽取调用先 evaluate（内部 kind=memory），
   计入该 persona 的 token 预算；blocked、静默或预算不足时延后：真人回复优先，整理延后。
   摘要按对象分别存：DM 为 (persona, counterpart)，群为 (persona, room)。
-- **R3 档案事实（PR3a）**：支持主人显式写入及模型抽取结果应用；模型永不覆盖主人写入
-  或 pinned 事实，其余同 key 后写覆盖。白名单常量限定 name、nickname、birthday、
+- **R3 档案事实（PR3a）**：支持主人显式写入及模型抽取结果应用；主人写入 `trust=owner`，模型抽取
+  `trust=derived`（旧行幂等迁移：`source=owner → owner`、`source=extraction → derived`）；召回时两类
+  事实分别以「主人写入」与「模型抽取」标签成组，但都只在不可信数据区。模型永不覆盖主人写入
+  或 pinned 事实，其余同 key 后写覆盖。可信本地人类写入的指令式文字可以作为档案值保存，
+  但召回时始终位于不可信数据区，绝不进入 system，也绝不作为指令执行。白名单常量限定 name、nickname、birthday、
   likes、dislikes、location、occupation、language、pronouns、notes。
   **无 intimacy / 亲密度字段**（留 B2.8 关系模块）。仅可信本服人类内容可抽取为事实；
   外服 / untrusted 永不进入档案。AI 自己的回复进①，但永不抽取。
@@ -927,8 +935,36 @@ PR3c 的 HTTP 主人端点当前不启用。
   开头；非法拒绝加载 / 启动，不回显秘密或文件内容。未设 owner 的角色无主人权限
   （无人能经主人 API 查看、删除、钉住），仅可接收模型抽取结果。
   v1 只有主人可查看、删除、钉住；非主人删除请求经主人处理。
-  HTTP `/v1/memories*` 属 PR3c minor additive，开工前先将端点草案交总管；
-  修改 gateway.v1.yaml 必须获得总管批准。
+  HTTP `/v1/memories*` 已作为 PR3c minor additive 发布：`GET /memories`、
+  `GET`/`DELETE /memories/{memory_id}`、`PUT`/`DELETE /memories/{memory_id}/pin`、
+  `PUT /memories/facts`。它们只接收 matrix OpenID 或 Matrix user token，拒绝站点 bearer；
+  响应为 `Cache-Control: no-store`。读取限 60/min、写入限 20/min。可选
+  `Idempotency-Key` 的 set-fact 使用有界、进程内 24 小时（最多 2000 key）缓存；同 key
+  同请求重放返回该**当前仍存在**的事实，已删除目标重放返回 `404 memory.not_found`，不同请求
+  返回 `409 idempotency.conflict`。profile 的 shared fact 仍是 DM counterpart scope；成员门禁
+  只适用于 group-scoped recent/summary。群组正文只有 owner 当前 joined 时返回，成员查询失败
+  按非成员脱敏。**该 AI 的主人可以查看和删除它与你的聊天记忆**。审计不存正文、事实值、消息体、原始 txn ID 或凭据。
+
+  **PR3c 端点、审计与 Q1–Q7 定论**：E1 `GET /memories` 接受必填 `persona_id`、重复
+  `layer=recent|summary|profile`、`scope_kind`、`counterpart`、`room_id`、`pinned`、cursor、limit；
+  以 `updated_at desc, id desc` 分页（默认 20，最大 100）。E2 读取单项，E3 删除，E4/E5 幂等
+  pin/unpin，E6 写事实；summary 不可 pin，单 persona pin 上限 200。ID 为 `mr_`/`ms_`/`mf_` 加
+  `HMAC(layer + row id)` 前 16 hex，不暴露 vector。模块关闭一律 `404 memory.disabled`；找不到或
+  属于其他 persona 为 `404 memory.not_found`。删除 recent 会删除 row/vector、墓碑 event_id 或
+  `spk:` 占位并把覆盖 summary 标 dirty；删除 extracted fact 会墓碑 source_event_ids 并写 suppression
+  `(persona,counterpart,key)`，模型不能重写，owner set-fact 清除 suppression；删除 summary 只重置
+  watermark 以重算，并不忘记原始对话。
+
+  `memory_audit` 是 memory.db 的 additive 表，随 `GATEWAY_MEMORY_RETENTION_DAYS` purge，数据库
+  文件为 0600。每次 E1 list、E2 view、每次写入均追加一行：`occurred_at`、`request_id`、`caller`、
+  `persona_id`、`action`（list/view/delete/pin/unpin/set_fact）、`memory_id`、`layer`、`result_code`、
+  `counterpart_hmac`（部署 HMAC key 的 HMAC-SHA256 hex，可空）。审计无查询端点；绝不保存 plaintext
+  counterpart、记忆 text、fact value、message body、raw txn ID、token 或 key。
+
+  Q1 extracted fact 显示 `trust=derived`，与 owner fact 分组；Q2 模块关闭用 404；Q3 删除 extracted
+  fact 必须 suppression；Q4 启用时 capability manifest 发布 `memory.manage`（memory.read/write、native
+  entry、`owner_can_read_dm=true`），关闭时不发布；Q5 v1 不提供 audit query；Q6 v1 不提供 bulk delete
+  （CLI 可用）；Q7 `persona_id` 保留在 query/body，而非路径。
 - **R5 lite/full（PR3b，已实现）**：lite 仅 stdlib，float32 BLOB 存 memory.db，纯 Python cosine；
   sqlite-vec 可选加速，仅当 sqlite3 enable_load_extension 可用且扩展可加载时自动启用，
   否则回退 Python。pgvector 仅定义 VectorStore 接口，full 实现不在本轮。
@@ -945,10 +981,13 @@ PR3c 的 HTTP 主人端点当前不启用。
   回复）经 isolation.build_untrusted_segment 包裹，每条最多 8000 Unicode 码点，注记
   layer / time / trust，全部进入不可信数据区，永不进入 system。日志不含记忆正文、
   消息正文、原始 txn ID、token 或密钥。PR3a SummaryProvider / VectorRecall 可插拔接口
-  由 PR3b 接入真实摘要及向量召回，④每次同 scope 最多扫描 500 条，返回 top-5，并与原文及摘要去重。
+  由 PR3b 接入真实摘要及向量召回：纯 Python 后端④每次在同 scope 只扫描最新 500 条（按写入
+  顺序，不是先选「最相关」500 条），返回 top-5，并与原文及摘要去重；启用 sqlite-vec 时查询
+  覆盖该 scope 的全部向量。
   向量查询预算不足或失败时跳过该层，继续真人回复。当前真人输入另外隔离追加，不计入历史召回预算，
   但完整提示词和预留回复均参与既有 token 预算预检。记忆 DB 读写错误延后事件，不回退房间 ring buffer。
-  连续记忆 DB 瞬态失败按 30 秒倍增、上限 1 小时重试，不消耗 attempts；完整记忆操作成功后重置连续计数。
+  连续记忆 DB/模型/网络瞬态失败按全局 30 秒倍增、上限 1 小时重试，不消耗 attempts；永久错误仅按
+  (persona, scope) 30 秒倍增、上限 1 小时退避，不阻塞其他 scope；完整记忆操作成功后重置相应计数。
   引擎 stats 暴露 `memory_db_unavailable_consecutive`，每次连续失败达到 5 时增加
   `memory_db_alerts`；达到阈值后 warning 每小时最多一次，仅含异常类型名（进程重启重置这些状态）。
   召回 SQL 按 pinned 优先限取 200 条对话、每对象 100 条事实，最多 100 个对象；
@@ -979,9 +1018,8 @@ PR3c 的 HTTP 主人端点当前不启用。
 - **R11 空闲 worker（PR3b，已实现）**：独立 daemon 线程 `memory-idle-worker`，与消费者共享
   注入时钟的活动信号，遵守 §1.7.4 单进程假设；模型 / embedding / memory DB 瞬态失败从 30 秒
   指数退避、上限 1 小时，每轮最多 8 个 scope；端口绑定后才启动，关闭时 join。
-- **R12 拆分顺序**：PR3a 为本 PR（存储、档案规则、隔离召回、主人内部 API/CLI、接线及
-  保留清理）；PR3b 为摘要、向量、空闲批处理；PR3c 为需批准 YAML 的主人 HTTP 端点。
-  每个 PR 在前一个合并后再开。
+- **R12 拆分顺序**：PR3a（存储、档案规则、隔离召回、主人内部 API/CLI、接线及保留清理）与
+  PR3b（摘要、向量、空闲批处理）已合并；PR3c 为已批准、已实现的 owner HTTP 端点与 additive YAML。
 - **R13 来源与输出（PR3a；摘要/抽取调用 PR3b）**：每条记忆携带 source
   （event_id / owner / extraction）和 visibility，主人可查看、删除、钉住。
   摘要和抽取输入中的外服内容放不可信数据区；从不可信内容产生的摘要本身仍为不可信
@@ -1019,7 +1057,8 @@ token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，�
 
 **⑬ 契约范围**
 
-本节只描述网关内部消费与引擎行为，**不改任何 `/v1` 端点、不改 OpenAPI**；C 线不受影响。
+除⑩ PR3c 已明确新增的 `/v1/memories*`、capability 和 OpenAPI 外，本节其余消费与引擎行为
+不改变 `/v1`；C 线按 0.2.0 契约接入。
 
 ---
 
@@ -1047,6 +1086,10 @@ token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，�
 | GET/PUT | `/limits` | 三层限额读取与设置 | 我的 AI、所有者设置 |
 | GET | `/usage` | 用量汇总与预算 | 我的 AI、账单 |
 | GET | `/usage/events` | 账单明细 | 审计、对账 |
+| GET | `/memories` | owner 记忆筛选、游标分页 | AI 主人 |
+| GET/DELETE | `/memories/{memory_id}` | owner 读取或删除单条记忆 | AI 主人 |
+| PUT/DELETE | `/memories/{memory_id}/pin` | 固定或取消固定 | AI 主人 |
+| PUT | `/memories/facts` | 显式设置允许的 profile fact | AI 主人 |
 | GET/POST | `/cards` | 卡片列表与创建 | App、通知/小镇模块 |
 | GET/PATCH | `/cards/{card_id}` | 卡片读取与状态 | App |
 | POST | `/cards/{card_id}/actions/{action_id}` | 卡片操作（授权，幂等键必填） | App（C3.1） |
@@ -1170,6 +1213,7 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 | `session_token.ttl_seconds` | ❌ | 建议 TTL，60–86400，默认 300 |
 | `min_app_version` | ❌ | 低于此版本的 App 不显示该能力（由服务端按 `?app_version=` 过滤） |
 | `i18n` | ❌ | 语言 → `{title, summary, description}`；缺失时回退顶层字段 |
+| `owner_can_read_dm` | ❌ | `memory.manage` 的披露布尔值，默认 `true` |
 
 ### 3.4 四种入口
 
@@ -1227,6 +1271,10 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
   "min_app_version": "0.4.0"
 }
 ```
+
+当记忆模块启用时，清单额外发布 `memory.manage`：`module: memory`、
+`scopes: ["memory.read", "memory.write"]`、`entry.type: native` 指向 App 原生记忆管理页，且
+`owner_can_read_dm: true`；模块关闭时不得发布该 capability。`memory.search` 仍只是示例能力。
 
 ### 3.7 命名约定
 
@@ -1626,8 +1674,10 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 ### 5.5 Changelog
 
 | 版本 | 日期 | 变更 |
-| 0.1.0 | 2026-11-13 | [B 线 PR3b memory-idle，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 实现空闲批处理滚动摘要、可信本服人类事实抽取、embedding 与 scope 隔离向量召回；memory-idle-worker 在端口绑定后启动，真人回复优先，内部 memory token 用量照常计入预算而不暴露新 /v1 枚举。新增 summaries/vectors 加法迁移、撤回 dirty 重算及 sqlite-vec 回退；/v1 服务端 token floor 现将 CJK 按约 1 token/字估算（字段/状态无变化）。 |
 |---|---|---|
+| 0.2.0 | 2026-11-13 | [B 线 PR3c memory-owner，**新增端点（minor），不改既有字段/状态码**] 新增 owner memory 浏览、删除、固定与显式事实端点，以及 `memory.manage` capability、审计与群组成员脱敏约束。 |
+| 0.1.0 | 2026-11-13 | [B 线 #207 nits，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 抽取事实标为 derived 并与主人事实分别隔离召回；空闲门忽略尚未到期的 defer 事务；永久错误按 scope 退避而非全局阻塞；摘要输入按 6000 tokens 最早分块滚动；纯 Python 向量仅扫 scope 最新 500 条、sqlite-vec 覆盖全 scope；回复 query embedding 先预留预算；memory usage 归属 persona/会话；补独立 embedding 提供方 DM/群聊文本披露，以及可信本地人类指令式档案值永不执行的边界。 |
+| 0.1.0 | 2026-11-13 | [B 线 PR3b memory-idle，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 实现空闲批处理滚动摘要、可信本服人类事实抽取、embedding 与 scope 隔离向量召回；memory-idle-worker 在端口绑定后启动，真人回复优先，内部 memory token 用量照常计入预算而不暴露新 /v1 枚举。新增 summaries/vectors 加法迁移、撤回 dirty 重算及 sqlite-vec 回退；/v1 服务端 token floor 现将 CJK 按约 1 token/字估算（字段/状态无变化）。 |
 | 0.1.0 | 2026-11-13 | [B 线 #205 nits，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 主人删除永久墓碑、记忆读取失败延后、DB 指数退避与告警计数、本服真人 counterpart 校验、旧库权限收紧、召回 SQL 上限、CJK token 估算及并发单行 schema 迁移；明确助手记忆尽力写入与 spk 占位撤回限制。 |
 | 0.1.0 | 2026-11-13 | [B 线 PR3a memory，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] B2.6 可选 SQLite 记忆基础：①持久化对话、③档案规则、scope 隔离与预算召回、主人内部 Python API / CLI、owner_user_id 校验、撤回墓碑及保留清理；三个 memory 配置默认关闭并保持 PR2 ring buffer。⑩写明完整批准规则及 PR3b 摘要/向量/空闲整理、PR3c HTTP 边界；无热路径模型抽取，不改 compose。 |
 | 0.1.0 | 2026-11-13 | [B 线 #203 复审 nits，**不改 /v1 字段/状态码/错误码，不改 OpenAPI**] 成员查询增加有界负缓存、全局熔断与 5 秒超时；独立验证 LRU、TTL、拒绝重定向和错误脱敏；静默重放上下文按 event_id 去重；处理时间使用注入时钟；公开只读 persona_ids；补充稳定 HMAC 密钥及重启窗口内模型重复调用和计费限制。 |
@@ -2317,7 +2367,7 @@ B 类清单的 12 项已于 **2026-11-10 由棉棉霸拍板**，逐项定论见 
 | B9 | 保留能力 ID：`social.moments`（`module=social`）、`role.personas`（`module=role`）、`bridge.manage`（`module=bridge`）；正式发布前可改，不写进示例清单（见 §3.7） | C2.5（#38）、D2.3 | 无字段/状态码变化 |
 | B10 | 评论通知 `source.capability_id` 用 `social.moments`（`source.module=social`）；不发明新通知对象 | D1.1 / C 线通知列表 | 无字段/状态码变化 |
 | B11 | `Conversation` 不加未读数 / 最近消息摘要 / 搜索；这些走 Matrix；排序可用已有 `last_activity_at` | C 线会话列表（设计 01） | 无字段/状态码变化 |
-| B12 | 四层记忆开放 API 等 B2.6 再按「只增不删」新增；私聊记忆默认不在群上下文召回；v1 不预写字段名 | B2.6（#22） | 无字段/状态码变化 |
+| B12 | PR3c 已新增 owner memory HTTP API；私聊记忆默认不在群上下文召回，群组正文受 owner 当前 joined 成员门禁 | B2.6（#22） | 0.2.0 minor additive |
 
 共同约束：以上各项在落地前都**不**改变本契约的字段集合、状态码集合与 schema 约束；
 实现 PR 若需要新增字段或接口，按 [§5.3](#53-变更等级) 的「只增不删」走 minor。

@@ -226,7 +226,8 @@ class EngineHooks(ConsumerHooks):
                     from ..memory.vector import VectorRecall
                     try:
                         query = budgeted_embed(self._memory_embedding, self._service,
-                                               persona.user_id, text)
+                                               persona.user_id, text,
+                                               conversation_id=room_id)
                         vector_recall = VectorRecall(self._memory_vectors, query_vec=query,
                                                      model=self._memory_embedding.config.model,
                                                      dim=self._memory_embedding.dimension)

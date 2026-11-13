@@ -101,6 +101,17 @@ EXAMPLE_TARGETS = {
     "moment-like-state.json": "#/paths/~1moments~1{moment_id}~1likes~1me/put/responses/200/content/application~1json/schema",
     "moment-like-page.json": "#/paths/~1moments~1{moment_id}~1likes/get/responses/200/content/application~1json/schema",
     "problem-moment-not-found.json": "#/components/responses/NotFound/content/application~1problem+json/schema",
+    # B2.6 PR3c owner memory HTTP API
+    "memory.json": "#/paths/~1memories~1{memory_id}/get/responses/200/content/application~1json/schema",
+    "memory-page.json": "#/paths/~1memories/get/responses/200/content/application~1json/schema",
+    "memory-fact-write.json": "#/paths/~1memories~1facts/put/requestBody/content/application~1json/schema",
+    "problem-memory-disabled.json": "#/components/responses/NotFound/content/application~1problem+json/schema",
+    "problem-memory-not-found.json": "#/components/responses/NotFound/content/application~1problem+json/schema",
+    "problem-memory-key-not-allowed.json": "#/components/responses/UnprocessableEntity/content/application~1problem+json/schema",
+    "problem-memory-counterpart-invalid.json": "#/components/responses/UnprocessableEntity/content/application~1problem+json/schema",
+    "problem-memory-not-pinnable.json": "#/components/responses/UnprocessableEntity/content/application~1problem+json/schema",
+    "problem-memory-pin-limit.json": "#/components/responses/Conflict/content/application~1problem+json/schema",
+    "problem-memory-unavailable.json": "#/components/responses/ServiceUnavailable/content/application~1problem+json/schema",
 }
 
 SECRET_PATTERNS = [

@@ -502,11 +502,13 @@ class GatewayService:
             )
         )
 
-    def record_memory_usage(self, *, persona_id: str, tokens: int) -> None:
+    def record_memory_usage(self, *, persona_id: str, tokens: int,
+                            conversation_id: Optional[str] = None) -> None:
         """Account internal model work without sending or adding a public kind."""
         if tokens > 0:
             self._store.append(UsageEvent.make(
-                EventKind.MEMORY, persona_id=persona_id, at=self._now(),
+                EventKind.MEMORY, persona_id=persona_id,
+                conversation_id=conversation_id, at=self._now(),
                 tokens_in=tokens, secret=self._store.secret))
 
     def memory_budget_available(self, persona_id: str, estimate: int) -> bool:
@@ -518,7 +520,8 @@ class GatewayService:
                         r.tokens for r in self._reservations.for_persona(persona_id)
                     ) >= budget['limit'] * 0.2)
 
-    def authorize_memory_call(self, persona_id: str, estimate: int) -> bool:
+    def authorize_memory_call(self, persona_id: str, estimate: int,
+                              conversation_id: Optional[str] = None) -> bool:
         """Atomically precharge conservative usage; no message or text is stored.
 
         Failed calls retain the charge since remote consumption is unknown.
@@ -526,12 +529,14 @@ class GatewayService:
         with self._lock:
             decision = self.evaluate_policy({
                 'persona_id': persona_id, 'kind': 'memory',
+                'conversation_id': conversation_id,
                 'token_estimate': estimate,
             }, internal_memory=True)
             if (decision['decision'] != 'allow' or
                     not self.memory_budget_available(persona_id, estimate)):
                 return False
-            self.record_memory_usage(persona_id=persona_id, tokens=estimate)
+            self.record_memory_usage(persona_id=persona_id, tokens=estimate,
+                                     conversation_id=conversation_id)
             return True
 
     # ------------------------------------------------------------- B2.3 context/assemble
@@ -1651,6 +1656,11 @@ def _bucket_key(event: UsageEvent, group_by: str, tz: ZoneInfoLite) -> str:
         return "gateway"
     if group_by == "model":
         return "unknown"
+    # Internal memory work may run without a room (for example idle
+    # consolidation).  Attribute that work to its persona so usage never
+    # produces an anonymous "(none)" bucket.
+    if event.kind == EventKind.MEMORY:
+        return event.conversation_id or event.persona_id or "(none)"
     return event.conversation_id or "(none)"
 
 

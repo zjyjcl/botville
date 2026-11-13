@@ -100,5 +100,5 @@ class OwnerMemoryAPI:
             raise ValueError("fact value must be a non-empty string")
         return self._store.upsert_fact(
             persona_id, counterpart, key, value, visibility, "owner", [],
-            "trusted", False, True,
+            "owner", False, True,
         )

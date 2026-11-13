@@ -1,0 +1,1 @@
+{"type":"urn:botville:error:memory.key_not_allowed","title":"Memory key not allowed","status":422,"detail":"The fact key is not allowed.","instance":"/v1/memories/facts","code":"memory.key_not_allowed","request_id":"req_memory_key","errors":[{"field":"key","code":"not_allowed","message":"not allowed"}],"retry_after_seconds":0}

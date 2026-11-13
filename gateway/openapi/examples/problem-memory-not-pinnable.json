@@ -1,0 +1,1 @@
+{"type":"urn:botville:error:memory.not_pinnable","title":"Memory not pinnable","status":422,"detail":"Summary memories cannot be pinned.","instance":"/v1/memories/ms_0123456789abcdef/pin","code":"memory.not_pinnable","request_id":"req_memory_pin","retry_after_seconds":0}

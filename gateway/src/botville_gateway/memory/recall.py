@@ -68,7 +68,8 @@ def assemble_recall(
                                 visibility='shared' if scope_kind == 'group' else None):
             if scope_kind == 'group' and fact['visibility'] != 'shared':
                 continue
-            candidates.append((0 if fact['pinned'] else 1, 'profile',
+            candidates.append((0 if fact['pinned'] else 1,
+                               'profile_owner' if fact['source'] == 'owner' else 'profile_extracted',
                                fact['updated_at'], fact['trust'],
                                f"{fact['key']}: {fact['value']}"))
     recent_entries = {}
@@ -113,11 +114,15 @@ def assemble_recall(
 
     # Stable sorts retain store's descending id order for same-second entries.
     candidates.sort(key=lambda entry: entry[2], reverse=True)
-    candidates.sort(key=lambda entry: entry[0])
+    # Keep owner and extracted profile groups distinct within each priority tier.
+    profile_group = {'profile_owner': 0, 'profile_extracted': 1}
+    candidates.sort(key=lambda entry: (entry[0], profile_group.get(entry[1], 2)))
     output = []
     remaining = budget
     for _, layer, stamp, trust, text in candidates:
-        prefix = f'[memory layer={layer} time={stamp} trust={trust}]\n'
+        source = {'profile_owner': 'owner', 'profile_extracted': 'extraction'}.get(layer)
+        provenance = f' source={source}' if source else ''
+        prefix = f'[memory layer={layer}{provenance} time={stamp} trust={trust}]\n'
         text = text[:max(0, 8000 - len(prefix))]
         nonce = generate_nonce()
 

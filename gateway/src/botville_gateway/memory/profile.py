@@ -98,6 +98,6 @@ def apply_extractions(
             continue
         count += int(store.upsert_fact(
             persona_id, counterpart, key, value, 'dm_only', 'extraction',
-            [event_id], 'trusted',
+            [event_id], 'derived',
         ))
     return count
