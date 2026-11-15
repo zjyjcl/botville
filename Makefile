@@ -316,5 +316,7 @@ federation-e2e:
 federation-down:
 	# down -v needs the env file for interpolation; regenerate it if this
 	# checkout never ran federation-e2e (cheap, no Docker involved).
-	@test -f "$(FED_ENV)" || python3 server/scripts/federation-setup.py
+	# A-R1: env files from before the service tokens existed would fail
+	# interpolation (:?), so regenerate those too.
+	@grep -q '^PAIRING_SERVICE_TOKEN_A=' "$(FED_ENV)" 2>/dev/null || python3 server/scripts/federation-setup.py
 	$(FED_COMPOSE) down -v --remove-orphans

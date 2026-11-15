@@ -283,6 +283,8 @@ class FederationNoProxyConfigTest(ComposeNoProxyRenderCase):
         # generated/federation.env by federation-setup.py in real runs).
         "PAIRING_ADMIN_TOKEN_A=test-only",
         "PAIRING_ADMIN_TOKEN_B=test-only",
+        "PAIRING_SERVICE_TOKEN_A=test-only-service",
+        "PAIRING_SERVICE_TOKEN_B=test-only-service",
     )
 
     def test_defaults_on_every_federation_service(self):
