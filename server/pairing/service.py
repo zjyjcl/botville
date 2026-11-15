@@ -45,8 +45,9 @@ Pairing facts for the gateway (A-R1; service token, read-only):
          reused; omit `since` (= 0) to start at the beginning. A cursor
          whose following events were pruned (30-day retention) or that is
          ahead of the log (restored DB) gets 410 BV_CURSOR_EXPIRED with
-         `resync_cursor`: re-read the peers you track, then continue from
-         it.
+         `resync_cursor` = the prune watermark (every later event is still
+         retained): re-read the peers you track, then continue from it;
+         replayed facts must be handled idempotently.
   Auth: `Authorization: Bearer $PAIRING_SERVICE_TOKEN` (constant-time),
   a token distinct from the admin token. Unset token = every internal
   call is refused (401, fail-closed); the admin token is never accepted
@@ -101,6 +102,7 @@ from .store import (
     REDEEM_USED,
     PairingStore,
 )
+from .hswhitelist import HsWhitelistWriter
 from .validate import (
     ServerNameError,
     normalize_server_name,
@@ -122,11 +124,19 @@ NONCE_MIN_HEX_CHARS = 32  # >=16 random bytes, hex-encoded
 NOTIFY_SECRET_BYTES = 32  # per-peer shared secret, stored as hex
 NOTIFY_BODY_TIMEOUT = 5.0
 PRUNE_INTERVAL_SECONDS = 3600.0
+HS_WHITELIST_RESYNC_SECONDS = 60.0
 MAX_BODY_BYTES = 65536
 PEER_HTTP_TIMEOUT = 15.0
 INVITE_ID_BYTES = 12  # urlsafe -> 16 chars
 SERVICE_TOKEN_MIN_CHARS = 32
-INTERNAL_PREFIX = "/v1/pairing/internal/"
+# A-R1 internal facts namespace. INTERNAL_ROOT (no trailing slash) and
+# everything under INTERNAL_PREFIX are internal: both go through service
+# auth, so the bare root can never fall through to another route.
+INTERNAL_ROOT = "/v1/pairing/internal"
+INTERNAL_PREFIX = INTERNAL_ROOT + "/"
+# At most one "internal request refused" warning per interval; the rest
+# are counted and reported in the next warning (#243 review 2).
+INTERNAL_REJECT_LOG_INTERVAL = 60.0
 FACTS_DEFAULT_LIMIT = 100
 FACTS_MAX_LIMIT = 500
 CURSOR_MAX_DIGITS = 18  # fits a signed 64-bit SQLite integer
@@ -388,12 +398,36 @@ def _parse_trusted_proxies(raw):
     return networks
 
 
+class LogThrottle:
+    """Rate-limit one repetitive warning: allow() is True at most once per
+    `interval` seconds and reports how many calls it swallowed since the
+    last allowed one. Thread-safe."""
+
+    def __init__(self, interval):
+        self.interval = interval
+        self._lock = threading.Lock()
+        self._next_at = 0.0
+        self._suppressed = 0
+
+    def allow(self, now=None):
+        """(allowed, suppressed_since_last_allowed)."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            if now >= self._next_at:
+                suppressed, self._suppressed = self._suppressed, 0
+                self._next_at = now + self.interval
+                return True, suppressed
+            self._suppressed += 1
+            return False, 0
+
+
 class PairingConfig:
     def __init__(self, db_path, admin_token, server_name, api_url,
                  invite_ttl=DEFAULT_INVITE_TTL, verify_peer_key=True,
                  peer_key_url_template="https://{server_name}/_matrix/key/v2/server",
                  insecure_tls=False, host="127.0.0.1", port=8090,
-                 trusted_proxies=(), service_token=None):
+                 trusted_proxies=(), service_token=None,
+                 hs_whitelist_path=None, hs_restart_marker=None):
         self.db_path = db_path
         self.admin_token = admin_token
         if service_token:
@@ -420,6 +454,23 @@ class PairingConfig:
         self.host = host
         self.port = port
         self.trusted_proxies = list(trusted_proxies)
+        # A-R2 (#118 item 8): optional Synapse federation_domain_whitelist
+        # include + restart marker; unset = feature off (fedgate only).
+        if hs_restart_marker and not hs_whitelist_path:
+            raise ConfigError(
+                "PAIRING_HS_RESTART_MARKER needs PAIRING_HS_WHITELIST_PATH")
+        for key, value in (("PAIRING_HS_WHITELIST_PATH", hs_whitelist_path),
+                           ("PAIRING_HS_RESTART_MARKER", hs_restart_marker)):
+            if value and not os.path.isabs(value):
+                raise ConfigError("{} must be an absolute path".format(key))
+        if (hs_whitelist_path and hs_restart_marker
+                and os.path.abspath(hs_whitelist_path)
+                == os.path.abspath(hs_restart_marker)):
+            raise ConfigError(
+                "PAIRING_HS_RESTART_MARKER must differ from"
+                " PAIRING_HS_WHITELIST_PATH")
+        self.hs_whitelist_path = hs_whitelist_path or None
+        self.hs_restart_marker = hs_restart_marker or None
 
     @classmethod
     def from_env(cls, env):
@@ -459,6 +510,8 @@ class PairingConfig:
             trusted_proxies=_parse_trusted_proxies(
                 env.get("PAIRING_TRUSTED_PROXIES", "")),
             service_token=env.get("PAIRING_SERVICE_TOKEN", "") or None,
+            hs_whitelist_path=env.get("PAIRING_HS_WHITELIST_PATH", "").strip(),
+            hs_restart_marker=env.get("PAIRING_HS_RESTART_MARKER", "").strip(),
         )
 
 
@@ -476,6 +529,45 @@ class PairingApp:
         self.nonces = NonceGuard()
         self.notify_rejected = 0
         self.internal_rejected = 0
+        self._internal_rejected_lock = threading.Lock()
+        self.internal_reject_log = LogThrottle(INTERNAL_REJECT_LOG_INTERVAL)
+
+        self.hs_whitelist = None
+        if config.hs_whitelist_path:
+            self.hs_whitelist = HsWhitelistWriter(
+                config.hs_whitelist_path, config.server_name,
+                marker_path=config.hs_restart_marker)
+        self.hs_whitelist_failures = 0
+
+    def note_internal_rejected(self):
+        """Count one refused internal request; returns the new total."""
+        with self._internal_rejected_lock:
+            self.internal_rejected += 1
+            return self.internal_rejected
+
+    def sync_hs_whitelist(self):
+        """Re-render the homeserver whitelist from the peers table (A-R2).
+
+        Called after every pairing state change, at startup and from the
+        background loop; idempotent (unchanged content writes nothing).
+        Never raises: the pairing change is already committed and fedgate
+        enforces it regardless, so a write failure is logged and retried
+        on the next call. Returns True when a restart marker was written.
+        """
+        if self.hs_whitelist is None:
+            return False
+        try:
+            changed = self.hs_whitelist.sync(self.store.active_server_names())
+        except (OSError, sqlite3.Error) as exc:
+            self.hs_whitelist_failures += 1
+            log.error("homeserver whitelist render failed (%s); fedgate still"
+                      " enforces pairing, will retry", exc)
+            return False
+        if changed:
+            log.warning("homeserver federation whitelist changed: restart the"
+                        " homeserver, then delete %s",
+                        self.hs_whitelist.marker_path)
+        return changed
 
 
 def _iso(ts):
@@ -593,14 +685,20 @@ class PairingHandler(BaseHTTPRequestHandler):
         """A-R1 pairing facts (read-only). Auth first, uniformly 401, so an
         unauthenticated caller learns nothing about routes or peers."""
         if not self._is_service():
-            self.app.internal_rejected += 1
-            log.warning("internal facts request refused from %s (%d refused"
-                        " in total)", self._client_ip(),
-                        self.app.internal_rejected)
+            total = self.app.note_internal_rejected()
+            allowed, suppressed = self.app.internal_reject_log.allow()
+            if allowed:
+                # Never the token; at most one line per interval so a
+                # misconfigured or hostile poller cannot flood the log.
+                log.warning("internal facts request refused from %s (%d"
+                            " refused in total; %d similar warnings"
+                            " suppressed since the last one)",
+                            self._client_ip(), total, suppressed)
             self._error(401, "M_UNKNOWN_TOKEN",
                         "internal endpoints need the pairing service token")
             return
-        rest = path[len(INTERNAL_PREFIX):]
+        rest = path[len(INTERNAL_PREFIX):] if path.startswith(INTERNAL_PREFIX) \
+            else ""  # the bare INTERNAL_ROOT names no endpoint
         if rest == "events":
             route = "events"
         elif rest.startswith("peers/") and len(rest) > len("peers/") \
@@ -697,7 +795,12 @@ class PairingHandler(BaseHTTPRequestHandler):
 
         # A-R1 internal facts: service token only, and never via the
         # /_matrix/pairing/ alias (that prefix is what fedgate forwards).
-        if path.startswith(INTERNAL_PREFIX) or path == INTERNAL_PREFIX.rstrip("/"):
+        # Decision (#243 review): the alias answers 404 BEFORE auth, even
+        # for the right token. /_matrix/pairing/ is the public namespace
+        # fedgate forwards; internal endpoints do not exist there, and a
+        # 401 would advertise an authenticated variant worth guessing
+        # tokens against on the public prefix.
+        if path == INTERNAL_ROOT or path.startswith(INTERNAL_PREFIX):
             if aliased:
                 self._error(404, "M_UNRECOGNIZED", "no such pairing endpoint")
                 return
@@ -859,6 +962,7 @@ class PairingHandler(BaseHTTPRequestHandler):
             status, errcode, message = REDEEM_ERRORS[reason]
             self._error(status, errcode, message)
             return
+        self.app.sync_hs_whitelist()
         # The secret travels only in this TLS-protected response; the
         # accepting side stores it on its own peers row.
         self._send_json(200, {"ok": True, "server_name": self.config.server_name,
@@ -919,6 +1023,7 @@ class PairingHandler(BaseHTTPRequestHandler):
             return
         self.app.store.upsert_peer_active(
             remote_name, api_url, shared_secret=shared_secret)
+        self.app.sync_hs_whitelist()
         self._send_json(200, {"ok": True, "server_name": remote_name})
 
     def _handle_sever(self, server_name):
@@ -933,6 +1038,7 @@ class PairingHandler(BaseHTTPRequestHandler):
             self._error(404, "M_NOT_FOUND", "unknown peer")
             return
         self.app.store.sever_peer(server_name, "local")
+        self.app.sync_hs_whitelist()
         # A severed pairing must not stay cancellable: invites issued before
         # this sever are refused for this peer at redeem time
         # (REDEEM_PREDATES_SEVER); unrelated pending invites stay valid.
@@ -1061,6 +1167,7 @@ class PairingHandler(BaseHTTPRequestHandler):
         peer = self.app.store.get_peer(origin)
         if changed:
             log.info("notify-severed accepted from %s", origin)
+            self.app.sync_hs_whitelist()
         self._send_json(200, {"ok": True, "server_name": origin,
                               "state": "severed",
                               "severed_by": peer["severed_by"]})
@@ -1092,6 +1199,21 @@ def start_pruner(app, interval=PRUNE_INTERVAL_SECONDS):
     return thread
 
 
+def start_hs_whitelist_loop(app, interval=HS_WHITELIST_RESYNC_SECONDS):
+    """Re-render the homeserver whitelist every `interval` seconds (A-R2):
+    retries a failed write and repairs an include someone edited or
+    deleted by hand. Unchanged content writes nothing. Daemon thread."""
+    def run():
+        while True:
+            time.sleep(interval)
+            app.sync_hs_whitelist()
+
+    thread = threading.Thread(target=run, name="pairing-hs-whitelist",
+                              daemon=True)
+    thread.start()
+    return thread
+
+
 def main(argv=None):
     logging.basicConfig(
         level=logging.INFO,
@@ -1102,6 +1224,14 @@ def main(argv=None):
         print("pairing.service: {}".format(exc), file=sys.stderr)
         return 2
     httpd = build_server(config)
+    if httpd.app.hs_whitelist is not None:
+        # Render before serving so a homeserver that waits for this
+        # service (compose depends_on: service_healthy) starts with the
+        # current list.
+        httpd.app.sync_hs_whitelist()
+        log.info("homeserver whitelist include: %s (marker %s)",
+                 config.hs_whitelist_path, httpd.app.hs_whitelist.marker_path)
+        start_hs_whitelist_loop(httpd.app)
     start_pruner(httpd.app)
     host, port = httpd.server_address[:2]
     if not config.trusted_proxies:

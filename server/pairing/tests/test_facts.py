@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(TESTS_DIR, "..", ".."))  # server/ -> `pairing`
@@ -111,11 +112,33 @@ class FactsStoreTest(unittest.TestCase):
             self.db.fact_events(0, 100)
         self.assertEqual(ctx.exception.reason, "cursor_pruned")
         resync = ctx.exception.resync_cursor
-        self.assertEqual(resync, events[-1]["cursor"])
-        # A cursor at the watermark (it saw everything pruned) still works.
-        self.assertEqual(self.db.fact_events(events[1]["cursor"], 100)[0],
-                         events[2:])
-        self.assertEqual(self.db.fact_events(resync, 100), ([], resync, False))
+        # #243 review 1: resync at the WATERMARK (last pruned id), not at
+        # the newest id -- the retained hs-c fact must not be skipped.
+        self.assertEqual(resync, events[1]["cursor"])
+        self.assertEqual(self.db.fact_events(resync, 100)[0], events[2:])
+
+    def test_resync_after_prune_returns_every_retained_event(self):
+        now = time.time()
+        old = now - 40 * 86400
+        for i in range(3):
+            self.db.upsert_peer_active("old{}".format(i), PEER_URL, now=old + i)
+        for i in range(7):
+            self.db.upsert_peer_active("new{}".format(i), PEER_URL, now=now + i)
+        everything, _, _ = self.db.fact_events(0, 100)
+        self.db.prune(now=now)
+        with self.assertRaises(store.CursorExpired) as ctx:
+            self.db.fact_events(everything[0]["cursor"], 2)
+        cursor = ctx.exception.resync_cursor
+        self.assertEqual(cursor, everything[2]["cursor"])
+        seen = []
+        while True:  # page with a small limit, as a gateway would
+            events, cursor, has_more = self.db.fact_events(cursor, 2)
+            seen.extend(events)
+            if not has_more:
+                break
+        self.assertEqual([e["server_name"] for e in seen],
+                         ["new{}".format(i) for i in range(7)])
+        self.assertEqual(seen, everything[3:])
 
     def test_cursor_ahead_of_log_is_expired(self):
         self.db.upsert_peer_active("hs-b", PEER_URL)
@@ -123,7 +146,102 @@ class FactsStoreTest(unittest.TestCase):
         with self.assertRaises(store.CursorExpired) as ctx:
             self.db.fact_events(cursor + 5, 100)
         self.assertEqual(ctx.exception.reason, "cursor_ahead_of_log")
-        self.assertEqual(ctx.exception.resync_cursor, cursor)
+        # Nothing pruned yet: watermark 0, so the resync re-reads the
+        # whole (possibly rebuilt) log instead of skipping it.
+        self.assertEqual(ctx.exception.resync_cursor, 0)
+        self.assertEqual(len(self.db.fact_events(0, 100)[0]), 1)
+
+    def test_cursor_ahead_after_prune_resyncs_at_watermark(self):
+        now = time.time()
+        self.db.upsert_peer_active("hs-old", PEER_URL, now=now - 40 * 86400)
+        self.db.upsert_peer_active("hs-b", PEER_URL, now=now)
+        self.db.prune(now=now)
+        events, latest, _ = self.db.fact_events(1, 100)
+        with self.assertRaises(store.CursorExpired) as ctx:
+            self.db.fact_events(latest + 1, 100)
+        self.assertEqual(ctx.exception.resync_cursor, 1)
+        self.assertEqual(self.db.fact_events(1, 100)[0], events)
+
+    def test_limit_equal_to_remaining(self):
+        for name in ("hs-b", "hs-c", "hs-d"):
+            self.db.upsert_peer_active(name, PEER_URL)
+        self.db.record_event("invite_created", invite_id="x")  # non-fact tail
+        latest = self.db._latest_event_id()
+        events, next_cursor, has_more = self.db.fact_events(0, 3)
+        self.assertEqual(len(events), 3)
+        self.assertFalse(has_more)
+        self.assertEqual(next_cursor, latest)  # jumps past the non-fact tail
+        self.assertEqual(self.db.fact_events(next_cursor, 3),
+                         ([], latest, False))
+        # One fewer than remaining: has_more and the cursor stops on a fact.
+        events, next_cursor, has_more = self.db.fact_events(0, 2)
+        self.assertTrue(has_more)
+        self.assertEqual(next_cursor, events[-1]["cursor"])
+
+    def test_repaired_when_upserting_an_active_peer_again(self):
+        self.db.upsert_peer_active("hs-b", PEER_URL)
+        self.db.upsert_peer_active("hs-b", PEER_URL)  # still active
+        events, _, _ = self.db.fact_events(0, 100)
+        self.assertEqual([(e["kind"], e["repaired"]) for e in events],
+                         [("peer_paired", False), ("peer_paired", True)])
+
+    # --- same-transaction guarantees (#243 review) -------------------------
+
+    def fail_on_event(self, kind):
+        """SQLite trigger that aborts any INSERT of an event of `kind`."""
+        self.db._conn.execute(
+            "CREATE TRIGGER fail_{0} BEFORE INSERT ON events"
+            " WHEN NEW.kind = '{0}'"
+            " BEGIN SELECT RAISE(ABORT, 'injected failure'); END".format(kind))
+        self.db._conn.commit()
+
+    def committed_peer_state(self, name):
+        reader = sqlite3.connect(self.path)
+        try:
+            row = reader.execute("SELECT state FROM peers WHERE server_name=?",
+                                 (name,)).fetchone()
+        finally:
+            reader.close()
+        return row[0] if row else None
+
+    def test_upsert_active_and_peer_paired_commit_together(self):
+        self.fail_on_event("peer_paired")
+        with self.assertRaises(sqlite3.Error):
+            self.db.upsert_peer_active("hs-b", PEER_URL)
+        # An unrelated later commit must not publish the half-done change.
+        self.db.record_event("invite_created", invite_id="x")
+        self.assertIsNone(self.committed_peer_state("hs-b"))
+        self.assertIsNone(self.db.get_peer("hs-b"))
+
+    def test_upsert_over_severed_rolls_back_to_severed(self):
+        self.db.upsert_peer_active("hs-b", PEER_URL)
+        self.db.sever_peer("hs-b", "local")
+        self.fail_on_event("peer_paired")
+        with self.assertRaises(sqlite3.Error):
+            self.db.upsert_peer_active("hs-b", PEER_URL)
+        self.db.record_event("invite_created", invite_id="x")
+        self.assertEqual(self.committed_peer_state("hs-b"), "severed")
+
+    def test_redeem_active_and_peer_paired_commit_together(self):
+        self.db.create_invite("inv", "sec", 600)
+        self.fail_on_event("peer_paired")
+        with self.assertRaises(sqlite3.Error):
+            self.db.redeem_invite("inv", "sec", "hs-b", PEER_URL)
+        self.db.record_event("invite_created", invite_id="y")
+        self.assertIsNone(self.committed_peer_state("hs-b"))
+        # The invite was not consumed either (whole transaction rolled back).
+        self.db._conn.execute("DROP TRIGGER fail_peer_paired")
+        self.db._conn.commit()
+        ok, reason = self.db.redeem_invite("inv", "sec", "hs-b", PEER_URL)
+        self.assertTrue(ok, reason)
+
+    def test_sever_and_peer_severed_commit_together(self):
+        self.db.upsert_peer_active("hs-b", PEER_URL)
+        self.fail_on_event("peer_severed")
+        with self.assertRaises(sqlite3.Error):
+            self.db.sever_peer("hs-b", "local")
+        self.db.record_event("invite_created", invite_id="x")
+        self.assertEqual(self.committed_peer_state("hs-b"), "active")
 
     def test_ids_survive_pruning_everything(self):
         now = time.time()
@@ -200,12 +318,61 @@ class FactsApiTest(unittest.TestCase):
             self.assertEqual(status, 401, header[:8])
 
     def test_unconfigured_token_refuses_everything(self):
-        base, _ = self.start(service_token=None)
-        for token in (None, "", SERVICE, ADMIN):
-            status, resp = self.get(base, "/v1/pairing/internal/events",
-                                    token=token)
-            self.assertEqual(status, 401)
-            self.assertEqual(resp["errcode"], "M_UNKNOWN_TOKEN")
+        base, httpd = self.start(service_token=None)
+        httpd.app.store.upsert_peer_active("hs-b", PEER_URL)
+        for path in ("/v1/pairing/internal/events",
+                     "/v1/pairing/internal/peers/hs-b",
+                     "/v1/pairing/internal/peers/hs-unknown"):
+            for token in (None, "", SERVICE, ADMIN):
+                with self.subTest(path=path, token=token and token[:6]):
+                    status, resp = self.get(base, path, token=token)
+                    self.assertEqual(status, 401)
+                    self.assertEqual(resp["errcode"], "M_UNKNOWN_TOKEN")
+                    self.assertNotIn("active", json.dumps(resp))
+
+    def test_bare_internal_root_needs_auth_then_404(self):
+        base, _ = self.start()
+        for path in ("/v1/pairing/internal", "/v1/pairing/internal/"):
+            with self.subTest(path=path):
+                self.assertEqual(self.get(base, path, token=None)[0], 401)
+                self.assertEqual(self.get(base, path)[0], 404)
+
+    def test_internal_rejections_are_counted_and_log_throttled(self):
+        base, httpd = self.start()
+        app = httpd.app
+        with self.assertLogs("pairing.service", "WARNING") as logs:
+            for token in (None, ADMIN, "wrong-" + SERVICE, None, ADMIN):
+                self.assertEqual(
+                    self.get(base, "/v1/pairing/internal/events",
+                             token=token)[0], 401)
+        self.assertEqual(app.internal_rejected, 5)
+        refused = [r for r in logs.output if "internal facts request refused" in r]
+        self.assertEqual(len(refused), 1, logs.output)  # throttled
+        self.assertIn("1 refused in total; 0 similar warnings suppressed", refused[0])
+        # Next interval: one more warning that reports the swallowed ones.
+        with mock.patch.object(service.time, "monotonic",
+                               return_value=time.monotonic()
+                               + service.INTERNAL_REJECT_LOG_INTERVAL + 1):
+            with self.assertLogs("pairing.service", "WARNING") as logs:
+                self.get(base, "/v1/pairing/internal/events", token=None)
+        self.assertEqual(app.internal_rejected, 6)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("6 refused in total; 4 similar warnings suppressed",
+                      logs.output[0])
+        for line in logs.output:
+            self.assertNotIn(SERVICE, line)
+            self.assertNotIn(ADMIN, line)
+        # A valid request is not counted.
+        self.assertEqual(self.get(base, "/v1/pairing/internal/events")[0], 200)
+        self.assertEqual(app.internal_rejected, 6)
+
+    def test_log_throttle_unit(self):
+        throttle = service.LogThrottle(10)
+        self.assertEqual(throttle.allow(now=100), (True, 0))
+        self.assertEqual(throttle.allow(now=105), (False, 0))
+        self.assertEqual(throttle.allow(now=109.9), (False, 0))
+        self.assertEqual(throttle.allow(now=110), (True, 2))
+        self.assertEqual(throttle.allow(now=125), (True, 0))
 
     def test_service_token_never_opens_admin_endpoints(self):
         base, _ = self.start()
@@ -218,11 +385,45 @@ class FactsApiTest(unittest.TestCase):
             self.assertEqual(status, 401, path)
 
     def test_internal_not_reachable_through_matrix_alias(self):
-        base, _ = self.start()
-        for path in ("/_matrix/pairing/internal/events",
-                     "/_matrix/pairing/internal/peers/hs-b"):
-            status, _ = self.get(base, path)
-            self.assertEqual(status, 404, path)
+        base, httpd = self.start()
+        httpd.app.store.upsert_peer_active("hs-b", PEER_URL)
+        port = httpd.server_address[1]
+        # Decision: the alias forms of the internal namespace are 404
+        # before auth, whatever the token (see _dispatch) -- never 200 and
+        # never a 401 that hints at an authenticated route.
+        alias = ("/_matrix/pairing/internal",
+                 "/_matrix/pairing/internal/",
+                 "/_matrix/pairing/internal/events",
+                 "/_matrix/pairing/internal/events?since=0&limit=1",
+                 "/_matrix/pairing/internal/peers/hs-b",
+                 "/_matrix/pairing/internal/nope",
+                 # refused by the path-hygiene check before routing
+                 "/_matrix/pairing//internal/events",
+                 "/_matrix/pairing/x/../internal/events",
+                 "/_matrix/pairing/internal%2Fevents",
+                 "/v1/pairing/internal/../internal/events",
+                 "/v1/pairing//internal/events")
+        # Spellings the router never normalises into the internal namespace
+        # (case, percent-encoding, "." segment): they land on the ordinary
+        # admin routing (401 without the admin token, 404 with it), so the
+        # service token opens nothing there either.
+        lookalike = ("/_matrix/pairing/./internal/events",
+                     "/_matrix/pairing/%69nternal/events",
+                     "/_matrix/pairing/INTERNAL/events",
+                     "/_MATRIX/pairing/internal/events")
+        for paths, allowed in ((alias, {404}), (lookalike, {401, 404})):
+            for path in paths:
+                for token in (SERVICE, ADMIN, None):
+                    headers = ([("Authorization", "Bearer " + token)]
+                               if token else [])
+                    with self.subTest(path=path, token=token and token[:6]):
+                        status, _, _, body = testutil.raw_request(
+                            port, "GET", path, headers)
+                        self.assertIn(status, allowed)
+                        self.assertNotIn(b"active", body)
+                        self.assertNotIn(b"hs-b", body)
+                        if token == SERVICE:
+                            self.assertIn(status, {401, 404})
 
     def test_config_rules_for_service_token(self):
         env = {"PAIRING_ADMIN_TOKEN": ADMIN, "PAIRING_SERVER_NAME": "hs-a",
@@ -334,7 +535,10 @@ class FactsApiTest(unittest.TestCase):
         status, resp2 = self.get(
             base, "/v1/pairing/internal/events?since={}".format(
                 resp["resync_cursor"]))
-        self.assertEqual((status, resp2["events"]), (200, []))
+        # The retained hs-c fact comes back (#243 review 1).
+        self.assertEqual(status, 200)
+        self.assertEqual([(e["kind"], e["server_name"]) for e in resp2["events"]],
+                         [("peer_paired", "hs-c")])
         status, resp3 = self.get(
             base, "/v1/pairing/internal/events?since={}".format(
                 resp["resync_cursor"] + 100))

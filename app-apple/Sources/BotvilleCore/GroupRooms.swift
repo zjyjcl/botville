@@ -168,7 +168,10 @@ public final class PersonaGroupRoomsModel: ObservableObject {
     /// page arrives (409 conflict refresh). On failure the stale rows stay, and the
     /// next loadMore restarts from the first page instead of an old cursor.
     /// The room list and persona settings refresh independently; each field reports
-    /// only its own request (nil settingsError = settings refreshed), so a settings failure never hides a fresh room page.
+    /// only its own request, so a settings failure never hides a fresh room page.
+    /// A nil settingsError normally means settings refreshed. Exception: when a
+    /// settings refresh is already in flight, settings.refresh() returns early and
+    /// settingsError reflects the previous state, not a new request.
     /// `settingsError` is the settings error captured by this reload, so the
     /// combined conflict message never needs its own fallback text.
     struct ReloadOutcome: Equatable {

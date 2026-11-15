@@ -56,6 +56,11 @@ public struct MatrixMessage: Identifiable, Equatable, Sendable {
     public let timestamp: Date
     public let isOwn: Bool
     public let deliveryState: MessageDeliveryState?
+    /// An `m.room.encrypted` event this device cannot decrypt yet. The body is
+    /// the placeholder; the SDK replaces the same item once the key arrives.
+    public let isUndecryptable: Bool
+
+    public static let undecryptablePlaceholder = "无法解密此消息"
 }
 
 public enum MatrixServiceError: LocalizedError {

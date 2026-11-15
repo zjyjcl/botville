@@ -57,6 +57,10 @@
 #         stdlib-only source bind-mounted). federation_e2e.py proves:
 #         unpaired federation denied, pairing enables invite/join/messages
 #         both ways, and each side severing cuts traffic in both directions.
+#         A-R2 (#118 item 8): pairing renders each Synapse's
+#         federation_domain_whitelist include + a restart marker; the script
+#         restarts Synapse itself and proves zero homeserver traffic to a
+#         severed peer after the restart, and recovery after re-pair.
 #         Certs/configs/tokens are generated at run time (gitignored).
 # lint:   compose config for all three profiles (each also with push and
 #         with gateway; + the federation stack),
