@@ -16,7 +16,7 @@ import threading
 import time
 from urllib.parse import parse_qs
 
-from ..capability_manifest import DEFAULTS, BASE_CAPABILITIES, MEMORY_MANAGE
+from ..capability_manifest import DEFAULTS, BASE_CAPABILITIES, MEMORY_MANAGE, GROUPS_MANAGE
 from ..engine.personas import _is_local_owner
 from ..errors import ValidationError
 from .profile import FACT_KEYS
@@ -91,10 +91,17 @@ def capabilities(server, query):
         # Keep the published manifest order stable (memory.manage follows
         # memory.search); clients still must not depend on it.
         entries.insert(2, manage)
+    groups = server.group_invites
+    manage = deepcopy(GROUPS_MANAGE)
+    if groups.store is None:
+        manage.update(status='disabled', unavailable_reason='module_disabled')
+    elif not groups.enabled:
+        manage.update(status='degraded', unavailable_reason='groups_disabled')
+    entries.append(manage)
     for name in ('module', 'status'):
         if name in params:
             entries = [entry for entry in entries if entry[name] == params[name][-1]]
-    return dict(manifest_version='1.3.0', contract_version=server.config.contract_version,
+    return dict(manifest_version='1.4.0', contract_version=server.config.contract_version,
                 generated_at=datetime.now(timezone.utc).isoformat(),
                 cache_ttl_seconds=300, defaults=deepcopy(DEFAULTS), capabilities=entries)
 

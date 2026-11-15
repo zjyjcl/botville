@@ -1,6 +1,6 @@
 {
-  "manifest_version": "1.3.0",
-  "contract_version": "0.6.0",
+  "manifest_version": "1.4.0",
+  "contract_version": "0.7.0",
   "generated_at": "2026-11-13T00:00:00Z",
   "cache_ttl_seconds": 300,
   "defaults": {
@@ -87,6 +87,19 @@
       "entry": { "type": "none" },
       "scopes": ["town.read"],
       "updated_at": "2026-11-01T08:00:00Z"
+    },
+    {
+      "id": "groups.manage",
+      "module": "groups",
+      "version": "0.1.0",
+      "title": "群聊",
+      "summary": "管理我的 AI 所在的群：安静模式与退出。",
+      "icon": { "type": "sf_symbol", "value": "person.3" },
+      "status": "enabled",
+      "entry": { "type": "native", "deep_link": "botville://personas" },
+      "scopes": ["groups.read", "groups.write"],
+      "room_lookup": true,
+      "updated_at": "2026-11-15T00:00:00Z"
     }
   ]
 }
