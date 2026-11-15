@@ -124,8 +124,21 @@ struct DynamicUIView: View {
     private var visibleCapabilities: [GatewayCapability] {
         guard let manifest = model.manifest else { return [] }
         return manifest.capabilityProjections(knownNativeRoutes: ["chat.direct": "botville://chat"])
-            .filter { $0.capability.id != "memory.manage" }
+            .filter {
+                // Both live under 我的 AI; the tile list never duplicates them.
+                $0.capability.id != "memory.manage"
+                    && $0.capability.id != GroupsManageEntryState.capabilityID
+            }
             .filter(\.isVisible).map(\.capability)
+    }
+
+    /// Only rooms this device already knows; the closure reads them when a
+    /// group list loads so the mapping follows the current room list.
+    private var groupRoomLookupSource: GroupRoomLookupSource {
+        let service = matrixService
+        return GroupRoomLookupSource(
+            localServerName: service.userID.flatMap(MemoryPresentationPolicy.matrixServerName),
+            knownRooms: { service.rooms })
     }
 
     private var canManageMemories: Bool {
@@ -292,7 +305,10 @@ struct DynamicUIView: View {
             }
             .sheet(isPresented: $showMyAI) {
                 NavigationStack {
-                    MyAIListView(client: model.client)
+                    MyAIListView(
+                        client: model.client,
+                        groupsEntry: GroupsManageEntryState(manifest: model.manifest),
+                        lookupSource: groupRoomLookupSource)
                         .toolbar {
                             ToolbarItem(placement: .cancellationAction) {
                                 Button("完成") { showMyAI = false }

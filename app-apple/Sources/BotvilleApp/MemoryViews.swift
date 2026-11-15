@@ -8,9 +8,16 @@ private let memoryAccent = Color(red: 26 / 255, green: 173 / 255, blue: 142 / 25
 
 struct MyAIListView: View {
     @StateObject private var model: PersonaListModel
+    let groupsEntry: GroupsManageEntryState
+    let lookupSource: GroupRoomLookupSource?
 
-    init(client: any GatewayClient) {
+    init(
+        client: any GatewayClient, groupsEntry: GroupsManageEntryState = .legacy,
+        lookupSource: GroupRoomLookupSource? = nil
+    ) {
         _model = StateObject(wrappedValue: PersonaListModel(client: client))
+        self.groupsEntry = groupsEntry
+        self.lookupSource = lookupSource
     }
 
     var body: some View {
@@ -33,7 +40,8 @@ struct MyAIListView: View {
                     ForEach(model.personas) { persona in
                         NavigationLink {
                             PersonaMemoryView(
-                                persona: persona, client: modelClient)
+                                persona: persona, client: modelClient,
+                                groupsEntry: groupsEntry, lookupSource: lookupSource)
                         } label: {
                             Label(persona.displayName, systemImage: "person.crop.circle")
                         }
@@ -168,10 +176,17 @@ private struct PersonaMemoryView: View {
     // deliberately does not carry them, so do not infer ownership from it.
     @State private var ownerGroups: PersonaGroupsSettingsController?
     @State private var ownerGroupsError: String?
+    let groupsEntry: GroupsManageEntryState
+    let lookupSource: GroupRoomLookupSource?
 
-    init(persona: MemoryPersona, client: any GatewayClient) {
+    init(
+        persona: MemoryPersona, client: any GatewayClient, groupsEntry: GroupsManageEntryState,
+        lookupSource: GroupRoomLookupSource?
+    ) {
         self.persona = persona
         self.client = client
+        self.groupsEntry = groupsEntry
+        self.lookupSource = lookupSource
         _model = StateObject(wrappedValue: MemoryListModel(personaID: persona.id, client: client))
         _mood = StateObject(wrappedValue: PersonaMoodController(personaID: persona.id, client: client))
     }
@@ -217,21 +232,29 @@ private struct PersonaMemoryView: View {
                     }
                 }
             }
-            if let ownerGroups {
-                Section("群聊") {
+            if let ownerGroups, groupsEntry.isVisible {
+                Section {
                     NavigationLink {
-                        PersonaGroupRoomsView(persona: persona, client: client, settings: ownerGroups)
+                        PersonaGroupRoomsView(
+                            persona: persona, client: client, settings: ownerGroups,
+                            entry: groupsEntry, lookupSource: lookupSource)
                     } label: {
                         Label("群聊", systemImage: "person.3")
+                            .foregroundStyle(groupsEntry.visibility == .dimmed ? .secondary : .primary)
                     }
                     NavigationLink {
                         PersonaGroupsSettingsView(model: ownerGroups)
                     } label: {
                         Label("群聊设置", systemImage: "person.3.sequence")
                     }
+                    .disabled(!groupsEntry.canOpenSettings)
+                } header: {
+                    Text("群聊")
+                } footer: {
+                    if let notice = groupsEntry.notice { Text(notice) }
                 }
             }
-            if let ownerGroupsError {
+            if let ownerGroupsError, groupsEntry.isVisible {
                 Section("群聊") {
                     Label(ownerGroupsError, systemImage: "exclamationmark.triangle")
                         .foregroundStyle(.secondary)
@@ -516,25 +539,32 @@ private func userFacingMemoryError(_ error: Error, fallback: String) -> String {
     return fallback
 }
 
-/// Owner-only room management. The gateway intentionally never returns a
-/// Matrix room id or a display name here; the ordinal is therefore a stable
-/// presentation choice for the current result set, never an identifier.
+/// Owner-only room management. The gateway never returns a Matrix room id or a
+/// display name; rows matched through POST rooms/lookup against rooms this device
+/// already knows show the local name, all others keep the presentation ordinal
+/// (never an identifier).
 private struct PersonaGroupRoomsView: View {
     let persona: MemoryPersona
     let client: any GatewayClient
     @StateObject private var model: PersonaGroupRoomsModel
     @State private var roomToLeave: GroupRoom?
 
-    init(persona: MemoryPersona, client: any GatewayClient, settings: PersonaGroupsSettingsController) {
+    init(
+        persona: MemoryPersona, client: any GatewayClient, settings: PersonaGroupsSettingsController,
+        entry: GroupsManageEntryState, lookupSource: GroupRoomLookupSource?
+    ) {
         self.persona = persona
         self.client = client
         _model = StateObject(wrappedValue: PersonaGroupRoomsModel(
-            personaID: persona.id, client: client, settings: settings))
+            personaID: persona.id, client: client, settings: settings,
+            entry: entry, lookupSource: lookupSource))
     }
 
     var body: some View {
         List {
-            if let notice = GroupRoomListViewState(groupsEnabled: model.groupsEnabled).disabledNotice {
+            if let notice = model.entry.notice
+                ?? GroupRoomListViewState(groupsEnabled: model.groupsEnabled).disabledNotice
+            {
                 Section {
                     Label(notice, systemImage: "info.circle")
                         .foregroundStyle(.secondary)
@@ -565,7 +595,9 @@ private struct PersonaGroupRoomsView: View {
                     ForEach(Array(model.rooms.enumerated()), id: \.element.roomRef) { index, room in
                         GroupRoomRow(
                             state: GroupRoomRowViewState(
-                                room: room, ordinal: index + 1, groupsEnabled: model.groupsEnabled,
+                                room: room, ordinal: index + 1,
+                                name: model.roomName(for: room.roomRef),
+                                groupsEnabled: model.groupsEnabled,
                                 canEnableMentionOnly: model.canEnableMentionOnly,
                                 isSubmitting: model.isUpdating || model.isLoading || model.isLoadingMore),
                             onModeChanged: { mode in

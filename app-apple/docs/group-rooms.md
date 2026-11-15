@@ -11,7 +11,7 @@
 - 「我的 AI → 某个 AI」读取 owner 详情，仅当响应包含 `groups` 时显示群设置与群聊入口；对方资料页不显示。
 - 「允许被拉进群」和「谁可以拉它进群」保存完整的 `groups` 对象，失败恢复上次服务端值；不发送 revision、If-Match 或其他 persona 字段。
 - 群列表默认活跃群，切换「显示已退出的群」重置分页。下拉刷新重新请求第一页，加载更多原样传递 `next_cursor`，按 `room_ref` 去重。PATCH 成功后若还需加载更多，先刷新第一页以重新取得更新后排序的游标；写入期间暂停筛选、刷新和其他提交。
-- 每行用「群聊 1、2…」及可选加入时间展示；序号仅为本次列表位置。绝不向用户显示不透明引用或把它当作 Matrix room ID。
+- 每行默认用「群聊 1、2…」及可选加入时间展示；序号仅为本次列表位置。网关声明 `room_lookup` 时，能通过 lookup 映射到本机已知房间的行改显示本地群名（见下文「群名映射」），映射不到的保持序号。绝不向用户显示不透明引用或把它当作 Matrix room ID。
 - 安静模式仅在 accepted/encrypted_disabled 且模式已知时可改。群功能开启时可以切换 muted / mention_only；关闭时只有单向「设为安静」，已 muted 仅显示状态，同时保留「退出群聊」。控制器在关闭或 persona 设置尚未确认时拒绝 mention_only，不发请求。开启安静模式后被 @ 也不回复，仍会记住群里的内容。
 - AI 退群需红色 destructive 二次确认，明确不可撤销、不会继续发言或自动加入。成功使用响应原地更新，活跃视图暂保留「已退出」，下次刷新再移除。
 - `left` 始终显示「已退出」；`leave_pending=true` 只加弱提示「正在同步」。该字段不是持久状态，后续列表不承诺提供。未知 state/mode 显示未知提示并禁止操作。
@@ -21,7 +21,7 @@
 
 ## 门控及错误
 
-没有已发布的群/rooms capability ID；不新增 ID，不改变 mock manifest。owner `groups` 字段控制入口与设置是否出现。部署 `groups_enabled=false` **或** owner `groups.enabled=false` 即视为群功能关闭：仍显示现有列表与分页，顶部显示普通提示「群聊功能已关闭，AI 不会在群里发言」，不当作故障。关闭时内置 AI 即使被 @ 或回复也不发言，不自动退群。设置页与群列表共享 owner 设置控制器，关闭邀请开关后立即联动，保存失败会回滚；重载列表同时重取 owner 详情，详情失败时保留可读列表但禁止恢复 mention_only。
+契约 0.7.0（#244）起部署级能力 `groups.manage` 决定入口形态（见下文）；能力缺失（旧网关）时保持原行为，由 owner `groups` 字段控制入口与设置是否出现。部署 `groups_enabled=false` **或** owner `groups.enabled=false` 即视为群功能关闭：仍显示现有列表与分页，顶部显示普通提示「群聊功能已关闭，AI 不会在群里发言」，不当作故障。关闭时内置 AI 即使被 @ 或回复也不发言，不自动退群。设置页与群列表共享 owner 设置控制器，关闭邀请开关后立即联动，保存失败会回滚；重载列表同时重取 owner 详情，详情失败时保留可读列表但禁止恢复 mention_only。
 
 所有页面复用 `GatewayClientError.errorDescription` 的脱敏错误映射，只根据 problem `code` 与 HTTP status 分支；解析器不读取或保留 `title`，页面也不比较 title，不显示服务端原始 detail：
 
@@ -42,6 +42,33 @@
 
 GET 保持现有有限退避重试；三个新 PATCH 均不携带 Idempotency-Key，遇 500 只发送一次。OpenID 路由严格按方法、组件数及非空组件匹配，不接受形似名称或额外层级。persona ID 和 room_ref 分别编码为一个 path 组件；cursor 仅原样传回，不解析或构造。
 
+## 群名映射与 groups.manage（#244，契约 0.7.0）
+
+依据契约 §2.4.1 与「groups.manage（B2.8f）」。#244 的示例 manifest 与 App mock 逐字节一致（1.4.0 / 0.7.0），本 PR 未改动两者，版本断言继续从契约读取。
+
+### 群名映射
+
+- 进入某个 AI 的群列表并且首页加载成功后，若 `groups.manage.room_lookup == true`，从本机 Matrix 房间列表取非私聊房间，按网关同样的规则预过滤：严格 `!<localpart>:<server_name>`、localpart 仅 `[A-Za-z0-9._~=-]`、总长 ≤255、无空白/控制字符、服务器名与登录 MXID 的完整 server_name（含端口）忽略大小写相等；按「localpart 原样 + 服务器名小写」去重，保留首个原始字符串。任一不合规 ID 都会让整批 400，所以不发。
+- 每批最多 50 个，超过即分批顺序 POST `/personas/{id}/rooms/lookup`（OpenID 鉴权，room_id 只在请求体，不进 URL）。回复必须与请求按下标对齐，否则整批丢弃；`null` 表示「没有这个群」，不生成映射。
+- 映射为 `room_ref → 本地房间名`；名字为空或等于 room_id 时不用。行标题有群名就显示群名，否则保持「群聊 N」。
+- 群名只是装饰：首页一到即可操作，lookup 期间不锁行；任一批失败（含 429 与 memory 共用的每分钟读配额、503、未对齐）静默停止后续批次，保留已得到的映射，不显示错误。
+- 每次整页重载（含 404 room.not_found 触发的轮换刷新）先清空旧映射再用本地已知 room_id 重查；409 保留旧列表的刷新同样重查。加载更多不重查（映射与分页无关）。
+- 不提供反查或发现房间：只查本机已知房间；owner 不在的群继续显示序号。
+
+### groups.manage 显示规则
+
+判断在 Core 的 `GroupsManageEntryState`，有单测覆盖。
+
+| 能力状态 | 入口 | mention_only | 群聊设置 | lookup |
+| --- | --- | --- | --- | --- |
+| enabled | 正常显示 | 与 persona 开关、房间 state 共同决定 | 可进入 | 按 room_lookup |
+| degraded，或 unavailable_reason=groups_disabled | 置灰显示并附说明「群聊功能已关闭，只能设为安静或退出群聊」，仍可进入 | 不提供 | 置灰不可进入 | 按 room_lookup |
+| disabled（module_disabled 等） | 不显示 | — | — | 不调用 |
+| 其他未知 status | 不显示（同未知能力默认 hidden） | — | — | 不调用 |
+| 能力缺失（网关 < 0.7.0）或清单未加载 | 保持旧行为 | 旧规则 | 旧规则 | 不调用 |
+
+degraded 选「置灰」而非隐藏：参照微信对暂不可用功能保留灰色条目并说明原因的做法，让用户知道群聊被关闭而不是消失；同时契约要求 degraded 仍可安静/退出，隐藏会让已在群里的 AI 无法被设为安静或退出。群聊设置置灰是因为部署关闭期间改 persona 开关不生效，避免误导。`groups.manage` 不出现在动态功能卡片列表（与 memory.manage 一样只在「我的 AI」里）。
+
 ## 依赖 #235（B2.8d2）
 
 依赖 #235（B2.8d2）的网关行为，#235 已合入 main。未升级到 #235 的旧网关在关闭时 GET 返回空页、PATCH mention_only 可能成功，App 行为仍安全：本地关闭判定后不提供也不发送 mention_only，仍可管理网关实际返回的房间。部署升级后关闭时会恢复显示现有房间，无需修改 App。开启时仍按 #232 允许 accepted/encrypted_disabled 在两种模式间切换。
@@ -60,8 +87,8 @@ GET 保持现有有限退避重试；三个新 PATCH 均不携带 Idempotency-Ke
 
 ## 需要总管拿主意
 
-1. 功能清单没有群 capability，当前按响应字段门控；如需部署前隐藏独立入口，需先补正式契约。
-2. room_ref 不能映射 Matrix 房间，且没有群名/成员信息：owner 列表仅序号；Matrix 聊天信息不能显示或修改 AI 群模式。
+1. ~~功能清单没有群 capability~~：0.7.0 已发布 `groups.manage`，见上文显示规则。
+2. room_ref 仍不能反查 Matrix 房间；0.7.0 lookup 只能把本机已知房间映射成名字，owner 不在的群仍是序号；Matrix 聊天信息仍不能显示或修改 AI 群模式。
 3. leave_pending 仅属于本次 leave 响应，刷新后不保留确认提示；joined_rooms 查询失败可能无法入清理队列，不能保证后台恢复。因此 UI 不承诺一定自动退出 Matrix 成员资格，也不对 left 提供自动重复提交。
 4. PATCH 没有幂等键/版本条件，500 后结果可能不确定；不自动重试，用户可刷新核对，设置失败按要求回滚本地显示。
 5. 分页无快照，更新会移动记录；客户端去重并允许刷新，不声称一次遍历取得原子快照。
