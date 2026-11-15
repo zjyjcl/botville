@@ -280,9 +280,13 @@ fedgate 是**实时的第一道闸**：配对表一变（≤1s），双方入站
 
    列表去重、排序（同一配对状态永远渲染出相同字节）；severed 对端不在其中；名字以 JSON 字符串写出（配对本就只接受裸 DNS 名）。启动时、以及之后每 60s 也会重算一次（重试失败的写入、修复被手改/删掉的文件）。
 2. **原子写入**：同目录临时文件 → fsync → `os.replace` → fsync 目录；Synapse 永远读不到半个文件；写失败时旧文件原样保留。文件权限 0644（不是密钥，homeserver 以其他 uid 读取）。
-3. **重启标记**：文件内容真的变了才写 `<path>.restart-required`（可用 `PAIRING_HS_RESTART_MARKER` 改路径），内容是 `{"reason","whitelist","at"}`。**内容没变（例如重复切断、同一状态的重算）不写文件也不写标记**，不会触发无谓重启。例外：进程**首次**同步时文件根本不存在 → 只建文件不写标记（homeserver 通过 `--config-path` 加载它，文件不存在时不可能在运行，首启无需重启）；之后若文件被删再重建，照常写标记。标记写失败会在下一次同步时重试，不会因为文件内容已是最新而漏掉重启。
+3. **重启标记**：文件内容真的变了才写 `<path>.restart-required`（可用 `PAIRING_HS_RESTART_MARKER` 改路径），内容是 `{"reason","whitelist","at"}`。**内容没变（例如重复切断、同一状态的重算）不写文件也不写标记**，不会触发无谓重启。
+   - **读表→渲染→写盘在同一把锁里**（#247 审查 S1）：并发的两次同步不会出现「慢的那次用旧快照覆盖新内容」。
+   - **标记写两次**（#247 审查 S2）：先写标记、再替换 include、再写一次标记。进程若在 include 与标记之间崩溃，标记已经在了（否则下次启动发现 include 已是最新、什么都不写，重启就丢了）；若 supervisor 恰好在 include 落盘前就认领了第一个标记并重启，第二个标记会让它再重启一次。最坏多重启一次，绝不漏。
+   - **标记写失败**（#247 审查 N3）：include 照常更新，重启记为待办；之后每次同步（含每 60s 的后台重算）都重写并重试标记，每次失败都记一条 ERROR（`restart marker could not be written`），直到写成为止。
+   - 例外：进程**首次**同步时文件根本不存在 → 只建文件不写标记（homeserver 通过 `--config-path` 加载它，文件不存在时不可能在运行，首启无需重启）。之后若文件被删再重建，照常写标记——**但这只在同一进程内成立**（#247 审查 S4）：「首次同步」是进程内状态，pairing 停机期间被删掉的文件，下次启动时按首启处理、重建但**不写标记**；运维若手动删过 include，请在 pairing 启动后自行重启一次 homeserver。
 4. **不自动重启**：pairing 不持有 docker socket，也不调用任何编排 API。Synapse 只在启动时读这个 include，**由运维或外部 supervisor/systemd 在看到标记后重启 Synapse，并在重启后删除标记**。在重启之前，新的配对状态仍由 fedgate 实时执行，只是本端 HS 还会白费力气地尝试出站。
-5. 写入失败不影响配对请求本身（状态已提交，fedgate 已生效）：记 ERROR 日志并在下一次同步重试。
+5. 写入失败不影响配对请求本身（状态已提交，fedgate 已生效）：任何异常（不只是 IO/SQLite 错误，#247 审查 S3）都只记 ERROR 日志、计入失败计数（加锁，N1），并在下一次同步重试；后台重算循环本身也包了一层异常保护，单次意外不会让循环线程退出。
 
 **Synapse 接入**：把 include 作为第二个 `--config-path` 传给 Synapse（后加载的文件覆盖同名键，所以**不要**在 homeserver.yaml 里再写 `federation_domain_whitelist`），并让 Synapse 在 pairing 健康之后再启动（pairing 先渲染再开始服务）。CI 栈的写法：
 
@@ -297,6 +301,12 @@ pairing-a:
 ```
 
 生产部署时把这个目录做成宿主机目录（bind mount），supervisor 才看得到标记。
+
+**目录属主与权限（#247 审查 S6）**：
+- pairing 需要对该目录**可写**（临时文件 + `os.replace` 发生在同一目录，只给文件写权限不够）；homeserver 只需**可读**（挂 `:ro`）；supervisor 需要在目录里 `mv` / `rm` 标记，所以也要可写。
+- 官方镜像里 pairing（`python:3.12-slim`）默认以 root 运行，Synapse 镜像以 UID 991 运行。推荐：宿主机建 `/srv/botville/hs`，属主 `root:991`、模式 `0750`（或 `0755`）；include 由 pairing 以 `0644` 写出，Synapse 能读、不能改。
+- 如果把 pairing 改成非 root 运行，目录属主改为该 UID（或给它组写权限 `0770`），否则每次渲染都会失败并只留下 ERROR 日志（fedgate 仍然生效）。
+- 不要把这个目录放在 homeserver 的数据卷里，也不要让 homeserver 可写：include 决定它能和谁联邦。
 
 **重启流程**（手工或 supervisor，顺序很重要）：
 
@@ -341,11 +351,15 @@ ExecStart=/bin/sh -c 'for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8008/h
 ExecStartPost=/bin/rm -f ${M}.processing
 ```
 
-启用：`systemctl daemon-reload && systemctl enable --now botville-hs-restart.path`。服务失败时 `.processing` 留在原地、不会被删除，便于排查；`PathExists` 会在新标记出现时再次触发。
+启用：`systemctl daemon-reload && systemctl enable --now botville-hs-restart.path`。
+
+**失败不会自愈（#247 审查 S5）**：服务任何一步失败（restart 失败、60 次健康检查都没过）时，`.processing` 留在原地、不会被删除，**也不会自动重试**——标记已经被 `mv` 走，`PathExists` 条件不再成立；之后只有 pairing 再写出**新**标记（下一次配对变化）才会再次触发，而在那之前 homeserver 可能一直运行着旧白名单（fedgate 仍然实时执行配对状态，安全上不受影响）。频繁失败时 systemd 还可能让 path unit 进入 `trigger-limit-hit` 失败态，之后连新标记都不再触发。请对 `botville-hs-restart.service` 的失败配置告警（如 `OnFailure=` 发通知），人工处理：确认 Synapse 状态后，`mv ….processing ….restart-required` 让它重跑，或手动重启并删除 `.processing`；必要时 `systemctl reset-failed botville-hs-restart.path`。
 
 **短暂停机的影响**：重启期间（CI 实测约 10–30s）本端用户的客户端请求失败/重连、推送与 appservice 事务延后；联邦方向上，对端发来的事务在本端闸门后得不到应答，对端 Synapse 会退避重试，之后补齐 PDU；**重启窗口内对端发来的 EDU（输入提示、已读回执、to-device）可能丢失**。因此重启应在配对变更后尽快、但可以择时进行——在此之前 fedgate 已经执行了新状态，安全上不依赖重启的时机。
 
 **验收**（`make federation-e2e`，e2e 脚本自己扮演 supervisor，执行上面的认领→`docker compose restart`→删除流程）：首启双方白名单只有自己且无标记；配对后两边列表都含双方、双方都有标记，重启后互通；切断后**重启前**本端 HS 仍在出站、由对端 fedgate 拦下（对端闸门访问日志里能看到请求，作为对照）；**切断并重启后**本端 HS 向对端发出的 `/_matrix/federation|key` 请求为 0（对端闸门访问日志计数不变），向对端用户发邀请在本端直接失败；重新配对并重启后双向恢复；重复切断不写标记。
+
+**负向断言的局限（#247 审查 N4）**：「没有出站」「消息没送到」这类断言是在一个有限窗口里观察的（`NEGATIVE_TIMEOUT` 20 秒，切断后另加闸门刷新的宽限），它们证明的是「窗口内没有发生」，**不是**「永远不会发生」。Synapse 的事务重试退避可能长于 20 秒，所以窗口之后才出现的延迟出站在 e2e 里观察不到；这一层的保证来自代码路径（白名单在 Synapse 启动时加载、fedgate 实时拦截）和单元测试，e2e 只是在合理时长内的抽样验证。
 
 **Conduit 系不在本 PR**：Tuwunel（`allowed_remote_server_names_experimental` / `forbidden_remote_server_names`）与 continuwuity（`allowed_remote_server_names` / `forbidden_remote_server_names`）的配置面与 Synapse 不同，联邦栈也只有 Synapse；留到 A-R3 之后单独做。在此之前这两家只靠 fedgate。
 

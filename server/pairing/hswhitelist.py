@@ -23,12 +23,28 @@ Guarantees (tests: server/pairing/tests/test_hswhitelist.py):
   so Synapse never reads a half-written include;
 - when the rendered text equals what is already on disk nothing is
   written and NO marker is created (no pointless restarts);
-- the marker is written (atomically) only after the include changed;
+- the marker is written (atomically) only when the include changes, and
+  it is written TWICE around the include write (#247 review S2): once
+  BEFORE the include is replaced, so a crash between the two writes can
+  never lose the restart (the next process would find the include already
+  current and write nothing), and once AFTER, so a supervisor that
+  consumed the first marker before the include landed restarts again with
+  the new content (worst case: one extra restart, never a missed one);
+- reading the peers table, rendering and writing all happen under one
+  lock (#247 review S1), so a slower concurrent sync can never write an
+  older snapshot over a newer one;
+- a marker that cannot be written stays pending: every later sync (the
+  service's 60s loop included) rewrites the include and retries the
+  marker, raising MarkerWriteError each time so the caller logs an ERROR
+  (#247 review N3);
 - exception: when this process's FIRST sync finds no include at all, the
   file is created without a marker. The homeserver loads the include via
   --config-path and cannot have started without it, so there is nothing
   running to restart (first boot: pairing renders before the homeserver
-  starts). A file that disappears later is recreated WITH a marker.
+  starts). A file that disappears later is recreated WITH a marker -- but
+  only within the same process (#247 review S4): "first sync" is
+  per-process state, so a file deleted while the service is down is
+  recreated at the next start WITHOUT a marker.
 
 Only Synapse is supported. Conduit-family homeservers (tuwunel,
 continuwuity) use a different config surface and are left for a later
@@ -103,6 +119,11 @@ def _read(path):
         return None
 
 
+class MarkerWriteError(OSError):
+    """The include was written but the restart marker could not be; the
+    restart stays pending and is retried on every later sync."""
+
+
 class HsWhitelistWriter:
     """Renders the include file and the restart marker; thread-safe."""
 
@@ -117,26 +138,45 @@ class HsWhitelistWriter:
         self._marker_pending = False
         self._first_sync = True
 
+    def _write_marker(self, stamp):
+        _atomic_write(self.marker_path, json.dumps({
+            "reason": "federation whitelist changed",
+            "whitelist": os.path.basename(self.path),
+            "at": int(stamp),
+        }) + "\n")
+
     def sync(self, active_peers, now=None):
-        """Render for `active_peers`; True when the file and the restart
+        """Render for `active_peers` -- an iterable of names, or a callable
+        returning one (called under the writer lock, so read -> render ->
+        write is one critical section). True when the file and the restart
         marker were written, False when nothing needs a restart (content
-        already current, or the first-boot creation above). Raises
-        OSError on write failure (callers log and retry later)."""
-        text = render(self.server_name, active_peers)
+        already current, or the first-boot creation above). Raises OSError
+        when the include cannot be written and MarkerWriteError when only
+        the marker failed (callers log and retry later)."""
         with self._lock:
+            peers = active_peers() if callable(active_peers) else active_peers
+            text = render(self.server_name, peers)
             current = _read(self.path)
             first, self._first_sync = self._first_sync, False
             if current == text and not self._marker_pending:
                 return False
-            _atomic_write(self.path, text)
-            if current is None and first and not self._marker_pending:
-                return False  # first boot: the homeserver is not running yet
-            self._marker_pending = True
+            needs_restart = not (current is None and first
+                                 and not self._marker_pending)
             stamp = time.time() if now is None else now
-            _atomic_write(self.marker_path, json.dumps({
-                "reason": "federation whitelist changed",
-                "whitelist": os.path.basename(self.path),
-                "at": int(stamp),
-            }) + "\n")
+            if needs_restart:
+                self._marker_pending = True
+                try:
+                    self._write_marker(stamp)  # before: crash-safe
+                except OSError:
+                    pass  # retried right after the include write below
+            _atomic_write(self.path, text)
+            if not needs_restart:
+                return False  # first boot: the homeserver is not running yet
+            try:
+                self._write_marker(stamp)  # after: covers an early consumer
+            except OSError as exc:
+                raise MarkerWriteError(
+                    "restart marker {} not written: {}".format(
+                        self.marker_path, exc)) from exc
             self._marker_pending = False
             return True
