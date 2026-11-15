@@ -1596,6 +1596,210 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(client.openIDCalls, 1)
     }
 
+    // MARK: - #81 / #245: Keychain session survives, encrypted store does not
+
+    private static let lostStoreMessage = "本机加密数据已丢失，需要重新登录"
+
+    private func oldDeviceCredentials(userID: String) -> SessionCredentials {
+        SessionCredentials(accessToken: "fake-access", refreshToken: nil, userID: userID, deviceID: "OLDDEVICE",
+                           homeserverURL: "https://matrix.test", oauthData: nil, storeID: UUID(),
+                           storeKey: Data(repeating: 7, count: 32))
+    }
+
+    /// Simulates an SDK store that already exists on disk: the store directory
+    /// plus the crypto database file the SDK keeps in its data path.
+    private func seedExistingStore(_ directory: SessionStoreDirectory, _ storeID: UUID, bytes: Int = 16) throws {
+        let path = try directory.create(for: storeID)
+        try Data(repeating: 1, count: bytes).write(to: path.appendingPathComponent("matrix-sdk-crypto.sqlite3"))
+    }
+
+    private func assertForcedRelogin(_ service: MatrixService, store: InMemorySessionStore, shared: InMemorySharedPushCredentialsStore,
+                                     directory: SessionStoreDirectory, saved: SessionCredentials, client: FakeClient, factoryCalls: Int,
+                                     file: StaticString = #filePath, line: UInt = #line) throws {
+        // The old device ID must never reach the SDK: no client, no restore.
+        XCTAssertEqual(factoryCalls, 0, "client must not be built for a lost store", file: file, line: line)
+        XCTAssertEqual(client.restoreCalls, 0, file: file, line: line)
+        XCTAssertNil(client.restoredSession?.deviceId, "restored with old device ID", file: file, line: line)
+        XCTAssertFalse(service.isLoggedIn, file: file, line: line)
+        XCTAssertNil(service.userID, file: file, line: line)
+        XCTAssertEqual(service.sessionError, Self.lostStoreMessage, file: file, line: line)
+        XCTAssertNil(try store.load(), "old Keychain session must be removed", file: file, line: line)
+        XCTAssertNil(try shared.load(), file: file, line: line)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.url(for: saved.storeID).path), file: file, line: line)
+        XCTAssertFalse(service.canRetryRestore, file: file, line: line)
+        XCTAssertFalse(service.canClearLocalSession, file: file, line: line)
+        XCTAssertFalse(service.requiresPasswordReauthentication, file: file, line: line)
+    }
+
+    private func lostStoreService(_ store: InMemorySessionStore, _ shared: InMemorySharedPushCredentialsStore, _ temporary: URL,
+                                  _ client: FakeClient, _ authentication: FakePasswordAuthentication,
+                                  factoryCalls: @escaping () -> Void) -> MatrixService {
+        let service = makeService(sessionStore: store, directory: temporary, client: client, authentication: authentication,
+                                  sharedPushCredentialsStore: shared)
+        let base = service.clientFactory
+        service.clientFactory = { server, path, key in factoryCalls(); return try await base(server, path, key) }
+        return service
+    }
+
+    func testRestoreWithMissingStoreDirectoryForcesReloginWithoutOldDeviceID() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let saved = oldDeviceCredentials(userID: "@lost-dir:matrix.test")
+        let store = InMemorySessionStore(saved)
+        let shared = InMemorySharedPushCredentialsStore()
+        try shared.save(SharedPushCredentials(homeserverURL: saved.homeserverURL, userID: saved.userID,
+                                              accessToken: saved.accessToken, deviceID: saved.deviceID))
+        let directory = SessionStoreDirectory(baseURL: temporary)
+        let client = FakeClient(session: fakeSession(userID: saved.userID, deviceID: "OLDDEVICE"))
+        var calls = 0
+        let service = lostStoreService(store, shared, temporary, client, FakePasswordAuthentication()) { calls += 1 }
+
+        // Reinstall: Keychain kept the session, the app container (and store) is gone.
+        await service.restoreSession()
+
+        try assertForcedRelogin(service, store: store, shared: shared, directory: directory, saved: saved, client: client, factoryCalls: calls)
+        // A foreground event must not resurrect anything either.
+        await service.applicationDidBecomeActive()
+        XCTAssertFalse(service.isLoggedIn)
+        XCTAssertEqual(client.restoreCalls, 0)
+    }
+
+    func testRestoreWithClearedOrEmptyCryptoDatabaseForcesRelogin() async throws {
+        for variant in ["empty-directory", "zero-byte-database", "only-cache"] {
+            let temporary = try makeTemporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: temporary) }
+            let saved = oldDeviceCredentials(userID: "@lost-\(variant):matrix.test")
+            let store = InMemorySessionStore(saved)
+            let shared = InMemorySharedPushCredentialsStore()
+            let directory = SessionStoreDirectory(baseURL: temporary)
+            switch variant {
+            case "zero-byte-database": try seedExistingStore(directory, saved.storeID, bytes: 0)
+            case "only-cache":
+                let path = try directory.create(for: saved.storeID)
+                try FileManager.default.createDirectory(at: path.appendingPathComponent("cache"), withIntermediateDirectories: false)
+                try Data(repeating: 1, count: 16).write(to: path.appendingPathComponent("matrix-sdk-state.sqlite3"))
+            default: _ = try directory.create(for: saved.storeID)
+            }
+            let client = FakeClient(session: fakeSession(userID: saved.userID, deviceID: "OLDDEVICE"))
+            var calls = 0
+            let service = lostStoreService(store, shared, temporary, client, FakePasswordAuthentication()) { calls += 1 }
+
+            await service.restoreSession()
+
+            try assertForcedRelogin(service, store: store, shared: shared, directory: directory, saved: saved, client: client, factoryCalls: calls)
+        }
+    }
+
+    func testReloginAfterLostStoreUsesNewStoreAndServerAssignedDevice() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let saved = oldDeviceCredentials(userID: "@lost-relogin:matrix.test")
+        let store = InMemorySessionStore(saved)
+        let shared = InMemorySharedPushCredentialsStore()
+        let directory = SessionStoreDirectory(baseURL: temporary)
+        let authentication = FakePasswordAuthentication()
+        authentication.sessionForLogin = { _ in fakeSession(userID: "@lost-relogin:matrix.test", deviceID: "NEWDEVICE") }
+        let client = FakeClient(session: fakeSession(userID: saved.userID, deviceID: "NEWDEVICE"))
+        var calls = 0
+        let service = lostStoreService(store, shared, temporary, client, authentication) { calls += 1 }
+
+        await service.restoreSession()
+        XCTAssertEqual(service.sessionError, Self.lostStoreMessage)
+
+        try await service.login(homeserver: "https://matrix.test", username: "lost-relogin", password: "test-password")
+
+        XCTAssertEqual(authentication.loginCalls.map(\.deviceID), [nil], "re-login must let the server assign a device")
+        let replacement = try XCTUnwrap(store.load())
+        XCTAssertEqual(replacement.deviceID, "NEWDEVICE")
+        XCTAssertNotEqual(replacement.storeID, saved.storeID)
+        XCTAssertEqual(client.restoredSession?.deviceId, "NEWDEVICE")
+        XCTAssertTrue(service.isLoggedIn)
+        XCTAssertNil(service.sessionError)
+        await service.logout()
+    }
+
+    func testSoftLogoutReauthenticationWithLostStoreDoesNotReuseOldDeviceID() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let saved = oldDeviceCredentials(userID: "@lost-soft:matrix.test")
+        let store = InMemorySessionStore(saved)
+        let shared = InMemorySharedPushCredentialsStore()
+        let directory = SessionStoreDirectory(baseURL: temporary)
+        try seedExistingStore(directory, saved.storeID)
+        let softLogout = ClientError.MatrixApi(kind: .unknownToken(softLogout: true), code: "M_UNKNOWN_TOKEN", msg: "redacted", details: nil)
+        let client = FakeClient(session: fakeSession(userID: saved.userID, deviceID: "OLDDEVICE"), restoreError: softLogout)
+        let authentication = FakePasswordAuthentication()
+        let service = makeService(sessionStore: store, directory: temporary, client: client, authentication: authentication,
+                                  sharedPushCredentialsStore: shared)
+        await service.restoreSession()
+        XCTAssertTrue(service.requiresPasswordReauthentication)
+        // The store disappears while the password prompt is showing.
+        try FileManager.default.removeItem(at: directory.url(for: saved.storeID))
+
+        do {
+            try await service.login(homeserver: "https://matrix.test", username: saved.userID, password: "test-password")
+            XCTFail("Expected forced re-login")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, Self.lostStoreMessage)
+        }
+
+        XCTAssertEqual(authentication.loginCalls, [], "old device ID must not be sent to the server")
+        XCTAssertEqual(client.restoreCalls, 1)  // Only the original soft-logout restore attempt.
+        XCTAssertFalse(service.isLoggedIn)
+        XCTAssertFalse(service.requiresPasswordReauthentication)
+        XCTAssertEqual(service.sessionError, Self.lostStoreMessage)
+        XCTAssertNil(try store.load())
+    }
+
+    func testIntactStoreRestoresSameDeviceAndFirstInstallStaysQuiet() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        // First install: nothing in Keychain, nothing on disk.
+        let emptyStore = InMemorySessionStore()
+        var calls = 0
+        let fresh = lostStoreService(emptyStore, InMemorySharedPushCredentialsStore(), temporary, FakeClient(),
+                                     FakePasswordAuthentication()) { calls += 1 }
+        await fresh.restoreSession()
+        XCTAssertFalse(fresh.isLoggedIn)
+        XCTAssertNil(fresh.sessionError)
+        XCTAssertEqual(calls, 0)
+
+        // Normal start: the crypto database is present.
+        let saved = oldDeviceCredentials(userID: "@intact:matrix.test")
+        let store = InMemorySessionStore(saved)
+        let directory = SessionStoreDirectory(baseURL: temporary)
+        try seedExistingStore(directory, saved.storeID)
+        let client = FakeClient(session: fakeSession(userID: saved.userID, deviceID: "OLDDEVICE"))
+        let service = makeService(sessionStore: store, directory: temporary, client: client)
+        await service.restoreSession()
+        XCTAssertTrue(service.isLoggedIn)
+        XCTAssertNil(service.sessionError)
+        XCTAssertEqual(client.restoredSession?.deviceId, "OLDDEVICE")
+        XCTAssertEqual(try store.load(), saved)
+        await service.logout()
+    }
+
+    func testLogoutThenLoginThenRestoreKeepsWorking() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let store = InMemorySessionStore()
+        let first = makeService(sessionStore: store, directory: temporary, client: FakeClient())
+        try await first.login(homeserver: "https://matrix.test", username: "cycle", password: "test-password")
+        await first.logout()
+        XCTAssertNil(try store.load())
+        XCTAssertNil(first.sessionError)
+
+        try await first.login(homeserver: "https://matrix.test", username: "cycle", password: "test-password")
+        let saved = try XCTUnwrap(store.load())
+        let restoredClient = FakeClient()
+        let restored = makeService(sessionStore: store, directory: temporary, client: restoredClient)
+        await restored.restoreSession()
+        XCTAssertTrue(restored.isLoggedIn)
+        XCTAssertNil(restored.sessionError)
+        XCTAssertEqual(restoredClient.restoredSession?.deviceId, saved.deviceID)
+        await restored.logout()
+    }
+
     private func makeService(sessionStore: any SessionStore, directory: URL, client: FakeClient,
                              authentication: FakePasswordAuthentication = FakePasswordAuthentication(),
                              sharedRoomMuteStore: any SharedRoomMuteStoring = MemoryRoomMuteStore(),
