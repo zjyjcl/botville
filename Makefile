@@ -311,7 +311,7 @@ federation-e2e:
 	bash server/scripts/federation-certs.sh
 	python3 server/scripts/federation-setup.py
 	$(FED_COMPOSE) up -d
-	python3 server/tests/federation_e2e.py --env-file $(FED_ENV)
+	python3 server/tests/federation_e2e.py --env-file $(FED_ENV) --compose '$(FED_COMPOSE)'
 
 federation-down:
 	# down -v needs the env file for interpolation; regenerate it if this
