@@ -83,7 +83,7 @@ final class CryptoStoreDetectionTests: XCTestCase {
     }
 }
 
-private final class ThrowingAttributesFileManager: FileManager, @unchecked Sendable {
+private final class ThrowingAttributesFileManager: FileManager {
     private let error: Error
     init(error: Error) { self.error = error; super.init() }
     override func attributesOfItem(atPath path: String) throws -> [FileAttributeKey: Any] { throw error }

@@ -1998,6 +1998,8 @@ final class MatrixServiceLifecycleTests: XCTestCase {
             authenticationTimeout: 5,
             sharedRoomMuteStore: sharedRoomMuteStore
         )
+        // Unit tests never reach a real homeserver, not even best-effort.
+        service.staleSessionLogout = FakeStaleSessionLogout()
         // Like the real SDK, building a client creates the crypto database.
         service.clientFactory = { _, path, _ in
             try Data(repeating: 1, count: 16).write(to: path.appendingPathComponent(SessionStoreDirectory.cryptoDatabaseFileName))
@@ -2545,7 +2547,7 @@ private final class FakeStaleSessionLogout: StaleSessionLoggingOut, @unchecked S
 }
 
 /// Every metadata read fails the way it does before first unlock.
-private final class MetadataErrorFileManager: FileManager, @unchecked Sendable {
+private final class MetadataErrorFileManager: FileManager {
     private let error: Error
     init(error: Error) { self.error = error; super.init() }
     override func attributesOfItem(atPath path: String) throws -> [FileAttributeKey: Any] { throw error }

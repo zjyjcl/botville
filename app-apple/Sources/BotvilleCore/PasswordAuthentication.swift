@@ -72,6 +72,83 @@ public struct MatrixPasswordAuthentication: PasswordAuthenticating {
     }
 }
 
+/// Best-effort `POST /_matrix/client/v3/logout` for a session whose local
+/// encrypted store is gone (#81). Logs out only that access token's device:
+/// never `/logout/all`, never `delete_devices`, never UIA.
+public protocol StaleSessionLoggingOut: Sendable {
+    func logout(homeserver: URL, accessToken: String) async throws
+}
+
+public struct MatrixStaleSessionLogout: StaleSessionLoggingOut {
+    private let session: URLSession
+    private let requestTimeout: TimeInterval
+
+    public init(requestTimeout: TimeInterval = 5) {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpCookieStorage = nil
+        configuration.urlCredentialStorage = nil
+        configuration.timeoutIntervalForRequest = requestTimeout
+        configuration.timeoutIntervalForResource = requestTimeout
+        session = URLSession(configuration: configuration, delegate: HTTPSRedirectGuard(), delegateQueue: nil)
+        self.requestTimeout = requestTimeout
+    }
+
+    public init(session: URLSession, requestTimeout: TimeInterval = 5) {
+        self.session = session
+        self.requestTimeout = requestTimeout
+    }
+
+    public func logout(homeserver: URL, accessToken: String) async throws {
+        var request = URLRequest(url: homeserver.appendingPathComponent("_matrix/client/v3/logout"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = requestTimeout
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data("{}".utf8)
+        let (_, response) = try await session.data(for: request)
+        guard let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode) else {
+            throw AuthenticationError.serverFailure
+        }
+    }
+}
+
+/// Waits for `operation` at most `timeout` seconds without waiting for an
+/// uncooperative network future; the operation is cancelled on timeout.
+@MainActor
+enum BoundedWait {
+    enum Outcome: String { case finished, failed, timedOut = "timed-out" }
+
+    static func run(timeout: TimeInterval, _ operation: @escaping @Sendable () async throws -> Void) async -> Outcome {
+        let limit = timeout.isFinite && timeout > 0 ? min(timeout, 60) : 5
+        let gate = Gate()
+        return await withCheckedContinuation { continuation in
+            gate.continuation = continuation
+            let work = Task.detached {
+                let outcome: Outcome
+                do { try await operation(); outcome = .finished } catch { outcome = .failed }
+                await gate.resume(outcome)
+            }
+            gate.timer = Task { @MainActor in
+                guard (try? await Task.sleep(for: .seconds(limit))) != nil else { return }
+                gate.resume(.timedOut)
+                work.cancel()
+            }
+        }
+    }
+
+    @MainActor
+    private final class Gate {
+        var continuation: CheckedContinuation<Outcome, Never>?
+        var timer: Task<Void, Never>?
+        func resume(_ outcome: Outcome) {
+            continuation?.resume(returning: outcome)
+            continuation = nil
+            if outcome != .timedOut { timer?.cancel() }
+            timer = nil
+        }
+    }
+}
+
 enum MatrixRateLimit {
     static func error(response: HTTPURLResponse, data: Data, now: Date = Date()) -> AuthenticationError? {
         let body = try? JSONDecoder().decode(ErrorBody.self, from: data)

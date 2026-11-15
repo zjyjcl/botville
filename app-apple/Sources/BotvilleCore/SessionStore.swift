@@ -304,18 +304,48 @@ public struct SessionStoreDirectory: Sendable {
     /// (matrix-rust-sdk sqlite store; verified against matrix-rust-components-swift 26.10.27).
     public static let cryptoDatabaseFileName = "matrix-sdk-crypto.sqlite3"
 
-    /// True only when the SDK crypto database for `storeID` exists as a non-empty
-    /// regular file. A missing directory (reinstall, cleared container), a missing
-    /// file or a zero-byte file all mean the Olm account for the saved device is
-    /// gone; building a client there would mint a new identity under the old
-    /// device ID (#81, #245). Never creates anything.
-    public func hasCryptoStore(for storeID: UUID, fileManager: FileManager = .default) -> Bool {
+    public enum CryptoStoreState: Sendable, Equatable {
+        /// The crypto database exists as a non-empty regular file.
+        case present
+        /// Definitely gone: not found, empty, or not a regular file.
+        case missing
+        /// Metadata could not be read (e.g. before first unlock / protected data
+        /// unavailable, permission errors). Never treated as lost; judge later.
+        case undetermined
+    }
+
+    /// Reads only metadata of the SDK crypto database for `storeID`; never
+    /// creates anything. A missing directory (reinstall, cleared container), a
+    /// missing file or a zero-byte file mean the Olm account for the saved device
+    /// is gone; building a client there would mint a new identity under the old
+    /// device ID (#81, #245).
+    ///
+    /// Only `.typeRegular` counts. `attributesOfItem` does not follow symlinks, so
+    /// a symlink (or a directory) at the database path is deliberately treated as
+    /// missing: the SDK never creates one, and following it could point the old
+    /// device ID at an unrelated database.
+    public func cryptoStoreState(for storeID: UUID, fileManager: FileManager = .default) -> CryptoStoreState {
         let file = url(for: storeID).appendingPathComponent(Self.cryptoDatabaseFileName)
-        guard let attributes = try? fileManager.attributesOfItem(atPath: file.path),
-              attributes[.type] as? FileAttributeType == .typeRegular,
-              let size = attributes[.size] as? NSNumber
-        else { return false }
-        return size.int64Value > 0
+        let attributes: [FileAttributeKey: Any]
+        do { attributes = try fileManager.attributesOfItem(atPath: file.path) }
+        catch { return Self.isDefinitelyNotFound(error) ? .missing : .undetermined }
+        guard attributes[.type] as? FileAttributeType == .typeRegular else { return .missing }
+        guard let size = attributes[.size] as? NSNumber else { return .undetermined }
+        return size.int64Value > 0 ? .present : .missing
+    }
+
+    /// Only "no such file" style errors are definite. Everything else, notably
+    /// permission and data-protection errors, stays undetermined.
+    static func isDefinitelyNotFound(_ error: Error) -> Bool {
+        let error = error as NSError
+        if error.domain == NSCocoaErrorDomain,
+           error.code == NSFileReadNoSuchFileError || error.code == NSFileNoSuchFileError {
+            if let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError {
+                return isDefinitelyNotFound(underlying) || underlying.domain != NSPOSIXErrorDomain
+            }
+            return true
+        }
+        return error.domain == NSPOSIXErrorDomain && (error.code == Int(ENOENT) || error.code == Int(ENOTDIR))
     }
 
     /// Removes all app-owned encrypted stores, including ones whose Keychain
