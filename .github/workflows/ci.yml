@@ -603,6 +603,7 @@ jobs:
         run: |
           python3 -m py_compile server/tests/smoke.py server/tests/e2e_synapse.py \
             server/tests/push_e2e.py server/tests/appservice_e2e.py server/tests/federation_e2e.py \
+            server/tests/federation_relations.py server/pairing/relations.py \
             server/scripts/render_push_denylist.py server/scripts/federation-setup.py \
             server/pairing/__init__.py server/pairing/store.py server/pairing/service.py \
             server/pairing/fedgate.py server/pairing/validate.py

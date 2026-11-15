@@ -102,6 +102,7 @@ from .store import (
     REDEEM_USED,
     PairingStore,
 )
+from . import relations
 from .hswhitelist import HsWhitelistWriter
 from .validate import (
     ServerNameError,
@@ -137,6 +138,16 @@ INTERNAL_PREFIX = INTERNAL_ROOT + "/"
 # At most one "internal request refused" warning per interval; the rest
 # are counted and reported in the next warning (#243 review 2).
 INTERNAL_REJECT_LOG_INTERVAL = 60.0
+# A-R3 relation transport rate limits (per minute). Inbound: per effective
+# client IP before authentication, per authenticated origin after it.
+# Outbound: per destination peer, so one gateway bug cannot hammer a peer.
+RELATIONS_PER_IP_PER_MINUTE = 120
+RELATIONS_PER_ORIGIN_PER_MINUTE = 60
+RELATIONS_OUT_PER_PEER_PER_MINUTE = 60
+RELATIONS_PREFIX = "/v1/pairing/relations/"
+# Same throttle for refused inbound relation messages (counted always,
+# logged at most once per interval with the suppressed count).
+RELATIONS_REJECT_LOG_INTERVAL = 60.0
 FACTS_DEFAULT_LIMIT = 100
 FACTS_MAX_LIMIT = 500
 CURSOR_MAX_DIGITS = 18  # fits a signed 64-bit SQLite integer
@@ -427,7 +438,8 @@ class PairingConfig:
                  peer_key_url_template="https://{server_name}/_matrix/key/v2/server",
                  insecure_tls=False, host="127.0.0.1", port=8090,
                  trusted_proxies=(), service_token=None,
-                 hs_whitelist_path=None, hs_restart_marker=None):
+                 hs_whitelist_path=None, hs_restart_marker=None,
+                 relations_gateway="none", relations_test_record=None):
         self.db_path = db_path
         self.admin_token = admin_token
         if service_token:
@@ -440,6 +452,27 @@ class PairingConfig:
                 raise ConfigError(
                     "PAIRING_SERVICE_TOKEN must differ from PAIRING_ADMIN_TOKEN")
         self.service_token = service_token or None
+        # A-R3: how verified inbound relation messages reach the local
+        # gateway. "none" (default) refuses them with 503; "test-recorder"
+        # is for tests/CI only. The real HTTP gateway client is not part
+        # of this build (A/B have not aligned the gateway endpoints), so
+        # "http" is reserved and refused rather than silently ignored.
+        if relations_gateway == "http":
+            raise ConfigError(
+                "PAIRING_RELATIONS_GATEWAY=http is reserved: the gateway HTTP"
+                " client lands once the gateway's internal relation endpoints"
+                " are agreed; use none")
+        if relations_gateway not in relations.GATEWAY_MODES:
+            raise ConfigError(
+                "PAIRING_RELATIONS_GATEWAY must be one of: {}".format(
+                    ", ".join(relations.GATEWAY_MODES)))
+        if relations_gateway == "test-recorder" and \
+                not relations.record_path_ok(relations_test_record):
+            raise ConfigError(
+                "PAIRING_RELATIONS_GATEWAY=test-recorder needs an absolute"
+                " PAIRING_RELATIONS_TEST_RECORD")
+        self.relations_gateway = relations_gateway
+        self.relations_test_record = relations_test_record or None
         try:
             self.server_name = normalize_server_name(server_name)
         except ServerNameError as exc:
@@ -510,6 +543,10 @@ class PairingConfig:
             trusted_proxies=_parse_trusted_proxies(
                 env.get("PAIRING_TRUSTED_PROXIES", "")),
             service_token=env.get("PAIRING_SERVICE_TOKEN", "") or None,
+            relations_gateway=(env.get("PAIRING_RELATIONS_GATEWAY", "").strip()
+                               or "none"),
+            relations_test_record=env.get(
+                "PAIRING_RELATIONS_TEST_RECORD", "").strip() or None,
             hs_whitelist_path=env.get("PAIRING_HS_WHITELIST_PATH", "").strip(),
             hs_restart_marker=env.get("PAIRING_HS_RESTART_MARKER", "").strip(),
         )
@@ -529,6 +566,19 @@ class PairingApp:
         self.nonces = NonceGuard()
         self.notify_rejected = 0
         self.internal_rejected = 0
+        # A-R3 relation transport.
+        self.relations_gateway = relations.build_gateway_client(
+            config.relations_gateway, config.relations_test_record)
+        self.relation_nonces = relations.StrictNonceGuard()
+        self.relations_ip_limiter = RateLimiter(limit=RELATIONS_PER_IP_PER_MINUTE)
+        self.relations_origin_limiter = RateLimiter(
+            limit=RELATIONS_PER_ORIGIN_PER_MINUTE)
+        self.relations_out_limiter = RateLimiter(
+            limit=RELATIONS_OUT_PER_PEER_PER_MINUTE)
+        self.relations_rejected = 0
+        self._relations_rejected_lock = threading.Lock()
+        self.relations_reject_log = LogThrottle(
+            RELATIONS_REJECT_LOG_INTERVAL)
         self._internal_rejected_lock = threading.Lock()
         self.internal_reject_log = LogThrottle(INTERNAL_REJECT_LOG_INTERVAL)
 
@@ -538,6 +588,12 @@ class PairingApp:
                 config.hs_whitelist_path, config.server_name,
                 marker_path=config.hs_restart_marker)
         self.hs_whitelist_failures = 0
+
+    def note_relation_rejected(self):
+        """Count one refused inbound relation message; returns the total."""
+        with self._relations_rejected_lock:
+            self.relations_rejected += 1
+            return self.relations_rejected
 
     def note_internal_rejected(self):
         """Count one refused internal request; returns the new total."""
@@ -682,7 +738,8 @@ class PairingHandler(BaseHTTPRequestHandler):
                                    ("Bearer " + token).encode("utf-8"))
 
     def _handle_internal(self, method, path, query):
-        """A-R1 pairing facts (read-only). Auth first, uniformly 401, so an
+        """A-R1 pairing facts (read-only) + A-R3 relation send
+        (relations/<kind>, POST). Auth first, uniformly 401, so an
         unauthenticated caller learns nothing about routes or peers."""
         if not self._is_service():
             total = self.app.note_internal_rejected()
@@ -699,6 +756,9 @@ class PairingHandler(BaseHTTPRequestHandler):
             return
         rest = path[len(INTERNAL_PREFIX):] if path.startswith(INTERNAL_PREFIX) \
             else ""  # the bare INTERNAL_ROOT names no endpoint
+        if rest.startswith("relations/"):
+            self._handle_relation_outbound(method, rest[len("relations/"):])
+            return
         if rest == "events":
             route = "events"
         elif rest.startswith("peers/") and len(rest) > len("peers/") \
@@ -816,6 +876,11 @@ class PairingHandler(BaseHTTPRequestHandler):
             return
         if path == "/v1/pairing/notify-severed" and method == "POST":
             self._handle_notify_severed()
+            return
+        if path.startswith(RELATIONS_PREFIX):
+            # Peer-facing (fedgate forwards /_matrix/pairing/relations/*);
+            # authenticated by the per-peer HMAC, never by a bearer token.
+            self._handle_relation_inbound(method, path[len(RELATIONS_PREFIX):])
             return
 
         # Everything below is admin-only.
@@ -1171,6 +1236,204 @@ class PairingHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True, "server_name": origin,
                               "state": "severed",
                               "severed_by": peer["severed_by"]})
+
+
+    # --- A-R3 relation transport ------------------------------------------
+
+    def _method_not_allowed(self, allow):
+        self.close_connection = True
+        body = json.dumps({"errcode": "M_UNRECOGNIZED",
+                           "error": "method not allowed"}).encode("utf-8")
+        self.send_response(405)
+        self.send_header("Allow", allow)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _reject_relation(self, client_ip, reason, status=401,
+                         errcode="M_UNAUTHORIZED",
+                         message="invalid relations authentication"):
+        """Count + log a refused inbound relation message; never writes
+        events and never echoes request content or secrets. The warning is
+        throttled like the internal-401 one (LogThrottle, #243 review 2):
+        every refusal is counted, at most one line per interval is logged
+        with the number swallowed since the previous line."""
+        total = self.app.note_relation_rejected()
+        allowed, suppressed = self.app.relations_reject_log.allow()
+        if allowed:
+            log.warning("relation message rejected from %s (%s; %d rejected"
+                        " in total; %d similar warnings suppressed since the"
+                        " last one)", client_ip, reason, total, suppressed)
+        self._error(status, errcode, message)
+
+    def _handle_relation_inbound(self, method, kind):
+        """POST /v1/pairing/relations/<kind> from a paired peer (A-R3).
+
+        Order: per-IP limit -> bounded body -> origin/peer -> timestamp ->
+        nonce shape -> HMAC -> per-origin limit -> replay guard -> active
+        gate -> envelope format -> local gateway. Every failure refuses;
+        nothing is delivered on a doubt."""
+        if kind not in relations.RELATION_KINDS:
+            self._error(404, "M_UNRECOGNIZED", "no such relations endpoint")
+            return
+        if method != "POST":
+            self._method_not_allowed("POST")
+            return
+        client_ip = self._client_ip()
+        if not self.app.relations_ip_limiter.allow(client_ip):
+            self._reject_relation(client_ip, "rate_limited_ip", 429,
+                                  "M_LIMIT_EXCEEDED",
+                                  "too many relation messages; retry later")
+            return
+        raw, err = self._read_body()
+        if err:
+            self._reject_relation(client_ip, "body_too_large", *err)
+            return
+        if len(raw) > relations.MAX_ENVELOPE_BYTES:
+            self._reject_relation(client_ip, "body_too_large", 413,
+                                  "M_TOO_LARGE", "relation envelope too large")
+            return
+        origin = self.headers.get("X-Botville-Origin") or ""
+        ts = self.headers.get("X-Botville-Ts") or ""
+        nonce = self.headers.get("X-Botville-Nonce") or ""
+        sig = self.headers.get("X-Botville-Sig") or ""
+        try:
+            origin = normalize_server_name(origin)
+        except ServerNameError:
+            self._reject_relation(client_ip, "bad_origin")
+            return
+        peer = self.app.store.get_peer(origin)
+        secret = (peer or {}).get("shared_secret")
+        if peer is None or not secret:
+            self._reject_relation(client_ip, "unknown_peer")
+            return
+        if not relations.timestamp_ok(ts):
+            self._reject_relation(client_ip, "bad_timestamp")
+            return
+        if not relations.nonce_ok(nonce):
+            self._reject_relation(client_ip, "bad_nonce")
+            return
+        if not relations.signature_ok(secret, kind, origin, ts, nonce, raw, sig):
+            self._reject_relation(client_ip, "bad_signature")
+            return
+        if not self.app.relations_origin_limiter.allow(origin):
+            self._reject_relation(client_ip, "rate_limited_origin", 429,
+                                  "M_LIMIT_EXCEEDED",
+                                  "too many relation messages; retry later")
+            return
+        seen = self.app.relation_nonces.check_and_mark((origin, nonce))
+        if seen == relations.StrictNonceGuard.SEEN:
+            self._reject_relation(client_ip, "replayed_nonce")
+            return
+        if seen == relations.StrictNonceGuard.FULL:
+            self._reject_relation(client_ip, "replay_guard_full", 503,
+                                  "M_UNAVAILABLE",
+                                  "relations temporarily unavailable")
+            return
+        # Re-read: a sever may have landed while we verified.
+        peer = self.app.store.get_peer(origin)
+        if peer is None or peer["state"] != "active":
+            self._reject_relation(client_ip, "peer_inactive", 403,
+                                  "BV_PEER_INACTIVE", "pairing is not active")
+            return
+        try:
+            envelope = relations.parse_envelope_bytes(
+                raw, kind, origin, self.config.server_name)
+        except relations.EnvelopeError as exc:
+            self._reject_relation(client_ip, "bad_envelope", 400,
+                                  "BV_BAD_ENVELOPE", str(exc))
+            return
+        meta = {"origin": origin, "sent_at": int(ts),
+                "received_at": int(time.time())}
+        try:
+            status, body = relations.checked_gateway_result(
+                self.app.relations_gateway.deliver(kind, envelope, meta))
+        except relations.GatewayUnavailable as exc:
+            log.warning("relation %s from %s not delivered: %s", kind, origin,
+                        exc)
+            self._error(503, "BV_RELATIONS_UNAVAILABLE",
+                        "relations are not available on this server")
+            return
+        except Exception:  # noqa: BLE001 - a buggy client must fail closed
+            log.exception("relations gateway client failed")
+            self._error(503, "BV_RELATIONS_UNAVAILABLE",
+                        "relations are not available on this server")
+            return
+        log.info("relation %s %s from %s delivered (gateway %d)", kind,
+                 envelope["request_id"], origin, status)
+        self._send_json(status, body)
+
+    def _handle_relation_outbound(self, method, kind):
+        """POST /v1/pairing/internal/relations/<kind> from the local gateway
+        (service token already checked): sign and send to an ACTIVE peer,
+        with a timeout and no retries. The reply wraps the peer's answer so
+        transport failures (5xx here) never look like business answers."""
+        if kind not in relations.RELATION_KINDS:
+            self._error(404, "M_UNRECOGNIZED", "no such internal endpoint")
+            return
+        if method != "POST":
+            self._method_not_allowed("POST")
+            return
+        payload, err = self._read_json()
+        if err:
+            self._error(*err)
+            return
+        try:
+            relations.validate_outbound_request(payload)
+            destination = normalize_server_name(payload["destination"])
+        except relations.EnvelopeError as exc:
+            self._error(400, "BV_BAD_ENVELOPE", str(exc))
+            return
+        except ServerNameError:
+            self._error(400, "BV_BAD_ENVELOPE", "invalid destination")
+            return
+        if destination == self.config.server_name:
+            self._error(400, "BV_BAD_ENVELOPE", "destination is this server")
+            return
+        peer = self.app.store.get_peer(destination)
+        if peer is None or peer["state"] != "active" or \
+                not peer.get("shared_secret") or not peer.get("peer_api_url"):
+            self._error(409, "BV_PEER_INACTIVE",
+                        "destination is not an active paired server")
+            return
+        if not self.app.relations_out_limiter.allow(destination):
+            self._error(429, "M_LIMIT_EXCEEDED",
+                        "too many relation messages to this server")
+            return
+        try:
+            envelope = relations.build_envelope(
+                kind, self.config.server_name, destination,
+                payload["request_id"], payload["payload"])
+        except relations.EnvelopeError as exc:
+            self._error(400, "BV_BAD_ENVELOPE", str(exc))
+            return
+        body = relations.encode_envelope(envelope)
+        try:
+            headers = relations.build_relation_headers(
+                peer["shared_secret"], kind, self.config.server_name, body)
+        except (ValueError, TypeError):  # corrupt stored secret
+            log.error("stored shared secret for %s is unusable", destination)
+            self._error(409, "BV_PEER_INACTIVE",
+                        "destination is not an active paired server")
+            return
+        url = peer["peer_api_url"].rstrip("/") + "/relations/" + kind
+        try:
+            peer_status, peer_body = relations.post_relation(
+                url, body, headers,
+                ssl_context=_maybe_insecure_context(self.config.insecure_tls),
+                timeout=relations.PEER_TIMEOUT_SECONDS)
+        except relations.PeerTimeout:
+            log.warning("relation %s to %s timed out", kind, destination)
+            self._error(504, "BV_PEER_TIMEOUT", "peer did not answer in time")
+            return
+        except OSError as exc:
+            log.warning("relation %s to %s failed: %s", kind, destination, exc)
+            self._error(502, "BV_PEER_UNREACHABLE", "peer unreachable")
+            return
+        self._send_json(200, {"delivered": 200 <= peer_status < 300,
+                              "peer_status": peer_status,
+                              "peer_body": peer_body})
 
 
 def build_server(config):
