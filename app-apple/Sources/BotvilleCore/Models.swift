@@ -60,7 +60,14 @@ public struct MatrixMessage: Identifiable, Equatable, Sendable {
     /// the placeholder; the SDK replaces the same item once the key arrives.
     public let isUndecryptable: Bool
 
-    public static let undecryptablePlaceholder = "无法解密此消息"
+    /// Visible text and VoiceOver label of the UTD placeholder live together so
+    /// the two can never drift apart (#248 review nit).
+    public static let undecryptablePlaceholder = UndecryptablePlaceholder(body: "无法解密此消息")
+}
+
+public struct UndecryptablePlaceholder: Sendable, Equatable {
+    public let body: String
+    public var accessibilityLabel: String { "\(body)，等待密钥后自动显示" }
 }
 
 public enum MatrixServiceError: LocalizedError {
