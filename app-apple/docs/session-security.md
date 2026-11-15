@@ -6,6 +6,26 @@
 
 `allowLocalHTTP` 是旧 Debug 会话中保存的开发标记。恢复时由正在运行的构建重新判定：只有 Debug 且该标记为真时，才允许 `localhost` 或 `127.0.0.1` 的 HTTP；Release 一律按 HTTPS 策略验证。公开的 `MatrixService.login` 入口也使用同一构建门禁，不能通过绕过 UI 传入 `allowLocalHTTP` 放宽 Release。
 
+## 加密存储丢失时强制重新登录（#81，关联 #245）
+
+**场景**：Keychain 里的会话记录还在，但本机 SDK 加密存储已丢失——iOS 卸载重装（Keychain 保留、App 容器清空）、Application Support 下的存储目录被清空或数据库被删、首次建库中断留下空文件等。此前恢复流程会先 `create(for: storeID)` 补建空目录，再让 SDK 在新库里以**旧设备 ID** 生成一套新的 Olm 账号；服务端看到同一设备 ID 换了身份密钥，导致 #245 中的 OTK 签名失败和对方无法加密给本机。
+
+**检测信号**：该 storeID 目录下 SDK 加密数据库 `matrix-sdk-crypto.sqlite3` 是否为非空普通文件（`SessionStoreDirectory.hasCryptoStore(for:)`）。
+
+- 选它的理由：Olm 账号（设备身份密钥）只存在这个库里，它的有无就是「旧设备 ID 还能不能安全复用」的直接判据；目录缺失、目录空、只剩 state/cache、0 字节文件都归为丢失。检查只读，在构建 SDK client、`create(for:)` 和任何网络请求之前执行，不会顺手建库。已安装用户的库本来就有这个文件，不需要迁移或额外写 sentinel。
+- 没选的方案：只看目录——覆盖不了「目录在、库没了」；自写 sentinel 文件——老用户没有 sentinel，需要迁移逻辑，且 sentinel 在而库被删时会漏判；比对 SDK 加密身份——必须先用旧设备 ID 构建 client 并 restore，SDK 会在空库里先生成新账号，正是要避免的动作，还要额外在 Keychain 里存指纹。
+- 文件名来自固定 SDK 26.10.27（在其二进制中确认 `matrix-sdk-crypto.sqlite3` / `matrix-sdk-state.sqlite3` 位于 data path，event-cache / media 位于 cache path）。`CryptoStoreDetectionTests` 用生产 `clientFactory` 和真 SDK 离线建库，断言文件正落在检测位置；升级 SDK 若改名或改位置，这条测试会先失败。
+
+**误判风险**：
+
+- 假阳性（库在却判丢）：SDK 升级改了文件名/位置（由上面的真 SDK 用例拦截）；文件暂时不可读（iOS 设备首次解锁前，目录保护级别为 `completeUntilFirstUserAuthentication`，预计仍可读取文件元数据，未在真机验证；若系统此时返回错误，会被判为丢失，代价是一次重新登录）。
+- 假阴性（库坏却判在）：数据库内容损坏但文件非空、或 store key 与库不匹配——检测不覆盖，仍走既有路径：SDK 构建失败按存储错误提示，用户可用「清除本地会话」退出。不对这类情况自动清除，避免把暂时性错误当成丢失。
+- 旧设备的 pusher 仍留在服务端（未登出），重新登录后新设备再注册同一 APNs token，可能出现重复推送或旧设备推送无法解密的通知；扩展的共享凭据已随旧会话删除。
+
+**行为**：检测到丢失后绝不构建 client、不调用 `restoreSession`、不向服务端发送旧设备 ID；立即删除 Keychain 会话、扩展可读的共享推送凭据和本地存储目录（含残留目录），回到登录页并提示「本机加密数据已丢失，需要重新登录」。前台事件不会再次触发恢复覆盖这条提示。soft logout 重输密码时同样先检查，库已丢失就不带旧设备 ID 去登录，按同样方式清理。重新登录不传 device ID，由服务端分配新设备、新建 store ID 与 store key。正常启动、正常登出再登录、首次安装不受影响（均有单测）。
+
+**旧设备不在服务端登出或删除**：默认只在本地丢弃。Keychain 里其实还有旧 access token，技术上可以用它调用 `/logout` 删除旧设备及其 device keys / pusher，这能清掉 #245 中服务端残留的错误密钥状态，也能停止旧 pusher 继续向本机推送；但本 PR 不实现，理由：① 任务要求默认不调用会删除服务端设备的接口；② 丢失判断若是假阳性，远端登出会把一个其实完好的设备删掉，不可逆；③ 删除设备会让对方看到设备变更，需要和 #245 的确认步骤一起评估。建议作为后续单独评估项：在检测到丢失且用户确认后，用旧 token 尽力调用一次 `/logout`（失败忽略，不重试、不走 UIA）。
+
 ## Soft logout 与 refresh token
 
 固定的 `matrix-rust-components-swift` **26.10.27**（commit `989ea1cc1e0c38cb2dd63970b8ab03d7c1e192eb`，对应 Rust SDK `e675036b27be102b05ec5c5bff843cf8d739338c`）具备自动 refresh 与 token 轮换持久化接口，不能简单认定 SDK 不支持：

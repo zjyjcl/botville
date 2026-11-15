@@ -55,7 +55,7 @@ struct TimelineState {
                 body = message.body
                 isUndecryptable = false
             case .unableToDecrypt:
-                body = MatrixMessage.undecryptablePlaceholder
+                body = MatrixMessage.undecryptablePlaceholder.body
                 isUndecryptable = true
             default:
                 return nil

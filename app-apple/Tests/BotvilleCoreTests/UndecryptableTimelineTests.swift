@@ -10,13 +10,24 @@ final class UndecryptableTimelineTests: XCTestCase {
         var state = TimelineState()
         state.apply([.reset(values: [item("utd", kind: utd())])])
         XCTAssertEqual(state.messages.map(\.id), ["utd"])
-        XCTAssertEqual(state.messages.first?.body, MatrixMessage.undecryptablePlaceholder)
+        XCTAssertEqual(state.messages.first?.body, MatrixMessage.undecryptablePlaceholder.body)
         XCTAssertEqual(state.messages.first?.isUndecryptable, true)
+    }
+
+    func testPlaceholderTextAndAccessibilityLabelShareOneConstant() {
+        let placeholder = MatrixMessage.undecryptablePlaceholder
+        XCTAssertEqual(placeholder.body, "无法解密此消息")
+        XCTAssertEqual(placeholder.accessibilityLabel, "无法解密此消息，等待密钥后自动显示")
+        XCTAssertTrue(placeholder.accessibilityLabel.hasPrefix(placeholder.body))
     }
 
     func testLateRoomKeyReplacesPlaceholderWithBodyInPlace() {
         var state = TimelineState()
         state.apply([.reset(values: [item("before", kind: text("前一条")), item("utd", kind: utd())])])
+        // The placeholder must already occupy that slot before the key arrives.
+        XCTAssertEqual(state.messages.map(\.id), ["before", "utd"])
+        XCTAssertEqual(state.messages.last?.body, MatrixMessage.undecryptablePlaceholder.body)
+        XCTAssertEqual(state.messages.last?.isUndecryptable, true)
         // The SDK retries decryption when the key arrives and replaces the same item.
         state.apply([.set(index: 1, value: item("utd", kind: text("密钥到达后的正文")))])
         XCTAssertEqual(state.messages.map(\.id), ["before", "utd"])
