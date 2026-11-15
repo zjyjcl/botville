@@ -741,8 +741,16 @@ private struct MessageBubble: View {
                 Text(message.sender)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text(message.body)
-                    .textSelection(.enabled)
+                if message.isUndecryptable {
+                    // Placeholder only; no body exists yet, so nothing to select.
+                    Label(message.body, systemImage: "lock")
+                        .italic()
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("\(message.body)，等待密钥后自动显示")
+                } else {
+                    Text(message.body)
+                        .textSelection(.enabled)
+                }
                 HStack(spacing: 6) {
                     Text(message.timestamp, format: .dateTime.month().day().hour().minute())
                     if let deliveryState = message.deliveryState {
