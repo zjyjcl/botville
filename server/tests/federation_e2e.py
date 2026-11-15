@@ -16,6 +16,12 @@ no /_synapse/admin. Phases (issue A2.1 acceptance):
   4. re-pair    (B invites this time) traffic flows again;
   5. A severs   the same isolation asserted the other way round.
 
+Alongside every phase the read-only pairing-facts API (A-R1,
+/v1/pairing/internal/*, service token) is checked on both sides: the
+peer state it reports and the peer_paired / peer_severed events it
+emits (re-pair included), plus that the admin token and no token are
+refused there.
+
 Every polling step is bounded (<=60s positive, 20s negative windows).
 First failure exits non-zero with the failing step name.
 """
@@ -104,6 +110,57 @@ class PairingAdmin:
     def sever(self, server_name):
         return self._call(
             "DELETE", "/v1/pairing/peers/{}".format(server_name))
+
+
+class PairingFacts:
+    """Service-token client for one side's internal facts API (A-R1)."""
+
+    def __init__(self, base_url, token):
+        self.base = base_url.rstrip("/")
+        self.token = token
+        self.cursor = 0
+        self.seen = []
+
+    def peer(self, server_name):
+        status, resp = request_json(
+            "GET", self.base + "/v1/pairing/internal/peers/" + server_name,
+            token=self.token)
+        expect(status == 200, "facts peer returned HTTP {}".format(status))
+        return resp
+
+    def poll(self):
+        """Drain new facts; returns the list of (kind, server_name, extra)."""
+        new = []
+        while True:
+            status, resp = request_json(
+                "GET", self.base + "/v1/pairing/internal/events?since={}".format(
+                    self.cursor), token=self.token)
+            expect(status == 200, "facts events returned HTTP {}".format(status))
+            for event in resp["events"]:
+                expect(event["cursor"] > self.cursor, "cursor went backwards")
+                new.append((event["kind"], event["server_name"],
+                            event.get("repaired", event.get("severed_by"))))
+            self.cursor = resp["next_cursor"]
+            if not resp["has_more"]:
+                break
+        self.seen += new
+        return new
+
+    def status_with(self, token):
+        status, _ = request_json(
+            "GET", self.base + "/v1/pairing/internal/events", token=token)
+        return status
+
+
+def expect_facts(facts, server_name, state, events):
+    """The facts API on one side shows `state` for server_name and emitted
+    exactly `events` (kind, server_name, repaired|severed_by) since the
+    last check."""
+    got = facts.poll()
+    expect(got == events, "facts events {!r} != {!r}".format(got, events))
+    peer = facts.peer(server_name)
+    expect(peer["state"] == state and peer["changed_at"],
+           "facts peer {}: {!r}".format(server_name, peer))
 
 
 def register_user(base_url, name):
@@ -225,6 +282,8 @@ def main():
     env = load_env(args.env_file)
     admin_a = PairingAdmin(args.a_admin, env["PAIRING_ADMIN_TOKEN_A"])
     admin_b = PairingAdmin(args.b_admin, env["PAIRING_ADMIN_TOKEN_B"])
+    facts_a = PairingFacts(args.a_admin, env["PAIRING_SERVICE_TOKEN_A"])
+    facts_b = PairingFacts(args.b_admin, env["PAIRING_SERVICE_TOKEN_B"])
     suffix = secrets.token_hex(3)
 
     # --- readiness + users ------------------------------------------------
@@ -234,7 +293,16 @@ def main():
         smoke.Smoke(args.b_client, None).wait_for_versions(POSITIVE_TIMEOUT)
         wait_until("both pairing services healthy",
                    lambda: admin_a.health() and admin_b.health(), 60)
-        return "versions + pairing /health ok"
+        # A-R1 auth: the facts API answers its own token only.
+        for facts, admin_token in ((facts_a, env["PAIRING_ADMIN_TOKEN_A"]),
+                                   (facts_b, env["PAIRING_ADMIN_TOKEN_B"])):
+            expect(facts.status_with(None) == 401, "facts without token not 401")
+            expect(facts.status_with(admin_token) == 401,
+                   "facts with the admin token not 401")
+            expect(facts.status_with(facts.token) == 200,
+                   "facts with the service token not 200")
+            facts.poll()  # start both feeds from "now"
+        return "versions + pairing /health ok; facts API token-gated"
 
     def step_users():
         globals()["alice"] = register_user(args.a_client, "alice" + suffix)
@@ -275,7 +343,9 @@ def main():
         peer = admin_b.peer_state("hs-a")
         expect(peer and peer["state"] == "active",
                "hs-b's view of hs-a: {!r}".format(peer))
-        return "both peers active"
+        expect_facts(facts_a, "hs-b", "active", [("peer_paired", "hs-b", False)])
+        expect_facts(facts_b, "hs-a", "active", [("peer_paired", "hs-a", False)])
+        return "both peers active; peer_paired facts on both sides"
 
     def step_federated_chat():
         room = create_room(alice, invite=["@{}:hs-b".format(bob.username)])
@@ -309,6 +379,8 @@ def main():
         # then refuse; each side's own messages stop reaching the other).
         wait_until("hs-a's peers[hs-b] severed by remote",
                    lambda: peer_state_is(admin_a, "hs-b", "severed", "remote"), 15)
+        expect_facts(facts_b, "hs-a", "severed", [("peer_severed", "hs-a", "local")])
+        expect_facts(facts_a, "hs-b", "severed", [("peer_severed", "hs-b", "remote")])
         time.sleep(GATE_REFRESH_GRACE)
 
         cut_b2a = send_message(bob, fed_room, "b-severed-a")
@@ -330,6 +402,8 @@ def main():
             wait_until("{} active again".format(name),
                        lambda admin=admin, name=name:
                        peer_state_is(admin, name, "active"), 10)
+        expect_facts(facts_a, "hs-b", "active", [("peer_paired", "hs-b", True)])
+        expect_facts(facts_b, "hs-a", "active", [("peer_paired", "hs-a", True)])
         # Both gates must reload the pairing table first; a transaction that
         # hits a gate still holding the severed snapshot is sunk (dropped).
         time.sleep(GATE_REFRESH_GRACE)
@@ -345,6 +419,8 @@ def main():
                "sever response: {!r}".format(resp))
         wait_until("hs-b's peers[hs-a] severed by remote",
                    lambda: peer_state_is(admin_b, "hs-a", "severed", "remote"), 15)
+        expect_facts(facts_a, "hs-b", "severed", [("peer_severed", "hs-b", "local")])
+        expect_facts(facts_b, "hs-a", "severed", [("peer_severed", "hs-a", "remote")])
         time.sleep(GATE_REFRESH_GRACE)
 
         cut_a2b = send_message(alice, fed_room, "a-final")

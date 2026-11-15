@@ -31,7 +31,8 @@
 # Host port mappings are loopback-only test conveniences (never copy into
 # a real deployment; they let the host bypass fedgate entirely):
 #   18101/18102  synapse-a/b client API (federation_e2e.py users)
-#   18111/18112  pairing-a/b admin API (federation_e2e.py pairing steps)
+#   18111/18112  pairing-a/b admin API + internal facts API (A-R1;
+#                federation_e2e.py pairing and facts steps)
 #
 # Everything under ./generated/ is produced at run time (certs by
 # server/scripts/federation-certs.sh, homeserver configs + admin tokens by
@@ -139,6 +140,10 @@ services:
       <<: *noproxy-env
       PAIRING_DB: /data/pairing.db
       PAIRING_ADMIN_TOKEN: ${PAIRING_ADMIN_TOKEN_A:?run python3 server/scripts/federation-setup.py first}
+      # A-R1: separate token for the read-only pairing-facts API
+      # (/v1/pairing/internal/*), never the admin token. Generated next to
+      # the admin token by federation-setup.py.
+      PAIRING_SERVICE_TOKEN: ${PAIRING_SERVICE_TOKEN_A:?run python3 server/scripts/federation-setup.py first}
       PAIRING_SERVER_NAME: hs-a
       # The URL the peer sees; /_matrix/pairing is fedgate's forwarding
       # prefix, so both servers only need their 443 gate exposed.
@@ -179,6 +184,7 @@ services:
       <<: *noproxy-env
       PAIRING_DB: /data/pairing.db
       PAIRING_ADMIN_TOKEN: ${PAIRING_ADMIN_TOKEN_B:?run python3 server/scripts/federation-setup.py first}
+      PAIRING_SERVICE_TOKEN: ${PAIRING_SERVICE_TOKEN_B:?run python3 server/scripts/federation-setup.py first}
       PAIRING_SERVER_NAME: hs-b
       PAIRING_API_URL: https://hs-b:443/_matrix/pairing
       PAIRING_HOST: 0.0.0.0

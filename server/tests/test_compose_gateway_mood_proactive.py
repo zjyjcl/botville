@@ -31,6 +31,9 @@ CONFIG_PY = GATEWAY / "src" / "botville_gateway" / "config.py"
 ENV_EXAMPLES = (
     REPO_ROOT / ".env.example",
     REPO_ROOT / "server" / "compose" / ".env.example",
+    # gateway/.env.example is maintained by B line (gateway/ is theirs); A
+    # line only reads it here. If a check fails on it, ask B to fix it
+    # rather than editing gateway/ from an A-line PR.
     GATEWAY / ".env.example",
 )
 REQUIRED_ENV = "POSTGRES_PASSWORD=test-only\nBOTVILLE_REGISTRATION_TOKEN=test-only\n"
@@ -403,20 +406,71 @@ class MoodProactiveEnvStaticTest(unittest.TestCase):
         # mention of it names both conditions.
         self.assertIn("`GATEWAY_GROUPS_ENABLED=true` 且配了记忆库、却没有显式密钥", doc)
         self.assertIn("`GATEWAY_GROUPS_ENABLED=true` 且配了记忆库时，群功能的专用检查", doc)
-        for name, text in (("appservice.md", doc), ("server/README.md", readme),
-                           ("z423-synapse.md", z423)):
-            for marker in ("群功能的专用检查", "配了记忆库却没有显式密钥"):
-                for match in re.finditer(re.escape(marker), text):
-                    with self.subTest(doc=name, marker=marker, at=match.start()):
-                        self.assertIn("GATEWAY_GROUPS_ENABLED=true",
-                                      text[max(0, match.start() - 60):match.start()])
+        self.assert_hmac_check_mentions_name_groups_enabled(
+            {"appservice.md": doc, "server/README.md": readme,
+             "z423-synapse.md": z423})
+
+    # Every way the docs phrase the groups-specific HMAC check. The optional
+    # 、 matters: the docs write "配了记忆库、却没有显式密钥", and a marker
+    # without it silently matched nothing (#233 nit 1).
+    HMAC_CHECK_MARKERS = (r"配了记忆库、?却没有显式密钥",
+                          r"配了记忆库时，群功能的专用检查")
+    # What must stand IMMEDIATELY before each marker (no slack window;
+    # #233 nit 2 replaced the old 60-character look-back).
+    HMAC_CHECK_PREFIX = "`GATEWAY_GROUPS_ENABLED=true` 且"
+
+    @classmethod
+    def hmac_check_violations(cls, docs):
+        """(hits, violations) for HMAC_CHECK_MARKERS across {name: text}."""
+        hits, bad = 0, []
+        for name, text in docs.items():
+            for marker in cls.HMAC_CHECK_MARKERS:
+                for match in re.finditer(marker, text):
+                    hits += 1
+                    before = text[max(0, match.start() - len(cls.HMAC_CHECK_PREFIX)):
+                                  match.start()]
+                    if before != cls.HMAC_CHECK_PREFIX:
+                        bad.append((name, marker, before))
+        return hits, bad
+
+    def assert_hmac_check_mentions_name_groups_enabled(self, docs):
+        hits, bad = self.hmac_check_violations(docs)
+        self.assertEqual(bad, [])
+        # Guard against the markers drifting away from the docs again: both
+        # appservice.md phrasings must actually be found.
+        self.assertGreaterEqual(hits, 2)
+
+    def test_hmac_check_assertion_catches_a_missing_condition(self):
+        """Reverse check for #233 nits 1/2: drop the GATEWAY_GROUPS_ENABLED
+        condition from either phrasing (or move it away from the marker)
+        and the check must report it."""
+        doc = (REPO_ROOT / "docs" / "deploy" / "appservice.md").read_text(encoding="utf-8")
+        self.assertEqual(self.hmac_check_violations({"doc": doc}), (2, []))
+        for case, broken in enumerate((
+                doc.replace("`GATEWAY_GROUPS_ENABLED=true` 且配了记忆库、却", "配了记忆库、却", 1),
+                doc.replace("`GATEWAY_GROUPS_ENABLED=true` 且配了记忆库、却", "配了记忆库却", 1),
+                doc.replace("`GATEWAY_GROUPS_ENABLED=true` 且配了记忆库时，群功能",
+                            "配了记忆库时，群功能", 1),
+                # Condition still nearby, but not directly before the marker.
+                doc.replace("`GATEWAY_GROUPS_ENABLED=true` 且配了记忆库时，群功能",
+                            "`GATEWAY_GROUPS_ENABLED=true`（开）。且配了记忆库时，群功能", 1))):
+            with self.subTest(case=case):
+                self.assertNotEqual(broken, doc)
+                hits, bad = self.hmac_check_violations({"doc": broken})
+                self.assertEqual(len(bad), 1)
 
     def test_forget_stale_keys_comment_in_all_env_examples(self):
         """All three .env.example files (repo root, server/compose, gateway --
         the last owned by B line) explain next to GATEWAY_GROUP_FORGET_STALE_KEYS
         that it is a one-off cleanup switch to set back to false after one
-        restart, and what it deletes. Checks the comment block directly
-        above the KEY= line (contiguous '#' lines)."""
+        restart, what it deletes and that kicked/left groups may be joined
+        again.
+
+        CONSTRAINT: only the comment block DIRECTLY above the KEY= line is
+        read (contiguous '#' lines, stopping at the first blank or
+        non-comment line). Moving the explanation elsewhere in the file,
+        or putting a blank line between it and KEY=, fails this test -- the
+        root and server/compose files say so in the block itself."""
         for path in ENV_EXAMPLES:
             with self.subTest(path=str(path.relative_to(REPO_ROOT))):
                 lines = path.read_text(encoding="utf-8").splitlines()
@@ -433,6 +487,35 @@ class MoodProactiveEnvStaticTest(unittest.TestCase):
                 self.assertIn("一次性", comment)
                 self.assertIn("重启一次后改回 false", comment)
                 self.assertIn("永久删除旧 key_id 的群台账", comment)
+                self.assertIn("再次加入", comment)
+
+    def test_compose_env_example_forget_comment_en_zh_in_sync(self):
+        """#233 nit 4: server/compose/.env.example explains FORGET_STALE_KEYS
+        in English AND Chinese. Both halves must carry the same four facts
+        (one-off, what is deleted, kicked/left groups may come back, set
+        back to false after one restart); the compose file's own English
+        comment must carry the deletion and the set-back-to-false too."""
+        lines = (REPO_ROOT / "server" / "compose" / ".env.example").read_text(
+            encoding="utf-8").splitlines()
+        index = lines.index("GATEWAY_GROUP_FORGET_STALE_KEYS=false")
+        block = []
+        for line in reversed(lines[:index]):
+            if not line.startswith("#"):
+                break
+            block.insert(0, line.lstrip("# ").rstrip())
+        english = " ".join(line for line in block if line.isascii())
+        chinese = "".join(line for line in block if not line.isascii())
+        for fact in ("One-off cleanup switch", "permanently deletes group rows of old HMAC key_ids",
+                     "kicked/left group can be accepted again",
+                     "restart once, then set it back to false"):
+            self.assertIn(fact, english)
+        for fact in ("一次性清理开关", "永久删除旧 key_id 的群台账", "再次加入",
+                     "重启一次后改回 false"):
+            self.assertIn(fact, chinese)
+        self.assertIn("edit both together", english)
+        compose = COMPOSE.read_text(encoding="utf-8")
+        self.assertIn("permanently deletes", compose)
+        self.assertIn("set it back to false", compose)
 
     def test_no_hmac_secret_value_written_anywhere(self):
         """The HMAC secret is only ever a placeholder / empty in tracked text."""

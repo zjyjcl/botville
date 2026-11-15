@@ -501,6 +501,12 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         parts = rest.split("/")
         if len(parts) == 2 and parts[1] == "state" and self.command in ("GET", "HEAD", "PATCH"):
             handle_mood(self, parts[0])
+        elif len(parts) == 3 and parts[1:] == ["rooms", "lookup"]:
+            from .group_rooms_http import handle_lookup, owner_persona
+            if self.command == "POST":
+                handle_lookup(self, parts[0])
+            elif owner_persona(self, parts[0]) is not None:
+                self._method_not_allowed(allow="POST")
         elif len(parts) in (2, 3) and parts[1] == "rooms":
             from .group_rooms_http import handle, owner_persona
             collection = len(parts) == 2

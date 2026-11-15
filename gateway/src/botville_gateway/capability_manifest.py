@@ -66,3 +66,15 @@ MEMORY_MANAGE = {'id': 'memory.manage',
  'scopes': ['memory.read', 'memory.write'],
  'owner_can_read_dm': False,
  'updated_at': '2026-11-13T00:00:00Z'}
+
+GROUPS_MANAGE = {'id': 'groups.manage',
+ 'module': 'groups',
+ 'version': '0.1.0',
+ 'title': '群聊',
+ 'summary': '管理我的 AI 所在的群：安静模式与退出。',
+ 'icon': {'type': 'sf_symbol', 'value': 'person.3'},
+ 'status': 'enabled',
+ 'entry': {'type': 'native', 'deep_link': 'botville://personas'},
+ 'scopes': ['groups.read', 'groups.write'],
+ 'room_lookup': True,
+ 'updated_at': '2026-11-15T00:00:00Z'}

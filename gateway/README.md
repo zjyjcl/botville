@@ -48,7 +48,7 @@ gateway/src/botville_gateway/
 ├── service.py           send_ai_message() 编排、幂等、/limits 与 /usage 查询
 ├── store.py             内存 UsageEvent 日志（append-only、容量有界、不存正文）
 ├── http_server.py       stdlib HTTP + build_transport 工厂（/health、/policy、/messages、/limits、/usage、/memories、/capabilities、/_matrix/app/v1/*）
-├── capability_manifest.py 完整基础能力清单与记忆管理元数据（随代码打包）
+├── capability_manifest.py 完整基础能力清单与记忆/群管理元数据（随代码打包）
 ├── memory/              可选四层记忆（默认关闭）
 │   ├── store.py         SQLite 存储、迁移、保留期清理与公开 ID
 │   ├── recall.py        scope 隔离与预算内上下文召回
@@ -114,6 +114,7 @@ continuwuity 仍用 `memory`（尚无文件注册）。运维注意见
 | GET | `/v1/personas` | `listPersonas` | 0.4.0：owner 摘要列表，含 bio（缺省 null），不含 mood |
 | GET | `/v1/personas/{id}` | `getPersona` | 0.4.0：owner 详情 / 本服非 owner 最小视图，含 bio 与 mood；列表项不加 mood |
 | GET/PATCH | `/v1/personas/{id}/state` | `getPersonaState` / `updatePersonaState` | 0.4.0：仅 owner 的 mood 与 mood_public，关闭时 404 `mood.disabled`，响应 no-store |
+| POST | `/v1/personas/{id}/rooms/lookup` | `lookupPersonaRooms` | 0.7.0：owner 批量查询本地已知 room_id，按下标返回 GroupRoom/null；只读、不回显 ID |
 | GET | `/health` | `getHealth` | 免鉴权；返回 Health 形态 |
 | POST | `/v1/policy/evaluate` | `evaluatePolicy` | 预检，不投递、不占额度 |
 | POST | `/v1/conversations/{id}/messages` | `sendMessage` | 完整裁决 + 投递 |
@@ -568,6 +569,7 @@ persona 可配置 `"groups": {"enabled": true, "invite_policy": "owner"}`；
 已接受群中途加密后停止模型回复和实际发送，不自动退出。
 群功能（部署或 persona）关闭时，内置引擎在群中即使被 @/回复也不发言，成员未确认按群处理；DM 不受影响，不自动退群。仍按现有规则记录群记忆（group scope，含其他 AI 发言作为 untrusted）。
 外部运行时 POST /messages 不受此限制。有 memory DB 时 rooms GET 仍列出现有房间；PATCH 仅允许 muted/leave，mention_only 返回 409 room.state_conflict。
+能力清单总是发布 `groups.manage`（`room_lookup:true`）：开启且有 DB 为 enabled，关闭但有 DB 为 degraded/groups_disabled，无 DB 为 disabled/module_disabled。清单是部署级；App 设置 mention_only 还须 persona groups.enabled=true。POST rooms/lookup 共用 owner memory 的 60 次/分钟读配额，PATCH 不受该配额影响；关闭但有 DB 仍可查询，无 DB 返回全 null。
 已知 encrypted_disabled / rejected_encrypted 房间的 messages 与 policy/evaluate 返回
 `403 conversation.e2ee`，不入队、不消耗限额；关闭开关仍禁止加密群发言。
 

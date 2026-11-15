@@ -16,7 +16,16 @@ Standard library only. Schema:
       canonical lower-case form (validate.normalize_server_name).
   events(id, at, kind, detail)
       Append-only audit log (pairings, severs, rejects); old rows are
-      pruned by prune().
+      pruned by prune(). `id` is AUTOINCREMENT, so ids are strictly
+      increasing and never reused (even after pruning): it doubles as the
+      cursor of the pairing-facts feed (fact_events(), A-R1). The fact
+      kinds are `peer_paired` (every transition to active, both the
+      redeeming and the accepting side, re-pairs included; detail carries
+      `repaired`) and `peer_severed` (detail carries `severed_by`); both are
+      written in the same transaction as the peers row change.
+  meta(key, value)
+      Small key/value table; `events_pruned_through` is the highest event
+      id prune() ever deleted (cursors at or below it have lost events).
 
 Timestamps are POSIX floats (time.time()). redeem_invite() is a single
 transaction covering the invite checks (unknown / already used / expired /
@@ -61,7 +70,18 @@ CREATE TABLE IF NOT EXISTS events (
     kind   TEXT NOT NULL,
     detail TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
+
+# Pairing-facts feed (A-R1): the only event kinds the gateway sees, and
+# the only detail keys copied out of them (never secrets or URLs).
+FACT_KINDS = ("peer_paired", "peer_severed")
+FACT_DETAIL_KEYS = {"peer_paired": ("repaired",),
+                    "peer_severed": ("severed_by",)}
+PRUNED_THROUGH_KEY = "events_pruned_through"
 
 PRUNE_DEFAULT_DAYS = 30
 
@@ -72,6 +92,22 @@ REDEEM_USED = "invite_already_used"
 REDEEM_EXPIRED = "invite_expired"
 REDEEM_BAD_SECRET = "invalid_secret"
 REDEEM_PREDATES_SEVER = "invite_predates_sever"
+
+
+class CursorExpired(Exception):
+    """The requested feed position can no longer be served gap-free.
+
+    Raised by fact_events() when events after the cursor were pruned
+    (retention, 30 days) or when the cursor is ahead of the newest event
+    (e.g. the database was restored from an older backup). `resync_cursor`
+    is the newest event id: resync the peers you care about via
+    peer_fact(), then continue from it.
+    """
+
+    def __init__(self, reason, resync_cursor):
+        super().__init__(reason)
+        self.reason = reason
+        self.resync_cursor = resync_cursor
 
 
 def hash_secret(secret):
@@ -227,7 +263,8 @@ class PairingStore:
                 # between check_invite() / peer-key fetch and a concurrent
                 # local sever).
                 peer = self._conn.execute(
-                    "SELECT last_local_sever_at FROM peers WHERE server_name = ?",
+                    "SELECT last_local_sever_at, state FROM peers"
+                    " WHERE server_name = ?",
                     (server_name,)).fetchone()
                 reason = None
                 if row is None:
@@ -269,6 +306,7 @@ class PairingStore:
                          json.dumps({"invite_id": invite_id,
                                      "server_name": server_name}, sort_keys=True)),
                     )
+                    self._insert_paired_event(server_name, peer, now)
                     self._conn.execute("COMMIT")
             except Exception:
                 try:
@@ -281,6 +319,19 @@ class PairingStore:
                               server_name=server_name, reason=reason)
             return False, reason
         return True, None
+
+    def _insert_paired_event(self, server_name, previous_row, now):
+        """peer_paired fact (A-R1), inside the caller's transaction.
+
+        `repaired` is True when a peers row already existed (the server had
+        been paired before, whatever its state was)."""
+        self._conn.execute(
+            "INSERT INTO events (at, kind, detail) VALUES (?, ?, ?)",
+            (now, "peer_paired",
+             json.dumps({"server_name": server_name,
+                         "repaired": previous_row is not None},
+                        sort_keys=True)),
+        )
 
     # --- peers -----------------------------------------------------------
 
@@ -334,6 +385,9 @@ class PairingStore:
         now = time.time() if now is None else now
         server_name = server_name.lower()
         with self._lock:
+            previous = self._conn.execute(
+                "SELECT state FROM peers WHERE server_name = ?",
+                (server_name,)).fetchone()
             self._conn.execute(
                 "INSERT INTO peers (server_name, state, paired_at,"
                 " severed_at, severed_by, peer_api_url, shared_secret)"
@@ -345,11 +399,7 @@ class PairingStore:
                 "   shared_secret = excluded.shared_secret",
                 (server_name, now, api_url, shared_secret),
             )
-            self._conn.execute(
-                "INSERT INTO events (at, kind, detail) VALUES (?, ?, ?)",
-                (now, "peer_paired",
-                 json.dumps({"server_name": server_name}, sort_keys=True)),
-            )
+            self._insert_paired_event(server_name, previous, now)
             self._conn.commit()
 
     def sever_peer(self, server_name, by, now=None, only_if_active=False):
@@ -379,10 +429,16 @@ class PairingStore:
         with self._lock:
             cur = self._conn.execute(query, params)
             changed = cur.rowcount > 0
+            if changed:
+                # Same commit as the state change (A-R1 facts feed): a
+                # reader never sees a severed row without its event.
+                self._conn.execute(
+                    "INSERT INTO events (at, kind, detail) VALUES (?, ?, ?)",
+                    (now, "peer_severed",
+                     json.dumps({"server_name": server_name,
+                                 "severed_by": by}, sort_keys=True)),
+                )
             self._conn.commit()
-        if changed:
-            self.record_event("peer_severed", now=now, server_name=server_name,
-                              severed_by=by)
         return changed
 
     def invalidate_unused_invites(self, now=None):
@@ -419,8 +475,87 @@ class PairingStore:
                 " OR expires_at < ?",
                 (cutoff, cutoff),
             ).rowcount
+            # Remember how far the feed lost history before deleting, so a
+            # fact_events() cursor behind it is refused (CursorExpired)
+            # instead of silently skipping pruned facts.
+            doomed = self._conn.execute(
+                "SELECT max(id) FROM events WHERE at < ?", (cutoff,)
+            ).fetchone()[0]
+            if doomed is not None and doomed > self._pruned_through():
+                self._conn.execute(
+                    "INSERT INTO meta (key, value) VALUES (?, ?)"
+                    " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (PRUNED_THROUGH_KEY, str(doomed)))
             events = self._conn.execute(
                 "DELETE FROM events WHERE at < ?", (cutoff,)
             ).rowcount
             self._conn.commit()
         return {"invites": invites, "events": events}
+
+    # --- pairing facts (A-R1, read-only views for the gateway) --------------
+
+    def _pruned_through(self):
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (PRUNED_THROUGH_KEY,)
+        ).fetchone()
+        return int(row["value"]) if row else 0
+
+    def _latest_event_id(self):
+        # sqlite_sequence keeps the AUTOINCREMENT high-water mark even when
+        # every event row has been pruned.
+        row = self._conn.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'events'"
+        ).fetchone()
+        return int(row["seq"]) if row else 0
+
+    def peer_fact(self, server_name):
+        """{state, changed_at} for one server: state is 'active',
+        'severed' or 'unpaired' (no row); changed_at is the POSIX time of
+        the last transition (None when unpaired)."""
+        peer = self.get_peer(server_name)
+        if peer is None:
+            return {"state": "unpaired", "changed_at": None}
+        if peer["state"] == "active":
+            return {"state": "active", "changed_at": peer["paired_at"]}
+        return {"state": "severed", "changed_at": peer["severed_at"]}
+
+    def fact_events(self, since, limit):
+        """Pairing facts after cursor `since` (exclusive), oldest first.
+
+        Returns (events, next_cursor, has_more). Each event is
+        {cursor, kind, server_name, at, ...FACT_DETAIL_KEYS}. Cursors are
+        event ids: strictly increasing, never reused. When there is no
+        further fact, next_cursor jumps to the newest event id of ANY kind,
+        so an idle-but-polling client never falls behind retention.
+        Raises CursorExpired when `since` is behind the prune watermark or
+        ahead of the newest event id.
+        """
+        with self._lock:
+            latest = self._latest_event_id()
+            pruned = self._pruned_through()
+            if since > latest:
+                raise CursorExpired("cursor_ahead_of_log", latest)
+            if since < pruned:
+                raise CursorExpired("cursor_pruned", latest)
+            rows = self._conn.execute(
+                "SELECT id, at, kind, detail FROM events"
+                " WHERE id > ? AND id <= ? AND kind IN ({})"
+                " ORDER BY id LIMIT ?".format(",".join("?" * len(FACT_KINDS))),
+                (since, latest) + FACT_KINDS + (limit + 1,),
+            ).fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        events = []
+        for row in rows:
+            try:
+                detail = json.loads(row["detail"])
+            except ValueError:
+                detail = {}
+            event = {"cursor": row["id"], "kind": row["kind"],
+                     "server_name": detail.get("server_name"),
+                     "at": row["at"]}
+            for key in FACT_DETAIL_KEYS[row["kind"]]:
+                event[key] = detail.get(key)
+            events.append(event)
+        next_cursor = events[-1]["cursor"] if has_more else latest
+        return events, next_cursor, has_more

@@ -33,6 +33,27 @@ Endpoints (JSON everywhere; errors are `{"errcode", "error"}`):
          debugging; fedgate reads the SQLite file directly).
   GET  /health                           any    liveness probe.
 
+Pairing facts for the gateway (A-R1; service token, read-only):
+
+  GET  /v1/pairing/internal/peers/{server_name}   service
+         -> {state: active|severed|unpaired, changed_at: ISO-8601|null}
+  GET  /v1/pairing/internal/events?since=<cursor>&limit=<1-500>   service
+         -> {events: [{cursor, kind: peer_paired|peer_severed,
+                       server_name, at, repaired | severed_by}],
+             next_cursor, has_more}
+         Cursors are integers (event ids): strictly increasing, never
+         reused; omit `since` (= 0) to start at the beginning. A cursor
+         whose following events were pruned (30-day retention) or that is
+         ahead of the log (restored DB) gets 410 BV_CURSOR_EXPIRED with
+         `resync_cursor`: re-read the peers you track, then continue from
+         it.
+  Auth: `Authorization: Bearer $PAIRING_SERVICE_TOKEN` (constant-time),
+  a token distinct from the admin token. Unset token = every internal
+  call is refused (401, fail-closed); the admin token is never accepted
+  here and the service token never opens admin endpoints. The internal
+  paths are NOT reachable through the /_matrix/pairing/ alias, so fedgate
+  can never expose them to peers.
+
 Paths under /_matrix/pairing/... are accepted as aliases of /v1/pairing/...
 so fedgate can forward them unmodified (`/_matrix/pairing/redeem` ==
 `/v1/pairing/redeem`); fedgate only forwards redeem and notify-severed.
@@ -44,8 +65,10 @@ PAIRING_TRUSTED_PROXIES (fedgate overwrites that header with the direct
 client IP, review B3).
 
 Admin auth: `Authorization: Bearer $PAIRING_ADMIN_TOKEN` (constant-time
-compare); the service refuses to start without it. Secrets/tokens are
-never written to the log.
+compare); the service refuses to start without it. PAIRING_SERVICE_TOKEN
+is optional (internal endpoints answer 401 without it) but, when set,
+must be at least 32 characters and differ from the admin token, or the
+service refuses to start. Secrets/tokens are never written to the log.
 """
 
 import base64
@@ -70,6 +93,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
 from .store import (
+    CursorExpired,
     REDEEM_BAD_SECRET,
     REDEEM_EXPIRED,
     REDEEM_PREDATES_SEVER,
@@ -101,6 +125,11 @@ PRUNE_INTERVAL_SECONDS = 3600.0
 MAX_BODY_BYTES = 65536
 PEER_HTTP_TIMEOUT = 15.0
 INVITE_ID_BYTES = 12  # urlsafe -> 16 chars
+SERVICE_TOKEN_MIN_CHARS = 32
+INTERNAL_PREFIX = "/v1/pairing/internal/"
+FACTS_DEFAULT_LIMIT = 100
+FACTS_MAX_LIMIT = 500
+CURSOR_MAX_DIGITS = 18  # fits a signed 64-bit SQLite integer
 SECRET_BYTES = 32  # urlsafe -> 43 chars
 
 REDEEM_ERRORS = {
@@ -364,9 +393,19 @@ class PairingConfig:
                  invite_ttl=DEFAULT_INVITE_TTL, verify_peer_key=True,
                  peer_key_url_template="https://{server_name}/_matrix/key/v2/server",
                  insecure_tls=False, host="127.0.0.1", port=8090,
-                 trusted_proxies=()):
+                 trusted_proxies=(), service_token=None):
         self.db_path = db_path
         self.admin_token = admin_token
+        if service_token:
+            if len(service_token) < SERVICE_TOKEN_MIN_CHARS:
+                raise ConfigError(
+                    "PAIRING_SERVICE_TOKEN must be at least {} characters".format(
+                        SERVICE_TOKEN_MIN_CHARS))
+            if hmac.compare_digest(service_token.encode("utf-8"),
+                                   (admin_token or "").encode("utf-8")):
+                raise ConfigError(
+                    "PAIRING_SERVICE_TOKEN must differ from PAIRING_ADMIN_TOKEN")
+        self.service_token = service_token or None
         try:
             self.server_name = normalize_server_name(server_name)
         except ServerNameError as exc:
@@ -419,6 +458,7 @@ class PairingConfig:
             port=int(env.get("PAIRING_PORT", "8090")),
             trusted_proxies=_parse_trusted_proxies(
                 env.get("PAIRING_TRUSTED_PROXIES", "")),
+            service_token=env.get("PAIRING_SERVICE_TOKEN", "") or None,
         )
 
 
@@ -435,6 +475,7 @@ class PairingApp:
         self.notify_limiter = RateLimiter(limit=NOTIFY_PER_MINUTE)
         self.nonces = NonceGuard()
         self.notify_rejected = 0
+        self.internal_rejected = 0
 
 
 def _iso(ts):
@@ -538,10 +579,110 @@ class PairingHandler(BaseHTTPRequestHandler):
         return hmac.compare_digest(auth.encode("utf-8"),
                                    expected.encode("utf-8"))
 
+    def _is_service(self):
+        """Service-token check for the internal facts API (fail-closed:
+        no configured token means nobody is a service caller)."""
+        token = self.config.service_token
+        if not token:
+            return False
+        auth = self.headers.get("Authorization") or ""
+        return hmac.compare_digest(auth.encode("utf-8"),
+                                   ("Bearer " + token).encode("utf-8"))
+
+    def _handle_internal(self, method, path, query):
+        """A-R1 pairing facts (read-only). Auth first, uniformly 401, so an
+        unauthenticated caller learns nothing about routes or peers."""
+        if not self._is_service():
+            self.app.internal_rejected += 1
+            log.warning("internal facts request refused from %s (%d refused"
+                        " in total)", self._client_ip(),
+                        self.app.internal_rejected)
+            self._error(401, "M_UNKNOWN_TOKEN",
+                        "internal endpoints need the pairing service token")
+            return
+        rest = path[len(INTERNAL_PREFIX):]
+        if rest == "events":
+            route = "events"
+        elif rest.startswith("peers/") and len(rest) > len("peers/") \
+                and "/" not in rest[len("peers/"):]:
+            route = "peer"
+        else:
+            self._error(404, "M_UNRECOGNIZED", "no such internal endpoint")
+            return
+        if method != "GET":
+            self.close_connection = True
+            body = json.dumps({"errcode": "M_UNRECOGNIZED",
+                               "error": "method not allowed"}).encode("utf-8")
+            self.send_response(405)
+            self.send_header("Allow", "GET")
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if route == "peer":
+            try:
+                server_name = normalize_server_name(
+                    unquote(rest[len("peers/"):]))
+            except ServerNameError:
+                self._error(400, "M_INVALID_PARAM", "invalid server_name")
+                return
+            fact = self.app.store.peer_fact(server_name)
+            self._send_json(200, {"state": fact["state"],
+                                  "changed_at": _iso(fact["changed_at"])})
+            return
+        params, err = self._parse_facts_query(query)
+        if err:
+            self._error(*err)
+            return
+        since, limit = params
+        try:
+            events, next_cursor, has_more = self.app.store.fact_events(
+                since, limit)
+        except CursorExpired as exc:
+            self._send_json(410, {
+                "errcode": "BV_CURSOR_EXPIRED",
+                "error": "cursor can no longer be served gap-free ({});"
+                         " resync peers, then continue from resync_cursor"
+                         .format(exc.reason),
+                "reason": exc.reason,
+                "resync_cursor": exc.resync_cursor,
+            })
+            return
+        for event in events:
+            event["at"] = _iso(event["at"])
+        self._send_json(200, {"events": events, "next_cursor": next_cursor,
+                              "has_more": has_more})
+
+    @staticmethod
+    def _parse_facts_query(query):
+        """since/limit for the events feed; anything else is a 400."""
+        since, limit = 0, FACTS_DEFAULT_LIMIT
+        seen = set()
+        for part in query.split("&") if query else ():
+            key, sep, value = part.partition("=")
+            if not sep or key in seen or key not in ("since", "limit"):
+                return None, (400, "M_INVALID_PARAM",
+                              "only since and limit are accepted, once each")
+            seen.add(key)
+            if not value.isdigit() or not value.isascii() \
+                    or len(value) > CURSOR_MAX_DIGITS:
+                return None, (400, "M_INVALID_PARAM",
+                              "{} must be a non-negative integer".format(key))
+            if key == "since":
+                since = int(value)
+            else:
+                limit = int(value)
+                if not 1 <= limit <= FACTS_MAX_LIMIT:
+                    return None, (400, "M_INVALID_PARAM",
+                                  "limit must be within 1-{}".format(
+                                      FACTS_MAX_LIMIT))
+        return (since, limit), None
+
     def _dispatch(self, method):
         # Raw request-target, not urlsplit(): "//x/y" would otherwise be
         # parsed as a network-location and hide the empty segment.
-        path = self.path.split("?", 1)[0]
+        path, _, query = self.path.partition("?")
         # Path hygiene (review: bypass-via-path): refuse traversal
         # segments, empty segments and encoded separators before routing,
         # so prefix matching can never be fed a normalisable path.
@@ -550,8 +691,18 @@ class PairingHandler(BaseHTTPRequestHandler):
             return
         # fedgate forwards /_matrix/pairing/<x> unchanged; treat it as an
         # alias of /v1/pairing/<x> so peers only need one public port.
-        if path.startswith("/_matrix/pairing/"):
+        aliased = path.startswith("/_matrix/pairing/")
+        if aliased:
             path = "/v1/pairing/" + path[len("/_matrix/pairing/"):]
+
+        # A-R1 internal facts: service token only, and never via the
+        # /_matrix/pairing/ alias (that prefix is what fedgate forwards).
+        if path.startswith(INTERNAL_PREFIX) or path == INTERNAL_PREFIX.rstrip("/"):
+            if aliased:
+                self._error(404, "M_UNRECOGNIZED", "no such pairing endpoint")
+                return
+            self._handle_internal(method, path, query)
+            return
 
         if path == "/health":
             self._send_json(200, {"ok": True})
@@ -957,6 +1108,9 @@ def main(argv=None):
         log.warning("PAIRING_TRUSTED_PROXIES is empty: X-Forwarded-For is "
                     "ignored; behind fedgate every peer shares one rate-limit "
                     "bucket. Set it to fedgate's address.")
+    if not config.service_token:
+        log.warning("PAIRING_SERVICE_TOKEN is unset: the internal pairing-facts"
+                    " endpoints refuse every request (401).")
     log.info("pairing service listening on %s:%s (db=%s, server_name=%s)",
              host, port, config.db_path, config.server_name)
     try:
