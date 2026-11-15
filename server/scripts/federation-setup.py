@@ -20,8 +20,10 @@ The Synapse configs deliberately stack CI-only relaxations on top of the
 standard surface (see the header comment in the template below): open
 registration for the e2e bootstrap, no certificate verification and no
 private-range blacklist because federation goes through fedgate over
-self-signed certs on the compose network. The gate itself is fedgate; the
-homeserver runs no whitelist (docs/compat/homeserver-compat.md §2.4).
+self-signed certs on the compose network. The real-time gate is fedgate;
+on top of it each Synapse loads a second --config-path,
+/hs/federation-whitelist.yaml, that the pairing service renders from its
+active peers (A-R2, #118 item 8; not rendered here).
 """
 
 import os
@@ -52,8 +54,10 @@ HOMESERVER_TEMPLATE = """\
 #   federation_verify_certificates: false  (fedgate TLS is self-signed here)
 #   federation_ip_range_blacklist: []      (fedgate lives on the compose net)
 #   enable_registration: true              (e2e registers alice/bob via UIA)
-# The pairing gate is fedgate in front of this listener; no homeserver-side
-# federation whitelist (docs/compat/homeserver-compat.md §2.4).
+# The real-time pairing gate is fedgate in front of this listener. The
+# federation_domain_whitelist comes from a second --config-path
+# (/hs/federation-whitelist.yaml, rendered by the pairing service; A-R2).
+# Do not set federation_domain_whitelist here: it would be overridden.
 server_name: {server_name}
 pid_file: /data/homeserver.pid
 listeners:
