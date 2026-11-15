@@ -9,6 +9,107 @@ import XCTest
 
 @MainActor
 final class PersonaGroupRoomsModelTests: XCTestCase {
+    func testLookupMapsNamesInBatchesOfFiftyAndNullKeepsOrdinal() async {
+        let client = RoomsScriptClient(
+            pages: [.success(page([room("a"), room("b"), room("c")], nil, false))],
+            lookups: [
+                .success(lookup(50, hits: [0: "a"])),
+                .success(lookup(50, hits: [10: "b"])),
+                .success(lookup(20)),
+            ])
+        let model = lookupModel(client, rooms: knownRooms(120))
+        await model.load()
+        let batches = await client.lookupCalls()
+        XCTAssertEqual(batches.map(\.count), [50, 50, 20])
+        XCTAssertEqual(batches.flatMap { $0 }, knownRooms(120).map(\.id))
+        XCTAssertEqual(model.roomName(for: ref("a")), "群0")
+        XCTAssertEqual(model.roomName(for: ref("b")), "群60")
+        XCTAssertNil(model.roomName(for: ref("c")))  // 没有这个群：保持序号。
+        XCTAssertNil(model.errorMessage)
+        XCTAssertFalse(model.isLoading)
+    }
+
+    func testLookupFailureStopsQuietlyAndKeepsEarlierBatches() async {
+        let client = RoomsScriptClient(
+            pages: [.success(page([room("a"), room("b")], nil, false))],
+            lookups: [
+                .success(lookup(50, hits: [1: "a"])),
+                .failure(.problem(status: 429, code: "rate_limited.transport")),
+            ])
+        let model = lookupModel(client, rooms: knownRooms(120))
+        await model.load()
+        let batches = await client.lookupCalls()
+        XCTAssertEqual(batches.count, 2)  // No third batch after a failure.
+        XCTAssertEqual(model.roomName(for: ref("a")), "群1")
+        XCTAssertNil(model.roomName(for: ref("b")))
+        XCTAssertNil(model.errorMessage)  // Names are optional; the list itself loaded.
+        XCTAssertEqual(model.rooms.count, 2)
+    }
+
+    func testMisalignedLookupReplyIsIgnored() async {
+        let client = RoomsScriptClient(
+            pages: [.success(page([room("a")], nil, false))],
+            lookups: [.success(lookup(2, hits: [0: "a"]))])
+        let model = lookupModel(client, rooms: knownRooms(3))
+        await model.load()
+        XCTAssertNil(model.roomName(for: ref("a")))
+    }
+
+    func testNoLookupWithoutCapabilityServerNameRoomsOrKnownIDs() async {
+        for (entry, server, rooms, pageRooms) in [
+            (GroupsManageEntryState.legacy, "local", knownRooms(2), [room("a")]),
+            (.enabledForTesting, nil, knownRooms(2), [room("a")]),
+            (.enabledForTesting, "other", knownRooms(2), [room("a")]),
+            (.enabledForTesting, "local", knownRooms(2), []),
+            (.enabledForTesting, "local", [], [room("a")]),
+        ] as [(GroupsManageEntryState, String?, [MatrixRoom], [GroupRoom])] {
+            let client = RoomsScriptClient(pages: [.success(page(pageRooms, nil, false))])
+            let model = lookupModel(client, entry: entry, rooms: rooms, server: server)
+            await model.load()
+            let batches = await client.lookupCalls()
+            XCTAssertEqual(batches, [])
+            XCTAssertNil(model.roomName(for: ref("a")))
+        }
+    }
+
+    func testRoomNotFoundReloadClearsOldNamesAndLooksUpAgain() async {
+        let client = RoomsScriptClient(
+            pages: [
+                .success(page([room("a")], nil, false)),
+                .success(page([room("b")], nil, false)),
+            ],
+            lookups: [
+                .success(lookup(1, hits: [0: "a"])),
+                .success(lookup(1, hits: [0: "b"])),  // Key rotation: same room id, new ref.
+            ],
+            modes: [.failure(.problem(status: 404, code: "room.not_found"))])
+        let model = lookupModel(client, rooms: knownRooms(1))
+        await model.load()
+        XCTAssertEqual(model.roomName(for: ref("a")), "群0")
+        await model.setMode(roomRef: ref("a"), mode: .muted)
+        XCTAssertNil(model.roomName(for: ref("a")))
+        XCTAssertEqual(model.roomName(for: ref("b")), "群0")
+        let batches = await client.lookupCalls()
+        XCTAssertEqual(batches.count, 2)
+    }
+
+    func testDimmedCapabilityAllowsQuietAndLeaveButNeverMentionOnly() async {
+        let client = RoomsScriptClient(
+            pages: [.success(page([room("a", mode: "muted")], nil, false))],
+            lookups: [.success(lookup(1))],
+            modes: [.success(room("a", mode: "muted"))],
+            leaves: [.success(room("a", state: "left", mode: "muted", pending: true))])
+        let model = lookupModel(client, entry: .dimmedForTesting, rooms: knownRooms(1))
+        await model.load()
+        XCTAssertFalse(model.canEnableMentionOnly)
+        await model.setMode(roomRef: ref("a"), mode: .mentionOnly)
+        let modes = await client.modeRequests()
+        XCTAssertEqual(modes, [])
+        await model.leave(roomRef: ref("a"))
+        let leaves = await client.leaveCount()
+        XCTAssertEqual(leaves, 1)
+    }
+
     func testPaginationDedupAndIncludeSwitch() async {
         let client = RoomsScriptClient(pages: [
             .success(page([room("a"), room("b")], "next", true)),
@@ -364,6 +465,36 @@ final class PersonaGroupRoomsModelTests: XCTestCase {
 }
 
 @MainActor
+private func lookupModel(
+    _ client: any GatewayClient, entry: GroupsManageEntryState = .enabledForTesting,
+    rooms: [MatrixRoom], server: String? = "local"
+) -> PersonaGroupRoomsModel {
+    PersonaGroupRoomsModel(personaID: "@ai:local", client: client,
+        settings: PersonaGroupsSettingsController(personaID: "@ai:local",
+            initialGroups: groups(true, .owner), client: client),
+        entry: entry,
+        lookupSource: GroupRoomLookupSource(localServerName: server, knownRooms: { rooms }))
+}
+private func knownRooms(_ count: Int) -> [MatrixRoom] {
+    (0..<count).map { MatrixRoom(id: "!r\($0):local", name: "群\($0)") }
+}
+/// One lookup reply for `count` ids; `hits` maps an index in the batch to a room label.
+private func lookup(_ count: Int, hits: [Int: String] = [:], enabled: Bool = true)
+    -> GroupRoomLookupResult
+{
+    GroupRoomLookupResult(
+        items: (0..<count).map { index in hits[index].map { room($0) } }, groupsEnabled: enabled)
+}
+extension GroupsManageEntryState {
+    fileprivate static let enabledForTesting = GroupsManageEntryState(
+        visibility: .visible, notice: nil, allowsMentionOnly: true, canOpenSettings: true,
+        supportsRoomLookup: true)
+    fileprivate static let dimmedForTesting = GroupsManageEntryState(
+        visibility: .dimmed, notice: "群聊功能已关闭，只能设为安静或退出群聊",
+        allowsMentionOnly: false, canOpenSettings: false, supportsRoomLookup: true)
+}
+
+@MainActor
 private func roomsModel(_ client: any GatewayClient) -> PersonaGroupRoomsModel {
     PersonaGroupRoomsModel(personaID: "@ai:local", client: client,
         settings: PersonaGroupsSettingsController(personaID: "@ai:local",
@@ -445,14 +576,18 @@ private actor RoomsScriptClient: GatewayClient {
     private var leavesSent = 0
     private var modesSent: [GroupRoomMode] = []
     private var personasRead = 0
+    private var lookups: [Result<GroupRoomLookupResult, GatewayClientError>]
+    private var lookupBatches: [[String]] = []
     init(
         pages: [Result<GroupRoomList, GatewayClientError>] = [],
+        lookups: [Result<GroupRoomLookupResult, GatewayClientError>] = [],
         modes: [Result<GroupRoom, GatewayClientError>] = [],
         leaves: [Result<GroupRoom, GatewayClientError>] = [],
         personas: [Result<PersonaDetail, GatewayClientError>] = [],
         updates: [Result<PersonaDetail, GatewayClientError>] = []
     ) {
         self.pages = pages
+        self.lookups = lookups
         self.modes = modes
         self.leaves = leaves
         self.personas = personas
@@ -464,6 +599,13 @@ private actor RoomsScriptClient: GatewayClient {
         roomCalls.append("\(cursor ?? "nil"):\(includeAll)")
         return try pages.removeFirst().get()
     }
+    func lookupGroupRooms(personaID: String, roomIDs: [String]) async throws
+        -> GroupRoomLookupResult
+    {
+        lookupBatches.append(roomIDs)
+        return try lookups.removeFirst().get()
+    }
+    func lookupCalls() -> [[String]] { lookupBatches }
     func updateGroupRoomMode(personaID: String, roomRef: String, mode: GroupRoomMode) async throws
         -> GroupRoom
     {
