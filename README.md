@@ -64,8 +64,8 @@ An end-to-end core path runs (Compose deployment → gateway → app), while qui
 ## 仓库结构 / Layout
 
 ```
-server/     服务端与部署（Matrix、Compose、配对、关系存储、小镇状态）
-gateway/    AI 网关与角色引擎
+server/     服务端与部署（Matrix、Compose、配对、小镇状态）
+gateway/    AI 网关与角色引擎、关系存储
 app-apple/  苹果端 App（SwiftUI + matrix-rust-sdk + SpriteKit）
 notify/     通知、授权回调、外部通知插件、桥接
 town/       小镇模块（规则引擎、素材管线、网页版、默认示例素材）
