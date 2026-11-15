@@ -32,7 +32,8 @@
 # a real deployment; they let the host bypass fedgate entirely):
 #   18101/18102  synapse-a/b client API (federation_e2e.py users)
 #   18111/18112  pairing-a/b admin API + internal facts API (A-R1;
-#                federation_e2e.py pairing and facts steps)
+#                federation_e2e.py pairing and facts steps) + internal
+#                relations send API (A-R3)
 #
 # Everything under ./generated/ is produced at run time (certs by
 # server/scripts/federation-certs.sh, homeserver configs + admin tokens by
@@ -160,6 +161,12 @@ services:
       # fedgate-a (.10) is the only reverse proxy this pairing service
       # trusts for X-Forwarded-For; anything else is treated as spoofed.
       PAIRING_TRUSTED_PROXIES: 172.30.81.10
+      # A-R3 CI-only: verified inbound relation messages go to the TEST
+      # recorder (JSON lines on the state volume) instead of a gateway; the
+      # real gateway client is not part of this build. Never copy into a
+      # real deployment (it accepts everything); the default is "none".
+      PAIRING_RELATIONS_GATEWAY: test-recorder
+      PAIRING_RELATIONS_TEST_RECORD: /data/relations-recorder.jsonl
     ports:
       - "127.0.0.1:18111:8090"
     volumes:
@@ -195,6 +202,8 @@ services:
       # fedgate-b (.11) is the only reverse proxy this pairing service
       # trusts for X-Forwarded-For; anything else is treated as spoofed.
       PAIRING_TRUSTED_PROXIES: 172.30.81.11
+      PAIRING_RELATIONS_GATEWAY: test-recorder
+      PAIRING_RELATIONS_TEST_RECORD: /data/relations-recorder.jsonl
     ports:
       - "127.0.0.1:18112:8090"
     volumes:

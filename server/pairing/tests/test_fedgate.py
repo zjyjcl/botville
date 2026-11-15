@@ -707,6 +707,84 @@ class FedgateMatrixTest(unittest.TestCase):
             self.assertEqual(resp["errcode"], "M_UNRECOGNIZED", path)
             self.assertEqual(len(self.pairing_cls.received), before, path)
 
+    # --- A-R3 relation transport: active gate in front of pairing ------------
+
+    def relation(self, kind="request", method="POST", origins=("hs-a",)):
+        pairs = [("X-Botville-Origin", o) for o in origins]
+        pairs += [("X-Botville-Ts", "1"), ("X-Botville-Nonce", "0" * 32),
+                  ("X-Botville-Sig", "0" * 64),
+                  ("Content-Type", "application/json")]
+        body = b'{"v":1}' if method == "POST" else None
+        if body is not None:
+            pairs.append(("Content-Length", str(len(body))))
+        status, _reason, _headers, raw = testutil.raw_request(
+            self.port, method, "/_matrix/pairing/relations/" + kind, pairs,
+            body=body)
+        return status, raw
+
+    def test_relations_forwarded_for_active_origin(self):
+        self.paired("hs-a")
+        for kind in ("request", "respond", "revoke"):
+            before = len(self.pairing_cls.received)
+            status, raw = self.relation(kind)
+            self.assertEqual(status, 200, kind)
+            self.assertEqual(len(self.pairing_cls.received), before + 1)
+            sent = self.pairing_cls.received[-1]
+            self.assertEqual(sent["path"], "/_matrix/pairing/relations/" + kind)
+            self.assertEqual(sent["body"], '{"v":1}')
+            # Signature headers pass through untouched; XFF is rewritten.
+            self.assertEqual(sent["headers"]["x-botville-origin"], "hs-a")
+            self.assertEqual(sent["headers"]["x-botville-sig"], "0" * 64)
+            self.assertEqual(sent["headers"]["x-forwarded-for"], "127.0.0.1")
+
+    def test_relations_refused_unless_single_active_origin(self):
+        self.paired("hs-a")
+        self.db.upsert_peer_active("hs-gone", "https://peer/x")
+        self.db.sever_peer("hs-gone", "local")
+        cases = [
+            ("unpaired", ("hs-x",)),
+            ("severed", ("hs-gone",)),
+            ("missing", ()),
+            ("duplicate", ("hs-a", "hs-a")),
+            ("smuggled", ("hs-a", "hs-x")),
+            ("upper-case", ("HS-A",)),
+            ("invalid", ("hs a",)),
+        ]
+        for name, origins in cases:
+            with self.subTest(name):
+                before = len(self.pairing_cls.received)
+                status, raw = self.relation(origins=origins)
+                self.assertEqual(status, 403)
+                self.assertEqual(json.loads(raw)["errcode"], "M_FORBIDDEN")
+                self.assertEqual(len(self.pairing_cls.received), before)
+
+    def test_relations_method_and_unknown_paths(self):
+        self.paired("hs-a")
+        before = len(self.pairing_cls.received)
+        for method in ("GET", "PUT", "DELETE"):
+            status, _ = self.relation(method=method)
+            self.assertEqual(status, 405, method)
+        for kind in ("block", "request/", "", "REQUEST", "request/x"):
+            status, _ = self.relation(kind)
+            self.assertEqual(status, 404, kind)
+        self.assertEqual(len(self.pairing_cls.received), before)
+
+    def test_relations_503_when_db_unavailable(self):
+        class UnavailableAllowed:
+            def refresh_if_stale(self):
+                return False, frozenset()
+
+            def contains(self, server_name):
+                return False
+
+        self.paired("hs-a")
+        self.httpd.allowed = UnavailableAllowed()
+        before = len(self.pairing_cls.received)
+        status, raw = self.relation()
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(raw)["errcode"], "M_UNAVAILABLE")
+        self.assertEqual(len(self.pairing_cls.received), before)
+
     def test_pairing_forward_overwrites_forwarded_hints(self):
         # Client-supplied forwarding hints must be dropped and replaced by
         # the direct client IP (review B3); Content-Length is recomputed.

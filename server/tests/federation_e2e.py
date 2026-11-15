@@ -16,6 +16,12 @@ no /_synapse/admin. Phases (issue A2.1 acceptance):
   4. re-pair    (B invites this time) traffic flows again;
   5. A severs   the same isolation asserted the other way round.
 
+A-R3 relation transport (federation_relations.py): while paired, a
+relation message sent through hs-a's internal API reaches hs-b's test
+recorder signed and once; a byte-identical replay is refused (401); after
+hs-b severs, hs-a's internal API refuses (409) and a correctly signed
+message from hs-a is stopped at fedgate-b (403) -- nothing more recorded.
+
 Alongside every phase the read-only pairing-facts API (A-R1,
 /v1/pairing/internal/*, service token) is checked on both sides: the
 peer state it reports and the peer_paired / peer_severed events it
@@ -36,6 +42,7 @@ import urllib.parse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import smoke  # noqa: E402  (same directory as this file)
+import federation_relations  # noqa: E402  (A-R3 relation transport steps)
 from smoke import Failure, expect, request_json  # noqa: E402
 
 POLL_INTERVAL = 2.0
@@ -285,6 +292,9 @@ def main():
     facts_a = PairingFacts(args.a_admin, env["PAIRING_SERVICE_TOKEN_A"])
     facts_b = PairingFacts(args.b_admin, env["PAIRING_SERVICE_TOKEN_B"])
     suffix = secrets.token_hex(3)
+    rel = federation_relations.Relations(
+        args.env_file, args.a_admin, args.b_admin,
+        env["PAIRING_SERVICE_TOKEN_A"], env["PAIRING_SERVICE_TOKEN_B"])
 
     # --- readiness + users ------------------------------------------------
 
@@ -437,7 +447,11 @@ def main():
         ("unpaired servers cannot federate", step_unpaired),
         ("pair hs-a -> hs-b", step_pair),
         ("federated invite/join/messages", step_federated_chat),
+        ("relations: signed delivery, replay refused",
+         lambda: federation_relations.step_active(rel)),
         ("hs-b severs unilaterally", step_b_severs),
+        ("relations: non-active peer refused",
+         lambda: federation_relations.step_inactive(rel)),
         ("re-pair hs-b -> hs-a", step_repair),
         ("hs-a severs unilaterally", step_a_severs),
     ]
