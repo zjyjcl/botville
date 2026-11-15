@@ -44,6 +44,10 @@ synapse-X`, wait, delete it). On top of the phases above it proves:
   - an idempotent repeat sever renders nothing and leaves no marker.
 
 Every polling step is bounded (<=60s positive, 20s negative windows).
+Negative checks ("never arrives", "no outbound request") only prove
+nothing happened inside their window, not that it never will (#247
+review N4): a retry backoff longer than 20s would go unobserved here;
+that guarantee rests on the code paths and unit tests.
 First failure exits non-zero with the failing step name.
 """
 

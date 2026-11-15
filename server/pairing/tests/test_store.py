@@ -275,3 +275,47 @@ class StoreTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SafeRollbackTest(unittest.TestCase):
+    """#247 review N2: a failing rollback never masks the original error."""
+
+    def setUp(self):
+        import tempfile as _tempfile
+        self._tmp = _tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        import os as _os
+        self.store = store.PairingStore(_os.path.join(self._tmp.name, "p.db"))
+        self.real = self.store._conn
+        self.addCleanup(self.real.close)
+
+    def broken(self):
+        real = self.real
+
+        class BrokenConn:
+            def execute(self, *args, **kwargs):
+                if args and str(args[0]).lstrip().upper().startswith(
+                        ("INSERT INTO PEERS", "UPDATE PEERS")):
+                    raise ValueError("write failed")
+                return real.execute(*args, **kwargs)
+
+            def rollback(self):
+                raise RuntimeError("rollback failed too")
+
+            def commit(self):
+                real.commit()
+
+        return BrokenConn()
+
+    def test_upsert_and_sever_reraise_the_original_error(self):
+        self.store._conn = self.broken()
+        try:
+            with self.assertLogs("pairing.store", "ERROR"):
+                with self.assertRaises(ValueError):
+                    self.store.upsert_peer_active("hs-b", "https://hs-b/x")
+            with self.assertLogs("pairing.store", "ERROR"):
+                with self.assertRaises(ValueError):
+                    self.store.sever_peer("hs-b", "local")
+        finally:
+            self.store._conn = self.real
+

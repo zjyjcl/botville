@@ -104,6 +104,7 @@ from .store import (
 )
 from . import relations
 from .hswhitelist import HsWhitelistWriter
+from .hswhitelist import MarkerWriteError as HsMarkerWriteError
 from .validate import (
     ServerNameError,
     normalize_server_name,
@@ -588,6 +589,7 @@ class PairingApp:
                 config.hs_whitelist_path, config.server_name,
                 marker_path=config.hs_restart_marker)
         self.hs_whitelist_failures = 0
+        self._hs_whitelist_failures_lock = threading.Lock()
 
     def note_relation_rejected(self):
         """Count one refused inbound relation message; returns the total."""
@@ -601,23 +603,38 @@ class PairingApp:
             self.internal_rejected += 1
             return self.internal_rejected
 
+    def _note_hs_whitelist_failure(self):
+        with self._hs_whitelist_failures_lock:  # #247 review N1
+            self.hs_whitelist_failures += 1
+            return self.hs_whitelist_failures
+
     def sync_hs_whitelist(self):
         """Re-render the homeserver whitelist from the peers table (A-R2).
 
         Called after every pairing state change, at startup and from the
         background loop; idempotent (unchanged content writes nothing).
-        Never raises: the pairing change is already committed and fedgate
-        enforces it regardless, so a write failure is logged and retried
+        Never raises (#247 review S3: any Exception, not only OSError /
+        sqlite3.Error): the pairing change is already committed and
+        fedgate enforces it regardless, so a failure is logged and retried
         on the next call. Returns True when a restart marker was written.
+        The peers table is read under the writer lock (review S1).
         """
         if self.hs_whitelist is None:
             return False
         try:
-            changed = self.hs_whitelist.sync(self.store.active_server_names())
-        except (OSError, sqlite3.Error) as exc:
-            self.hs_whitelist_failures += 1
-            log.error("homeserver whitelist render failed (%s); fedgate still"
-                      " enforces pairing, will retry", exc)
+            changed = self.hs_whitelist.sync(self.store.active_server_names)
+        except HsMarkerWriteError as exc:
+            self._note_hs_whitelist_failure()
+            log.error("homeserver whitelist updated but the restart marker"
+                      " could not be written (%s); a restart is pending and"
+                      " the marker is retried every %ds", exc,
+                      int(HS_WHITELIST_RESYNC_SECONDS))
+            return False
+        except Exception as exc:  # noqa: BLE001 - must never fail a request
+            self._note_hs_whitelist_failure()
+            log.error("homeserver whitelist render failed (%s: %s); fedgate"
+                      " still enforces pairing, will retry",
+                      type(exc).__name__, exc)
             return False
         if changed:
             log.warning("homeserver federation whitelist changed: restart the"
@@ -1469,7 +1486,10 @@ def start_hs_whitelist_loop(app, interval=HS_WHITELIST_RESYNC_SECONDS):
     def run():
         while True:
             time.sleep(interval)
-            app.sync_hs_whitelist()
+            try:  # #247 review S3: the loop must outlive any surprise
+                app.sync_hs_whitelist()
+            except Exception:  # noqa: BLE001
+                log.exception("homeserver whitelist loop iteration failed")
 
     thread = threading.Thread(target=run, name="pairing-hs-whitelist",
                               daemon=True)
