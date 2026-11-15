@@ -34,7 +34,7 @@
 ```
 
 - **fedgate 是权威闸门**（`server/pairing/fedgate.py`，`python -m pairing.fedgate`）：标准库 `ThreadingHTTPServer` 反向代理 + 可选 TLS。它只判断"这个 origin 是否在 active 配对表中"，**事件签名验证仍由上游 homeserver 完成**（标准库无 ed25519，闸门不验签；媒体端点的残余风险见「安全说明」）。方法/端到端头/体/状态码原样转发（客户端 `Content-Length`/`Transfer-Encoding` 不透传，按已读 body 重算），响应支持流式。配对表从 pairing 的 SQLite 以只读连接（`mode=ro`）读取（同一卷；WAL 模式下读者需要写 `-shm` wal-index，所以共享卷必须挂 rw），每 1s 刷新缓存——切断即刻生效，不触碰 homeserver；**数据库读失败不等于空配对集**：最多沿用 30s 前的最后成功快照，之后 gated 请求返回 `503 M_UNAVAILABLE`（不 sink）、`/health` 返回 `503 {"ok":false,"db":false}`。
-- **pairing 是配对面**（`server/pairing/service.py`，`python -m pairing.service`）：invite（一次性邀请码）/redeem/accept/sever 的 HTTP API + 审计事件，SQLite 持久化（`server/pairing/store.py`：`invites`、`peers`、`events` 三表，WAL；启动时自动迁移旧库并清理 30 天前的已完成邀请与旧事件）。
+- **pairing 是配对面**（`server/pairing/service.py`，`python -m pairing.service`）：invite（一次性邀请码）/redeem/accept/sever 的 HTTP API + 审计事件，SQLite 持久化（`server/pairing/store.py`：`invites`、`peers`、`events` 三表加 A-R1 的 `meta` 小表，WAL；启动时自动迁移旧库并清理 30 天前的已完成邀请与旧事件）。
 - **HS 白名单是第二道闸**（A-R2，仅 Synapse）：pairing 在配对变化时原子重渲染 `federation_domain_whitelist` include（active 对端 + 本服务器）并写「需要重启」标记，由运维/supervisor 重启 Synapse；pairing 不持有 docker socket，不自动重启。fedgate 仍是实时的第一道闸，安全上不依赖重启时机（见「HS 白名单与重启」）。
 
 ## 配对流程（扫码）
@@ -83,6 +83,36 @@ pairing 服务（错误统一 `{"errcode","error"}`；`/_matrix/pairing/<x>` 是
 | `POST /v1/pairing/notify-severed` | 对端（HMAC） | `{server_name}` + `X-Botville-Origin/-Ts/-Nonce/-Sig`：把该对端标 `severed_by=remote`（仅 active→severed，不覆盖 `severed_by=local`）。签名 = `HMAC-SHA256(shared_secret, "origin\nts\nnonce\nsha256hex(body)")`；`\|now-ts\|≤300s`、nonce ≥16 字节 hex 且防重放、30/min/IP；一切失败 → 401 且不写 events（仅日志计数） |
 | `GET /v1/pairing/allowed` | admin | active 名单（调试用；fedgate 直接读 SQLite） |
 | `GET /health` | 无 | 存活探针 |
+| `GET /v1/pairing/internal/peers/{name}` | service | 配对事实（A-R1，供网关）：`{state, changed_at}`，见下节 |
+| `GET /v1/pairing/internal/events?since=&limit=` | service | 配对事实事件流（A-R1）：`peer_paired` / `peer_severed`，见下节 |
+
+### 配对事实接口（A-R1，供网关只读）
+
+网关（B 线关系存储）据此判断「对端服务器是否仍配对」，并在切断时降级跨服关系。只读，不改任何状态。
+
+**鉴权（fail-closed）**：`Authorization: Bearer $PAIRING_SERVICE_TOKEN`，常量时间比较。
+- service token 与 admin token 相互独立：admin token 调内部端点一律 401，service token 调 admin 端点也一律 401。
+- 没配 `PAIRING_SERVICE_TOKEN` 时，内部端点对任何请求都返回 401（服务照常启动，启动日志 WARNING）。
+- 配了但短于 32 个字符、或与 admin token 相同 → 拒绝启动，报错不回显取值。
+- 鉴权在路由之前：缺 token / 错 token / 用 admin token，不论路径对不对，都是同一个 401 `M_UNKNOWN_TOKEN`，不泄露端点或对端是否存在。失败只记日志计数（含来源 IP，不含 token），不写 events。
+- 内部端点**不走** `/_matrix/pairing/` 别名（别名路径一律 404），fedgate 也只转发 redeem / notify-severed，所以对端永远够不着。只应在内网（compose 网络或 loopback）访问。
+
+**`GET /v1/pairing/internal/peers/{server_name}`** → `200 {"state": "active"|"severed"|"unpaired", "changed_at": ISO-8601|null}`
+- `changed_at`：active 取最近一次配对时间，severed 取切断时间，unpaired（从未配对）为 null。
+- server_name 按同一规则小写化并严格校验；不合法 → 400（不回显）。
+
+**`GET /v1/pairing/internal/events?since=<cursor>&limit=<1-500>`** → `200 {"events": [...], "next_cursor": N, "has_more": bool}`
+- 事件只有两类，按游标升序：
+  - `{"cursor", "kind": "peer_paired", "server_name", "at", "repaired"}`：每次进入 active 都写一条——redeem 方和 accept 方都写，重新配对也写，`repaired=true` 表示该服务器以前配对过；A-R1 之前的旧事件没有这个字段，返回 null。
+  - `{"cursor", "kind": "peer_severed", "server_name", "at", "severed_by": "local"|"remote"}`：每次切断写一条；对已切断的行再收到对端通知不会重复写。
+- 事件与 `peers` 行的变化在**同一个事务**里提交，读到新状态就一定读得到对应事件。事件里没有 shared_secret、peer_api_url、invite 等字段。
+- **游标**：就是 `events.id`（`AUTOINCREMENT`）——严格递增、删除后也不复用；同一个游标重放得到同一页（稳定）。省略 `since` 等同 `since=0`（从头读）。`since` / `limit` 只能各出现一次，必须是非负十进制整数，其他参数一律 400。
+- `has_more=false` 时 `next_cursor` 会直接跳到当前最新事件 id（包括非配对类的审计事件），所以网关只要按 5–10 秒轮询，游标就不会因为长期没有配对变化而落到保留期之外。
+- **保留期 30 天的后果**：`events` 每小时清理 30 天前的行（invites 同理），清理时记下删掉的最大 id（`meta.events_pruned_through`）。
+  - 游标 < 该水位：中间的事件可能已经删掉，无法保证不丢，返回 `410 {"errcode": "BV_CURSOR_EXPIRED", "reason": "cursor_pruned", "resync_cursor": N}`。
+  - 游标 > 当前最新 id（比如从旧备份恢复了 pairing 库）：同样返回 410，`reason` 是 `cursor_ahead_of_log`。
+  - 收到 410 时，网关先记下 `resync_cursor`，再对自己关心的每个服务器调 `peers/{name}` 重建状态，然后从 `resync_cursor` 继续轮询。这期间新到的事件会再处理一次，所以网关侧必须幂等。
+  - 网关停机超过 30 天、且期间有清理时一定会遇到 410；按上述步骤自愈即可。
 
 fedgate 路由规则：
 
@@ -155,6 +185,7 @@ pairing 服务：
 | `PAIRING_PEER_KEY_URL_TEMPLATE` | `https://{server_name}/_matrix/key/v2/server` | key 拉取模板（CI 经 fedgate 地址 + 端口） |
 | `PAIRING_INSECURE_TLS` | `false` | 关闭出站 TLS 校验（仅 CI） |
 | `PAIRING_TRUSTED_PROXIES` | 空 | 逗号分隔 IP/CIDR；仅当直连地址命中时才采信 `X-Forwarded-For` 最后一个值作为限速键（空=一律用直连 IP） |
+| `PAIRING_SERVICE_TOKEN` | 空（内部端点全部 401） | A-R1 配对事实接口的 service token；≥32 字符且不得等于 admin token，否则拒绝启动。联邦测试栈由 `federation-setup.py` 与 admin token 分别随机生成（`PAIRING_SERVICE_TOKEN_A/B`，写入 gitignored 的 `generated/federation.env`）。它是密钥，不要贴到文档、聊天或日志 |
 | `PAIRING_HS_WHITELIST_PATH` | 空（关闭） | 绝对路径；设置后渲染 Synapse `federation_domain_whitelist` include（A-R2，见「HS 白名单与重启」） |
 | `PAIRING_HS_RESTART_MARKER` | `<PAIRING_HS_WHITELIST_PATH>.restart-required` | 「需要重启」标记的绝对路径；须先设 `PAIRING_HS_WHITELIST_PATH`，且不能与它相同 |
 
