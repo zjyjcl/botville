@@ -310,7 +310,7 @@ ExecStartPost=/bin/rm -f ${M}.processing
 
 **Conduit 系不在本 PR**：Tuwunel（`allowed_remote_server_names_experimental` / `forbidden_remote_server_names`）与 continuwuity（`allowed_remote_server_names` / `forbidden_remote_server_names`）的配置面与 Synapse 不同，联邦栈也只有 Synapse；留到 A-R3 之后单独做。在此之前这两家只靠 fedgate。
 
-仍不在本节范围：对拒不配合对端的出站拉取、切断窗口内容栅栏（按 B6 决策归 #118 后续）、App 侧扫码 UI（C2.2）、跨服 AI 关系（A2.3）、公网 TLS 证书的获取与续期流程、媒体端点的签名/令牌校验。
+仍不在本节范围：对拒不配合对端的出站拉取、切断窗口内容栅栏（按 B6 决策归 #118 后续）、App 侧扫码 UI（C2.2）、跨服 AI 关系（业务归网关 B2.8；A 线提供配对事实与经 fedgate 的跨服传输）、公网 TLS 证书的获取与续期流程、媒体端点的签名/令牌校验。
 
 ## 实测要点（federation-e2e 调试结论）
 

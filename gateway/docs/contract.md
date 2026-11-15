@@ -386,7 +386,7 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 | 422 | `limit.out_of_range` / `card.invalid_block` / `card.missing_fallback_text` / `card.source_scope_mismatch` / `card.missing_event_id` / `card.missing_expires_at` / `state.invalid_value` / `request.invalid` / `memory.key_not_allowed` / `memory.counterpart_invalid` / `memory.not_pinnable` | 语义不合法 |
 | 429 | `rate_limited.transport` | 传输层限流（**不是**发言额度） |
 | 500 | `internal.error` | 网关内部错误 |
-| 503 | `memory.unavailable` / `room.unavailable` / `relation.unavailable` / `persona.unavailable` / `mood.unavailable` | 存储或外部依赖不可用；memory/mood/relation 错误带 `Retry-After` |
+| 503 | `memory.unavailable` / `room.unavailable` / `relation.unavailable` / `persona.unavailable` / `mood.unavailable` | 存储或外部依赖不可用；`/state` 失败审计写入遇到 SQLite 错误返回 `memory.unavailable`；memory/mood/relation 错误带 `Retry-After` |
 
 卡片操作相关错误码（C4 / D3）：
 
@@ -1295,7 +1295,7 @@ token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，�
 | POST | `/personas/{persona_id}/relations/{relation_id}/{action}` | owner 批准、拒绝、撤销、屏蔽、解除屏蔽 | 我的 AI |
 | GET/PATCH | `/personas/{persona_id}/state` | 已实现：owner mood 与公开开关 | 我的 AI |
 | GET | `/conversations` | 会话列表 | App |
-| POST | `/conversations` | 登记 Matrix room | 服务端（A 线） |
+| POST | `/conversations` | 登记 Matrix room | 可选的显式登记，主路径由网关推导 |
 | GET | `/conversations/{conversation_id}` | 会话详情 | App |
 | GET | `/conversations/{conversation_id}/messages` | 读消息（带 trust 标记） | App |
 | POST | `/conversations/{conversation_id}/messages` | **请求以 AI 身份发言（核心）** | AI 运行时 |
@@ -1328,7 +1328,7 @@ token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，�
 
 跨服已验证调用方、未知/非法路径 id、无 owner 的 persona 均返回相同 `404 persona.not_found`，不泄露存在性；不因联邦配对放行。legacy/空 owner/dev 无身份与列表一致为 `403 persona.not_owned`；未认证为既有 401。详情专用用户验证器仅保留可信 homeserver 返回的跨服身份以作 404 拒绝，使用独立缓存；其他端点仍按原规则拒绝跨服用户（401）。bearer caller 的 owner_id 受现有配置格式限制，非 Matrix ID 无法访问详情（404），本 PR 不放宽 token 配置格式。`/state` 对非 owner（含跨服）、未知/非法 id 或无 owner persona 同样返回 `404 persona.not_found`；站点 token 或无 owner 身份为 `403 persona.not_owned`。其它未实现子路径返回 `404 not_found`。
 
-用户 OpenID / Matrix 用户 Bearer 使用已验证 user_id，调用方凭据使用其 owner_id；legacy、空 owner 与 dev 无身份放行返回 403 `persona.not_owned`。`owner_id` 只允许自身，其他合法本服人类用户返回 403；格式非法、非 `GATEWAY_MATRIX_SERVER_NAME` 域或 `@ai_*` 返回 400 `request.invalid`。kind/status 按映射值过滤，其他合法枚举返回空，非法枚举返回 400。按 id 升序，cursor 为最后返回 id 的无填充 base64url keyset 游标；畸形 cursor、非法 limit 返回 400。limit 为 1–100 整数，默认 20。响应 `{items, next_cursor, has_more}`，末页游标为 null。复用启动时人设快照，未配置文件返回空页，与记忆开关无关。`/state` 在有效 owner 校验后若 mood 关闭返回 404 `mood.disabled`；未知、跨服、非法 id 或无 owner persona 返回 404 `persona.not_found`，站点 token / 无 owner 身份返回 403 `persona.not_owned`，未认证返回 401。GET/PATCH 都是 `Cache-Control: no-store`；GET 使用 owner memory 的每 caller 读限流、PATCH 使用写限流与无正文审计，超限为 429，memory DB 不可用为 503 `mood.unavailable`。PATCH 只接受 `{mood?, mood_public?}`，至少一项、未知字段或类型/枚举错误为 422。
+用户 OpenID / Matrix 用户 Bearer 使用已验证 user_id，调用方凭据使用其 owner_id；legacy、空 owner 与 dev 无身份放行返回 403 `persona.not_owned`。`owner_id` 只允许自身，其他合法本服人类用户返回 403；格式非法、非 `GATEWAY_MATRIX_SERVER_NAME` 域或 `@ai_*` 返回 400 `request.invalid`。kind/status 按映射值过滤，其他合法枚举返回空，非法枚举返回 400。按 id 升序，cursor 为最后返回 id 的无填充 base64url keyset 游标；畸形 cursor、非法 limit 返回 400。limit 为 1–100 整数，默认 20。响应 `{items, next_cursor, has_more}`，末页游标为 null。复用启动时人设快照，未配置文件返回空页，与记忆开关无关。`/state` 在有效 owner 校验后若 mood 关闭返回 404 `mood.disabled`；未知、跨服、非法 id 或无 owner persona 返回 404 `persona.not_found`，站点 token / 无 owner 身份返回 403 `persona.not_owned`，未认证返回 401。GET/PATCH 都是 `Cache-Control: no-store`；GET 使用 owner memory 的每 caller 读限流、PATCH 使用写限流与无正文审计，超限为 429，心情读写等处理异常且失败审计可写时返回 503 `mood.unavailable`；失败审计写入遇到 SQLite 错误则返回 503 `memory.unavailable`（包括成功路径审计失败后，失败审计仍写入失败的情形）。两者 title 均等于 code，带 `Retry-After: 5` 与 `retry_after_seconds: 5`。PATCH 只接受 `{mood?, mood_public?}`，至少一项、未知字段或类型/枚举错误为 422。
 
 ### 2.0 动态（Moments）接口说明
 
@@ -1386,6 +1386,9 @@ AI 运行时                        网关                        Matrix
   `stranger`；**不做跨群汇总**。AI 好友角标只在 `kind=ai` 且该查看者视角下
   `relation.state=friend` 时出现。关系编辑与审批已由 B-R1 的 `/relations/*` 提供（见 §2.4.1），
   **不在 `PATCH /personas` 里改关系**。本条同时禁止发明 `Persona.relation`。
+  关系存储、好友图、同服默认好友、撤销与 owner API 均归网关 B 线（B-R1，本版本已实现）。
+  A2.3 仅提供配对事实与经 fedgate 的跨服传输，并负责 #118 第 8 项出站切断、compose 透传加双服 e2e。
+  卡片服务归 D，网关作为来源模块建关系卡；D2.1 之前网关只用 pending 列表加 `revocable_until`。
 
 ---
 
@@ -1531,7 +1534,10 @@ localpart 非空且只允许 `[A-Za-z0-9._~=\-]`。服务器名须与部署 serv
 未配置 server_name 时一律视为非本服。别名、跨服、缺冒号及其他畸形输入全部拒绝。
 严格校验后判重：原字符串重复或只有服务器名大小写不同均拒绝；localpart 大小写仍有区别。
 HMAC 始终使用原始字符串，保持现有派生规则；服务器名大小写不同的单独查询可能未命中。
-以上错误及非 JSON、非对象体统一 400 `request.invalid`，title 为 `Room request rejected`，不反射输入。
+以上错误及请求体过大、JSON 无法解析、非对象体等读体校验错误统一返回 400 `request.invalid`，
+title 为 `Room request rejected`；不区分具体原因，不反射输入，也不保留底层 `detail`/`errors`。
+`Content-Length` 缺失、空白或为 0 时按空对象处理，随后因缺少 `room_ids` 返回相同的 400；
+非整数或负值也返回相同的 400。上述读体与输入校验均在 owner 鉴权和读限流通过后执行。
 
 | 身份 / 条件 | 结果 |
 |---|---|
@@ -1540,6 +1546,11 @@ HMAC 始终使用原始字符串，保持现有派生规则；服务器名大小
 | 非 owner、跨服或未知 persona | 404 `persona.not_found`，隐藏存在性 |
 | owner + POST | 校验并查询，成功 200 |
 | owner + GET/HEAD/PATCH/DELETE/PUT/其他方法 | 405 `request.invalid`，`Allow: POST`；HEAD 无响应体 |
+
+对字面路径 `/personas/{persona_id}/rooms/lookup` 发 PATCH 等非 POST 方法时，当前在 owner
+鉴权后返回 405 `request.invalid`，带 `Allow: POST`。其中 PATCH 在 0.6.0 中携带合法房间更新
+请求体时，会将 `lookup` 当作 `room_ref`；它不是 64 位十六进制房间引用，查询未命中后返回
+404 `room.not_found`。现在 `lookup` 不再被当作 `room_ref` 匹配；旧版其他不支持的方法已经返回 405。
 
 鉴权失败不带 Allow。owner 判定成功后、读体之前，共用 owner memory 每 caller 的读限流
 （60 次/分钟）；非 owner 不消耗 owner 配额。超限 429 `rate_limited.transport`，与 memory 相同
@@ -2128,7 +2139,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 | 版本 | 日期 | 变更 |
 |---|---|---|
 | 0.8.0 | 2026-11-15 | [B-R1] 新增 owner `/relations/*`、schema 12 关系存储、关系默认值与同服新增 AI 默认好友差集；新增 `relations.manage`，manifest 1.5.0，并同步 App mock。 |
-| 0.7.0 | 2026-11-15 | [B2.8f] 新增 owner POST rooms/lookup：严格本服批量映射、只读限流、按下标返回且不回显 ID；新增部署级 groups.manage 与 room_lookup，manifest_version 1.4.0，三态映射及 C 线 mock 同步；room_ref 跨 owner 可关联的既有语义不变。 |
+| 0.7.0 | 2026-11-15 | [B2.8f] 新增 owner POST rooms/lookup：严格本服批量映射、只读限流、按下标返回且不回显 ID；新增部署级 groups.manage 与 room_lookup，manifest_version 1.4.0，三态映射及 C 线 mock 同步；room_ref 跨 owner 可关联的既有语义不变。 B2.8g 文档：删除实现未输出的 instance 示例并对齐 title/detail，说明 /state 503 的 mood.unavailable 与 memory.unavailable 两种 code，更新关系归属与 POST /conversations 调用方措辞，ModuleStatus.name 加 groups，补充 lookup 读体错误统一 400 及字面路径 rooms/lookup 的 PATCH 从 404 room.not_found 变为非 POST 统一 405 request.invalid（Allow: POST）的说明；纯文档，不升版本。 |
 | 0.6.0 | 2026-11-13 | [B2.8d] 新增 owner GET /personas/{id}/rooms 与 PATCH /personas/{id}/rooms/{room_ref}；owner 详情和 UpdatePersonaRequest 增加 groups；mention_only/muted 模式与退群、leave_pending 确认状态及 owner leave 持久清理；新增 room.not_found / room.state_conflict；group.replies_per_hour.exceeded 原因码正式纳入。汇总 B2.8 行为：严格双人 DM、群仅被提及/回复才发言、AI 不触发 AI、群节流与熔断、加密群 403 conversation.e2ee、HMAC 密钥轮换隔离及退出后禁止发送自动 rejoin；群节流/熔断计数以规范 persona 与规范 room 为键，别名与裸 id 不能绕过，key_id 回填先于 forget。 B2.8d2 评审清理：evaluate 解析失败 404/400 替代 500；rooms 错误方法鉴权后 405 + Allow；record_group_send 复用已解析 id；示例 title 与 0.5.0 残留表述修正；群功能关闭时引擎群回复 fail-closed、PATCH 仅 muted/leave、有 DB 的 GET 仍列出现有房间；无字段变化、不升版本。 B2.8d3：错误码表补 mood.unavailable/mood.disabled、/state 503 示例、rooms 405 响应、群关闭时仍记录群记忆说明、evaluate 404 示例 instance 修正；纯文档。 |
 | 0.5.0 | 2026-11-13 | [B2.8c #228] accepted 群冷却与滚动小时回复限额、群 ai_loop / anti_spam 底线（群内连续计数在人类发言时归零；默认 30/h 为滚动一小时硬底线，人类发言不重置）；schema 10→11 的 HMAC key_id 与轮换隔离/可选忘记旧行、上限只计当前键、发送层独立加密拦截；严格本服 room id、accepted 房间忽略不合格再邀请、拒绝 leave 的 M_FORBIDDEN 视为完成，以及 Synapse /sync invite 过滤说明修正。无 API 字段变化、契约仍 0.5.0。 |
 | 0.5.0 | 2026-11-13 | [#226 评审 nit] `/sync` 权威确认改为仅邀请的一次性请求（set_presence=offline、无 since、不消费 to-device）；leave 遇 `M_FORBIDDEN` 视为已离开并移出清理队列；格式异常的成员事件只跳过该事件；邀请台账 TTL（`GATEWAY_INVITE_LEDGER_TTL_SECONDS`，默认 1 天）。无 API 字段变化。 |

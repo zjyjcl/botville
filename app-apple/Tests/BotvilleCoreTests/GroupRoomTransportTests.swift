@@ -19,6 +19,7 @@ final class GroupRoomTransportTests: XCTestCase {
             ("PATCH", "personas/p/rooms/ref"), ("PATCH", "personas/p"),
             ("PATCH", "personas/p%2Fq/rooms/ref%2Fpart"),
             ("GET", "personas/p"),  // Existing owner-detail route stays authorized.
+            ("POST", "personas/p/rooms/lookup"), ("post", "personas/p%2Fq/rooms/lookup"),
         ]
         let invalid: [(String, String)] = [
             ("GET", "personas/p/rooms/ref"), ("GET", "personas/p/rooms/"),
@@ -31,6 +32,10 @@ final class GroupRoomTransportTests: XCTestCase {
             ("DELETE", "personas/p/rooms/ref"), ("PATCH", "personas"),
             ("PATCH", "personas/"), ("PATCH", "personas/p/extra"),
             ("POST", "personas/p"), ("DELETE", "personas/p"),
+            ("GET", "personas/p/rooms/lookup"), ("DELETE", "personas/p/rooms/lookup"),
+            ("POST", "personas//rooms/lookup"), ("POST", "personas/p/rooms/lookupx"),
+            ("POST", "personas/p/rooms/lookup/extra"), ("POST", "personas/p/roomsx/lookup"),
+            ("POST", "personas/p/lookup"), ("POST", "personasx/p/rooms/lookup"),
         ]
         for (method, path) in valid + invalid {
             var request = URLRequest(
@@ -208,6 +213,68 @@ final class GroupRoomTransportTests: XCTestCase {
         XCTAssertEqual(GatewayClientError.httpStatus(503).errorDescription, "网关请求失败，请稍后重试。")
         XCTAssertEqual(GatewayClientError.problem(status: 503, code: "").errorDescription,
                        "网关请求失败，请稍后重试。")
+    }
+
+    func testRoomLookupPostsOnlyRoomIDsWithOpenIDAndKeepsNullItems() async throws {
+        let item = String(decoding: roomBody, as: UTF8.self)
+        GroupRoomURLProtocol.reset(
+            status: 200, body: Data("{\"items\":[\(item),null],\"groups_enabled\":false}".utf8))
+        let client = try makeClient()
+        let result = try await client.lookupGroupRooms(
+            personaID: "p/q", roomIDs: ["!a:local.test", "!b:local.test"])
+        XCTAssertEqual(result.items.map { $0?.roomRef }, [String(repeating: "a", count: 64), nil])
+        XCTAssertFalse(result.groupsEnabled)
+        XCTAssertEqual(GroupRoomURLProtocol.requests.count, 1)
+        let request = try XCTUnwrap(GroupRoomURLProtocol.requests.first)
+        XCTAssertEqual(request.httpMethod, "POST")
+        let components = try XCTUnwrap(
+            URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false))
+        XCTAssertEqual(components.percentEncodedPath, "/prefix/v1/personas/p%2Fq/rooms/lookup")
+        XCTAssertNil(components.query)  // Room IDs never enter the URL.
+        XCTAssertEqual(
+            try jsonBody(request) as? [String: [String]],
+            ["room_ids": ["!a:local.test", "!b:local.test"]])
+        XCTAssertEqual(
+            request.value(forHTTPHeaderField: "Authorization"), "MatrixOpenID <fixture-only>")
+        XCTAssertNil(request.value(forHTTPHeaderField: "Idempotency-Key"))
+    }
+
+    func testRoomLookupRejectsMisalignedItemsAndOversizedBatchesWithoutGuessing() async throws {
+        let item = String(decoding: roomBody, as: UTF8.self)
+        GroupRoomURLProtocol.reset(
+            status: 200, body: Data("{\"items\":[\(item)],\"groups_enabled\":true}".utf8))
+        let client = try makeClient()
+        do {
+            _ = try await client.lookupGroupRooms(
+                personaID: "p", roomIDs: ["!a:local.test", "!b:local.test"])
+            XCTFail("A response that is not index-aligned must not be mapped")
+        } catch let error as GatewayClientError {
+            XCTAssertEqual(error, .invalidResponse)
+        }
+        for ids in [[], (0...50).map { "!r\($0):local.test" }] {
+            GroupRoomURLProtocol.reset(status: 200, body: Data())
+            do {
+                _ = try await client.lookupGroupRooms(personaID: "p", roomIDs: ids)
+                XCTFail("Expected local rejection for \(ids.count) ids")
+            } catch let error as GatewayClientError {
+                XCTAssertEqual(error, .invalidResponse)
+            }
+            XCTAssertTrue(GroupRoomURLProtocol.requests.isEmpty)
+        }
+    }
+
+    func testRoomLookupRateLimitIsSurfacedOnceWithoutRetry() async throws {
+        GroupRoomURLProtocol.reset(
+            status: 429,
+            body: Data("{\"status\":429,\"code\":\"rate_limited.transport\",\"retry_after_seconds\":30}".utf8))
+        let client = try makeClient()
+        do {
+            _ = try await client.lookupGroupRooms(personaID: "p", roomIDs: ["!a:local.test"])
+            XCTFail("Expected 429")
+        } catch let error as GatewayClientError {
+            XCTAssertEqual(error.httpStatus, 429)
+        }
+        XCTAssertEqual(GroupRoomURLProtocol.requests.count, 1)
     }
 
     private var activeRoomListBody: Data {

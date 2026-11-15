@@ -2,7 +2,7 @@
 
 状态：**PR1 契约已合入；PR2 同服实现已合入 main（#184，`e2dcf50`）**——存储与迁移、
 `can_view` / `can_see_interaction`、11 个同服操作、评论/点赞、软删清理任务均已上线代码。
-跨服只读（PR3）尚未开始。好友图在 A2.3（#8）落地前**默认为空**，影响见 §7.1。
+跨服只读（PR3）尚未开始。好友图在网关 B2.8 关系后续 PR（暂名 B-R1）落地前**默认为空**，影响见 §7.1。
 契约机器可读源：`gateway/openapi/gateway.v1.yaml`（`tags: [Moments]` 各路径）；
 示例：`gateway/openapi/examples/moment*.json` 等；DDL：`gateway/migrations/moments/0001_moments.sql`。
 `info.version` 在 #119（PR1）保持 `0.1.0` 不变；本特性为**只增不删**的 minor 变更，拟随合并升
@@ -25,9 +25,10 @@ homeserver）+ 可见范围 + 评论（≤500 字，一层回复引用）+ 点�
   **App 以外其他调用方**的阶段 1 共存路径（未标 `deprecated`，仍有效）；退场节奏见
   `contract.md` §1.2.3。共享 gateway token 不能用于以用户身份读写动态。完整身份规则见
   §3 与 `contract.md` §1.2.3。
-- 好友图归 A2.3（#8）。本项只定义 `RelationProvider.is_friend(viewer, author)` 接口，
+- 好友图与关系存储归网关 B 线（B2.8 关系后续 PR，暂名 B-R1）；A2.3 只提供配对事实与跨服传输。
+  本项只定义 `RelationProvider.is_friend(viewer, author)` 接口，
   PR2 已提供可测试的临时实现 `StaticRelationProvider`（配置文件
-  `GATEWAY_MOMENTS_FRIENDS_FILE` 或测试注入，见 §7.1），A2.3 落地后替换，本模块代码不变。
+  `GATEWAY_MOMENTS_FRIENDS_FILE` 或测试注入，见 §7.1），B-R1 落地后替换，本模块代码不变。
 
 原方案评论见 issue #7（方案 §0–§8）；本文在其基础上补充评论/点赞的可见性
 （`can_see_interaction`）与契约细节。
@@ -168,7 +169,7 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
 `paired_servers` 动态的评论与点赞跟随动态本身的可见面。
 
 `RelationProvider.is_friend(a, b)` 的两个参数均为 Matrix user id；PR2 临时实现按
-配置/测试注入的 user↔user 图回答，A2.3 落地后换成真实好友图，本模块调用点不变。
+配置/测试注入的 user↔user 图回答，B-R1 落地后换成真实好友图，本模块调用点不变。
 
 计数：`like_count` / `comment_count` 只计查看者可见的条目（上式为真者）；`liked_by_me`
 相对当前查看者。列表（`GET /moments`）逐条用 `can_view` 过滤，与读单条同一函数，
@@ -243,7 +244,7 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
    「共同好友」同理：AI 行为者绑到其 `owner_id`（响应 `MomentAuthor.owner_id` /
    落库 `moments_comments.owner_id` / `moments_likes.owner_id`）。示例
    `moment.json` 即 AI 作者路径。
-1. `friends` 级跨服可见需要跨服好友判定，归 A2.3；届时若 `is_friend` 判定为跨服好友，
+1. `friends` 级跨服可见需要跨服好友判定，归网关 B2.8（B-R1），配对事实与跨服传输由 A2.3 提供；届时若 `is_friend` 判定为跨服好友，
    该格升为 200。
 2. 跨服 API **只读**（feed / 单条），不提供评论、点赞、改、删；跨服用户对
    `paired_servers` 动态只能读到动态本身与其可见交互（`can_see_interaction` 同式计算，
@@ -304,9 +305,10 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
 不影响请求处理，下个周期重试。网关关闭（`server_close`）时停止该线程。设为 `0` 则不跑
 清理，两个保留天数**不生效**，软删行与审计会一直累积，需另行运维。
 
-### 7.1 好友图为空时的影响（A2.3 / #8 落地前）
+### 7.1 好友图为空时的影响（网关 B2.8 / B-R1 落地前）
 
-好友关系归 A2.3（#8）。在它落地前，网关只用 `StaticRelationProvider` 这个临时实现：
+好友关系归网关 B 线（B2.8 关系后续 PR，暂名 B-R1），A2.3 只提供配对事实与跨服传输。
+在 B-R1 落地前，网关只用 `StaticRelationProvider` 这个临时实现：
 
 - **默认（`GATEWAY_MOMENTS_FRIENDS_FILE` 留空）好友图为空**，`is_friend` 恒为假。于是：
   - `visibility = friends` 的动态**等同「仅自己」**：只有作者本人（AI 动态则为其主人
@@ -329,7 +331,7 @@ can_see_interaction(viewer, moment, actor) 为真当且仅当：
   - 文件只在**启动时读取一次**，改了要重启网关才生效；
   - 文件不存在、不是合法 JSON、缺 `friends` 数组或条目畸形 → **拒绝启动**（不会静默
     退化成空图）。
-- 该文件只是过渡与测试手段；A2.3 落地后替换 `RelationProvider` 实现，配置项随之下线，
+- 该文件只是过渡与测试手段；B-R1 落地后替换 `RelationProvider` 实现，配置项随之下线，
   本模块其余代码不变。
 
 另：persona 目录在 PR2 也是 fail-closed 的空实现，`POST /moments` 带 `author_persona_id`
