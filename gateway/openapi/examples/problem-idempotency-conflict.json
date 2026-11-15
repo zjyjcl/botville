@@ -1,0 +1,7 @@
+{
+  "type": "urn:botville:error:idempotency.conflict",
+  "title": "Idempotency conflict",
+  "status": 409,
+  "code": "idempotency.conflict",
+  "request_id": "example-request"
+}

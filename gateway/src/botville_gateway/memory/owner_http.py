@@ -16,7 +16,7 @@ import threading
 import time
 from urllib.parse import parse_qs
 
-from ..capability_manifest import DEFAULTS, BASE_CAPABILITIES, MEMORY_MANAGE, GROUPS_MANAGE
+from ..capability_manifest import DEFAULTS, BASE_CAPABILITIES, MEMORY_MANAGE, GROUPS_MANAGE, RELATIONS_MANAGE
 from ..engine.personas import _is_local_owner
 from ..errors import ValidationError
 from .profile import FACT_KEYS
@@ -98,10 +98,14 @@ def capabilities(server, query):
     elif not groups.enabled:
         manage.update(status='degraded', unavailable_reason='groups_disabled')
     entries.append(manage)
+    manage = deepcopy(RELATIONS_MANAGE)
+    if server.memory_store is None or not server.memory_store._hmac_secret:
+        manage.update(status='disabled', unavailable_reason='module_disabled')
+    entries.append(manage)
     for name in ('module', 'status'):
         if name in params:
             entries = [entry for entry in entries if entry[name] == params[name][-1]]
-    return dict(manifest_version='1.4.0', contract_version=server.config.contract_version,
+    return dict(manifest_version='1.5.0', contract_version=server.config.contract_version,
                 generated_at=datetime.now(timezone.utc).isoformat(),
                 cache_ttl_seconds=300, defaults=deepcopy(DEFAULTS), capabilities=entries)
 

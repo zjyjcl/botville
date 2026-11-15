@@ -9,7 +9,7 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: botville AI Gateway API
-  version: 0.7.0
+  version: 0.8.0
   summary: AI 网关契约初稿：对话与消息、角色、功能清单、卡片、用量与限额。
   description: |
     botville 自部署 AI 网关的开放 HTTP API。网关位于 Matrix homeserver 与 AI 运行时之间：
@@ -17,7 +17,7 @@ info:
     负责消息传输；本契约只覆盖网关自己的控制面（角色、会话登记、发言裁决、三层限额、
     用量账单、功能清单与通用卡片），不重复定义 Matrix 协议。
 
-    当前为 **0.7.0 草案**（M0），供 C 线（App）与 D 线（通知 / 开放 API）评审。
+    当前为 **0.8.0 草案**（M0），供 C 线（App）与 D 线（通知 / 开放 API）评审。
     版本规则见 `gateway/docs/contract.md#版本规则`：`/v1` 路径、只增不删、破坏性变更升主版本。
 
     所有示例、令牌与密钥均为占位符（`<change-me>`），本契约不含任何真实凭据。
@@ -299,7 +299,7 @@ paths:
         - matrixUserToken: []
       summary: 获取功能清单
       description: |
-        返回完整基础清单，记忆模块启用时额外发布 memory.manage，manifest_version 为 1.4.0。
+        返回完整基础清单，记忆模块启用时额外发布 memory.manage，manifest_version 为 1.5.0。
         总是追加 groups.manage：有 DB 且群开关开启为 enabled，关闭为 degraded/groups_disabled，无 DB 为 disabled/module_disabled。
         room_lookup=true 表示支持 POST /personas/{id}/rooms/lookup；persona 级开关不进入部署清单。
         客户端不得依赖 capabilities 数组顺序。
@@ -615,7 +615,7 @@ paths:
       operationId: updatePersona
       summary: 更新角色
       description: |
-        0.7.0 参考实现仅支持 groups 整体替换，鉴权与 /state 一致。进程内串行，校验后原子替换
+        0.8.0 参考实现支持 groups 与 relation_defaults.friend_request_policy 整体替换，鉴权与 /state 一致。进程内串行，校验后原子替换
         personas 文件并更新内存；文件需可写。检测到外部修改返回 409 persona.state_conflict。
         revision/If-Match 与其它规划字段尚未实现，传入返回 400；revision 仍为文件型摘要的 1。
         不支持多进程并发写同一 personas 文件；外部管理程序应停止网关后编辑并重启。
@@ -2378,6 +2378,134 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /personas/{persona_id}/relations:
+    get:
+      tags: [Personas]
+      operationId: listPersonaRelations
+      summary: 列出 owner 的关系
+      description: 仅返回当前 HMAC key_id 的关系，按 updated_at、relation_id keyset 分页；读到过期 pending 时惰性落地为 stranger。
+      security: [{matrixOpenIdToken: []}, {matrixUserToken: []}, {bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/PersonaId'
+        - {name: state, in: query, schema: {type: string, enum: [friend, pending, stranger, blocked]}}
+        - {name: direction, in: query, schema: {type: string, enum: [none, outgoing, incoming]}}
+        - {name: kind, in: query, schema: {type: string, enum: [ai, human]}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 200, default: 50}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        '200': {description: 关系分页, content: {application/json: {schema: {$ref: '#/components/schemas/PersonaRelationPage'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '405': {$ref: '#/components/responses/RelationMethodNotAllowed'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '503': {$ref: '#/components/responses/RelationUnavailable'}
+    head:
+      tags: [Personas]
+      operationId: headPersonaRelations
+      summary: 检查 owner 的关系列表
+      description: 与 GET 使用相同 owner 鉴权、参数校验和读限流；响应无正文。
+      security: [{matrixOpenIdToken: []}, {matrixUserToken: []}, {bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/PersonaId'
+        - {name: state, in: query, schema: {type: string, enum: [friend, pending, stranger, blocked]}}
+        - {name: direction, in: query, schema: {type: string, enum: [none, outgoing, incoming]}}
+        - {name: kind, in: query, schema: {type: string, enum: [ai, human]}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 200, default: 50}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        '200': {description: 关系列表存在且可读取。}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '405': {$ref: '#/components/responses/RelationMethodNotAllowed'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '503': {$ref: '#/components/responses/RelationUnavailable'}
+    post:
+      tags: [Personas]
+      operationId: createPersonaRelation
+      summary: 手动添加关系
+      description: 按本服 counterpart 的 persona 默认策略创建双向 AI 关系或单边人类关系。
+      security: [{matrixOpenIdToken: []}, {matrixUserToken: []}, {bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/PersonaId'}, {$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/CreatePersonaRelationRequest'}, example: {counterpart_id: '@friend:example.invalid'}}}
+      responses:
+        '200': {description: 已存在关系, content: {application/json: {schema: {$ref: '#/components/schemas/PersonaRelation'}}}}
+        '201': {description: 已创建关系, content: {application/json: {schema: {$ref: '#/components/schemas/PersonaRelation'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '405': {$ref: '#/components/responses/RelationMethodNotAllowed'}
+        '409': {$ref: '#/components/responses/RelationConflict'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '503': {$ref: '#/components/responses/RelationUnavailable'}
+
+  /personas/{persona_id}/relations/{relation_id}:
+    get:
+      tags: [Personas]
+      operationId: getPersonaRelation
+      summary: 获取 owner 的单条关系
+      description: relation_id 非当前 key_id、非法或不属于该 persona 时统一 404 relation.not_found。
+      security: [{matrixOpenIdToken: []}, {matrixUserToken: []}, {bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/PersonaId'}, {$ref: '#/components/parameters/RelationId'}]
+      responses:
+        '200': {description: 关系, content: {application/json: {schema: {$ref: '#/components/schemas/PersonaRelation'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/RelationNotFound'}
+        '405': {$ref: '#/components/responses/RelationMethodNotAllowed'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '503': {$ref: '#/components/responses/RelationUnavailable'}
+    head:
+      tags: [Personas]
+      operationId: headPersonaRelation
+      summary: 检查 owner 的单条关系
+      description: 与 GET 使用相同 owner 鉴权和读限流；响应无正文。
+      security: [{matrixOpenIdToken: []}, {matrixUserToken: []}, {bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/PersonaId'}, {$ref: '#/components/parameters/RelationId'}]
+      responses:
+        '200': {description: 关系存在且可读取。}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/RelationNotFound'}
+        '405': {$ref: '#/components/responses/RelationMethodNotAllowed'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '503': {$ref: '#/components/responses/RelationUnavailable'}
+
+  /personas/{persona_id}/relations/{relation_id}/{action}:
+    post:
+      tags: [Personas]
+      operationId: actOnPersonaRelation
+      summary: 批准、拒绝、撤销、屏蔽或解除屏蔽关系
+      description: 需要当前 revision；同一 Idempotency-Key 的不同请求返回 409 idempotency.conflict。
+      security: [{matrixOpenIdToken: []}, {matrixUserToken: []}, {bearerAuth: []}]
+      parameters:
+        - $ref: '#/components/parameters/PersonaId'
+        - $ref: '#/components/parameters/RelationId'
+        - name: action
+          in: path
+          required: true
+          schema: {type: string, enum: [approve, reject, revoke, block, unblock]}
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RelationActionRequest'}, example: {revision: 1}}}
+      responses:
+        '200': {description: 更新后的关系, content: {application/json: {schema: {$ref: '#/components/schemas/PersonaRelation'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/RelationNotFound'}
+        '405': {$ref: '#/components/responses/RelationMethodNotAllowed'}
+        '409': {$ref: '#/components/responses/RelationConflict'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '503': {$ref: '#/components/responses/RelationUnavailable'}
+
 components:
   securitySchemes:
     bearerAuth:
@@ -2474,6 +2602,12 @@ components:
       description: 角色 ID。
       schema:
         type: string
+    RelationId:
+      name: relation_id
+      in: path
+      required: true
+      description: 当前 HMAC 密钥派生的关系 ID。
+      schema: {type: string, pattern: '^[a-f0-9]{64}$'}
     ConversationId:
       name: conversation_id
       in: path
@@ -2679,6 +2813,43 @@ components:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/Problem'
+    RelationUnavailable:
+      description: 关系存储或 HMAC 密钥不可用：503 `relation.unavailable`，带 Retry-After。
+      headers:
+        Retry-After: {$ref: '#/components/headers/RetryAfter'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+          example: {type: 'urn:botville:error:relation.unavailable', title: Relation service unavailable, status: 503, code: relation.unavailable, request_id: example-request, retry_after_seconds: 5}
+    RelationNotFound:
+      description: 关系不存在、格式非法或对 caller 不可见：404 `relation.not_found`。
+      headers:
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+          example: {type: 'urn:botville:error:relation.not_found', title: Relation not found, status: 404, code: relation.not_found, request_id: example-request}
+    RelationMethodNotAllowed:
+      description: owner 鉴权成功后先检查方法，再检查服务可用性；错误方法始终返回 405 `request.invalid` 和 Allow，即使没有关系存储或 HMAC 密钥。
+      headers:
+        Allow: {schema: {type: string}}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    RelationConflict:
+      description: 关系状态、revision 或幂等冲突；`relation.peer_inactive` 为跨服 B-R2 预留。
+      headers:
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+          examples:
+            state_conflict: {value: {type: 'urn:botville:error:relation.state_conflict', title: Relation state conflict, status: 409, code: relation.state_conflict, request_id: example-request}}
+            revision_conflict: {value: {type: 'urn:botville:error:relation.revision_conflict', title: Relation revision conflict, status: 409, code: relation.revision_conflict, request_id: example-request}}
+            idempotency_conflict: {value: {type: 'urn:botville:error:idempotency.conflict', title: Idempotency conflict, status: 409, code: idempotency.conflict, request_id: example-request}}
+            peer_inactive: {value: {type: 'urn:botville:error:relation.peer_inactive', title: Relation peer inactive, status: 409, code: relation.peer_inactive, request_id: example-request}}
 
   schemas:
     # ----- 通用 -----
@@ -2962,6 +3133,12 @@ components:
           enum: [friends, paired_servers, nobody]
           default: friends
 
+    PersonaRelationDefaults:
+      type: object
+      additionalProperties: false
+      properties:
+        friend_request_policy: {type: string, enum: [approval_required, autonomous], default: approval_required}
+
     MemorySettings:
       type: object
       properties:
@@ -3064,7 +3241,7 @@ components:
       description: owner 的详情视图；列表 `PersonaSummary` 保持不含 mood。
       type: object
       additionalProperties: false
-      required: [id, owner_id, display_name, bio, kind, status, revision, created_at, updated_at, visibility, mood, groups]
+      required: [id, owner_id, display_name, bio, kind, status, revision, created_at, updated_at, visibility, mood, groups, relation_defaults]
       example:
         id: '@ai_demo:example.invalid'
         owner_id: '@owner:example.invalid'
@@ -3078,8 +3255,13 @@ components:
         visibility: private
         mood: calm
         groups: {enabled: false, invite_policy: owner}
+        relation_defaults: {friend_request_policy: approval_required}
       properties:
         groups: {$ref: '#/components/schemas/PersonaGroupsSettings'}
+        relation_defaults:
+          allOf:
+            - {$ref: '#/components/schemas/PersonaRelationDefaults'}
+            - {required: [friend_request_policy]}
         id: {type: string}
         owner_id: {type: string}
         display_name: {type: string}
@@ -3158,7 +3340,7 @@ components:
 
     UpdatePersonaRequest:
       type: object
-      description: 参考实现仅支持 groups；其他字段为规划，当前返回 400。groups 整体替换，未出现的子字段取默认。
+      description: 参考实现支持 groups 与 relation_defaults.friend_request_policy 的整体替换；其他字段为规划，当前返回 400。未出现的子字段取默认。
       properties:
         groups: {$ref: '#/components/schemas/PersonaGroupsSettings'}
         display_name:
@@ -3184,7 +3366,7 @@ components:
         proactive:
           $ref: '#/components/schemas/ProactiveSettings'
         relation_defaults:
-          $ref: '#/components/schemas/RelationDefaults'
+          $ref: '#/components/schemas/PersonaRelationDefaults'
         memory:
           $ref: '#/components/schemas/MemorySettings'
         revision:
@@ -3237,6 +3419,56 @@ components:
         policy:
           type: string
           enum: [approval_required, autonomous]
+
+    PersonaRelation:
+      type: object
+      additionalProperties: false
+      required: [relation_id, counterpart, state, direction, origin, revision, expires_at, revocable_until, last_change, created_at, updated_at]
+      properties:
+        relation_id: {type: string, pattern: '^[a-f0-9]{64}$'}
+        counterpart:
+          type: object
+          additionalProperties: false
+          required: [user_id, kind, server]
+          properties:
+            user_id: {type: string, example: '@friend:example.invalid'}
+            kind: {type: string, enum: [ai, human]}
+            server: {type: string, example: example.invalid}
+        state: {type: string, enum: [friend, pending, stranger, blocked]}
+        direction: {type: string, enum: [none, outgoing, incoming]}
+        origin: {type: string, enum: [default, request, manual, cross_server]}
+        revision: {type: integer, minimum: 1}
+        expires_at: {type: [string, 'null'], format: date-time}
+        revocable_until: {type: [string, 'null'], format: date-time}
+        last_change:
+          type: object
+          additionalProperties: false
+          required: [kind, at]
+          properties:
+            kind: {type: string}
+            at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    PersonaRelationPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, has_more]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/PersonaRelation'}}
+        next_cursor: {type: [string, 'null']}
+        has_more: {type: boolean}
+    CreatePersonaRelationRequest:
+      type: object
+      additionalProperties: false
+      required: [counterpart_id]
+      properties:
+        counterpart_id: {type: string, example: '@friend:example.invalid'}
+    RelationActionRequest:
+      type: object
+      additionalProperties: false
+      required: [revision]
+      properties:
+        revision: {type: integer, minimum: 1}
 
     ConversationLimits:
       type: object
@@ -4594,11 +4826,11 @@ components:
         manifest_version:
           type: string
           pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
-          example: 1.4.0
+          example: 1.5.0
         contract_version:
           type: string
           description: 生成该清单的网关契约版本。
-          example: 0.7.0
+          example: 0.8.0
         generated_at:
           type: string
           format: date-time

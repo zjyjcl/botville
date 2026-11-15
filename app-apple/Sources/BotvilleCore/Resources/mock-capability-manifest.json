@@ -1,6 +1,6 @@
 {
-  "manifest_version": "1.4.0",
-  "contract_version": "0.7.0",
+  "manifest_version": "1.5.0",
+  "contract_version": "0.8.0",
   "generated_at": "2026-11-13T00:00:00Z",
   "cache_ttl_seconds": 300,
   "defaults": {
@@ -99,6 +99,18 @@
       "entry": { "type": "native", "deep_link": "botville://personas" },
       "scopes": ["groups.read", "groups.write"],
       "room_lookup": true,
+      "updated_at": "2026-11-15T00:00:00Z"
+    },
+    {
+      "id": "relations.manage",
+      "module": "social",
+      "version": "0.1.0",
+      "title": "关系",
+      "summary": "查看和管理我的 AI 的好友、请求与撤销。",
+      "icon": { "type": "sf_symbol", "value": "person.2" },
+      "status": "enabled",
+      "entry": { "type": "native", "deep_link": "botville://personas" },
+      "scopes": ["relations.read", "relations.write"],
       "updated_at": "2026-11-15T00:00:00Z"
     }
   ]
