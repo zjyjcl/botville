@@ -194,7 +194,7 @@ docker compose -p botville-fed -f server/compose/federation/docker-compose.feder
 
 ## 出站硬化（后续，不在本 PR）
 
-切断的**入站**验收语义（对方不能再向我方发消息、不能从我方拉取内容）已由双方入站闸门闭环；「我方 homeserver 主动出站仍会尝试」的硬化（配对变更时重渲染 HS 白名单并编排重启，Tuwunel/continuwuity 用 allowed/forbidden 列表；含对拒不配合对端的出站停推与切断窗口内容栅栏，栅栏按 B6 决策归 #118）列为后续任务。同样不在本 PR：App 侧扫码 UI（C2.2）、跨服 AI 关系（A2.3）、公网 TLS 证书的获取与续期流程、媒体端点的签名/令牌校验。
+切断的**入站**验收语义（对方不能再向我方发消息、不能从我方拉取内容）已由双方入站闸门闭环；「我方 homeserver 主动出站仍会尝试」的硬化（配对变更时重渲染 HS 白名单并编排重启，Tuwunel/continuwuity 用 allowed/forbidden 列表；含对拒不配合对端的出站停推与切断窗口内容栅栏，栅栏按 B6 决策归 #118）列为后续任务。同样不在本 PR：App 侧扫码 UI（C2.2）、跨服 AI 关系（归网关 B2.8，关系后续 PR 暂名 B-R1；A2.3 提供配对事实与经 fedgate 的跨服传输，并负责 #118 第 8 项出站切断、compose 透传加双服 e2e）、公网 TLS 证书的获取与续期流程、媒体端点的签名/令牌校验。
 
 ## 实测要点（federation-e2e 调试结论）
 

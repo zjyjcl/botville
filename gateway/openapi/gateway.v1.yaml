@@ -909,7 +909,8 @@ paths:
       operationId: createConversation
       summary: 登记会话
       description: |
-        把 Matrix room 登记为网关会话（幂等：同一 `matrix_room_id` 已存在时返回 200 与已有会话）。
+        可选的显式登记；主路径由网关推导会话。此规划端点把 Matrix room 登记为网关会话
+        （幂等：同一 `matrix_room_id` 已存在时返回 200 与已有会话）。
         botville 的 AI 接入不支持加密会话：含 AI 的会话使用 `encryption: none`，App 不提供开启加密；
         E2EE 房间中 `ai_participation` 必须为 `disabled`，网关不得代表 AI 发言。
         这是网关参与策略，不代表撤销 Matrix 成员资格或密钥，也不是 AI 无法解密的保证。
@@ -968,7 +969,6 @@ paths:
                     title: Request validation failed
                     status: 422
                     detail: encryption=e2ee cannot be combined with ai_participation=enabled
-                    instance: /v1/conversations
                     code: request.invalid
                     request_id: req_demo_e2ee_create
                     errors:
@@ -1112,10 +1112,9 @@ paths:
                   summary: 加密或 AI 禁用会话拒绝代发言
                   value:
                     type: urn:botville:error:conversation.e2ee
-                    title: AI participation disabled for this conversation
+                    title: AI participation disabled
                     status: 403
-                    detail: encryption=e2ee or ai_participation=disabled; gateway must not speak as AI here
-                    instance: /v1/conversations/conv_demo/messages
+                    detail: AI participation is disabled in encrypted conversations
                     code: conversation.e2ee
                     request_id: req_demo_e2ee_send
         '404':
@@ -1264,10 +1263,9 @@ paths:
                   summary: 加密或 AI 禁用会话拒绝预检代发言
                   value:
                     type: urn:botville:error:conversation.e2ee
-                    title: AI participation disabled for this conversation
+                    title: Request invalid
                     status: 403
-                    detail: encryption=e2ee or ai_participation=disabled; gateway must not speak as AI here
-                    instance: /v1/policy/evaluate
+                    detail: AI participation is disabled in encrypted conversations
                     code: conversation.e2ee
                     request_id: req_demo_e2ee_policy
         '404':
@@ -2587,7 +2585,10 @@ components:
           schema:
             $ref: '#/components/schemas/Problem'
     MoodUnavailable:
-      description: 心情存储不可用：503 `mood.unavailable`，带 Retry-After。
+      description: |
+        GET/PATCH /personas/{persona_id}/state 的 503：心情读写等处理异常且失败审计可写时
+        返回 `mood.unavailable`；失败审计写入遇到 SQLite 错误时返回 `memory.unavailable`。
+        两者的 title 均等于 code，并带 Retry-After: 5 与 retry_after_seconds: 5。
       headers:
         Retry-After:
           $ref: '#/components/headers/RetryAfter'
@@ -2597,13 +2598,25 @@ components:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/Problem'
-          example:
-            type: urn:botville:error:mood.unavailable
-            title: mood.unavailable
-            status: 503
-            code: mood.unavailable
-            request_id: example-request
-            retry_after_seconds: 5
+          examples:
+            mood_unavailable:
+              summary: 心情处理失败，失败审计写入成功
+              value:
+                type: urn:botville:error:mood.unavailable
+                title: mood.unavailable
+                status: 503
+                code: mood.unavailable
+                request_id: example-request
+                retry_after_seconds: 5
+            memory_unavailable:
+              summary: 失败审计写入遇到 SQLite 错误
+              value:
+                type: urn:botville:error:memory.unavailable
+                title: memory.unavailable
+                status: 503
+                code: memory.unavailable
+                request_id: example-request
+                retry_after_seconds: 5
 
     ServiceUnavailable:
       description: 记忆存储或必要依赖暂不可用。

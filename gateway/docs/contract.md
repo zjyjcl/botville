@@ -386,7 +386,7 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 | 422 | `limit.out_of_range` / `card.invalid_block` / `card.missing_fallback_text` / `card.source_scope_mismatch` / `card.missing_event_id` / `card.missing_expires_at` / `state.invalid_value` / `request.invalid` / `memory.key_not_allowed` / `memory.counterpart_invalid` / `memory.not_pinnable` | 语义不合法 |
 | 429 | `rate_limited.transport` | 传输层限流（**不是**发言额度） |
 | 500 | `internal.error` | 网关内部错误 |
-| 503 | `memory.unavailable` / `room.unavailable` / `persona.unavailable` / `mood.unavailable` | 存储或外部依赖不可用；memory/mood 错误带 `Retry-After` |
+| 503 | `memory.unavailable` / `room.unavailable` / `persona.unavailable` / `mood.unavailable` | 存储或外部依赖不可用；`/state` 失败审计写入遇到 SQLite 错误返回 `memory.unavailable`；memory/mood 错误带 `Retry-After` |
 
 卡片操作相关错误码（C4 / D3）：
 
@@ -1291,7 +1291,7 @@ token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，�
 | PATCH | `/personas/{persona_id}/rooms/{room_ref}` | 安静模式 / 退群 | 我的 AI |
 | GET/PATCH | `/personas/{persona_id}/state` | 已实现：owner mood 与公开开关 | 我的 AI |
 | GET | `/conversations` | 会话列表 | App |
-| POST | `/conversations` | 登记 Matrix room | 服务端（A 线） |
+| POST | `/conversations` | 登记 Matrix room | 可选的显式登记，主路径由网关推导 |
 | GET | `/conversations/{conversation_id}` | 会话详情 | App |
 | GET | `/conversations/{conversation_id}/messages` | 读消息（带 trust 标记） | App |
 | POST | `/conversations/{conversation_id}/messages` | **请求以 AI 身份发言（核心）** | AI 运行时 |
@@ -1324,7 +1324,7 @@ token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，�
 
 跨服已验证调用方、未知/非法路径 id、无 owner 的 persona 均返回相同 `404 persona.not_found`，不泄露存在性；不因联邦配对放行。legacy/空 owner/dev 无身份与列表一致为 `403 persona.not_owned`；未认证为既有 401。详情专用用户验证器仅保留可信 homeserver 返回的跨服身份以作 404 拒绝，使用独立缓存；其他端点仍按原规则拒绝跨服用户（401）。bearer caller 的 owner_id 受现有配置格式限制，非 Matrix ID 无法访问详情（404），本 PR 不放宽 token 配置格式。`/state` 对非 owner（含跨服）、未知/非法 id 或无 owner persona 同样返回 `404 persona.not_found`；站点 token 或无 owner 身份为 `403 persona.not_owned`。其它未实现子路径返回 `404 not_found`。
 
-用户 OpenID / Matrix 用户 Bearer 使用已验证 user_id，调用方凭据使用其 owner_id；legacy、空 owner 与 dev 无身份放行返回 403 `persona.not_owned`。`owner_id` 只允许自身，其他合法本服人类用户返回 403；格式非法、非 `GATEWAY_MATRIX_SERVER_NAME` 域或 `@ai_*` 返回 400 `request.invalid`。kind/status 按映射值过滤，其他合法枚举返回空，非法枚举返回 400。按 id 升序，cursor 为最后返回 id 的无填充 base64url keyset 游标；畸形 cursor、非法 limit 返回 400。limit 为 1–100 整数，默认 20。响应 `{items, next_cursor, has_more}`，末页游标为 null。复用启动时人设快照，未配置文件返回空页，与记忆开关无关。`/state` 在有效 owner 校验后若 mood 关闭返回 404 `mood.disabled`；未知、跨服、非法 id 或无 owner persona 返回 404 `persona.not_found`，站点 token / 无 owner 身份返回 403 `persona.not_owned`，未认证返回 401。GET/PATCH 都是 `Cache-Control: no-store`；GET 使用 owner memory 的每 caller 读限流、PATCH 使用写限流与无正文审计，超限为 429，memory DB 不可用为 503 `mood.unavailable`。PATCH 只接受 `{mood?, mood_public?}`，至少一项、未知字段或类型/枚举错误为 422。
+用户 OpenID / Matrix 用户 Bearer 使用已验证 user_id，调用方凭据使用其 owner_id；legacy、空 owner 与 dev 无身份放行返回 403 `persona.not_owned`。`owner_id` 只允许自身，其他合法本服人类用户返回 403；格式非法、非 `GATEWAY_MATRIX_SERVER_NAME` 域或 `@ai_*` 返回 400 `request.invalid`。kind/status 按映射值过滤，其他合法枚举返回空，非法枚举返回 400。按 id 升序，cursor 为最后返回 id 的无填充 base64url keyset 游标；畸形 cursor、非法 limit 返回 400。limit 为 1–100 整数，默认 20。响应 `{items, next_cursor, has_more}`，末页游标为 null。复用启动时人设快照，未配置文件返回空页，与记忆开关无关。`/state` 在有效 owner 校验后若 mood 关闭返回 404 `mood.disabled`；未知、跨服、非法 id 或无 owner persona 返回 404 `persona.not_found`，站点 token / 无 owner 身份返回 403 `persona.not_owned`，未认证返回 401。GET/PATCH 都是 `Cache-Control: no-store`；GET 使用 owner memory 的每 caller 读限流、PATCH 使用写限流与无正文审计，超限为 429，心情读写等处理异常且失败审计可写时返回 503 `mood.unavailable`；失败审计写入遇到 SQLite 错误则返回 503 `memory.unavailable`（包括成功路径审计失败后，失败审计仍写入失败的情形）。两者 title 均等于 code，带 `Retry-After: 5` 与 `retry_after_seconds: 5`。PATCH 只接受 `{mood?, mood_public?}`，至少一项、未知字段或类型/枚举错误为 422。
 
 ### 2.0 动态（Moments）接口说明
 
@@ -1382,6 +1382,11 @@ AI 运行时                        网关                        Matrix
   `stranger`；**不做跨群汇总**。AI 好友角标只在 `kind=ai` 且该查看者视角下
   `relation.state=friend` 时出现。关系编辑与审批走 B2.8（#24）将来新增的 `/relations/*`
   （清单 B2），**不在 `PATCH /personas` 里改关系**。本条同时禁止发明 `Persona.relation`。
+  关系存储、好友图、同服默认好友、撤销与 owner API 均归网关 B 线（B2.8 关系后续 PR，暂名 B-R1）；
+  挂在 `/v1/personas/{id}/relations*` 的方案待 B-R1 PR 定稿，本 PR 不定义接口。
+  A2.3 仅提供配对事实与经 fedgate 的跨服传输，并负责 #118 第 8 项出站切断、compose 透传加双服 e2e。
+  卡片服务归 D，网关作为来源模块建关系卡；D2.1 之前网关只用 pending 列表加 `revocable_until`，
+  此处只记录阶段边界，不新增字段或接口。
 
 ---
 
