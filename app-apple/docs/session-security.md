@@ -8,23 +8,37 @@
 
 ## 加密存储丢失时强制重新登录（#81，关联 #245）
 
+**适用范围**：这套机制只**防止再次发生**，不修复已经发生的情况。旧版本已经在空库上以旧设备 ID 重建过加密身份的设备（库文件如今非空、检测判为「在」），不会被强制换成新设备；这类设备走「清除本地会话」再重新登录。iPhone 15 的设备验收走的就是这条路径。旧设备在服务端留下的 device keys 会继续让对方向一个本机已无私钥的设备加密，表现为解密失败等加密噪音；既成设备和服务端旧设备的清理见 #254。
+
 **场景**：Keychain 里的会话记录还在，但本机 SDK 加密存储已丢失——iOS 卸载重装（Keychain 保留、App 容器清空）、Application Support 下的存储目录被清空或数据库被删、首次建库中断留下空文件等。此前恢复流程会先 `create(for: storeID)` 补建空目录，再让 SDK 在新库里以**旧设备 ID** 生成一套新的 Olm 账号；服务端看到同一设备 ID 换了身份密钥，导致 #245 中的 OTK 签名失败和对方无法加密给本机。
 
-**检测信号**：该 storeID 目录下 SDK 加密数据库 `matrix-sdk-crypto.sqlite3` 是否为非空普通文件（`SessionStoreDirectory.hasCryptoStore(for:)`）。
+**检测信号**：该 storeID 目录下 SDK 加密数据库 `matrix-sdk-crypto.sqlite3` 的状态（`SessionStoreDirectory.cryptoStoreState(for:)`），分三态：
 
-- 选它的理由：Olm 账号（设备身份密钥）只存在这个库里，它的有无就是「旧设备 ID 还能不能安全复用」的直接判据；目录缺失、目录空、只剩 state/cache、0 字节文件都归为丢失。检查只读，在构建 SDK client、`create(for:)` 和任何网络请求之前执行，不会顺手建库。已安装用户的库本来就有这个文件，不需要迁移或额外写 sentinel。
+- **在**：非空普通文件。
+- **丢失**：只认确定的结论——目录或文件不存在（ENOENT / ENOTDIR / Cocoa NoSuchFile），或文件为 0 字节；只接受普通文件，符号链接和目录也按丢失处理（有意为之：SDK 只会写普通文件，链接指向的库不可信）。
+- **未定**：读元数据报权限错误或其他错误、读不到文件大小。未定**不算丢失**。
+
+- 选它的理由：Olm 账号（设备身份密钥）只存在这个库里，它的有无就是「旧设备 ID 还能不能安全复用」的直接判据。检查只读，在构建 SDK client、`create(for:)` 和任何网络请求之前执行，不会顺手建库。已安装用户的库本来就有这个文件，不需要迁移或额外写 sentinel。
 - 没选的方案：只看目录——覆盖不了「目录在、库没了」；自写 sentinel 文件——老用户没有 sentinel，需要迁移逻辑，且 sentinel 在而库被删时会漏判；比对 SDK 加密身份——必须先用旧设备 ID 构建 client 并 restore，SDK 会在空库里先生成新账号，正是要避免的动作，还要额外在 Keychain 里存指纹。
 - 文件名来自固定 SDK 26.10.27（在其二进制中确认 `matrix-sdk-crypto.sqlite3` / `matrix-sdk-state.sqlite3` 位于 data path，event-cache / media 位于 cache path）。`CryptoStoreDetectionTests` 用生产 `clientFactory` 和真 SDK 离线建库，断言文件正落在检测位置；升级 SDK 若改名或改位置，这条测试会先失败。
 
+**受保护数据未就绪时不判定**：iOS 首次解锁前（`UIApplication.isProtectedDataAvailable == false`），或元数据读取得到「未定」时，不清任何东西：保留 Keychain 会话和本地存储，提示稍后继续，可重试，也保留「清除本地会话」出口。收到 `protectedDataDidBecomeAvailableNotification` 或回到前台时再判定一次。
+
 **误判风险**：
 
-- 假阳性（库在却判丢）：SDK 升级改了文件名/位置（由上面的真 SDK 用例拦截）；文件暂时不可读（iOS 设备首次解锁前，目录保护级别为 `completeUntilFirstUserAuthentication`，预计仍可读取文件元数据，未在真机验证；若系统此时返回错误，会被判为丢失，代价是一次重新登录）。
+- 假阳性（库在却判丢）：SDK 升级改了文件名/位置（由上面的真 SDK 用例拦截）。暂时不可读不再导致误判（见上一条）。
 - 假阴性（库坏却判在）：数据库内容损坏但文件非空、或 store key 与库不匹配——检测不覆盖，仍走既有路径：SDK 构建失败按存储错误提示，用户可用「清除本地会话」退出。不对这类情况自动清除，避免把暂时性错误当成丢失。
-- 旧设备的 pusher 仍留在服务端（未登出），重新登录后新设备再注册同一 APNs token，可能出现重复推送或旧设备推送无法解密的通知；扩展的共享凭据已随旧会话删除。
 
-**行为**：检测到丢失后绝不构建 client、不调用 `restoreSession`、不向服务端发送旧设备 ID；立即删除 Keychain 会话、扩展可读的共享推送凭据和本地存储目录（含残留目录），回到登录页并提示「本机加密数据已丢失，需要重新登录」。前台事件不会再次触发恢复覆盖这条提示。soft logout 重输密码时同样先检查，库已丢失就不带旧设备 ID 去登录，按同样方式清理。重新登录不传 device ID，由服务端分配新设备、新建 store ID 与 store key。正常启动、正常登出再登录、首次安装不受影响（均有单测）。
+**行为**：判定丢失后绝不构建 client、不调用 `restoreSession`、不向服务端发送旧设备 ID。顺序是：
 
-**旧设备不在服务端登出或删除**：默认只在本地丢弃。Keychain 里其实还有旧 access token，技术上可以用它调用 `/logout` 删除旧设备及其 device keys / pusher，这能清掉 #245 中服务端残留的错误密钥状态，也能停止旧 pusher 继续向本机推送；但本 PR 不实现，理由：① 任务要求默认不调用会删除服务端设备的接口；② 丢失判断若是假阳性，远端登出会把一个其实完好的设备删掉，不可逆；③ 删除设备会让对方看到设备变更，需要和 #245 的确认步骤一起评估。建议作为后续单独评估项：在检测到丢失且用户确认后，用旧 token 尽力调用一次 `/logout`（失败忽略，不重试、不走 UIA）。
+1. 用 Keychain 里旧会话自己的 access token 尽力调用一次 `POST /_matrix/client/v3/logout`（只登出这个 token 对应的设备，服务端随之删除它的 device keys 和 pusher）。不调用 `/logout/all`，也不调用 `delete_devices`，不走 UIA，不重试；总时长上限 5 秒，网络卡住也不会拖住流程。成功与否都只在 DEBUG 日志里记录结果类别，不记 token 或任何标识。homeserver 地址按 Release 恢复规则校验，不会经 HTTP 发出 token。
+2. 删除 Keychain 会话、扩展可读的共享推送凭据和本地存储目录（含残留目录），回到登录页并提示加密数据已丢失、需要重新登录（具体文案以代码为准）。若 Keychain 删除失败，则不删本地目录，改为存储错误提示，并保留「清除本地会话」出口。
+
+前台事件不会再次触发恢复或 `/logout`。soft logout 重输密码时同样先检查，库已丢失就不带旧设备 ID 去登录，按同样方式处理。重新登录不传 device ID，由服务端分配新设备、新建 store ID 与 store key。正常启动、正常登出再登录、首次安装不受影响，也不会触发这次 `/logout`（均有单测）。
+
+**`/logout` 失败时的残留**：旧设备的 pusher 和 device keys 仍留在服务端，重新登录后可能出现重复推送、旧设备推送无法解密的通知，以及上面说的加密噪音；扩展的共享凭据已随旧会话删除。这些不在客户端自动重试，由 #254 跟踪。
+
+**测试数**（以代码为准）：#251 在 `MatrixServiceLifecycleTests` 新增 6 个测试方法（先失败提交里 4 个失败、2 个正常路径通过），共 9 种情形：存储目录缺失；空目录、0 字节库、只剩 state 库和 cache 三种；丢失后重新登录；soft logout 期间丢失；正常启动；首次安装；登出再登录再恢复。另有 `CryptoStoreDetectionTests` 2 个方法。#251 描述中的「新增 7 项」「3 项正常路径」计数有误，以此为准。本次（尽力 `/logout` 与延后判定）新增 9 个测试方法：`MatrixServiceLifecycleTests` 7 个、`CryptoStoreDetectionTests` 1 个、`PasswordAuthenticationTests` 1 个。
 
 ## Soft logout 与 refresh token
 
