@@ -36,23 +36,38 @@ struct TimelineState {
         }
     }
 
+    /// Text-like messages plus a placeholder for undecryptable events. A UTD is
+    /// never silently dropped: the foreground banner already announced it, so the
+    /// room must show the same event. Keeping the SDK item ID lets the decrypted
+    /// body replace the placeholder in place when a late room key arrives.
     var messages: [MatrixMessage] {
         items.compactMap { item in
             guard let event = item.asEvent(),
-                  case .msgLike(let content) = event.content,
-                  case .message(let message) = content.kind else { return nil }
-            switch message.msgType {
-            case .text, .notice, .emote: break
-            default: return nil
+                  case .msgLike(let content) = event.content else { return nil }
+            let body: String
+            let isUndecryptable: Bool
+            switch content.kind {
+            case .message(let message):
+                switch message.msgType {
+                case .text, .notice, .emote: break
+                default: return nil
+                }
+                body = message.body
+                isUndecryptable = false
+            case .unableToDecrypt:
+                body = MatrixMessage.undecryptablePlaceholder
+                isUndecryptable = true
+            default:
+                return nil
             }
-            let delivery = MessageDeliveryState(event.localSendState)
             return MatrixMessage(
                 id: item.uniqueId().id,
                 sender: event.sender,
-                body: message.body,
+                body: body,
                 timestamp: Date(timeIntervalSince1970: Double(event.timestamp) / 1_000),
                 isOwn: event.isOwn,
-                deliveryState: delivery
+                deliveryState: MessageDeliveryState(event.localSendState),
+                isUndecryptable: isUndecryptable
             )
         }
     }
