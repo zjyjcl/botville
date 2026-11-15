@@ -13,6 +13,8 @@ public protocol GatewayClient: ModuleWebSessionProviding {
     func personaState(id: String) async throws -> PersonaState
     func updatePersonaState(id: String, patch: PersonaStatePatch) async throws -> PersonaState
     func groupRooms(personaID: String, limit: Int?, cursor: String?, includeAll: Bool) async throws -> GroupRoomList
+    /// One batch (1–50 ids). Callers split larger sets with `GroupRoomLookupPlan`.
+    func lookupGroupRooms(personaID: String, roomIDs: [String]) async throws -> GroupRoomLookupResult
     func updateGroupRoomMode(personaID: String, roomRef: String, mode: GroupRoomMode) async throws -> GroupRoom
     func leaveGroupRoom(personaID: String, roomRef: String) async throws -> GroupRoom
     func updatePersonaGroups(id: String, groups: PersonaGroupsSettings) async throws -> PersonaDetail
@@ -35,6 +37,7 @@ public extension GatewayClient {
         throw GatewayClientError.invalidResponse
     }
     func groupRooms(personaID: String, limit: Int? = nil, cursor: String? = nil, includeAll: Bool = false) async throws -> GroupRoomList { throw GatewayClientError.invalidResponse }
+    func lookupGroupRooms(personaID: String, roomIDs: [String]) async throws -> GroupRoomLookupResult { throw GatewayClientError.invalidResponse }
     func updateGroupRoomMode(personaID: String, roomRef: String, mode: GroupRoomMode) async throws -> GroupRoom { throw GatewayClientError.invalidResponse }
     func leaveGroupRoom(personaID: String, roomRef: String) async throws -> GroupRoom { throw GatewayClientError.invalidResponse }
     func updatePersonaGroups(id: String, groups: PersonaGroupsSettings) async throws -> PersonaDetail { throw GatewayClientError.invalidResponse }
@@ -269,6 +272,22 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         return try await decode(
             request(["personas", personaID, "rooms"], query: query), as: GroupRoomList.self)
     }
+    /// POST keeps room ids out of the URL. The reply must be index-aligned with
+    /// the request; anything else is rejected rather than guessed at.
+    public func lookupGroupRooms(personaID: String, roomIDs: [String]) async throws
+        -> GroupRoomLookupResult
+    {
+        guard (1...GroupRoomLookupPlan.maxBatchSize).contains(roomIDs.count) else {
+            throw GatewayClientError.invalidResponse
+        }
+        let result = try await decode(
+            request(
+                ["personas", personaID, "rooms", "lookup"], method: "POST",
+                body: JSONEncoder().encode(["room_ids": roomIDs])),
+            as: GroupRoomLookupResult.self)
+        guard result.items.count == roomIDs.count else { throw GatewayClientError.invalidResponse }
+        return result
+    }
     public func updateGroupRoomMode(personaID: String, roomRef: String, mode: GroupRoomMode)
         async throws -> GroupRoom
     {
@@ -446,7 +465,8 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
 
     private static func isOpenIDPath(_ segments: [String], method: String) -> Bool {
         guard let first = segments.first else { return false }
-        // Contract 0.6.0 authenticates owner reads/writes and group-room management.
+        // Contract 0.6.0 authenticates owner reads/writes and group-room management;
+        // 0.7.0 adds the owner-only POST rooms/lookup.
         return first == "moments" || first == "memories"
             || (first == "personas" && method.caseInsensitiveCompare("GET") == .orderedSame
                 && (segments.count == 1 || (segments.count == 2 && !segments[1].isEmpty)))
@@ -455,6 +475,9 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
                 && segments.count == 3 && !segments[1].isEmpty && segments[2] == "state")
             || (first == "personas" && method.caseInsensitiveCompare("GET") == .orderedSame
                 && segments.count == 3 && !segments[1].isEmpty && segments[2] == "rooms")
+            || (first == "personas" && method.caseInsensitiveCompare("POST") == .orderedSame
+                && segments.count == 4 && !segments[1].isEmpty && segments[2] == "rooms"
+                && segments[3] == "lookup")
             || (first == "personas" && method.caseInsensitiveCompare("PATCH") == .orderedSame
                 && ((segments.count == 2 && !segments[1].isEmpty)
                     || (segments.count == 4 && !segments[1].isEmpty && segments[2] == "rooms" && !segments[3].isEmpty)))
@@ -581,6 +604,7 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
     private var mockMemories: [Memory] = []
     private var mockPersonaState: PersonaState?
     private var mockGroupRooms: [GroupRoom] = []
+    private var mockRoomLookup: [String: String] = [:]
     private var mockGroups = PersonaGroupsSettings()
     private var mockLeavePending = false
 
@@ -716,6 +740,32 @@ public actor MockGatewayClient: GatewayClient, MockModuleWebSessionProviding {
         return GroupRoomList(
             items: items, nextCursor: end < source.count ? String(end) : nil,
             hasMore: end < source.count, groupsEnabled: true)
+    }
+    /// Test/preview hook: local room id → mock room_ref. Unknown ids stay null.
+    public func setMockRoomLookup(_ mapping: [String: String]) {
+        mockRoomLookup = mapping
+    }
+    public func lookupGroupRooms(personaID: String, roomIDs: [String]) async throws
+        -> GroupRoomLookupResult
+    {
+        guard (try await personas()).contains(where: { $0.id == personaID }) else {
+            throw GatewayClientError.problem(status: 404, code: "persona.not_found")
+        }
+        let keys = roomIDs.compactMap(GroupRoomLookupPlan.duplicateKey)
+        guard (1...GroupRoomLookupPlan.maxBatchSize).contains(roomIDs.count),
+            keys.count == roomIDs.count, Set(keys).count == keys.count
+        else {
+            throw GatewayClientError.problem(status: 400, code: "request.invalid")
+        }
+        let items = roomIDs.map { id in
+            mockRoomLookup[id].flatMap { ref in mockGroupRooms.first { $0.roomRef == ref } }
+                .map {
+                    GroupRoom(
+                        roomRef: $0.roomRef, state: $0.state, mode: $0.mode,
+                        joinedAt: $0.joinedAt, updatedAt: $0.updatedAt, leavePending: nil)
+                }
+        }
+        return GroupRoomLookupResult(items: items, groupsEnabled: true)
     }
     public func updateGroupRoomMode(personaID: String, roomRef: String, mode: GroupRoomMode)
         async throws -> GroupRoom

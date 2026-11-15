@@ -52,11 +52,14 @@ public struct GatewayCapability: Codable, Sendable, Equatable, Identifiable {
     public let unavailableReason: String?
     /// Disclosure is opt-in: absent and false both remain hidden in the App.
     public let ownerCanReadDM: Bool?
+    /// `groups.manage` extension (0.7.0): only true advertises POST rooms/lookup.
+    public let roomLookup: Bool?
     enum CodingKeys: String, CodingKey {
         case id, module, version, title, summary, description, status, entry, scopes, requires
         case sessionToken = "session_token"
         case unavailableReason = "unavailable_reason"
         case ownerCanReadDM = "owner_can_read_dm"
+        case roomLookup = "room_lookup"
     }
     public var isEnabled: Bool { status == "enabled" || status == "degraded" }
     public var normalizedEntryType: GatewayCapabilityEntryType { .init(rawValue: entry.type) }

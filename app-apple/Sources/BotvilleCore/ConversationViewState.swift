@@ -29,11 +29,14 @@ public struct GroupRoomRowViewState: Sendable, Equatable {
     public let actions: [Action]
     public let isDisabled: Bool
 
+    /// `name` comes only from a local room matched through POST rooms/lookup;
+    /// without one the row keeps its presentation ordinal.
     public init(
-        room: GroupRoom, ordinal: Int, groupsEnabled: Bool,
+        room: GroupRoom, ordinal: Int, name: String? = nil, groupsEnabled: Bool,
         canEnableMentionOnly: Bool, isSubmitting: Bool
     ) {
-        title = "群聊 \(ordinal)"
+        let mapped = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        title = mapped.isEmpty ? "群聊 \(ordinal)" : mapped
         statusLabel = GroupRoomPresentation.label(room)
         joinedAt = room.joinedAt
         modeNotice = if case .unknown = room.mode { "模式未知" } else { nil }

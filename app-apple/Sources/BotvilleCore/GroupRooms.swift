@@ -119,9 +119,18 @@ public final class PersonaGroupRoomsModel: ObservableObject {
     private var settingsObservation: AnyCancellable?
 
     public var groupsEnabled: Bool { deploymentGroupsEnabled && settings.groups.enabled }
+    /// mention_only needs the deployment capability (not degraded), the rooms
+    /// page and the persona switch to agree.
     public var canEnableMentionOnly: Bool {
-        groupsEnabled && settings.hasLoaded && !settings.isLoading && !settings.isSaving
+        entry.allowsMentionOnly && groupsEnabled && settings.hasLoaded && !settings.isLoading
+            && !settings.isSaving
     }
+    public let entry: GroupsManageEntryState
+    /// room_ref → local room name, rebuilt on every full reload so a rotated key
+    /// never keeps an old mapping. Missing = keep the ordinal.
+    @Published private var roomNames: [String: String] = [:]
+    private let lookupSource: GroupRoomLookupSource?
+    public func roomName(for roomRef: String) -> String? { roomNames[roomRef] }
     @Published public private(set) var includeAll = false
     @Published public private(set) var isLoading = false
     @Published public private(set) var isLoadingMore = false
@@ -136,11 +145,14 @@ public final class PersonaGroupRoomsModel: ObservableObject {
     private var paginationNeedsRefresh = false
 
     public init(
-        personaID: String, client: any GatewayClient, settings: PersonaGroupsSettingsController
+        personaID: String, client: any GatewayClient, settings: PersonaGroupsSettingsController,
+        entry: GroupsManageEntryState = .legacy, lookupSource: GroupRoomLookupSource? = nil
     ) {
         self.personaID = personaID
         self.client = client
         self.settings = settings
+        self.entry = entry
+        self.lookupSource = lookupSource
         // The settings screen and rooms screen share this owner-scoped object.
         // Forward optimistic changes and rollbacks without reloading the page.
         settingsObservation = settings.objectWillChange.sink { [weak self] in
@@ -190,6 +202,7 @@ public final class PersonaGroupRoomsModel: ObservableObject {
             hasMore = false
             seenCursors = []
             paginationNeedsRefresh = false
+            roomNames = [:]
         }
         errorMessage = nil
         defer { if requestGeneration == generation { isLoading = false } }
@@ -207,12 +220,43 @@ public final class PersonaGroupRoomsModel: ObservableObject {
                 paginationNeedsRefresh = false
             }
             outcome.roomsRefreshed = apply(page, replacing: true)
+            // Names are decoration: the list is usable before and without them.
+            isLoading = false
+            await resolveNames(generation: requestGeneration)
             return outcome
         } catch {
             guard !Task.isCancelled, requestGeneration == generation else { return ReloadOutcome() }
             if preservingRoomsOnFailure { paginationNeedsRefresh = true }
             errorMessage = message(for: error)
             return outcome
+        }
+    }
+
+    /// Batches of ≤50 local ids; null items create no mapping. Any failure (429
+    /// quota shared with memory reads, 503, misaligned reply) stops quietly and
+    /// keeps what earlier batches produced; affected rows keep their ordinal.
+    private func resolveNames(generation requestGeneration: Int) async {
+        guard entry.supportsRoomLookup, let source = lookupSource, !rooms.isEmpty else { return }
+        let known = source.knownRooms()
+        let ids = GroupRoomLookupPlan.roomIDs(from: known, localServerName: source.localServerName)
+        guard !ids.isEmpty else { return }
+        var nameByID: [String: String] = [:]
+        for room in known where nameByID[room.id] == nil { nameByID[room.id] = room.name }
+        var names: [String: String] = [:]
+        for batch in GroupRoomLookupPlan.batches(ids) {
+            guard let result = try? await client.lookupGroupRooms(
+                personaID: personaID, roomIDs: batch)
+            else { break }
+            guard !Task.isCancelled, requestGeneration == generation else { return }
+            guard result.items.count == batch.count else { break }
+            for (id, item) in zip(batch, result.items) {
+                guard let item, names[item.roomRef] == nil,
+                    let name = nameByID[id]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                    !name.isEmpty, name != id
+                else { continue }
+                names[item.roomRef] = name
+            }
+            roomNames.merge(names) { _, new in new }
         }
     }
 

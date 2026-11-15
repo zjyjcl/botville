@@ -494,6 +494,7 @@ extension GroupsManageEntryState {
         allowsMentionOnly: false, canOpenSettings: false, supportsRoomLookup: true)
 }
 
+@MainActor
 private func roomsModel(_ client: any GatewayClient) -> PersonaGroupRoomsModel {
     PersonaGroupRoomsModel(personaID: "@ai:local", client: client,
         settings: PersonaGroupsSettingsController(personaID: "@ai:local",
