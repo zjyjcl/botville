@@ -22,20 +22,47 @@ final class CryptoStoreDetectionTests: XCTestCase {
     func testOnlyNonEmptyRegularCryptoDatabaseCountsAsIntactAndCheckCreatesNothing() throws {
         let directory = SessionStoreDirectory(baseURL: temporary.appendingPathComponent("sessions"))
         let storeID = UUID()
-        XCTAssertFalse(directory.hasCryptoStore(for: storeID))
+        XCTAssertEqual(directory.cryptoStoreState(for: storeID), .missing)
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.baseURL.path), "detection must not create the store")
 
         let path = try directory.create(for: storeID)
-        XCTAssertFalse(directory.hasCryptoStore(for: storeID))
+        XCTAssertEqual(directory.cryptoStoreState(for: storeID), .missing)
         let file = path.appendingPathComponent(SessionStoreDirectory.cryptoDatabaseFileName)
         try FileManager.default.createDirectory(at: file, withIntermediateDirectories: false)
-        XCTAssertFalse(directory.hasCryptoStore(for: storeID), "a directory with the database name is not a database")
+        XCTAssertEqual(directory.cryptoStoreState(for: storeID), .missing, "a directory with the database name is not a database")
+        try FileManager.default.removeItem(at: file)
+        let elsewhere = temporary.appendingPathComponent("real.sqlite3")
+        try Data(repeating: 1, count: 16).write(to: elsewhere)
+        try FileManager.default.createSymbolicLink(at: file, withDestinationURL: elsewhere)
+        XCTAssertEqual(directory.cryptoStoreState(for: storeID), .missing, "a symlink is deliberately treated as lost")
         try FileManager.default.removeItem(at: file)
         try Data().write(to: file)
-        XCTAssertFalse(directory.hasCryptoStore(for: storeID), "zero-byte database has no Olm account")
+        XCTAssertEqual(directory.cryptoStoreState(for: storeID), .missing, "zero-byte database has no Olm account")
         try Data(repeating: 1, count: 16).write(to: file)
-        XCTAssertTrue(directory.hasCryptoStore(for: storeID))
-        XCTAssertFalse(directory.hasCryptoStore(for: UUID()), "another store ID is unaffected")
+        XCTAssertEqual(directory.cryptoStoreState(for: storeID), .present)
+        XCTAssertEqual(directory.cryptoStoreState(for: UUID()), .missing, "another store ID is unaffected")
+    }
+
+    /// Only a definite "does not exist" counts as missing. Permission / protected
+    /// data errors (before first unlock) and anything unexpected are undetermined.
+    func testMetadataErrorsOtherThanNotFoundAreUndetermined() {
+        let directory = SessionStoreDirectory(baseURL: temporary)
+        let cases: [(Error, SessionStoreDirectory.CryptoStoreState)] = [
+            (CocoaError(.fileReadNoSuchFile), .missing),
+            (CocoaError(.fileNoSuchFile), .missing),
+            (NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT)), .missing),
+            (NSError(domain: NSCocoaErrorDomain, code: CocoaError.fileReadNoSuchFile.rawValue,
+                     userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))]), .missing),
+            (CocoaError(.fileReadNoPermission), .undetermined),
+            (NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES)), .undetermined),
+            (NSError(domain: NSPOSIXErrorDomain, code: Int(EPERM)), .undetermined),
+            (CocoaError(.fileReadUnknown), .undetermined),
+            (URLError(.unknown), .undetermined),
+        ]
+        for (error, expected) in cases {
+            XCTAssertEqual(directory.cryptoStoreState(for: UUID(), fileManager: ThrowingAttributesFileManager(error: error)),
+                           expected, "\(error)")
+        }
     }
 
     /// Guards the SDK-specific file name: the production client factory with the
@@ -51,7 +78,13 @@ final class CryptoStoreDetectionTests: XCTestCase {
         try await client.restoreSession(session: Session(
             accessToken: "fixture-only", refreshToken: nil, userId: "@probe:matrix.invalid", deviceId: "PROBE",
             homeserverUrl: "https://matrix.invalid", oauthData: nil, slidingSyncVersion: .none))
-        XCTAssertTrue(directory.hasCryptoStore(for: storeID),
+        XCTAssertEqual(directory.cryptoStoreState(for: storeID), .present,
                       "SDK crypto database name or location changed; update SessionStoreDirectory.cryptoDatabaseFileName")
     }
+}
+
+private final class ThrowingAttributesFileManager: FileManager, @unchecked Sendable {
+    private let error: Error
+    init(error: Error) { self.error = error; super.init() }
+    override func attributesOfItem(atPath path: String) throws -> [FileAttributeKey: Any] { throw error }
 }
