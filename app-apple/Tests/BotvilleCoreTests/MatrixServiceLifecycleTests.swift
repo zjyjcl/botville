@@ -1154,6 +1154,29 @@ final class MatrixServiceLifecycleTests: XCTestCase {
             notification: notification, roomID: "!push:matrix.test", userID: "@me:matrix.test"))
     }
 
+    func testSyncNotificationTitleUsesSenderForDirectAndRoomNameForGroups() throws {
+        func title(_ notification: NotificationItem) throws -> String {
+            try XCTUnwrap(ForegroundSyncNotificationBridge.candidate(
+                notification: notification, roomID: "!push:matrix.test", userID: "@me:matrix.test")).title
+        }
+        var direct = syncNotification(eventID: "$title-direct", body: "body", timestamp: 1_700_000_000_000)
+        XCTAssertEqual(try title(direct), "Sender")
+        // Blank sender display name in a DM falls back to the room name.
+        direct.senderInfo.displayName = "  "
+        XCTAssertEqual(try title(direct), "Push")
+        direct.senderInfo.displayName = nil
+        XCTAssertEqual(try title(direct), "Push")
+        // isDm alone (without isDirect) still counts as a direct chat.
+        var dmOnly = syncNotification(eventID: "$title-dm", body: "body", timestamp: 1_700_000_000_000)
+        dmOnly.roomInfo.isDirect = false
+        XCTAssertEqual(try title(dmOnly), "Sender")
+        var group = syncNotification(eventID: "$title-group", body: "body", timestamp: 1_700_000_000_000)
+        group.roomInfo.isDirect = false
+        group.roomInfo.isDm = false
+        group.roomInfo.displayName = "小组"
+        XCTAssertEqual(try title(group), "小组")
+    }
+
 #if DEBUG
     func testOwnMessageProbeFiltersDeduplicatesAndAttributesInitialSync() async {
         var lines = [String]()

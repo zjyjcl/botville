@@ -7,7 +7,22 @@
 # (server/pairing/service.py), so `make federation-e2e` can prove:
 #   1. unpaired servers cannot federate,
 #   2. pairing enables invite/join/messages both ways,
-#   3. either side severing cuts traffic in both directions.
+#   3. either side severing cuts traffic in both directions,
+#   4. (A-R2, #118 item 8) after a sever + homeserver restart the local
+#      Synapse no longer even tries to reach the peer (its
+#      federation_domain_whitelist include, rendered by pairing, drops
+#      it), and after a re-pair + restart federation resumes.
+#
+# Homeserver whitelist (A-R2): pairing-X renders
+# /hs/federation-whitelist.yaml (active peers + own name) on the
+# fed-hs-X-whitelist volume and drops /hs/federation-whitelist.yaml
+# .restart-required when it changes. synapse-X mounts the volume
+# read-only and loads the file as a second --config-path; it waits for
+# pairing-X to be healthy because pairing renders before it serves.
+# Nothing here restarts Synapse automatically (pairing has no docker
+# socket): federation_e2e.py plays the operator/supervisor and runs
+# `docker compose restart synapse-X` itself. Synapse only; Conduit-family
+# homeservers are not covered yet (docs/deploy/paired-federation.md).
 #
 # Layout per instance (hs-a shown; hs-b mirrors it):
 #
@@ -90,12 +105,18 @@ services:
         python -m synapse.app.homeserver --config-path /config/homeserver.yaml
         --generate-keys --keys-directory /data &&
         exec python -m synapse.app.homeserver --config-path /config/homeserver.yaml
+        --config-path /hs/federation-whitelist.yaml
         --keys-directory /data
     ports:
       - "127.0.0.1:18101:8008"
     volumes:
       - ./generated/hs-a:/config:ro
       - fed-synapse-a-data:/data
+      # Pairing-rendered federation_domain_whitelist (A-R2), read-only.
+      - fed-hs-a-whitelist:/hs:ro
+    depends_on:
+      pairing-a:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8008/health', timeout=5)"]
       interval: 10s
@@ -117,12 +138,18 @@ services:
         python -m synapse.app.homeserver --config-path /config/homeserver.yaml
         --generate-keys --keys-directory /data &&
         exec python -m synapse.app.homeserver --config-path /config/homeserver.yaml
+        --config-path /hs/federation-whitelist.yaml
         --keys-directory /data
     ports:
       - "127.0.0.1:18102:8008"
     volumes:
       - ./generated/hs-b:/config:ro
       - fed-synapse-b-data:/data
+      # Pairing-rendered federation_domain_whitelist (A-R2), read-only.
+      - fed-hs-b-whitelist:/hs:ro
+    depends_on:
+      pairing-b:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8008/health', timeout=5)"]
       interval: 10s
@@ -161,6 +188,9 @@ services:
       # fedgate-a (.10) is the only reverse proxy this pairing service
       # trusts for X-Forwarded-For; anything else is treated as spoofed.
       PAIRING_TRUSTED_PROXIES: 172.30.81.10
+      # A-R2: render synapse-a's federation_domain_whitelist include and
+      # the restart marker (default: <path>.restart-required) here.
+      PAIRING_HS_WHITELIST_PATH: /hs/federation-whitelist.yaml
       # A-R3 CI-only: verified inbound relation messages go to the TEST
       # recorder (JSON lines on the state volume) instead of a gateway; the
       # real gateway client is not part of this build. Never copy into a
@@ -172,6 +202,7 @@ services:
     volumes:
       - ../../pairing:/app/pairing:ro
       - fed-pairing-a-state:/data
+      - fed-hs-a-whitelist:/hs
     networks:
       default:
         ipv4_address: 172.30.81.20
@@ -202,6 +233,9 @@ services:
       # fedgate-b (.11) is the only reverse proxy this pairing service
       # trusts for X-Forwarded-For; anything else is treated as spoofed.
       PAIRING_TRUSTED_PROXIES: 172.30.81.11
+      # A-R2: render synapse-b's federation_domain_whitelist include and
+      # the restart marker (default: <path>.restart-required) here.
+      PAIRING_HS_WHITELIST_PATH: /hs/federation-whitelist.yaml
       PAIRING_RELATIONS_GATEWAY: test-recorder
       PAIRING_RELATIONS_TEST_RECORD: /data/relations-recorder.jsonl
     ports:
@@ -209,6 +243,7 @@ services:
     volumes:
       - ../../pairing:/app/pairing:ro
       - fed-pairing-b-state:/data
+      - fed-hs-b-whitelist:/hs
     networks:
       default:
         ipv4_address: 172.30.81.21
@@ -314,3 +349,5 @@ volumes:
   fed-synapse-b-data:
   fed-pairing-a-state:
   fed-pairing-b-state:
+  fed-hs-a-whitelist:
+  fed-hs-b-whitelist:

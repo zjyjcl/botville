@@ -28,13 +28,31 @@ peer state it reports and the peer_paired / peer_severed events it
 emits (re-pair included), plus that the admin token and no token are
 refused there.
 
+Homeserver whitelist (A-R2, #118 item 8): each pairing service renders its
+Synapse's federation_domain_whitelist include (active peers + own name)
+and a restart marker when it changes. Nothing restarts Synapse
+automatically, so this script plays the operator/supervisor: after each
+pairing change it checks the rendered lists and markers, then runs the
+documented procedure (move the marker aside, `docker compose restart
+synapse-X`, wait, delete it). On top of the phases above it proves:
+  - fedgate is the real-time gate: right after a sever (no restart yet)
+    hs-a still sends, the peer's fedgate sees and drops it;
+  - after sever + restart the local Synapse sends NOTHING to the peer
+    (zero /_matrix/ requests in the peer fedgate's access log while both
+    users talk; a new invite fails locally);
+  - after re-pair + restart federation resumes;
+  - an idempotent repeat sever renders nothing and leaves no marker.
+
 Every polling step is bounded (<=60s positive, 20s negative windows).
 First failure exits non-zero with the failing step name.
 """
 
 import argparse
 import os
+import re
 import secrets
+import shlex
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -55,6 +73,64 @@ DEFAULT_A_CLIENT = "http://127.0.0.1:18101"
 DEFAULT_B_CLIENT = "http://127.0.0.1:18102"
 DEFAULT_A_ADMIN = "http://127.0.0.1:18111"
 DEFAULT_B_ADMIN = "http://127.0.0.1:18112"
+HS_WHITELIST = "/hs/federation-whitelist.yaml"
+HS_MARKER = HS_WHITELIST + ".restart-required"
+# Requests a homeserver sends to a peer arrive at the peer's fedgate as
+# /_matrix/federation|key/... lines in its access log (BaseHTTPRequestHandler
+# log_request). /_matrix/pairing (pairing service) and /health
+# (healthchecks) are not homeserver traffic.
+HS_TRAFFIC_RE = re.compile(r'"[A-Z]+ /_matrix/(?:federation|key)/')
+SIDES = {"a": "hs-a", "b": "hs-b"}
+
+
+class Compose:
+    """`docker compose` for the botville-fed project (stdin isolated)."""
+
+    def __init__(self, command):
+        self.argv = shlex.split(command)
+
+    def run(self, *args, check=True, input_text=None):
+        """stdin is never inherited: DEVNULL, or the explicit `input_text`
+        (A-R3: the relations signer script is fed to `python -`)."""
+        stdin = {"stdin": subprocess.DEVNULL} if input_text is None \
+            else {"input": input_text}
+        proc = subprocess.run(self.argv + list(args), capture_output=True,
+                              text=True, timeout=180, **stdin)
+        if check and proc.returncode != 0:
+            raise Failure("{} failed ({}): {}".format(
+                " ".join(args[:3]), proc.returncode,
+                (proc.stderr or proc.stdout).strip()[-400:]))
+        return proc
+
+    def whitelist(self, side):
+        """Names in pairing-<side>'s rendered include (parsed YAML list)."""
+        text = self.run("exec", "-T", "pairing-" + side, "cat",
+                        HS_WHITELIST).stdout
+        names = []
+        for line in text.splitlines():
+            if line.startswith("  - "):
+                names.append(line[4:].strip().strip('"'))
+        expect(names, "empty whitelist on {}: {!r}".format(side, text))
+        return names
+
+    def marker(self, side):
+        return self.run("exec", "-T", "pairing-" + side, "test", "-e",
+                        HS_MARKER, check=False).returncode == 0
+
+    def hs_requests(self, side):
+        """Homeserver requests fedgate-<side> has logged so far."""
+        out = self.run("logs", "--no-color", "--no-log-prefix",
+                       "fedgate-" + side).stdout
+        return sum(1 for line in out.splitlines() if HS_TRAFFIC_RE.search(line))
+
+    def restart_homeserver(self, side, client_url):
+        """The documented supervisor procedure for one side: claim the
+        marker, restart Synapse, wait until it serves, drop the claim."""
+        claimed = HS_MARKER + ".processing"
+        self.run("exec", "-T", "pairing-" + side, "mv", HS_MARKER, claimed)
+        self.run("restart", "synapse-" + side)
+        smoke.Smoke(client_url, None).wait_for_versions(POSITIVE_TIMEOUT)
+        self.run("exec", "-T", "pairing-" + side, "rm", "-f", claimed)
 
 
 def run_step(name, fn):
@@ -284,17 +360,30 @@ def main():
     parser.add_argument("--b-client", default=DEFAULT_B_CLIENT)
     parser.add_argument("--a-admin", default=DEFAULT_A_ADMIN)
     parser.add_argument("--b-admin", default=DEFAULT_B_ADMIN)
+    parser.add_argument(
+        "--compose", default=None,
+        help="docker compose command for the botville-fed project (default:"
+             " docker compose -p botville-fed -f <federation compose>"
+             " --env-file <env-file>)")
     args = parser.parse_args()
+    if args.compose is None:
+        compose_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "compose",
+            "federation", "docker-compose.federation.yml")
+        args.compose = "docker compose -p botville-fed -f {} --env-file {}".format(
+            shlex.quote(compose_file), shlex.quote(args.env_file))
+    compose = Compose(args.compose)
+    clients = {"a": args.a_client, "b": args.b_client}
 
     env = load_env(args.env_file)
     admin_a = PairingAdmin(args.a_admin, env["PAIRING_ADMIN_TOKEN_A"])
     admin_b = PairingAdmin(args.b_admin, env["PAIRING_ADMIN_TOKEN_B"])
     facts_a = PairingFacts(args.a_admin, env["PAIRING_SERVICE_TOKEN_A"])
     facts_b = PairingFacts(args.b_admin, env["PAIRING_SERVICE_TOKEN_B"])
-    suffix = secrets.token_hex(3)
     rel = federation_relations.Relations(
-        args.env_file, args.a_admin, args.b_admin,
+        compose, args.a_admin, args.b_admin,
         env["PAIRING_SERVICE_TOKEN_A"], env["PAIRING_SERVICE_TOKEN_B"])
+    suffix = secrets.token_hex(3)
 
     # --- readiness + users ------------------------------------------------
 
@@ -312,7 +401,15 @@ def main():
             expect(facts.status_with(facts.token) == 200,
                    "facts with the service token not 200")
             facts.poll()  # start both feeds from "now"
-        return "versions + pairing /health ok; facts API token-gated"
+        # First boot: pairing rendered "self only" before Synapse started,
+        # and created no marker (nothing was running to restart).
+        for side, own in SIDES.items():
+            names = compose.whitelist(side)
+            expect(names == [own], "{} whitelist at boot: {}".format(side, names))
+            expect(not compose.marker(side),
+                   "first boot left a restart marker on {}".format(side))
+        return ("versions + pairing /health ok; facts API token-gated;"
+                " whitelists self-only, no marker")
 
     def step_users():
         globals()["alice"] = register_user(args.a_client, "alice" + suffix)
@@ -322,9 +419,10 @@ def main():
     # --- phase 1: unpaired -> federation is denied -------------------------
 
     def step_unpaired():
-        # Synapse sends the invite synchronously over federation; when the
-        # remote fedgate answers 403 the invite call itself fails. Create
-        # the room first, then the invite must be refused AND never arrive.
+        # Synapse sends the invite synchronously over federation. hs-b is
+        # not in hs-a's whitelist yet, so hs-a refuses it locally (the
+        # remote fedgate would answer 403 as well). Create the room
+        # first, then the invite must be refused AND never arrive.
         room = create_room(alice)
         status, resp = request_json(
             "POST", alice.url("/_matrix/client/v3/rooms/{}/invite".format(quote_room(room))),
@@ -379,6 +477,58 @@ def main():
 
     # --- phase 3: B severs unilaterally -------------------------------------
 
+    # --- homeserver whitelist helpers (A-R2) ---------------------------------
+
+    def expect_whitelists(expected):
+        for side, names in expected.items():
+            got = compose.whitelist(side)
+            expect(got == names, "{} whitelist {} != {}".format(side, got, names))
+
+    def restart_both(expected):
+        """Check rendered lists + markers, then restart both homeservers."""
+        expect_whitelists(expected)
+        for side in SIDES:
+            expect(compose.marker(side),
+                   "no restart marker on {} after a pairing change".format(side))
+        for side in SIDES:
+            compose.restart_homeserver(side, clients[side])
+        for side in SIDES:
+            expect(not compose.marker(side),
+                   "marker still present on {} after restart".format(side))
+
+    def step_restart_after_pair():
+        restart_both({"a": ["hs-a", "hs-b"], "b": ["hs-a", "hs-b"]})
+        return "both whitelists list hs-a + hs-b; markers consumed, restarted"
+
+    def assert_no_hs_traffic(sender_side, label):
+        """hs-<sender> talks into fed_room / invites; the peer's gate must
+        log zero homeserver requests from it, and the invite must fail
+        locally."""
+        peer_side = "b" if sender_side == "a" else "a"
+        sender = alice if sender_side == "a" else bob
+        peer_user = bob if sender_side == "a" else alice
+        before = compose.hs_requests(peer_side)
+        send_message(sender, fed_room, label)
+        room = create_room(sender)
+        status, resp = request_json(
+            "POST", sender.url("/_matrix/client/v3/rooms/{}/invite".format(
+                quote_room(room))),
+            body={"user_id": peer_user.user_id}, token=sender.access_token)
+        expect(status >= 400,
+               "invite to {} accepted after sever+restart: HTTP {} {!r}".format(
+                   peer_user.user_id, status, resp))
+        # Synapse's own FederationDeniedError: refused before any request
+        # left this homeserver (a peer-gate refusal reads differently).
+        expect("Federation denied" in str((resp or {}).get("error")),
+               "invite failed, but not by the local whitelist: {!r}".format(resp))
+        time.sleep(NEGATIVE_TIMEOUT)
+        after = compose.hs_requests(peer_side)
+        expect(after == before,
+               "hs-{} still sent {} request(s) to hs-{} after sever+restart".format(
+                   sender_side, after - before, peer_side))
+        return "invite refused locally (HTTP {}: {})".format(
+            status, (resp or {}).get("error"))
+
     def step_b_severs():
         resp = admin_b.sever("hs-a")
         expect(resp.get("state") == "severed" and resp.get("severed_by") == "local",
@@ -396,10 +546,24 @@ def main():
         cut_b2a = send_message(bob, fed_room, "b-severed-a")
         assert_never("alice seeing {!r}".format(cut_b2a),
                      lambda: cut_b2a in message_bodies(alice, fed_room))
+        before = compose.hs_requests("b")
         cut_a2b = send_message(alice, fed_room, "a-severed-b")
         assert_never("bob seeing {!r}".format(cut_a2b),
                      lambda: cut_a2b in message_bodies(bob, fed_room))
-        return "no traffic either way after hs-b severed"
+        # Positive control for the restart step below: before any restart
+        # hs-a still has hs-b whitelisted and DOES send; fedgate-b, the
+        # real-time gate, is what drops it.
+        expect(compose.hs_requests("b") > before,
+               "fedgate-b logged no hs-a traffic before the restart; the"
+               " access-log counter cannot prove anything")
+        return "no traffic either way after hs-b severed (fedgate-b dropped" \
+               " hs-a's attempts)"
+
+    def step_restart_after_b_sever():
+        restart_both({"a": ["hs-a"], "b": ["hs-b"]})
+        a = assert_no_hs_traffic("a", "a-after-restart")
+        b = assert_no_hs_traffic("b", "b-after-restart")
+        return "hs-a: {}; hs-b: {}".format(a, b)
 
     # --- phase 4+5: re-pair (B invites), then A severs -----------------------
 
@@ -414,14 +578,19 @@ def main():
                        peer_state_is(admin, name, "active"), 10)
         expect_facts(facts_a, "hs-b", "active", [("peer_paired", "hs-b", True)])
         expect_facts(facts_b, "hs-a", "active", [("peer_paired", "hs-a", True)])
-        # Both gates must reload the pairing table first; a transaction that
-        # hits a gate still holding the severed snapshot is sunk (dropped).
+        # Both homeservers still run the severed whitelist: restart them
+        # (A-R2). The gates reloaded the pairing table meanwhile.
+        restart_both({"a": ["hs-a", "hs-b"], "b": ["hs-a", "hs-b"]})
         time.sleep(GATE_REFRESH_GRACE)
         again = send_message(alice, fed_room, "a-repaired")
         wait_until("bob seeing {!r}".format(again),
                    lambda: again in message_bodies(bob, fed_room),
                    POSITIVE_TIMEOUT)
-        return "re-paired and delivering again"
+        back = send_message(bob, fed_room, "b-repaired")
+        wait_until("alice seeing {!r}".format(back),
+                   lambda: back in message_bodies(alice, fed_room),
+                   POSITIVE_TIMEOUT)
+        return "re-paired, restarted, delivering both ways again"
 
     def step_a_severs():
         resp = admin_a.sever("hs-b")
@@ -441,19 +610,35 @@ def main():
                      lambda: cut_b2a in message_bodies(alice, fed_room))
         return "no traffic either way after hs-a severed"
 
+    def step_restart_after_a_sever():
+        restart_both({"a": ["hs-a"], "b": ["hs-b"]})
+        # Severing an already-severed peer changes no list: no marker.
+        admin_a.sever("hs-b")
+        time.sleep(1)
+        for side in SIDES:
+            expect(not compose.marker(side),
+                   "repeat sever left a restart marker on {}".format(side))
+        detail = assert_no_hs_traffic("b", "b-after-final-restart")
+        return "repeat sever: no marker; hs-b: {}".format(detail)
+
     steps = [
         ("readiness", step_ready),
         ("users", step_users),
         ("unpaired servers cannot federate", step_unpaired),
         ("pair hs-a -> hs-b", step_pair),
+        ("whitelists rendered, homeservers restarted", step_restart_after_pair),
         ("federated invite/join/messages", step_federated_chat),
         ("relations: signed delivery, replay refused",
          lambda: federation_relations.step_active(rel)),
         ("hs-b severs unilaterally", step_b_severs),
         ("relations: non-active peer refused",
          lambda: federation_relations.step_inactive(rel)),
-        ("re-pair hs-b -> hs-a", step_repair),
+        ("sever + restart: no homeserver traffic to the peer",
+         step_restart_after_b_sever),
+        ("re-pair hs-b -> hs-a (+ restart)", step_repair),
         ("hs-a severs unilaterally", step_a_severs),
+        ("hs-a sever + restart, idempotent repeat leaves no marker",
+         step_restart_after_a_sever),
     ]
     for name, fn in steps:
         run_step(name, fn)

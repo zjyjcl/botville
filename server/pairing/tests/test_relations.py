@@ -311,6 +311,24 @@ class InboundTest(unittest.TestCase):
         self.assertEqual(self.app.relations_rejected, len(cases))
         self.assertEqual(self.events(), events)  # no fact events written
 
+    def test_rejection_log_is_throttled_but_always_counted(self):
+        # Same LogThrottle as the internal 401s (#243 review 2): one line
+        # per interval, the swallowed count reported in the next line.
+        with self.assertLogs("pairing.service", "WARNING") as logs:
+            for _ in range(5):
+                self.assertEqual(self.send(origin="hs-x")[0], 401)
+        lines = [r for r in logs.output if "relation message rejected" in r]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("1 rejected in total; 0 similar", lines[0])
+        self.assertEqual(self.app.relations_rejected, 5)
+        # Next interval: one line again, carrying the 4 suppressed ones.
+        self.app.relations_reject_log._next_at = 0.0
+        with self.assertLogs("pairing.service", "WARNING") as logs:
+            self.send(origin="hs-x")
+        self.assertIn("6 rejected in total; 4 similar warnings suppressed",
+                      logs.output[-1])
+        self.assertNotIn(SECRET, "".join(logs.output))
+
     def test_notify_severed_signature_cannot_be_replayed_here(self):
         body = self.envelope()
         ts, nonce = str(int(time.time())), "1f" * 16

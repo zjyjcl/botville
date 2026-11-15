@@ -14,22 +14,18 @@ gateway. Checked here:
 
 The replay/forged-sender checks need a correctly signed message from
 outside the send API, so a short stdlib snippet runs INSIDE pairing-a
-(`docker compose exec -T`, script passed via explicit stdin): it reads
+(`<--compose> exec -T`, the same Compose helper federation_e2e.py uses
+for the A-R2 restart steps; script passed via explicit stdin): it reads
 hs-a's per-peer shared secret from its own database, signs with the
 repo's pairing.relations module and prints only HTTP statuses and
 errcodes/request_ids -- never the secret.
 """
 
 import json
-import os
 import secrets
-import subprocess
 
 from smoke import expect, request_json
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-COMPOSE_FILE = os.path.join(HERE, "..", "compose", "federation",
-                            "docker-compose.federation.yml")
 RECORD = "/data/relations-recorder.jsonl"
 
 # Runs in pairing-a (python:3.12-slim, repo pairing code at /app/pairing).
@@ -67,10 +63,9 @@ def new_request_id(tag):
 
 
 class Relations:
-    def __init__(self, env_file, a_admin, b_admin, token_a, token_b):
-        self.compose = ["docker", "compose", "-p", "botville-fed",
-                        "-f", os.path.abspath(COMPOSE_FILE),
-                        "--env-file", os.path.abspath(env_file)]
+    def __init__(self, compose, a_admin, b_admin, token_a, token_b):
+        """`compose` is federation_e2e.Compose (built from --compose)."""
+        self.compose = compose
         self.a_admin = a_admin.rstrip("/")
         self.b_admin = b_admin.rstrip("/")
         self.token_a = token_a
@@ -84,13 +79,9 @@ class Relations:
             body={"destination": destination, "request_id": request_id,
                   "payload": {"e2e": True}}, token=token)
 
-    def _exec(self, service, argv, stdin_text):
-        proc = subprocess.run(
-            self.compose + ["exec", "-T", service] + argv,
-            input=stdin_text, capture_output=True, text=True, timeout=60)
-        expect(proc.returncode == 0, "compose exec {} failed ({}): {}".format(
-            service, proc.returncode, proc.stderr.strip()[-300:]))
-        return proc.stdout
+    def _exec(self, service, argv, stdin_text=None):
+        return self.compose.run("exec", "-T", service, *argv,
+                                input_text=stdin_text).stdout
 
     def signed_from_a(self, mode, request_id):
         out = self._exec("pairing-a", ["python", "-", mode, request_id],
@@ -101,8 +92,7 @@ class Relations:
     def recorded(self, service):
         """request_ids recorded by `service`'s test recorder (in order)."""
         out = self._exec(service, ["sh", "-c",
-                                   "cat {} 2>/dev/null || true".format(RECORD)],
-                         "")
+                                   "cat {} 2>/dev/null || true".format(RECORD)])
         return [json.loads(line)["envelope"]["request_id"]
                 for line in out.splitlines() if line.strip()]
 

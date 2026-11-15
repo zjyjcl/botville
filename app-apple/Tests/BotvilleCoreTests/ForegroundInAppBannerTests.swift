@@ -227,7 +227,8 @@ final class ForegroundInAppBannerTests: XCTestCase {
         let clock = TestClock()
         let store = ForegroundInAppBannerStore(displayDuration: .seconds(3), sleep: { duration in await clock.sleep(duration) })
         store.updateContext(isForeground: true, visibleRoomID: nil, isInputActive: false)
-        // ~10s apart: every event gets its own banner and its own full timer.
+        // Spaced events: the test only guarantees the previous banner has already
+        // expired before the next arrives; each gets its own banner and full timer.
         for index in 0 ..< 3 {
             let value = candidate(eventID: "$gap-\(index)", date: date.addingTimeInterval(Double(index) * 10))
             store.receive(value)
