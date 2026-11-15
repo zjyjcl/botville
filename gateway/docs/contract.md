@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# AI 网关契约 v1（草案 0.6.0）
+# AI 网关契约 v1（草案 0.7.0）
 
 > 任务：B0.1 · 里程碑 M0 · 评审：C 线（App）/ D 线（通知与开放 API）
 > 机器可读规范：[`gateway/openapi/gateway.v1.yaml`](../openapi/gateway.v1.yaml)
@@ -756,7 +756,7 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 **② 人设（B2.4 已实现）**
 
 - JSON 文件 `GATEWAY_PERSONAS_FILE`（空 = 没有人设 → 引擎**永不发言**，消费者
-  仍记录/计数）。可选 `bio` 必须为字符串，最多 500 Unicode 码点（Python `len(str)`，非字节）；显式 null 等同省略；其他类型或超长按既有人设校验抛 PersonaConfigError 拒绝启动，错误只含位置/字段/限制，不回显正文。仅 owner 可维护 personas 文件，模型不生成或修改 bio；0.6.0 的 PATCH 只写 groups，不写 bio。仓库只放**示例**：`gateway/examples/personas.example.json`；
+  仍记录/计数）。可选 `bio` 必须为字符串，最多 500 Unicode 码点（Python `len(str)`，非字节）；显式 null 等同省略；其他类型或超长按既有人设校验抛 PersonaConfigError 拒绝启动，错误只含位置/字段/限制，不回显正文。仅 owner 可维护 personas 文件，模型不生成或修改 bio；0.7.0 的 PATCH 只写 groups，不写 bio。仓库只放**示例**：`gateway/examples/personas.example.json`；
   **真实人设不进仓库**，用户自有人设不开源。
 - 结构：`{"personas": [...]}`，每项字段：
 
@@ -1268,7 +1268,7 @@ token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，�
 **⑬ 契约范围**
 
 除⑩ PR3c 已明确新增的 `/v1/memories*`、capability 和 OpenAPI 外，本节其余消费与引擎行为
-不改变 `/v1`；主动发言已在 0.5.0 落地，C 线按当前契约 0.6.0 接入，示例 manifest 由 C 线同步。
+不改变 `/v1`；主动发言已在 0.5.0 落地，C 线按当前契约 0.7.0 接入，示例 manifest 由 C 线同步。
 
 ---
 
@@ -1288,6 +1288,7 @@ token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，�
 | PATCH | `/personas/{persona_id}` | 已实现 groups；其他字段仍为规划 | 我的 AI |
 | DELETE | `/personas/{persona_id}` | 规划：角色删除 | 我的 AI |
 | GET | `/personas/{persona_id}/rooms` | owner 群列表与分页 | 我的 AI |
+| POST | `/personas/{persona_id}/rooms/lookup` | 将已知 room_id 批量映射到 room_ref | 我的 AI |
 | PATCH | `/personas/{persona_id}/rooms/{room_ref}` | 安静模式 / 退群 | 我的 AI |
 | GET/PATCH | `/personas/{persona_id}/state` | 已实现：owner mood 与公开开关 | 我的 AI |
 | GET | `/conversations` | 会话列表 | App |
@@ -1391,7 +1392,7 @@ AI 运行时                        网关                        Matrix
 未认证 401；legacy/无 owner 身份 403 `persona.not_owned`；非 owner、跨服、未知或非法
 persona id、无 owner persona 统一 404 `persona.not_found`，隐藏存在性。响应不缓存。
 
-rooms 集合仅支持 GET/HEAD，单项仅支持 PATCH；其他方法在相同 owner 鉴权后返回 405 `request.invalid`，带 `Allow` 头（集合 `GET, HEAD`，单项 `PATCH`）；非 owner 仍隐藏为 404 `persona.not_found`。
+rooms 集合仅支持 GET/HEAD，单项仅支持 PATCH，lookup 仅支持 POST；其他方法在相同 owner 鉴权后返回 405 `request.invalid`，带 `Allow` 头（集合 `GET, HEAD`，单项 `PATCH`，lookup `POST`）；非 owner 仍隐藏为 404 `persona.not_found`。
 
 - `GET /personas/{persona_id}/rooms`：默认仅 accepted/encrypted_disabled；`include=all` 也列
   left/rejected_encrypted。`limit` 为 1–200，默认 50。按 `(updated_at, room_ref)` 升序 keyset
@@ -1439,6 +1440,65 @@ fsync 后原子替换，并同步后续事件使用的内存人设。外部文�
 规划字段（包括 revision）和 If-Match 当前返回 400。文件型摘要 revision 仍为 1，不代表写入版本。
 部署应只运行一个文件写入者；外部管理程序应停止网关后修改并重启，不保证跨进程并发写安全。
 
+#### 2.4.1 POST /personas/{persona_id}/rooms/lookup（B2.8f，0.7.0）
+
+请求 `{"room_ids":["!known:example.invalid","!missing:example.invalid"]}`。
+响应 200（命中项与 GET rooms 列表中的 GroupRoom 完全相同）：
+
+```json
+{
+  "items": [
+    {
+      "room_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "state": "accepted",
+      "mode": "mention_only",
+      "joined_at": "2026-11-15T00:00:00Z",
+      "updated_at": "2026-11-15T00:00:00Z"
+    },
+    null
+  ],
+  "groups_enabled": true
+}
+```
+
+结果按下标与输入一一对应，未命中为 null；包括 left、encrypted_disabled、
+rejected_encrypted 在内的所有状态都可查，与 `include=all` 一致。
+
+只接受包含 room_ids 的 JSON 对象，不允许任何未知字段；room_ids 必须是 1–50 个字符串的数组。
+每个 ID 必须严格为 `!<localpart>:<server_name>`，整体长度不超过 255，不能含空白或控制字符；
+localpart 非空且只允许 `[A-Za-z0-9._~=\-]`。服务器名须与部署 server_name 忽略大小写完全相等，
+未配置 server_name 时一律视为非本服。别名、跨服、缺冒号及其他畸形输入全部拒绝。
+严格校验后判重：原字符串重复或只有服务器名大小写不同均拒绝；localpart 大小写仍有区别。
+HMAC 始终使用原始字符串，保持现有派生规则；服务器名大小写不同的单独查询可能未命中。
+以上错误及非 JSON、非对象体统一 400 `request.invalid`，title 为 `Room request rejected`，不反射输入。
+
+| 身份 / 条件 | 结果 |
+|---|---|
+| 无 token / 坏 token | 401，沿用 rooms 鉴权错误码 |
+| 站点 token 或其他已鉴权但无法确定 owner 的既有分支 | 403 `persona.not_owned` |
+| 非 owner、跨服或未知 persona | 404 `persona.not_found`，隐藏存在性 |
+| owner + POST | 校验并查询，成功 200 |
+| owner + GET/HEAD/PATCH/DELETE/PUT/其他方法 | 405 `request.invalid`，`Allow: POST`；HEAD 无响应体 |
+
+鉴权失败不带 Allow。owner 判定成功后、读体之前，共用 owner memory 每 caller 的读限流
+（60 次/分钟）；非 owner 不消耗 owner 配额。超限 429 `rate_limited.transport`，与 memory 相同
+Problem 形状，含 `Retry-After` 和 `retry_after_seconds`。PATCH rooms 不使用此配额，lookup 打满
+后仍可安静/退出。没有 memory_http 状态时不做该限流；存在状态但无 DB 时仍限流。
+
+使用当前 `group_key_id()` 和 `(persona_id, groups._key('room', 原始 room_id))`，在一次 store
+加锁内只读查询；旧 key_id 行返回 null。部署群开关关闭但有 DB 时照常查询，groups_enabled=false；
+没有 DB 时合法输入全部 null、groups_enabled=false，输入校验仍先做。groups_enabled 与 GET rooms
+同为 `bool(groups.enabled)`（部署开启且有 DB）。意外异常统一 503 `room.unavailable`。
+
+隐私边界：只能查到 App 已知 room_id 的房间；不提供反查或发现房间的入口。owner 不在的群
+不暴露 ID 和名字，App 继续显示序号。使用 POST 避免 room_id 进入 URL；响应、错误、访问日志、
+gateway 日志与 audit 不含输入 room_id；请求体不进日志。不落库、不写 audit、不改 schema，
+不调用 HS / transport。密钥轮换后清除旧映射，使用本地已知 room_id 重新 lookup 获取新 ref；
+只有当前 key_id 已存在的行能命中，lookup 不迁移或创建旧行。
+
+**room_ref 与 persona 无关，同一个群在不同 owner 的视图里 ref 相同，可跨 owner 关联，
+这是 B2.8d 起的已知现状，本轮不动。** 将 persona 纳入 HMAC 属于破坏性改动，本轮不实施。
+
 ## 3. 功能清单（Capability Manifest）规范
 
 ### 3.1 目的
@@ -1458,8 +1518,8 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 
 ```json
 {
-  "manifest_version": "1.3.0",
-  "contract_version": "0.6.0",
+  "manifest_version": "1.4.0",
+  "contract_version": "0.7.0",
   "generated_at": "2026-11-13T00:00:00Z",
   "cache_ttl_seconds": 300,
   "defaults": { "unknown_capability": "hidden", "card_fallback": "text" },
@@ -1482,13 +1542,13 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `id` | ✅ | 小写点分 ID，匹配 `^[a-z][a-z0-9]*(\.[a-z][a-z0-9_]*)*$`，如 `memory.search`。**发布后永不复用** |
-| `module` | ✅ | `core`/`role`/`memory`/`social`/`notify`/`bridge`/`town`，与仓库模块一致 |
+| `module` | ✅ | `core`/`role`/`memory`/`social`/`notify`/`bridge`/`town`/`groups`，与仓库模块一致 |
 | `version` | ✅ | 该能力自身的 semver |
 | `title` / `summary` | ✅ | 默认语言下的标题与一句话说明 |
 | `description` | ❌ | 详细说明 |
 | `icon` | ❌ | `{type: sf_symbol|url, value}` |
 | `status` | ✅ | `enabled` / `disabled` / `degraded` |
-| `unavailable_reason` | ❌ | 不可用/降级原因，如 `module_disabled`、`push_channel_degraded` |
+| `unavailable_reason` | ❌ | 不可用/降级原因，如 `module_disabled`、`push_channel_degraded`、`groups_disabled` |
 | `entry` | ✅ | 入口类型，见 3.4 |
 | `scopes` | ✅ | 调用所需网关 scope |
 | `requires` | ❌ | 依赖的其他能力 ID；依赖不可用时本能力也不可用 |
@@ -1497,6 +1557,7 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 | `min_app_version` | ❌ | 低于此版本的 App 不显示该能力（由服务端按 `?app_version=` 过滤） |
 | `i18n` | ❌ | 语言 → `{title, summary, description}`；缺失时回退顶层字段 |
 | `owner_can_read_dm` | ❌ | `memory.manage` 的 DM 可读披露布尔值，反映实际配置，默认 `false` |
+| `room_lookup` | ❌ | `groups.manage` 的布尔扩展字段；true 表示支持 POST /personas/{id}/rooms/lookup |
 
 ### 3.4 四种入口
 
@@ -1555,7 +1616,7 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 }
 ```
 
-清单版本为 `1.3.0`，`contract_version` 取网关配置（当前 `0.6.0`），缓存建议为 300 秒。
+清单版本为 `1.4.0`，`contract_version` 取网关配置（当前 `0.7.0`），缓存建议为 300 秒。
 无论记忆模块是否启用，均返回完整基础清单：`chat.direct`、`memory.search`、
 `notify.approvals`、`town.enter`，并保留各自状态、入口及 defaults；按 `module` / `status`
 查询时只返回匹配条目。基础元数据随代码打包，不在运行时读取 OpenAPI 示例文件。
@@ -1563,6 +1624,34 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 当记忆模块启用（`memory_store` 非空）时，在基础清单之外额外发布 `memory.manage`：`module: memory`、
 `scopes: ["memory.read", "memory.write"]`、`entry.type: native`、`entry.deep_link: botville://memories` 指向 App 原生记忆管理页，且
 `owner_can_read_dm` 反映 `GATEWAY_MEMORY_OWNER_CAN_READ_DM`（默认 false）；模块关闭时不得发布该 capability。`memory.search` 保留基础清单元数据，不代表本次实现了检索网页。
+
+#### groups.manage（B2.8f）
+
+清单末尾总是发布 `groups.manage`：module 为 groups、version 为 0.1.0、title 为“群聊”，
+summary 为“管理我的 AI 所在的群：安静模式与退出。”，SF Symbol 为 person.3，
+原生入口 `botville://personas`，scopes 为 `["groups.read","groups.write"]`，`room_lookup:true`，
+updated_at 为 `2026-11-15T00:00:00Z`。module/status 过滤同样适用。
+
+| 部署状态（读取 server.group_invites，与 GET rooms 同源） | status | unavailable_reason |
+|---|---|---|
+| 开关打开且有 memory DB | enabled | 不带此字段 |
+| 开关关闭但有 memory DB | degraded | groups_disabled |
+| 没有 memory DB | disabled | module_disabled |
+
+persona 自己的 `groups.enabled` 不进入能力清单：清单是部署级，对全体调用方相同，缓存 300 秒，
+不能表达某个 persona 的即时配置。App 只有在能力 enabled 且 persona `groups.enabled=true` 时
+才可设置 mention_only；仍须满足房间 state 允许设置 mode 的约束。degraded 时仅提供安静/退出。
+card source 的 module 开放枚举同步加入 groups，以遵守本章 module 对齐 Capability 的规则；
+unavailable_reason 是开放字符串，不新增封闭枚举。
+
+#### C 线同步清单（0.7.0）
+
+- 新增能力项 `groups.manage`；旧 App 遇到未知 native 能力按 `defaults.unknown_capability=hidden`
+  隐藏，兼容安全。App 不得硬编码模块列表，未知 module 按既有“其他”分组规则处理。
+- `manifest_version` 为 1.4.0，`contract_version` 为 0.7.0；示例与 App mock 已逐字节同步。
+- 群信息页对本地已知房间分批（每批最多 50）POST lookup，按下标建立 room_ref→本地房间映射；
+  owner 不在的群继续显示序号。null 不生成映射，轮换后用已知 room_id 重新查询。
+- enabled 与 persona 开关共同控制 mention_only；degraded 时只给安静/退出，不显示恢复发言入口。
 
 ### 3.7 命名约定
 
@@ -1908,7 +1997,7 @@ major（可在 `/v1` 内共存）。
 
 | 版本 | 位置 | 语义 |
 |---|---|---|
-| 契约版本（`0.6.0`） | `info.version`、`/health.contract_version`、manifest 的 `contract_version` | 整份契约的 semver |
+| 契约版本（`0.7.0`） | `info.version`、`/health.contract_version`、manifest 的 `contract_version` | 整份契约的 semver |
 | 接口主版本（`v1`） | 路径前缀、`servers` | 破坏性变更的分界 |
 | 功能清单版本 | `manifest_version` | 清单**内容**的变更 |
 | 能力版本 | `capability.version` | 单个能力自身演进 |
@@ -1963,6 +2052,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.7.0 | 2026-11-15 | [B2.8f] 新增 owner POST rooms/lookup：严格本服批量映射、只读限流、按下标返回且不回显 ID；新增部署级 groups.manage 与 room_lookup，manifest_version 1.4.0，三态映射及 C 线 mock 同步；room_ref 跨 owner 可关联的既有语义不变。 |
 | 0.6.0 | 2026-11-13 | [B2.8d] 新增 owner GET /personas/{id}/rooms 与 PATCH /personas/{id}/rooms/{room_ref}；owner 详情和 UpdatePersonaRequest 增加 groups；mention_only/muted 模式与退群、leave_pending 确认状态及 owner leave 持久清理；新增 room.not_found / room.state_conflict；group.replies_per_hour.exceeded 原因码正式纳入。汇总 B2.8 行为：严格双人 DM、群仅被提及/回复才发言、AI 不触发 AI、群节流与熔断、加密群 403 conversation.e2ee、HMAC 密钥轮换隔离及退出后禁止发送自动 rejoin；群节流/熔断计数以规范 persona 与规范 room 为键，别名与裸 id 不能绕过，key_id 回填先于 forget。 B2.8d2 评审清理：evaluate 解析失败 404/400 替代 500；rooms 错误方法鉴权后 405 + Allow；record_group_send 复用已解析 id；示例 title 与 0.5.0 残留表述修正；群功能关闭时引擎群回复 fail-closed、PATCH 仅 muted/leave、有 DB 的 GET 仍列出现有房间；无字段变化、不升版本。 B2.8d3：错误码表补 mood.unavailable/mood.disabled、/state 503 示例、rooms 405 响应、群关闭时仍记录群记忆说明、evaluate 404 示例 instance 修正；纯文档。 |
 | 0.5.0 | 2026-11-13 | [B2.8c #228] accepted 群冷却与滚动小时回复限额、群 ai_loop / anti_spam 底线（群内连续计数在人类发言时归零；默认 30/h 为滚动一小时硬底线，人类发言不重置）；schema 10→11 的 HMAC key_id 与轮换隔离/可选忘记旧行、上限只计当前键、发送层独立加密拦截；严格本服 room id、accepted 房间忽略不合格再邀请、拒绝 leave 的 M_FORBIDDEN 视为完成，以及 Synapse /sync invite 过滤说明修正。无 API 字段变化、契约仍 0.5.0。 |
 | 0.5.0 | 2026-11-13 | [#226 评审 nit] `/sync` 权威确认改为仅邀请的一次性请求（set_presence=offline、无 since、不消费 to-device）；leave 遇 `M_FORBIDDEN` 视为已离开并移出清理队列；格式异常的成员事件只跳过该事件；邀请台账 TTL（`GATEWAY_INVITE_LEDGER_TTL_SECONDS`，默认 1 天）。无 API 字段变化。 |
