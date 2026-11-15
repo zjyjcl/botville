@@ -1475,7 +1475,10 @@ localpart 非空且只允许 `[A-Za-z0-9._~=\-]`。服务器名须与部署 serv
 未配置 server_name 时一律视为非本服。别名、跨服、缺冒号及其他畸形输入全部拒绝。
 严格校验后判重：原字符串重复或只有服务器名大小写不同均拒绝；localpart 大小写仍有区别。
 HMAC 始终使用原始字符串，保持现有派生规则；服务器名大小写不同的单独查询可能未命中。
-以上错误及非 JSON、非对象体统一 400 `request.invalid`，title 为 `Room request rejected`，不反射输入。
+以上错误及请求体过大、JSON 无法解析、非对象体等读体校验错误统一返回 400 `request.invalid`，
+title 为 `Room request rejected`；不区分具体原因，不反射输入，也不保留底层 `detail`/`errors`。
+`Content-Length` 缺失、空白或为 0 时按空对象处理，随后因缺少 `room_ids` 返回相同的 400；
+非整数或负值也返回相同的 400。上述读体与输入校验均在 owner 鉴权和读限流通过后执行。
 
 | 身份 / 条件 | 结果 |
 |---|---|
@@ -1484,6 +1487,11 @@ HMAC 始终使用原始字符串，保持现有派生规则；服务器名大小
 | 非 owner、跨服或未知 persona | 404 `persona.not_found`，隐藏存在性 |
 | owner + POST | 校验并查询，成功 200 |
 | owner + GET/HEAD/PATCH/DELETE/PUT/其他方法 | 405 `request.invalid`，`Allow: POST`；HEAD 无响应体 |
+
+对字面路径 `/personas/{persona_id}/rooms/lookup` 发 PATCH 等非 POST 方法时，当前在 owner
+鉴权后返回 405 `request.invalid`，带 `Allow: POST`。其中 PATCH 在 0.6.0 中携带合法房间更新
+请求体时，会将 `lookup` 当作 `room_ref`；它不是 64 位十六进制房间引用，查询未命中后返回
+404 `room.not_found`。现在 `lookup` 不再被当作 `room_ref` 匹配；旧版其他不支持的方法已经返回 405。
 
 鉴权失败不带 Allow。owner 判定成功后、读体之前，共用 owner memory 每 caller 的读限流
 （60 次/分钟）；非 owner 不消耗 owner 配额。超限 429 `rate_limited.transport`，与 memory 相同
@@ -2057,7 +2065,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
-| 0.7.0 | 2026-11-15 | [B2.8f] 新增 owner POST rooms/lookup：严格本服批量映射、只读限流、按下标返回且不回显 ID；新增部署级 groups.manage 与 room_lookup，manifest_version 1.4.0，三态映射及 C 线 mock 同步；room_ref 跨 owner 可关联的既有语义不变。 |
+| 0.7.0 | 2026-11-15 | [B2.8f] 新增 owner POST rooms/lookup：严格本服批量映射、只读限流、按下标返回且不回显 ID；新增部署级 groups.manage 与 room_lookup，manifest_version 1.4.0，三态映射及 C 线 mock 同步；room_ref 跨 owner 可关联的既有语义不变。 B2.8g 文档：删除实现未输出的 instance 示例并对齐 title/detail，说明 /state 503 的 mood.unavailable 与 memory.unavailable 两种 code，更新关系归属与 POST /conversations 调用方措辞，ModuleStatus.name 加 groups，补充 lookup 读体错误统一 400 及字面路径 rooms/lookup 的 PATCH 从 404 room.not_found 变为非 POST 统一 405 request.invalid（Allow: POST）的说明；纯文档，不升版本。 |
 | 0.6.0 | 2026-11-13 | [B2.8d] 新增 owner GET /personas/{id}/rooms 与 PATCH /personas/{id}/rooms/{room_ref}；owner 详情和 UpdatePersonaRequest 增加 groups；mention_only/muted 模式与退群、leave_pending 确认状态及 owner leave 持久清理；新增 room.not_found / room.state_conflict；group.replies_per_hour.exceeded 原因码正式纳入。汇总 B2.8 行为：严格双人 DM、群仅被提及/回复才发言、AI 不触发 AI、群节流与熔断、加密群 403 conversation.e2ee、HMAC 密钥轮换隔离及退出后禁止发送自动 rejoin；群节流/熔断计数以规范 persona 与规范 room 为键，别名与裸 id 不能绕过，key_id 回填先于 forget。 B2.8d2 评审清理：evaluate 解析失败 404/400 替代 500；rooms 错误方法鉴权后 405 + Allow；record_group_send 复用已解析 id；示例 title 与 0.5.0 残留表述修正；群功能关闭时引擎群回复 fail-closed、PATCH 仅 muted/leave、有 DB 的 GET 仍列出现有房间；无字段变化、不升版本。 B2.8d3：错误码表补 mood.unavailable/mood.disabled、/state 503 示例、rooms 405 响应、群关闭时仍记录群记忆说明、evaluate 404 示例 instance 修正；纯文档。 |
 | 0.5.0 | 2026-11-13 | [B2.8c #228] accepted 群冷却与滚动小时回复限额、群 ai_loop / anti_spam 底线（群内连续计数在人类发言时归零；默认 30/h 为滚动一小时硬底线，人类发言不重置）；schema 10→11 的 HMAC key_id 与轮换隔离/可选忘记旧行、上限只计当前键、发送层独立加密拦截；严格本服 room id、accepted 房间忽略不合格再邀请、拒绝 leave 的 M_FORBIDDEN 视为完成，以及 Synapse /sync invite 过滤说明修正。无 API 字段变化、契约仍 0.5.0。 |
 | 0.5.0 | 2026-11-13 | [#226 评审 nit] `/sync` 权威确认改为仅邀请的一次性请求（set_presence=offline、无 since、不消费 to-device）；leave 遇 `M_FORBIDDEN` 视为已离开并移出清理队列；格式异常的成员事件只跳过该事件；邀请台账 TTL（`GATEWAY_INVITE_LEDGER_TTL_SECONDS`，默认 1 天）。无 API 字段变化。 |

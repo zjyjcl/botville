@@ -737,6 +737,9 @@ paths:
       description: |
         与 /rooms、/state 使用相同 owner 鉴权；非 owner 或未知 persona 返回 404 persona.not_found。
         POST 避免 room_id 进入 URL；响应按输入下标对应，不回显 room_id 或群名。
+        请求体过大、JSON 无法解析等读体校验错误统一返回 400 request.invalid，title 为 Room request rejected；
+        不区分具体原因，不反射输入，也不保留底层 detail/errors。Content-Length 缺失、空白或为 0 时按空对象
+        处理，随后因缺少 room_ids 返回相同的 400；非整数或负值也返回相同的 400。
         仅查当前 key_id，所有 state 均可返回，未命中为 null；不落库、不调 HS，日志和 audit 不含 room_id。
         部署群开关关闭但有 DB 时照常查询；无 DB 时合法输入返回全 null、groups_enabled=false。
         owner 判定成功后、读体前共用 owner memory 每 caller 60 次/分钟的读配额；
@@ -762,7 +765,7 @@ paths:
                   - null
                 groups_enabled: true
         '400':
-          description: 请求结构或 room_id 校验失败，不反射请求内容。
+          description: 请求结构、room_id 或读体校验失败（包括请求体过大、JSON 无法解析、Content-Length 非整数或负值）均为 400 request.invalid，title 为 Room request rejected；不区分原因、不反射输入、不保留底层 detail/errors。Content-Length 缺失、空白或为 0 时按空对象处理，随后因缺少 room_ids 返回相同错误。
           content:
             application/problem+json:
               schema: {$ref: '#/components/schemas/Problem'}
@@ -771,7 +774,7 @@ paths:
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
         '405':
-          description: '其他方法在 owner 鉴权后返回 405 request.invalid；Allow: POST。鉴权失败不带 Allow。'
+          description: '对字面路径 /personas/{persona_id}/rooms/lookup 发 PATCH 等非 POST 方法，在 owner 鉴权后返回 405 request.invalid；Allow: POST。0.6.0 中 PATCH 携带合法房间更新请求体时曾将 lookup 当作 room_ref，因其不是 64 位十六进制房间引用、查询未命中而返回 404 room.not_found；现在 lookup 不再按 room_ref 匹配。旧版其他不支持的方法已经返回 405。鉴权失败不带 Allow。'
           headers:
             Allow:
               schema: {type: string, const: POST}
@@ -5360,7 +5363,7 @@ components:
       properties:
         name:
           type: string
-          enum: [core, role, memory, social, notify, bridge, town]
+          enum: [core, role, memory, social, notify, bridge, town, groups]
         enabled:
           type: boolean
         status:
