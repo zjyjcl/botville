@@ -57,6 +57,15 @@ PROBLEM_MEDIA_TYPE = "application/problem+json"
 # example file -> JSON pointer to the schema it must satisfy.
 # Pointers target the contract itself, so a schema change breaks examples too.
 EXAMPLE_TARGETS = {
+    # B-R1 owner relations
+    "persona-relation.json": "#/components/schemas/PersonaRelation",
+    "persona-relation-page.json": "#/paths/~1personas~1{persona_id}~1relations/get/responses/200/content/application~1json/schema",
+    "create-persona-relation-request.json": "#/paths/~1personas~1{persona_id}~1relations/post/requestBody/content/application~1json/schema",
+    "relation-action-request.json": "#/paths/~1personas~1{persona_id}~1relations~1{relation_id}~1{action}/post/requestBody/content/application~1json/schema",
+    "problem-relation-state-conflict.json": "#/components/responses/RelationConflict/content/application~1problem+json/schema",
+    "problem-relation-revision-conflict.json": "#/components/responses/RelationConflict/content/application~1problem+json/schema",
+    "problem-relation-peer-inactive.json": "#/components/responses/RelationConflict/content/application~1problem+json/schema",
+    "problem-idempotency-conflict.json": "#/components/responses/RelationConflict/content/application~1problem+json/schema",
     "group-room.json": "#/components/schemas/GroupRoom",
     "group-room-list.json": "#/components/schemas/GroupRoomList",
     "update-group-room-request.json": "#/components/schemas/UpdateGroupRoomRequest",
@@ -678,12 +687,29 @@ def check_examples(document, report):
         else:
             report.ok(name + " detail example")
     public = document["components"]["schemas"]["PersonaPublicView"]
-    for key in ("owner_id", "model_binding", "credential_ref", "created_at", "updated_at", "visibility", "groups"):
+    for key in ("owner_id", "model_binding", "credential_ref", "created_at", "updated_at", "visibility", "groups", "relation_defaults"):
         payload = dict(public["example"], **{key: "forbidden"})
         if validate(payload, public, document):
             report.ok("public detail rejects " + key)
         else:
             report.fail("public detail rejects " + key, "unexpected field accepted")
+    relation_defaults = document["components"]["schemas"]["PersonaRelationDefaults"]
+    if validate({}, relation_defaults, document):
+        report.fail("relation defaults accepts empty object", "defaulted PATCH object rejected")
+    else:
+        report.ok("relation defaults accepts empty object")
+    for key in ("private_chat", "moments_visibility"):
+        if validate({key: "friends"}, relation_defaults, document):
+            report.ok("relation defaults rejects " + key)
+        else:
+            report.fail("relation defaults rejects " + key, "unimplemented field accepted")
+    relation = document["components"]["schemas"]["PersonaRelation"]
+    with open(os.path.join(EXAMPLES_DIR, "persona-relation.json"), encoding="utf-8") as handle:
+        relation_payload = json.load(handle)
+    if validate(dict(relation_payload, extra="forbidden"), relation, document):
+        report.ok("PersonaRelation rejects unknown fields")
+    else:
+        report.fail("PersonaRelation rejects unknown fields", "unexpected response field accepted")
     # Module versions and the C-line manifest fixture evolve independently.
     config_path = os.path.join(REPO_ROOT, "gateway", "src", "botville_gateway", "config.py")
     with open(config_path, encoding="utf-8") as handle:

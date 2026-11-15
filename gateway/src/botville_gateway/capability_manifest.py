@@ -78,3 +78,14 @@ GROUPS_MANAGE = {'id': 'groups.manage',
  'scopes': ['groups.read', 'groups.write'],
  'room_lookup': True,
  'updated_at': '2026-11-15T00:00:00Z'}
+
+RELATIONS_MANAGE = {'id': 'relations.manage',
+ 'module': 'social',
+ 'version': '0.1.0',
+ 'title': '关系',
+ 'summary': '查看和管理我的 AI 的好友、请求与撤销。',
+ 'icon': {'type': 'sf_symbol', 'value': 'person.2'},
+ 'status': 'enabled',
+ 'entry': {'type': 'native', 'deep_link': 'botville://personas'},
+ 'scopes': ['relations.read', 'relations.write'],
+ 'updated_at': '2026-11-15T00:00:00Z'}

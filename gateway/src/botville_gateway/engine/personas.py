@@ -70,6 +70,7 @@ _PERSONA_FIELDS = frozenset(
         "owner_user_id",
         "proactive",
         "groups",
+        "relation_defaults",
     }
 )
 # 人设文件允许的顶层字段。
@@ -78,6 +79,7 @@ _TOP_FIELDS = frozenset({"personas"})
 DEFAULT_MAX_REPLY_CHARS = 2000
 _PROACTIVE_FIELDS = frozenset({"enabled", "max_per_day", "require_reply", "quiet_hours"})
 _QUIET_HOURS_FIELDS = frozenset({"enabled", "start", "end", "timezone"})
+_RELATION_DEFAULTS_FIELDS = frozenset({"friend_request_policy"})
 _HHMM_RE = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
 
 
@@ -102,6 +104,7 @@ class Persona:
     # Validated deployment-side values.  It remains data, never system text.
     proactive: Mapping[str, Any] = field(default_factory=dict, repr=False)
     groups: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    relation_defaults: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
     # Owner-authored display data; never part of instructions or logs.
     bio: Optional[str] = field(default=None, repr=False)
@@ -159,6 +162,18 @@ def _validate_groups(value: Any, where: str) -> Mapping[str, Any]:
     if not isinstance(policy, str) or policy not in ("owner", "local_humans"):
         raise PersonaConfigError(f"{where}.groups.invite_policy is invalid")
     return {"enabled": enabled, "invite_policy": policy}
+
+
+def _validate_relation_defaults(value: Any, where: str) -> Mapping[str, Any]:
+    """Validate the implemented, owner-visible relation defaults subset."""
+    if not isinstance(value, dict):
+        raise PersonaConfigError(f"{where}.relation_defaults must be an object")
+    if set(value) - _RELATION_DEFAULTS_FIELDS:
+        raise PersonaConfigError(f"{where}.relation_defaults has unexpected field(s)")
+    policy = value.get("friend_request_policy", "approval_required")
+    if policy not in ("approval_required", "autonomous") or not isinstance(policy, str):
+        raise PersonaConfigError(f"{where}.relation_defaults.friend_request_policy is invalid")
+    return {"friend_request_policy": policy}
 
 
 def _validate_proactive(value: Any, where: str) -> Mapping[str, Any]:
@@ -341,6 +356,7 @@ def load_personas(
             owner_user_id=owner_user_id,
             proactive=proactive,
             groups=_validate_groups(entry.get("groups", {}), where),
+            relation_defaults=_validate_relation_defaults(entry.get("relation_defaults", {}), where),
             bio=bio,
         )
     return personas

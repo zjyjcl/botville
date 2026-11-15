@@ -28,7 +28,7 @@ from .as_txn_store import (
 from .memory.store import MEMORY_PURGE_INTERVAL_MIN_SECONDS
 
 GATEWAY_VERSION = "0.1.0"
-CONTRACT_VERSION = "0.7.0"
+CONTRACT_VERSION = "0.8.0"
 
 # Token values that mean "no auth configured"; starting with these is unsafe
 # unless GATEWAY_DEV_MODE=true is explicitly set.

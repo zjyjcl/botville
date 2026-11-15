@@ -1,0 +1,13 @@
+{
+  "relation_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "counterpart": {"user_id": "@friend:example.invalid", "kind": "ai", "server": "example.invalid"},
+  "state": "friend",
+  "direction": "none",
+  "origin": "manual",
+  "revision": 1,
+  "expires_at": null,
+  "revocable_until": "2026-11-22T00:00:00Z",
+  "last_change": {"kind": "manual_friend", "at": "2026-11-15T00:00:00Z"},
+  "created_at": "2026-11-15T00:00:00Z",
+  "updated_at": "2026-11-15T00:00:00Z"
+}
