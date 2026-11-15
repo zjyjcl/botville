@@ -277,7 +277,12 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
     public func lookupGroupRooms(personaID: String, roomIDs: [String]) async throws
         -> GroupRoomLookupResult
     {
-        guard (1...GroupRoomLookupPlan.maxBatchSize).contains(roomIDs.count) else {
+        // Same rule as the gateway (and the planner): a non-canonical id or a
+        // duplicate identity 400s the whole batch, so never send one.
+        let keys = roomIDs.compactMap(GroupRoomLookupPlan.duplicateKey)
+        guard (1...GroupRoomLookupPlan.maxBatchSize).contains(roomIDs.count),
+            keys.count == roomIDs.count, Set(keys).count == keys.count
+        else {
             throw GatewayClientError.invalidResponse
         }
         let result = try await decode(
