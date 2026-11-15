@@ -1,0 +1,57 @@
+// Copyright 2026 botville contributors
+// SPDX-License-Identifier: Apache-2.0
+
+@testable import BotvilleCore
+import Foundation
+import MatrixRustSDK
+import XCTest
+
+final class CryptoStoreDetectionTests: XCTestCase {
+    private var temporary: URL!
+
+    override func setUpWithError() throws {
+        temporary = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".build/crypto-store-tests/\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: temporary)
+    }
+
+    func testOnlyNonEmptyRegularCryptoDatabaseCountsAsIntactAndCheckCreatesNothing() throws {
+        let directory = SessionStoreDirectory(baseURL: temporary.appendingPathComponent("sessions"))
+        let storeID = UUID()
+        XCTAssertFalse(directory.hasCryptoStore(for: storeID))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.baseURL.path), "detection must not create the store")
+
+        let path = try directory.create(for: storeID)
+        XCTAssertFalse(directory.hasCryptoStore(for: storeID))
+        let file = path.appendingPathComponent(SessionStoreDirectory.cryptoDatabaseFileName)
+        try FileManager.default.createDirectory(at: file, withIntermediateDirectories: false)
+        XCTAssertFalse(directory.hasCryptoStore(for: storeID), "a directory with the database name is not a database")
+        try FileManager.default.removeItem(at: file)
+        try Data().write(to: file)
+        XCTAssertFalse(directory.hasCryptoStore(for: storeID), "zero-byte database has no Olm account")
+        try Data(repeating: 1, count: 16).write(to: file)
+        XCTAssertTrue(directory.hasCryptoStore(for: storeID))
+        XCTAssertFalse(directory.hasCryptoStore(for: UUID()), "another store ID is unaffected")
+    }
+
+    /// Guards the SDK-specific file name: the production client factory with the
+    /// real SDK must create the database exactly where detection looks. Offline:
+    /// restoring a fixture session builds local stores without any request.
+    @MainActor
+    func testRealSDKCreatesCryptoDatabaseWhereDetectionLooks() async throws {
+        let directory = SessionStoreDirectory(baseURL: temporary.appendingPathComponent("sdk"))
+        let storeID = UUID()
+        let path = try directory.create(for: storeID)
+        let service = MatrixService(sessionStore: InMemorySessionStore(), storeDirectory: directory, monitorNetwork: false)
+        let client = try await service.clientFactory("https://matrix.invalid", path, Data(repeating: 3, count: 32))
+        try await client.restoreSession(session: Session(
+            accessToken: "fixture-only", refreshToken: nil, userId: "@probe:matrix.invalid", deviceId: "PROBE",
+            homeserverUrl: "https://matrix.invalid", oauthData: nil, slidingSyncVersion: .none))
+        XCTAssertTrue(directory.hasCryptoStore(for: storeID),
+                      "SDK crypto database name or location changed; update SessionStoreDirectory.cryptoDatabaseFileName")
+    }
+}

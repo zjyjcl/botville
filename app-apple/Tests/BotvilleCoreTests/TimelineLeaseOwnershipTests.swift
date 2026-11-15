@@ -287,6 +287,7 @@ private struct LeaseFixture {
                                     sharedPushCredentialsCleanupStateStore: LeaseCleanupState(),
                                     storeDirectory: SessionStoreDirectory(baseURL: directory),
                                     discovery: LeaseDiscovery(), monitorNetwork: false, sharedRoomMuteStore: MemoryRoomMuteStore())
+        try SessionStoreDirectory(baseURL: directory).seedCryptoStoreForTesting(credentials.storeID)
         service.clientFactory = { _, _, _ in client }
         await service.restoreSession()
         return Self(service: service, room: room, timeline: timeline, directory: directory)

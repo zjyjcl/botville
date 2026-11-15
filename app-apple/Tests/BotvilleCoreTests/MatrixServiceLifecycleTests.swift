@@ -44,7 +44,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         let saved = testCredentials(userID: "@restore-shared:matrix.test")
         let sessionStore = InMemorySessionStore(saved)
         let sharedStore = InMemorySharedPushCredentialsStore()
-        _ = try SessionStoreDirectory(baseURL: temporary).create(for: saved.storeID)
+        try seedExistingStore(SessionStoreDirectory(baseURL: temporary), saved.storeID)
         let service = makeService(
             sessionStore: sessionStore,
             directory: temporary,
@@ -146,14 +146,14 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: temporary) }
         let allowed = SessionCredentials(accessToken: "test", refreshToken: nil, userID: "@debug:matrix.test", deviceID: "DEBUG", homeserverURL: "http://localhost:8028", oauthData: nil, storeID: UUID(), storeKey: Data(repeating: 4, count: 32), allowLocalHTTP: true)
         let allowedStore = InMemorySessionStore(allowed)
-        _ = try SessionStoreDirectory(baseURL: temporary).create(for: allowed.storeID)
+        try seedExistingStore(SessionStoreDirectory(baseURL: temporary), allowed.storeID)
         let allowedService = makeService(sessionStore: allowedStore, directory: temporary, client: FakeClient())
         await allowedService.restoreSession()
         XCTAssertTrue(allowedService.isLoggedIn)
 
         let denied = SessionCredentials(accessToken: "test", refreshToken: nil, userID: "@debug:matrix.test", deviceID: "DEBUG", homeserverURL: "http://127.0.0.1:8028", oauthData: nil, storeID: UUID(), storeKey: Data(repeating: 5, count: 32), allowLocalHTTP: false)
         let deniedStore = InMemorySessionStore(denied)
-        _ = try SessionStoreDirectory(baseURL: temporary).create(for: denied.storeID)
+        try seedExistingStore(SessionStoreDirectory(baseURL: temporary), denied.storeID)
         let deniedService = makeService(sessionStore: deniedStore, directory: temporary, client: FakeClient())
         await deniedService.restoreSession()
         XCTAssertNil(try deniedStore.load())
@@ -167,7 +167,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
             let saved = SessionCredentials(accessToken: "test", refreshToken: nil, userID: "@release:matrix.test", deviceID: "RELEASE", homeserverURL: homeserver, oauthData: nil, storeID: UUID(), storeKey: Data(repeating: 6, count: 32), allowLocalHTTP: true)
             let store = InMemorySessionStore(saved)
             let directory = SessionStoreDirectory(baseURL: temporary)
-            _ = try directory.create(for: saved.storeID)
+            try seedExistingStore(directory, saved.storeID)
             let service = MatrixService(sessionStore: store, storeDirectory: directory, discovery: PasswordDiscovery(), monitorNetwork: false)
             service.clientFactory = { _, _, _ in XCTFail("Release must reject stored HTTP before creating a client"); throw SessionStoreError.unavailable }
 
@@ -215,7 +215,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: temporary) }
         let saved = SessionCredentials(accessToken: "test", refreshToken: nil, userID: "@release:matrix.test", deviceID: "RELEASE", homeserverURL: "https://matrix.test", oauthData: nil, storeID: UUID(), storeKey: Data(repeating: 7, count: 32), allowLocalHTTP: true)
         let store = InMemorySessionStore(saved)
-        _ = try SessionStoreDirectory(baseURL: temporary).create(for: saved.storeID)
+        try seedExistingStore(SessionStoreDirectory(baseURL: temporary), saved.storeID)
         let service = makeService(sessionStore: store, directory: temporary, client: FakeClient())
         await service.restoreSession()
         XCTAssertTrue(service.isLoggedIn)
@@ -285,7 +285,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
             let saved = testCredentials(userID: "@delegate-\(testCase.isSoftLogout):matrix.test")
             let store = InMemorySessionStore(saved)
             let directory = SessionStoreDirectory(baseURL: temporary)
-            _ = try directory.create(for: saved.storeID)
+            try seedExistingStore(directory, saved.storeID)
             let client = FakeClient()
             let service = makeService(sessionStore: store, directory: temporary, client: client)
 
@@ -432,7 +432,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         let authentication = FakePasswordAuthentication()
         let service = MatrixService(sessionStore: store, sharedPushCredentialsStore: sharedStore, storeDirectory: SessionStoreDirectory(baseURL: temporary), discovery: PasswordDiscovery(), monitorNetwork: false, passwordAuthentication: authentication)
         service.clientFactory = { _, _, _ in try clients.next() }
-        _ = try SessionStoreDirectory(baseURL: temporary).create(for: saved.storeID)
+        try seedExistingStore(SessionStoreDirectory(baseURL: temporary), saved.storeID)
 
         await service.restoreSession()
         try await waitUntil { service.requiresPasswordReauthentication }
@@ -465,7 +465,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         let clients = ClientSequence([first, blocked])
         let service = MatrixService(sessionStore: store, storeDirectory: SessionStoreDirectory(baseURL: temporary), discovery: PasswordDiscovery(), monitorNetwork: false, passwordAuthentication: FakePasswordAuthentication())
         service.clientFactory = { _, _, _ in try clients.next() }
-        _ = try SessionStoreDirectory(baseURL: temporary).create(for: saved.storeID)
+        try seedExistingStore(SessionStoreDirectory(baseURL: temporary), saved.storeID)
 
         await service.restoreSession()
         try await waitUntil { service.requiresPasswordReauthentication }
@@ -495,7 +495,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         let authentication = FakePasswordAuthentication()
         let service = MatrixService(sessionStore: store, storeDirectory: SessionStoreDirectory(baseURL: temporary), discovery: PasswordDiscovery(), monitorNetwork: false, passwordAuthentication: authentication)
         service.clientFactory = { _, _, _ in try clients.next() }
-        _ = try SessionStoreDirectory(baseURL: temporary).create(for: saved.storeID)
+        try seedExistingStore(SessionStoreDirectory(baseURL: temporary), saved.storeID)
 
         await service.restoreSession()
         try await waitUntil { service.requiresPasswordReauthentication }
@@ -544,7 +544,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: temporary) }
         let saved = testCredentials(userID: "@offline-rooms:matrix.test")
         let sessionStore = InMemorySessionStore(saved)
-        _ = try SessionStoreDirectory(baseURL: temporary).create(for: saved.storeID)
+        try seedExistingStore(SessionStoreDirectory(baseURL: temporary), saved.storeID)
         let client = FakeClient(rooms: [FakeRoom(id: "!cached:matrix.test", name: "Cached room")])
         let service = makeService(sessionStore: sessionStore, directory: temporary, client: client)
 
@@ -561,7 +561,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         let temporary = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: temporary) }
         let saved = testCredentials(userID: "@banner:matrix.test")
-        _ = try SessionStoreDirectory(baseURL: temporary).create(for: saved.storeID)
+        try seedExistingStore(SessionStoreDirectory(baseURL: temporary), saved.storeID)
         let room = FakeRoom(id: "!banner:matrix.test", name: "本地房间")
         func event(_ timestamp: UInt64) -> LatestEventValue {
             .remote(timestamp: timestamp, sender: "@peer:matrix.test", isOwn: false, profile: .unavailable,
@@ -599,7 +599,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: temporary) }
         let saved = testCredentials(userID: "@cancel-after-rooms:matrix.test")
         let store = InMemorySessionStore(saved)
-        _ = try SessionStoreDirectory(baseURL: temporary).create(for: saved.storeID)
+        try seedExistingStore(SessionStoreDirectory(baseURL: temporary), saved.storeID)
         let client = FakeClient(
             rooms: [FakeRoom(id: "!cached:matrix.test", name: "Cached room")],
             blockQueueEnable: true
@@ -665,7 +665,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         let saved = testCredentials(userID: "@c21_transport:matrix.test")
         let sessionStore = InMemorySessionStore(saved)
         let directory = SessionStoreDirectory(baseURL: temporary)
-        _ = try directory.create(for: saved.storeID)
+        try seedExistingStore(directory, saved.storeID)
         let service = MatrixService(sessionStore: sessionStore, storeDirectory: directory, discovery: PasswordDiscovery(), monitorNetwork: false)
         service.clientFactory = { _, _, _ in throw URLError(.notConnectedToInternet) }
 
@@ -798,7 +798,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         let saved = testCredentials(userID: "@restore-expired:matrix.test")
         let store = InMemorySessionStore(saved)
         let directory = SessionStoreDirectory(baseURL: temporary)
-        _ = try directory.create(for: saved.storeID)
+        try seedExistingStore(directory, saved.storeID)
         let expired = ClientError.MatrixApi(kind: .unknownToken(softLogout: false), code: "M_UNKNOWN_TOKEN", msg: "expired", details: nil)
         let client = FakeClient(restoreError: expired)
         let service = makeService(sessionStore: store, directory: temporary, client: client)
@@ -817,7 +817,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         let saved = testCredentials(userID: "@restore-soft:matrix.test")
         let store = InMemorySessionStore(saved)
         let directory = SessionStoreDirectory(baseURL: temporary)
-        _ = try directory.create(for: saved.storeID)
+        try seedExistingStore(directory, saved.storeID)
         let softLogout = ClientError.MatrixApi(kind: .unknownToken(softLogout: true), code: "M_UNKNOWN_TOKEN", msg: "redacted", details: nil)
         let client = FakeClient(restoreError: softLogout)
         let service = makeService(sessionStore: store, directory: temporary, client: client)
@@ -849,7 +849,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         let saved = testCredentials(userID: "@soft-partial-clear:matrix.test")
         let store = FailFirstDeleteSessionStore(saved)
         let directory = SessionStoreDirectory(baseURL: temporary)
-        _ = try directory.create(for: saved.storeID)
+        try seedExistingStore(directory, saved.storeID)
         let softLogout = ClientError.MatrixApi(kind: .unknownToken(softLogout: true), code: "M_UNKNOWN_TOKEN", msg: "redacted", details: nil)
         let client = FakeClient(syncError: softLogout)
         let authentication = FakePasswordAuthentication()
@@ -1042,7 +1042,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: temporary) }
         let saved = testCredentials(userID: "@restore-limited:matrix.test")
         let store = InMemorySessionStore(saved)
-        _ = try SessionStoreDirectory(baseURL: temporary).create(for: saved.storeID)
+        try seedExistingStore(SessionStoreDirectory(baseURL: temporary), saved.storeID)
         let client = FakeClient(restoreError: AuthenticationError.rateLimited(retryAfter: 20))
         let service = makeService(sessionStore: store, directory: temporary, client: client)
         let task = Task { @MainActor in await service.restoreSession() }
@@ -1217,7 +1217,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         let temporary = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: temporary) }
         let credentials = testCredentials(userID: "@me:matrix.test")
-        _ = try SessionStoreDirectory(baseURL: temporary).create(for: credentials.storeID)
+        try seedExistingStore(SessionStoreDirectory(baseURL: temporary), credentials.storeID)
         let room = FakeRoom(id: "!push:matrix.test", name: "Push")
         let client = FakeClient(session: fakeSession(userID: "@me:matrix.test", deviceID: "C21TEST"), successfulSync: true, rooms: [room])
         let service = makeService(sessionStore: InMemorySessionStore(credentials), directory: temporary, client: client)
@@ -1248,7 +1248,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
     func testInitialSyncNotificationIsHistoryButNextNotificationIsLive() async throws {
         let temporary = try makeTemporaryDirectory(); defer { try? FileManager.default.removeItem(at: temporary) }
         let credentials = testCredentials(userID: "@me:matrix.test")
-        _ = try SessionStoreDirectory(baseURL: temporary).create(for: credentials.storeID)
+        try seedExistingStore(SessionStoreDirectory(baseURL: temporary), credentials.storeID)
         let client = FakeClient(session: fakeSession(userID: "@me:matrix.test", deviceID: "C21TEST"), successfulSync: true,
                                 rooms: [FakeRoom(id: "!push:matrix.test", name: "Push")])
         client.onSync = { [weak client] in
@@ -1273,7 +1273,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
     func testBackgroundSuppressesOnlyDeliveredEventIDsAndAllowsSameTimestampNewEvents() async throws {
         let temporary = try makeTemporaryDirectory(); defer { try? FileManager.default.removeItem(at: temporary) }
         let credentials = testCredentials(userID: "@me:matrix.test")
-        _ = try SessionStoreDirectory(baseURL: temporary).create(for: credentials.storeID)
+        try seedExistingStore(SessionStoreDirectory(baseURL: temporary), credentials.storeID)
         let client = FakeClient(session: fakeSession(userID: "@me:matrix.test", deviceID: "C21TEST"), successfulSync: true,
                                 rooms: [FakeRoom(id: "!push:matrix.test", name: "Push")])
         let service = makeService(sessionStore: InMemorySessionStore(credentials), directory: temporary, client: client)
@@ -1336,7 +1336,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
     func testNotificationDuringCancelledLongPollDrainStillPublishes() async throws {
         let temporary = try makeTemporaryDirectory(); defer { try? FileManager.default.removeItem(at: temporary) }
         let credentials = testCredentials(userID: "@me:matrix.test")
-        _ = try SessionStoreDirectory(baseURL: temporary).create(for: credentials.storeID)
+        try seedExistingStore(SessionStoreDirectory(baseURL: temporary), credentials.storeID)
         let client = FakeClient(session: fakeSession(userID: "@me:matrix.test", deviceID: "C21TEST"), successfulSync: true,
                                 rooms: [FakeRoom(id: "!push:matrix.test", name: "Push")])
         let service = makeService(sessionStore: InMemorySessionStore(credentials), directory: temporary, client: client)
@@ -1393,7 +1393,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         let temporary = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: temporary) }
         let credentials = testCredentials(userID: "@me:matrix.test")
-        _ = try SessionStoreDirectory(baseURL: temporary).create(for: credentials.storeID)
+        try seedExistingStore(SessionStoreDirectory(baseURL: temporary), credentials.storeID)
         let client = FakeClient(session: fakeSession(userID: "@me:matrix.test", deviceID: "C21TEST"), successfulSync: true,
                                 rooms: [FakeRoom(id: "!push:matrix.test", name: "Push")])
         let cache = MemoryRoomMuteStore()
@@ -1578,7 +1578,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: temporary) }
         let saved = SessionCredentials(session: fakeSession(userID: "@openid-test:matrix.test", deviceID: "TEST"),
             storeID: UUID(), storeKey: Data(repeating: 7, count: 32), gatewayURL: "https://gateway.test")
-        _ = try SessionStoreDirectory(baseURL: temporary).create(for: saved.storeID)
+        try seedExistingStore(SessionStoreDirectory(baseURL: temporary), saved.storeID)
         let client = FakeClient()
         let service = makeService(sessionStore: InMemorySessionStore(saved), directory: temporary, client: client)
         await service.restoreSession()
@@ -1662,6 +1662,7 @@ final class MatrixServiceLifecycleTests: XCTestCase {
         await service.applicationDidBecomeActive()
         XCTAssertFalse(service.isLoggedIn)
         XCTAssertEqual(client.restoreCalls, 0)
+        XCTAssertEqual(service.sessionError, Self.lostStoreMessage, "prompt must survive a foreground event")
     }
 
     func testRestoreWithClearedOrEmptyCryptoDatabaseForcesRelogin() async throws {
@@ -1818,7 +1819,11 @@ final class MatrixServiceLifecycleTests: XCTestCase {
             authenticationTimeout: 5,
             sharedRoomMuteStore: sharedRoomMuteStore
         )
-        service.clientFactory = { _, _, _ in client }
+        // Like the real SDK, building a client creates the crypto database.
+        service.clientFactory = { _, path, _ in
+            try Data(repeating: 1, count: 16).write(to: path.appendingPathComponent(SessionStoreDirectory.cryptoDatabaseFileName))
+            return client
+        }
         return service
     }
 

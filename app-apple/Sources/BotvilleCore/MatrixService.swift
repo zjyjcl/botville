@@ -431,6 +431,11 @@ public final class MatrixService: ObservableObject {
                       server.absoluteString == previous.homeserverURL else {
                     throw MatrixServiceError.storageUnavailable
                 }
+                // Re-authenticating with the old device ID is only safe while its
+                // Olm account still exists locally.
+                guard try directory().hasCryptoStore(for: previous.storeID) else {
+                    throw MatrixServiceError.cryptoStoreLost
+                }
             } else {
                 guard try sessionStore.load() == nil else { throw MatrixServiceError.storageUnavailable }
             }
@@ -478,6 +483,10 @@ public final class MatrixService: ObservableObject {
         } catch {
             await candidate?.enableAllSendQueues(enable: false)
             candidate = nil
+            if previous != nil, case MatrixServiceError.cryptoStoreLost? = error as? MatrixServiceError {
+                await discardSessionForLostCryptoStore()
+                throw error
+            }
             if let previous {
                 // A bad password, cancellation, or failed replacement token
                 // must not destroy a valid soft-logout store.
@@ -529,7 +538,9 @@ public final class MatrixService: ObservableObject {
                 try await performRestore()
             }
         } catch {
-            if let securityError = error as? SessionRestoreSecurityError {
+            if case MatrixServiceError.cryptoStoreLost? = error as? MatrixServiceError {
+                await discardSessionForLostCryptoStore()
+            } else if let securityError = error as? SessionRestoreSecurityError {
                 await clearSession()
                 canRetryRestore = false
                 canClearLocalSession = cleanupRequired
@@ -559,6 +570,11 @@ public final class MatrixService: ObservableObject {
             retrySharedPushCredentialsCleanupIfNeeded()
             if cleanupRequired { try cleanStoredSession() }
             guard let stored = try sessionStore.load() else { return }
+            // Check before anything touches the store path: `create(for:)` and the
+            // SDK would otherwise produce a fresh crypto store under the old device ID.
+            guard try directory().hasCryptoStore(for: stored.storeID) else {
+                throw MatrixServiceError.cryptoStoreLost
+            }
             credentials = stored
             // `allowLocalHTTP` is an old, persisted development choice.  A
             // Release binary must not inherit it from a Debug install.
@@ -1782,6 +1798,25 @@ public final class MatrixService: ObservableObject {
         didAttemptRestore = true
         sessionError = "会话需要重新输入密码；将使用当前设备 ID 重新登录，已加密的本地数据会保留。"
         isLoggingOut = false
+    }
+
+    /// #81: the saved device's encrypted store is gone. Drop the Keychain
+    /// session, shared push credentials and any local leftovers so the next
+    /// login gets a server-assigned device ID. Only local state is discarded;
+    /// no server endpoint (logout / delete device) is called.
+    private func discardSessionForLostCryptoStore() async {
+        await clearSession()
+        if !cleanupRequired {
+            // Leftover directories of other store IDs (e.g. a half-written one) go too.
+            try? directory().removeAll()
+        }
+        // didAttemptRestore stays true: a foreground event must not start another
+        // restore that would clear this prompt; login does not depend on it.
+        canRetryRestore = false
+        canClearLocalSession = cleanupRequired
+        sessionError = cleanupRequired
+            ? MatrixServiceError.storageUnavailable.localizedDescription
+            : MatrixServiceError.cryptoStoreLost.localizedDescription
     }
 
     private func clearSession() async {
