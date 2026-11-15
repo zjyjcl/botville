@@ -50,18 +50,26 @@ class MemoryHTTPState:
     def rate(self, caller, read):
         now = time.monotonic()
         with self.lock:
-            for key in list(self.rates):
-                queue = self.rates[key]
-                while queue and queue[0] <= now - WINDOW_SECONDS:
-                    queue.popleft()
-                if not queue:
-                    del self.rates[key]
-            queue = self.rates.setdefault((caller, read), deque())
-            cap = READS_PER_MINUTE if read else WRITES_PER_MINUTE
-            if len(queue) >= cap:
-                raise HTTPError(429, 'rate_limited.transport',
-                                max(1, math.ceil(queue[0] + WINDOW_SECONDS - now)))
-            queue.append(now)
+            retry = sliding_rate(self.rates, (caller, read),
+                                 READS_PER_MINUTE if read else WRITES_PER_MINUTE,
+                                 now, WINDOW_SECONDS)
+            if retry:
+                raise HTTPError(429, 'rate_limited.transport', retry)
+
+
+def sliding_rate(rates, key, cap, now, window):
+    """Shared bounded sliding-window accounting; caller owns synchronization."""
+    for old_key in list(rates):
+        queue = rates[old_key]
+        while queue and queue[0] <= now - window:
+            queue.popleft()
+        if not queue:
+            del rates[old_key]
+    queue = rates.setdefault(key, deque())
+    if len(queue) >= cap:
+        return max(1, math.ceil(queue[0] + window - now))
+    queue.append(now)
+    return 0
 
 
 def _remember_idempotency(state, caller, key, value):

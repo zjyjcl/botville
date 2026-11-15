@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 MEMORY_PURGE_INTERVAL_MIN_SECONDS = 60
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 OWNER_PIN_LIMIT = 200
 _log = logging.getLogger(__name__)
 
@@ -171,6 +171,30 @@ _MIGRATIONS = {
         """CREATE TABLE IF NOT EXISTS known_personas (
             persona_id TEXT PRIMARY KEY, first_seen_at REAL NOT NULL,
             baseline INTEGER NOT NULL CHECK(baseline IN (0,1)))""",
+    ),
+    13: (
+        """CREATE TABLE IF NOT EXISTS relation_federation (
+            persona_id TEXT NOT NULL, counterpart_id TEXT NOT NULL,
+            request_id TEXT NOT NULL, origin TEXT NOT NULL,
+            direction TEXT NOT NULL CHECK(direction IN ('incoming','outgoing')),
+            wire_state TEXT NOT NULL CHECK(wire_state IN ('pending','accepted','rejected','revoked','expired')),
+            expiry REAL NOT NULL, cooldown_until REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY(persona_id,counterpart_id))""",
+        """CREATE TABLE IF NOT EXISTS relation_inbound_idempotency (
+            origin TEXT NOT NULL, request_id TEXT NOT NULL, kind TEXT NOT NULL,
+            payload_hash TEXT NOT NULL, status INTEGER NOT NULL, response TEXT NOT NULL,
+            expires_at REAL NOT NULL, PRIMARY KEY(origin,request_id,kind))""",
+        """CREATE TABLE IF NOT EXISTS relation_peers (
+            server_name TEXT PRIMARY KEY, status TEXT NOT NULL CHECK(status IN ('active','severed')),
+            changed_at REAL NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS relation_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, persona_id TEXT NOT NULL,
+            counterpart_id TEXT NOT NULL, destination TEXT NOT NULL,
+            request_id TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL,
+            expiry REAL NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+            next_at REAL NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+            UNIQUE(persona_id,counterpart_id,request_id,kind))""",
+        """CREATE INDEX IF NOT EXISTS idx_relation_outbox_due ON relation_outbox(status,next_at)""",
     ),
 }
 

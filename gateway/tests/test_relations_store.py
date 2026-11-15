@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from botville_gateway.engine.personas import Persona
 from botville_gateway.memory.owner_http import HTTPError
-from botville_gateway.memory.store import MemoryStore, _MIGRATIONS
+from botville_gateway.memory.store import MemoryStore, _MIGRATIONS, SCHEMA_VERSION
 from botville_gateway.relations import Relations, WEEK
 
 SERVER = 'example.invalid'
@@ -72,7 +72,7 @@ class RelationsStoreTests(unittest.TestCase):
             store.close()
             for unused in range(2):
                 reopened = MemoryStore(path, hmac_secret=SECRET)
-                self.assertEqual(reopened._db.execute('SELECT version FROM memory_schema').fetchone()[0], 12)
+                self.assertEqual(reopened._db.execute('SELECT version FROM memory_schema').fetchone()[0], SCHEMA_VERSION)
                 self.assertEqual(reopened._db.execute('SELECT persona_id FROM known_personas').fetchone()[0], A)
                 self.assertEqual(reopened._db.execute('SELECT mode FROM group_rooms').fetchone()[0], 'muted')
                 for table in ('relations', 'relation_events', 'relation_tombstones'):
@@ -116,7 +116,7 @@ class RelationsStoreTests(unittest.TestCase):
             old.close()
             current = MemoryStore(path, hmac_secret=SECRET)
             try:
-                self.assertEqual(current._db.execute('SELECT version FROM memory_schema').fetchone()[0], 12)
+                self.assertEqual(current._db.execute('SELECT version FROM memory_schema').fetchone()[0], SCHEMA_VERSION)
                 self.assertEqual(dict(current._db.execute('SELECT * FROM memory_items').fetchone()), before)
                 self.assertEqual(current._db.execute('SELECT count(*) FROM relations').fetchone()[0], 0)
             finally:

@@ -2428,7 +2428,7 @@ paths:
       tags: [Personas]
       operationId: createPersonaRelation
       summary: 手动添加关系
-      description: 按本服 counterpart 的 persona 默认策略创建双向 AI 关系或单边人类关系。
+      description: 按本服 counterpart 的 persona 默认策略创建双向 AI 关系或单边人类关系。跨服在出站未配置时返回原有 400；已配置时建立 outgoing pending 并排队投递，对端 severed 返回 409 relation.peer_inactive，冷却期内返回 409 relation.state_conflict。
       security: [{matrixOpenIdToken: []}, {matrixUserToken: []}, {bearerAuth: []}]
       parameters: [{$ref: '#/components/parameters/PersonaId'}, {$ref: '#/components/parameters/IdempotencyKey'}]
       requestBody:
@@ -2855,7 +2855,7 @@ components:
         application/problem+json:
           schema: {$ref: '#/components/schemas/Problem'}
     RelationConflict:
-      description: 关系状态、revision 或幂等冲突；`relation.peer_inactive` 为跨服 B-R2 预留。
+      description: 关系状态、revision 或幂等冲突；跨服出站已配置但对端 severed 时返回 `relation.peer_inactive`（B-R2）。
       headers:
         X-Request-Id: {$ref: '#/components/headers/XRequestId'}
       content:

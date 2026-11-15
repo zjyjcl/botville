@@ -26,6 +26,7 @@ from .as_txn_store import (
     INVITE_LEDGER_TTL_MIN_SECONDS,
 )
 from .memory.store import MEMORY_PURGE_INTERVAL_MIN_SECONDS
+from .relations_outbound import OUTBOUND_TOKEN_ENV, OUTBOUND_URL_ENV
 
 GATEWAY_VERSION = "0.1.0"
 CONTRACT_VERSION = "0.8.0"
@@ -176,6 +177,21 @@ _CALLER_FIELD_SEP = ":"
 # §1.2.2：字段值不得含 `:`（字段分隔符）、`;`（条目分隔符）或换行；缺字段、空字段、
 # 字段数不为 3 → 拒绝启动（dev 也拒绝）。
 _CALLER_FIELD_FORBIDDEN_RE = re.compile(r"[:;\r\n]")
+
+
+def parse_relations_bind(value):
+    if value == '':
+        return None
+    try:
+        if not isinstance(value, str) or any(c.isspace() for c in value):
+            raise ValueError()
+        parsed = urllib.parse.urlsplit('//' + value)
+        if (not parsed.hostname or parsed.port is None or parsed.path or parsed.query
+                or parsed.fragment or parsed.username or parsed.password):
+            raise ValueError()
+        return parsed.hostname, parsed.port
+    except ValueError:
+        raise ConfigError('GATEWAY_RELATIONS_INBOUND_BIND must be host:port') from None
 
 
 class ConfigError(ValueError):
@@ -463,6 +479,10 @@ class Config:
     matrix_transport: str = "memory"
     homeserver_url: Optional[str] = None
     matrix_server_name: Optional[str] = None
+    relations_inbound_bind: str = ''
+    relations_inbound_token: str = field(default='', repr=False)
+    pairing_relations_url: str = ''
+    pairing_relations_token: str = field(default='', repr=False)
     # as_token 等同 @ai_* 命名空间管理员凭据：不进 repr（日志/断言消息不泄露）。
     as_token: Optional[str] = field(default=None, repr=False)
     # #114 PR-a：部署密钥，用于 txnId / text_sha256 的 HMAC。同样不进 repr。
@@ -592,6 +612,18 @@ class Config:
     mood_half_life_minutes: int = DEFAULT_MOOD_HALF_LIFE_MINUTES
 
     def __post_init__(self) -> None:
+        parse_relations_bind(self.relations_inbound_bind)
+        if self.pairing_relations_url:
+            try:
+                parsed = urllib.parse.urlsplit(self.pairing_relations_url)
+                valid = (parsed.scheme in ('http', 'https') and parsed.hostname
+                         and not parsed.username and not parsed.password
+                         and not parsed.query and not parsed.fragment)
+                parsed.port
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ConfigError('Invalid pairing relations URL: expected http/https base URL')
         # KEEP IN SYNC: deploy-side BOOLS in server/tests/test_compose_gateway_mood_proactive.py
         if not isinstance(self.group_forget_stale_keys, bool):
             raise ConfigError("GATEWAY_GROUP_FORGET_STALE_KEYS must be a boolean")
@@ -1257,6 +1289,10 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         # 由 Config 校验在 appservice 模式下拒绝启动（fail closed）。
         homeserver_url=_env_str(source, "GATEWAY_HOMESERVER_URL", "") or None,
         matrix_server_name=server_name,
+        relations_inbound_bind=_env_str(source, "GATEWAY_RELATIONS_INBOUND_BIND", ""),
+        relations_inbound_token=_env_str(source, "GATEWAY_RELATIONS_INBOUND_TOKEN", ""),
+        pairing_relations_url=_env_str(source, OUTBOUND_URL_ENV, ""),
+        pairing_relations_token=_env_str(source, OUTBOUND_TOKEN_ENV, ""),
         as_token=None if as_token in _INSECURE_TOKENS else as_token,
         hmac_secret=hmac_secret,
         room_alias_prefix=(

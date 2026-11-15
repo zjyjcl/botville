@@ -52,7 +52,7 @@ class Verifier:
 
 
 class MemoryHTTPServer:
-    def __init__(self, enabled=True, access_log=False, owner_can_read_dm=False, two_owners=False):
+    def __init__(self, enabled=True, access_log=False, owner_can_read_dm=False, two_owners=False, config_overrides=None):
         self.tmp = tempfile.mkdtemp(prefix='memory-owner-http-')
         personas = os.path.join(self.tmp, 'personas.json')
         rows = [
@@ -71,6 +71,7 @@ class MemoryHTTPServer:
                       hmac_secret=b'0123456789abcdef0123456789abcdef')
         if enabled:
             values['memory_db_path'] = os.path.join(self.tmp, 'memory.db')
+        values.update(config_overrides or {})
         self.server = build_server(Config(**values))
         self.server.user_verifier = Verifier()
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)

@@ -225,6 +225,10 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         # 本条只是注释，当前行为不变。
         if not super().parse_request():
             return False
+        if self.path.startswith('/_internal'):
+            self.close_connection = True
+            self._send_problem(404, 'not_found', 'Not Found')
+            return False
         normalized = _normalize_request_target(self.command, self.path)
         if normalized is None:
             self.close_connection = True
@@ -236,6 +240,11 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             )
             return False
         self.path = normalized
+        raw_path, _, route_path = self._route_path()
+        if raw_path.startswith('/_internal') or route_path.startswith('/_internal'):
+            self.close_connection = True
+            self._send_problem(404, 'not_found', 'Not Found')
+            return False
         return True
 
     def _route_path(self) -> Tuple[str, str, str]:
@@ -1506,6 +1515,11 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         self.relations = Relations(self.memory_store, self.memory_personas,
                                    server_name=config.matrix_server_name)
         self.relations.sync_known_personas(self.memory_personas)
+        from .relations_outbound import OutboundWorker
+        self.relations_outbound = OutboundWorker(self.relations.federation,
+            url=config.pairing_relations_url, token=config.pairing_relations_token)
+        self.relations.federation.worker = self.relations_outbound
+        self.relations_inbound = None
         from .groups import GroupInvites
         self.group_invites = GroupInvites(
             self.memory_store, transport, self.memory_personas,
@@ -1607,6 +1621,17 @@ class GatewayServer(http.server.ThreadingHTTPServer):
                     'Proactive inactive: requires memory DB, model and membership transport')
         log_startup_warnings(config)
         super().__init__((config.host, config.port), GatewayHandler)
+        from .config import parse_relations_bind
+        from .relations_inbound import InboundServer
+        address = parse_relations_bind(config.relations_inbound_bind)
+        try:
+            if address is not None:
+                self.relations_inbound = InboundServer(address, self.relations, config.relations_inbound_token)
+        except Exception:
+            self.server_close()
+            raise
+        if self.relations.available:
+            self.relations_outbound.start()
         # 监听端口绑定成功后才起消费线程：绑定失败（OSError）时不留下孤儿线程。
         if isinstance(transport, AppServiceMatrixTransport):
             transport.start_cleanup()
@@ -1721,6 +1746,12 @@ class GatewayServer(http.server.ThreadingHTTPServer):
 
     def server_close(self) -> None:
         """关闭监听前先停消费者，再停清理线程（未启用时为 no-op）。"""
+        inbound = getattr(self, 'relations_inbound', None)
+        if inbound is not None:
+            inbound.stop()
+            self.relations_inbound = None
+        outbound = getattr(self, 'relations_outbound', None)
+        outbound_stopped = outbound is None or outbound.stop()
         # 消费者先于清理线程停（避免清理线程 purge 后消费者还在处理已清理行）。
         from .matrix_appservice import AppServiceMatrixTransport
         if isinstance(getattr(self, "transport", None), AppServiceMatrixTransport):
@@ -1743,7 +1774,7 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         if memory_purger is not None:
             memory_purger.stop()
         memory_store = getattr(self, "memory_store", None)
-        if memory_store is not None and memory_worker_stopped:
+        if memory_store is not None and memory_worker_stopped and outbound_stopped:
             memory_store.close()
         super().server_close()
 

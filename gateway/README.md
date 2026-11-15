@@ -334,6 +334,10 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_AS_TXN_PURGE_INTERVAL_SECONDS` | `86400` | AS 事务保留期清理间隔（秒）：启动先跑一次，之后后台按间隔跑，失败只记日志（不记 token / 事件体）。`0` = 关闭（启动不跑、不起线程，库会持续增长）；非 0 时 **≥60**，否则拒绝启动。**校验与 `GATEWAY_AS_TXN_DB_PATH` 是否配置无关**。见 [docs/contract.md](docs/contract.md) §1.7.7 |
 | `GATEWAY_GROUP_MAX_RESPONDERS` | `3` | 每条群聊人类消息最多回复的 AI 数，按提及顺序；int，范围 1–20，非法/越界拒绝启动且错误不回显值。超出者跳过并计数，DM 不受影响 |
 | `GATEWAY_CONSUMER_ENABLED` | `false` | 进程内 AS 事务消费者（B 线 PR1，契约 §1.7.8）总开关。**默认 false = 行为与之前完全一致**（不起线程、不唤醒）。开启后：事务落库立即唤醒 + 5 秒兜底轮询，按 rowid 顺序消费，做事件分类 / trust / 防循环 / 计数并调用钩子。开启但 `GATEWAY_AS_TXN_DB_PATH` 未配置 → 启动 warning 且不起线程（不拒绝启动）；开启但未配置模型/人设 → 只记录计数，`/health` 不 degraded |
+| `GATEWAY_RELATIONS_INBOUND_BIND` | 空（关闭） | B-R2 独立入站监听 host:port；主端口 /_internal 始终 404 |
+| `GATEWAY_RELATIONS_INBOUND_TOKEN` | 空 | ≥32 字符；未配置或过短时入站一律 401，启动 warning 不含值 |
+| `GATEWAY_PAIRING_RELATIONS_URL` | 空 | 出站占位变量，待 A 线定名；http/https 基址，例如 http://pairing:8090 |
+| `GATEWAY_PAIRING_RELATIONS_TOKEN` | 空 | 出站占位变量，待 A 线拆分 PAIRING_SERVICE_TOKEN 后定名；与 URL 均非空才投递，未配置仍保存 outbox |
 | `GATEWAY_MEMORY_DB_PATH` | 空 | 可选记忆 SQLite 路径；空 = 关闭，继续 ring buffer；新库 0600、WAL，备份敏感 |
 | `GATEWAY_MEMORY_OWNER_CAN_READ_DM` | `false` | 主人是否可读 DM 正文/事实值；严格布尔解析，关闭仍可管理元数据和写入 |
 | `GATEWAY_MEMORY_RETENTION_DAYS` | `90` | 保留天数 ≥1；pinned 不到期，撤回仍删除 |

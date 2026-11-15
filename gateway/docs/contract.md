@@ -1465,8 +1465,12 @@ owner 视图为 `PersonaRelation`：
 RFC3339 UTC `Z`。变更在一个事务中 revision +1、写不含正文/密钥的 event，并把
 `revocable_until` 设为变更时刻后 7 天。它只是列表/撤销卡提示窗口，revoke 不因窗口结束而拒绝。
 
-`POST /personas/{id}/relations` 接收 `{counterpart_id}`。仅本服 Matrix user id，自己或跨服均为
-400 `request.invalid`（`relation.peer_inactive` 为 B-R2 预留，B-R1 不返回）。本服 AI 按对方
+`POST /personas/{id}/relations` 接收 `{counterpart_id}`。自己返回 400 `request.invalid`。
+跨服添加在出站 URL 或 token 未配置时仍返回原有 400 `request.invalid`；两者都配置时，
+对端 severed 返回 409 `relation.peer_inactive`（与既有 problem 示例一致），冷却期内返回
+409 `relation.state_conflict`，否则创建 outgoing pending（ULID request_id、7 天有效期），同事务
+写入 outbox request，返回 201 + 原有 `PersonaRelation`。已 friend/outgoing pending 仍为 200。
+不新增 owner 请求字段，出站 message 固定空串。跨服元数据与队列见 §2.5。本服 AI 按对方
 `relation_defaults.friend_request_policy`：autonomous 直接双向 friend；approval_required 建立
 outgoing/incoming pending（7 天过期）。人类直接单边 friend。已 friend 或 outgoing pending 返回
 200；首次没有该关系行时为 201，已有 stranger/blocked 等可变更行更新后为 200。对方 blocked 或被拒绝后的 7 天冷却期返回 409 `relation.state_conflict`。
@@ -1570,6 +1574,122 @@ gateway 日志与 audit 不含输入 room_id；请求体不进日志。不落库
 
 **room_ref 与 persona 无关，同一个群在不同 owner 的视图里 ref 相同，可跨 owner 关联，
 这是 B2.8d 起的已知现状，本轮不动。** 将 persona 纳入 HMAC 属于破坏性改动，本轮不实施。
+
+### 2.5 内部接口（跨服关系，B-R2）
+
+本节是 pairing 与网关之间的内部协议，不属于公开 API、不进 OpenAPI、不升
+`CONTRACT_VERSION`（仍为 0.8.0），capability manifest 与示例不变。公开 owner 错误继续
+遵守 §1.3；本节内部错误用下述 Matrix 风格 JSON，不使用 RFC 9457。
+
+**监听与鉴权。** `GATEWAY_RELATIONS_INBOUND_BIND` 默认空（关闭）；非空为 host:port，
+启动独立 ThreadingHTTPServer（支持测试端口 0、方括号 IPv6），随 GatewayServer 关闭。
+独立端口只处理 `/_internal/relations/<kind>`；其他路径 404，非 POST 为 405 + `Allow: POST`。
+主端口任何以 `/_internal` 开头的路径（含部署前缀剥离后），任意方法、任意令牌均 404。
+`Authorization: Bearer <token>` 使用 hmac.compare_digest 比较；入站 token 默认空，
+未配置、少于 32 字符、缺失、不符均 401 `M_UNKNOWN_TOKEN`。弱配置启动只打一条不含值的 warning。
+令牌不出现在日志、异常文本和响应体；请求正文与远端错误文本也不记录。
+
+**请求。** `POST /_internal/relations/request|respond|revoke`，顶层恰好三键：
+
+```json
+{"kind":"request","envelope":{"destination":"hs-b","kind":"request","origin":"hs-a","payload":{"from_user":"@ai_a:hs-a","to_user":"@ai_b:hs-b","from_kind":"ai","message":"Hello","created_at":1800000000,"expires_at":1800604800},"request_id":"01JD3Q7Z9F6V7K2N8W4X5Y6Z7A","v":1},"meta":{"origin":"hs-a","sent_at":1800000000,"received_at":1800000000}}
+```
+
+请求体及 envelope 各 ≤16 KiB；envelope 按 UTF-8、sort_keys、separators=(",",":")
+canonical JSON 计量，超限 400。拒绝重复 JSON 键、非 JSON 数字、未知或缺失字段。
+meta 恰好 origin/sent_at/received_at，两个时间均为整数秒（不接受 bool）。
+v 必须整数 1，kind 必须等于顶层及 URL kind；未知/不一致为 422 `relation.unsupported`。
+destination 是本服；from_user 的服务器 == envelope.origin == meta.origin（服务器名归一小写），
+否则 400 `relation.bad_payload`。to_user 必须是本服已知 persona，合法但不存在/外服目标为 404。
+request_id 为 16–64 位 `[0-9A-Za-z_-]`；本方生成 26 位 Crockford base32 ULID（stdlib），
+同一关系的 request/respond/revoke 复用该 ID。验签、±300s、nonce、active 门禁由 pairing 负责。
+
+| kind | payload 的全部字段 | 校验 |
+|---|---|---|
+| request | from_user, to_user, from_kind, message, created_at, expires_at | from_kind=ai/human；message 纯文本 ≤280 Unicode 码点，仅允许换行控制符；时间整数秒 |
+| respond | from_user, to_user, decision | decision=accept/reject；其他字符串 422，错误类型 400 |
+| revoke | from_user, to_user, reason | reason=withdrawn/unfriend；其他字符串 422，错误类型 400 |
+
+respond/revoke 的 from_user 仍是对端用户，to_user 是本服 persona。所有 payload 多余字段或类型错
+均 400。sent_at > now+300、created_at > sent_at+300 为 400；expiry=min(expires_at,sent_at+7 天)，
+now > expiry 为 410（等于 expiry 尚有效）；respond/revoke 使用已保存的请求 expiry。
+请求过期沿用 B-R1 惰性过期，本地变 stranger，wire state 变 expired，不写 tombstone。
+
+**响应与状态。** wire state 仅 pending/accepted/rejected/revoked/expired，由一个集中函数映射
+本地 B-R1 状态（friend→accepted，pending→pending，其余使用跨服元数据）。错误体为
+`{"errcode":"relation.*","error":"人话","request_id":"...","state":"可选"}`，
+不含 relation_id、persona 列表或内部 ID；尚未验证的 request_id 用 null。
+
+| HTTP | 结果/errcode | 说明 |
+|---|---|---|
+| 202 | accepted=true, request_id, state=pending | request 首次收下；approval_required → incoming pending |
+| 201 | request_id, state=accepted | autonomous → friend（同时发起除外） |
+| 200 | request_id, state=accepted/rejected/revoked | respond accept/reject 或 revoke 成功 |
+| 400 | relation.bad_payload | 格式、身份、时间或体积不合法，不使用 413 |
+| 403 | relation.peer_inactive | 仅本地记录 origin 已 severed |
+| 404 | relation.unknown_user | 目标不存在、目标已拉黑发送者或策略拒收，统一隐藏原因 |
+| 404 | relation.unknown_request | respond/revoke 不匹配该对端用户与 request_id |
+| 409 | relation.state_conflict | 状态机不允许，带当前 wire state |
+| 410 | relation.expired | 请求已过期，state=expired |
+| 422 | relation.unsupported | kind/decision/reason 不支持 |
+| 429 | relation.cooldown / relation.rate_limited | 带 retry_after_s |
+
+鉴权 401、方法 405 仅内部边界使用。内部失败 500；pairing 仅透传
+200/201/202/400/403/404/409/410/422/429，其他一律变 503 `BV_RELATIONS_UNAVAILABLE`。
+跨服拉黑/策略拒收一律 404，与同服 owner「对方拉黑 → 409」明确不同。
+策略预留 `FederationRelations.policy_allows`，目前恒允许。入站速率复用 owner memory 滑动窗口设施，
+按 origin 60 次/分钟与目标 persona 20 次/分钟两级限流，常量在 relations_federation.py。
+
+**幂等与事务。** schema 13 新增 relation_federation、relation_inbound_idempotency、
+relation_peers、relation_outbox，不改变 B-R1 列含义和公开字段。幂等键为 (origin,request_id,kind)，
+存 payload canonical SHA-256、首次状态码/响应体及 expires_at=请求 expiry+7 天；同 payload
+原样重放（202/201/业务错误也不变），不同 payload 409。过期记录惰性清理。400/401/422 不落键；
+通过身份检查后的 404/409/410/429 等业务回答都缓存。未知 request 的保留期使用 sent_at+7 天再加 7 天。
+幂等写入和状态变更同一 BEGIN IMMEDIATE 事务；进程内锁最长等待 100ms、SQLite busy_timeout=700ms。
+入站只落库，无网络调用，正常处理预算 1s；pairing 对网关超时为 5s，锁超时走 500 以触发对端重试。
+
+**状态机。** respond 只作用于 outgoing pending 的同 request_id；accept→friend，reject→stranger
+并冷却 7 天。withdrawn 只作用于 incoming pending，unfriend 只作用于 friend，成功均→stranger。
+owner approve/reject 对跨服行写出站 respond accept/reject；reject 同时冷却 7 天；revoke friend
+写 revoke unfriend，revoke outgoing pending 写 revoke withdrawn；block 仅本地 blocked 并取消待投递。
+跨服不产生 tombstone。冷却对同一双方生效：本方拒绝后或远端拒绝本方后，7 天内不能再发请求。
+
+**同时发起。** 本地已有 outgoing pending(r_local)，入站 request(r_in)：
+r_local < r_in → 409，响应 request_id=r_local、state=pending，本地不变；
+r_in < r_local → 取消旧 outbox，把行换为 incoming pending(r_in)，返回 202。
+相同 ID 而无幂等命中视为冲突。任何同时发起都不自动成为好友（即使 autonomous）。
+出站收到 409 且 request_id 不同，则停止重试、本地不改，等待对方请求。
+
+**对端切断。** relation_peers 保存 server_name→active/severed 与 changed_at；
+`mark_peer_severed` 把该服务器 pending/friend 全变 stranger、取消待投递；
+`mark_peer_active` 只改状态，不恢复关系。出站 409 BV_PEER_INACTIVE 或
+200 delivered:false + peer_status=403（BV_PEER_INACTIVE/M_FORBIDDEN）触发 severed；
+mark_peer_active 或一次 delivered:true 恢复 active。未知服务器无本地 severed 记录时允许尝试，
+实际配对 active 校验仍由 pairing 执行；当前不新增 pairing facts 网络客户端。
+
+**出站。** `relations_outbound.py` 唯一定义占位常量：
+`OUTBOUND_TOKEN_ENV="GATEWAY_PAIRING_RELATIONS_TOKEN"`（待 A 线拆分 PAIRING_SERVICE_TOKEN 后定名），
+`OUTBOUND_URL_ENV="GATEWAY_PAIRING_RELATIONS_URL"`（例如 http://pairing:8090）。两者默认空，均非空
+才已配置，config.py 引用常量；URL 仅 http/https，拒绝内嵌凭证及重定向转发。
+POST `{URL}/v1/pairing/internal/relations/<kind>`，Bearer 鉴权，body 恰好
+`{destination,request_id,payload}`，urllib 超时默认 10s 可注入。pairing 返回按
+`{delivered,peer_status,body}` 读取对端业务结果。outbox 与触发它的变更同事务；
+后台可停止，每轮最多投递一条；测试用 run_once(now)，不 sleep。未配置每轮跳过，不报错、不丢队列。
+
+| pairing 返回 | 处理 |
+|---|---|
+| 502 / 504；本地 429 M_LIMIT_EXCEEDED；200 delivered:false + peer_status=503 | 同 request_id/payload 重试：5s、30s、2m、10m、1h，此后每 1h |
+| 本地网络失败/超时 | 归入不可用 502，按同表重试，不记录异常文本 |
+| 401；200 delivered:false + peer_status=401 | 不重试，warning 提示检查凭证/重新配对 |
+| 409 BV_PEER_INACTIVE；delivered:false + peer 403 指定切断码 | 不重试，标记 severed |
+| 400；其它未列的传输错误 | 不重试 |
+| delivered:true，peer_status=202 / 201 / 200 | 保持 pending / friend / 按 body.state 同步 |
+| delivered:false，peer_status=409 | 按 state 同步；不同 request_id 的同时发起例外见上 |
+| delivered:false，peer_status=410 / 404 unknown_user / 429 cooldown | expired / stranger / stranger+冷却 |
+| 其它 delivered:false | 不重试，保留当前本地状态 |
+
+请求有效期结束后停止投递，outbox 标 expired；仍 pending 的关系变 expired。
+已取消、被新 request_id 替代或已完成的投递，其迟到结果不能覆盖新关系或解除 block。
 
 ## 3. 功能清单（Capability Manifest）规范
 
