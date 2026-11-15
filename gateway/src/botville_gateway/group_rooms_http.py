@@ -87,6 +87,73 @@ def room_page(groups, persona_id, query):
                 has_more=more, groups_enabled=bool(groups.enabled))
 
 
+def lookup_rooms(groups, persona_id, body):
+    if not isinstance(body, dict) or set(body) != {'room_ids'}:
+        raise RoomError()
+    room_ids = body['room_ids']
+    if not isinstance(room_ids, list) or not 1 <= len(room_ids) <= 50:
+        raise RoomError()
+    seen = set()
+    for room_id in room_ids:
+        if (not isinstance(room_id, str) or len(room_id) > 255
+                or any(c.isspace() or ord(c) < 32 or 127 <= ord(c) <= 159 for c in room_id)):
+            raise RoomError()
+        local, separator, server = room_id.partition(':')
+        if (not separator or not re.fullmatch(r'![A-Za-z0-9._~=\-]+', local)
+                or not groups.server_name or server.lower() != groups.server_name.lower()):
+            raise RoomError()
+        # Reject server-case aliases within a batch, but hash the original ID:
+        # changing HMAC input would break compatibility with existing room_refs.
+        canonical = (local, server.lower())
+        if canonical in seen:
+            raise RoomError()
+        seen.add(canonical)
+    if groups.store is None:
+        return dict(items=[None] * len(room_ids), groups_enabled=False)
+    with groups.store._lock:
+        key_id = groups.store.group_key_id()
+        items = []
+        for room_id in room_ids:
+            row = groups.store._db.execute(
+                'SELECT room_key,state,mode,joined_at,updated_at FROM group_rooms '
+                'WHERE persona_id=? AND room_key=? AND key_id=?',
+                (persona_id, groups._key('room', room_id), key_id)).fetchone()
+            items.append(room_item(row) if row is not None else None)
+    return dict(items=items, groups_enabled=bool(groups.enabled))
+
+
+def handle_lookup(handler, encoded_id):
+    from .memory.owner_http import HTTPError
+
+    persona = owner_persona(handler, encoded_id)
+    if persona is None:
+        return
+    try:
+        state = getattr(handler.server, 'memory_http', None)
+        if state is not None:
+            state.rate(persona.owner_user_id, read=True)
+        body, error = handler._read_json()
+        if error is not None:
+            raise RoomError()
+        result = lookup_rooms(handler.server.group_invites, persona.user_id, body)
+    except HTTPError as exc:
+        # Match memory's rate-limit wire format without writing an audit row.
+        body = handler._problem_body(exc.status, exc.code, exc.code)
+        headers = None
+        if exc.retry:
+            body['retry_after_seconds'] = exc.retry
+            headers = {'Retry-After': str(exc.retry)}
+        handler._send_json(exc.status, body, problem=True, extra_headers=headers)
+        return
+    except RoomError as exc:
+        handler._send_problem(exc.status, exc.code, 'Room request rejected')
+        return
+    except Exception:
+        handler._send_problem(503, 'room.unavailable', 'Room service unavailable')
+        return
+    handler._send_json(200, result)
+
+
 def handle(handler, encoded_id, encoded_ref=None):
     persona = owner_persona(handler, encoded_id)
     if persona is None:
