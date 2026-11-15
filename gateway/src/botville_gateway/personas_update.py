@@ -5,7 +5,8 @@ import os
 import tempfile
 from dataclasses import replace
 
-from .engine.personas import PersonaConfigError, _validate_groups, load_personas
+from .engine.personas import (PersonaConfigError, _validate_groups,
+                              _validate_relation_defaults, load_personas)
 from .group_rooms_http import owner_persona
 from .personas_list import persona_detail
 
@@ -19,10 +20,14 @@ def handle(handler, encoded_id):
         handler._send_json(error['status'], error, problem=True)
         return
     try:
-        if not body or set(body) != {'groups'} or handler.headers.get('If-Match') is not None:
+        if (not body or set(body) - {'groups', 'relation_defaults'}
+                or handler.headers.get('If-Match') is not None):
             raise PersonaConfigError('Unsupported update')
         # Same defaults and strict unknown-field validation as the startup loader.
-        groups = _validate_groups(body['groups'], 'persona')
+        groups = (_validate_groups(body['groups'], 'persona')
+                  if 'groups' in body else None)
+        relation_defaults = (_validate_relation_defaults(body['relation_defaults'], 'persona')
+                             if 'relation_defaults' in body else None)
     except PersonaConfigError:
         handler._send_problem(400, 'request.invalid', 'Invalid persona settings')
         return
@@ -44,7 +49,10 @@ def handle(handler, encoded_id):
             payload = json.loads(original)
             for entry in payload['personas']:
                 if entry['user_id'] == persona.user_id:
-                    entry['groups'] = groups
+                    if groups is not None:
+                        entry['groups'] = groups
+                    if relation_defaults is not None:
+                        entry['relation_defaults'] = relation_defaults
                     break
             fd, temporary = tempfile.mkstemp(prefix='.personas-', suffix='.json', dir=os.path.dirname(path) or '.')
             with os.fdopen(fd, 'w', encoding='utf-8') as target:
@@ -62,7 +70,12 @@ def handle(handler, encoded_id):
             temporary = None
             # The group controller and owner HTTP share this dictionary; engine
             # copies need the same immutable replacement for future events.
-            updated = replace(current, groups=groups)
+            updated = replace(
+                current,
+                groups=groups if groups is not None else current.groups,
+                relation_defaults=(relation_defaults if relation_defaults is not None
+                                   else current.relation_defaults),
+            )
             server.memory_personas[persona.user_id] = updated
             if server.engine_hooks is not None:
                 server.engine_hooks._personas[persona.user_id] = updated
