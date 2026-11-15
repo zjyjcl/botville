@@ -45,8 +45,9 @@ Pairing facts for the gateway (A-R1; service token, read-only):
          reused; omit `since` (= 0) to start at the beginning. A cursor
          whose following events were pruned (30-day retention) or that is
          ahead of the log (restored DB) gets 410 BV_CURSOR_EXPIRED with
-         `resync_cursor`: re-read the peers you track, then continue from
-         it.
+         `resync_cursor` = the prune watermark (every later event is still
+         retained): re-read the peers you track, then continue from it;
+         replayed facts must be handled idempotently.
   Auth: `Authorization: Bearer $PAIRING_SERVICE_TOKEN` (constant-time),
   a token distinct from the admin token. Unset token = every internal
   call is refused (401, fail-closed); the admin token is never accepted
@@ -128,7 +129,14 @@ MAX_BODY_BYTES = 65536
 PEER_HTTP_TIMEOUT = 15.0
 INVITE_ID_BYTES = 12  # urlsafe -> 16 chars
 SERVICE_TOKEN_MIN_CHARS = 32
-INTERNAL_PREFIX = "/v1/pairing/internal/"
+# A-R1 internal facts namespace. INTERNAL_ROOT (no trailing slash) and
+# everything under INTERNAL_PREFIX are internal: both go through service
+# auth, so the bare root can never fall through to another route.
+INTERNAL_ROOT = "/v1/pairing/internal"
+INTERNAL_PREFIX = INTERNAL_ROOT + "/"
+# At most one "internal request refused" warning per interval; the rest
+# are counted and reported in the next warning (#243 review 2).
+INTERNAL_REJECT_LOG_INTERVAL = 60.0
 FACTS_DEFAULT_LIMIT = 100
 FACTS_MAX_LIMIT = 500
 CURSOR_MAX_DIGITS = 18  # fits a signed 64-bit SQLite integer
@@ -390,6 +398,29 @@ def _parse_trusted_proxies(raw):
     return networks
 
 
+class LogThrottle:
+    """Rate-limit one repetitive warning: allow() is True at most once per
+    `interval` seconds and reports how many calls it swallowed since the
+    last allowed one. Thread-safe."""
+
+    def __init__(self, interval):
+        self.interval = interval
+        self._lock = threading.Lock()
+        self._next_at = 0.0
+        self._suppressed = 0
+
+    def allow(self, now=None):
+        """(allowed, suppressed_since_last_allowed)."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            if now >= self._next_at:
+                suppressed, self._suppressed = self._suppressed, 0
+                self._next_at = now + self.interval
+                return True, suppressed
+            self._suppressed += 1
+            return False, 0
+
+
 class PairingConfig:
     def __init__(self, db_path, admin_token, server_name, api_url,
                  invite_ttl=DEFAULT_INVITE_TTL, verify_peer_key=True,
@@ -498,12 +529,21 @@ class PairingApp:
         self.nonces = NonceGuard()
         self.notify_rejected = 0
         self.internal_rejected = 0
+        self._internal_rejected_lock = threading.Lock()
+        self.internal_reject_log = LogThrottle(INTERNAL_REJECT_LOG_INTERVAL)
+
         self.hs_whitelist = None
         if config.hs_whitelist_path:
             self.hs_whitelist = HsWhitelistWriter(
                 config.hs_whitelist_path, config.server_name,
                 marker_path=config.hs_restart_marker)
         self.hs_whitelist_failures = 0
+
+    def note_internal_rejected(self):
+        """Count one refused internal request; returns the new total."""
+        with self._internal_rejected_lock:
+            self.internal_rejected += 1
+            return self.internal_rejected
 
     def sync_hs_whitelist(self):
         """Re-render the homeserver whitelist from the peers table (A-R2).
@@ -645,14 +685,20 @@ class PairingHandler(BaseHTTPRequestHandler):
         """A-R1 pairing facts (read-only). Auth first, uniformly 401, so an
         unauthenticated caller learns nothing about routes or peers."""
         if not self._is_service():
-            self.app.internal_rejected += 1
-            log.warning("internal facts request refused from %s (%d refused"
-                        " in total)", self._client_ip(),
-                        self.app.internal_rejected)
+            total = self.app.note_internal_rejected()
+            allowed, suppressed = self.app.internal_reject_log.allow()
+            if allowed:
+                # Never the token; at most one line per interval so a
+                # misconfigured or hostile poller cannot flood the log.
+                log.warning("internal facts request refused from %s (%d"
+                            " refused in total; %d similar warnings"
+                            " suppressed since the last one)",
+                            self._client_ip(), total, suppressed)
             self._error(401, "M_UNKNOWN_TOKEN",
                         "internal endpoints need the pairing service token")
             return
-        rest = path[len(INTERNAL_PREFIX):]
+        rest = path[len(INTERNAL_PREFIX):] if path.startswith(INTERNAL_PREFIX) \
+            else ""  # the bare INTERNAL_ROOT names no endpoint
         if rest == "events":
             route = "events"
         elif rest.startswith("peers/") and len(rest) > len("peers/") \
@@ -749,7 +795,12 @@ class PairingHandler(BaseHTTPRequestHandler):
 
         # A-R1 internal facts: service token only, and never via the
         # /_matrix/pairing/ alias (that prefix is what fedgate forwards).
-        if path.startswith(INTERNAL_PREFIX) or path == INTERNAL_PREFIX.rstrip("/"):
+        # Decision (#243 review): the alias answers 404 BEFORE auth, even
+        # for the right token. /_matrix/pairing/ is the public namespace
+        # fedgate forwards; internal endpoints do not exist there, and a
+        # 401 would advertise an authenticated variant worth guessing
+        # tokens against on the public prefix.
+        if path == INTERNAL_ROOT or path.startswith(INTERNAL_PREFIX):
             if aliased:
                 self._error(404, "M_UNRECOGNIZED", "no such pairing endpoint")
                 return

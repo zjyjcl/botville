@@ -94,8 +94,8 @@ pairing 服务（错误统一 `{"errcode","error"}`；`/_matrix/pairing/<x>` 是
 - service token 与 admin token 相互独立：admin token 调内部端点一律 401，service token 调 admin 端点也一律 401。
 - 没配 `PAIRING_SERVICE_TOKEN` 时，内部端点对任何请求都返回 401（服务照常启动，启动日志 WARNING）。
 - 配了但短于 32 个字符、或与 admin token 相同 → 拒绝启动，报错不回显取值。
-- 鉴权在路由之前：缺 token / 错 token / 用 admin token，不论路径对不对，都是同一个 401 `M_UNKNOWN_TOKEN`，不泄露端点或对端是否存在。失败只记日志计数（含来源 IP，不含 token），不写 events。
-- 内部端点**不走** `/_matrix/pairing/` 别名（别名路径一律 404），fedgate 也只转发 redeem / notify-severed，所以对端永远够不着。只应在内网（compose 网络或 loopback）访问。
+- 鉴权在路由之前：缺 token / 错 token / 用 admin token，不论路径对不对，都是同一个 401 `M_UNKNOWN_TOKEN`，不泄露端点或对端是否存在。失败只计数（`internal_rejected`）并记 WARNING（含来源 IP，不含 token），日志每 60 秒最多一条、附带期间被压掉的条数（#243 审查第 2 条），不写 events。`/v1/pairing/internal`（无尾斜杠）同样先鉴权，通过后 404。
+- 内部端点**不走** `/_matrix/pairing/` 别名（别名路径一律 404，**在鉴权之前**、带不带正确 token 都一样：别名是 fedgate 转发的公共命名空间，那里不存在内部端点，回 401 反而暗示有个可以猜 token 的认证入口），fedgate 也只转发 redeem / notify-severed，所以对端永远够不着。只应在内网（compose 网络或 loopback）访问。
 
 **`GET /v1/pairing/internal/peers/{server_name}`** → `200 {"state": "active"|"severed"|"unpaired", "changed_at": ISO-8601|null}`
 - `changed_at`：active 取最近一次配对时间，severed 取切断时间，unpaired（从未配对）为 null。
@@ -103,15 +103,16 @@ pairing 服务（错误统一 `{"errcode","error"}`；`/_matrix/pairing/<x>` 是
 
 **`GET /v1/pairing/internal/events?since=<cursor>&limit=<1-500>`** → `200 {"events": [...], "next_cursor": N, "has_more": bool}`
 - 事件只有两类，按游标升序：
-  - `{"cursor", "kind": "peer_paired", "server_name", "at", "repaired"}`：每次进入 active 都写一条——redeem 方和 accept 方都写，重新配对也写，`repaired=true` 表示该服务器以前配对过；A-R1 之前的旧事件没有这个字段，返回 null。
+  - `{"cursor", "kind": "peer_paired", "server_name", "at", "repaired"}`：每次进入 active 都写一条——redeem 方和 accept 方都写，重新配对也写，`repaired=true` 表示写入前 `peers` 里已有这台服务器的行（以前配对过，不论当时是 severed 还是仍 active——仍 active 时再次配对同样是 true）；A-R1 之前的旧事件没有这个字段，返回 null。
   - `{"cursor", "kind": "peer_severed", "server_name", "at", "severed_by": "local"|"remote"}`：每次切断写一条；对已切断的行再收到对端通知不会重复写。
 - 事件与 `peers` 行的变化在**同一个事务**里提交，读到新状态就一定读得到对应事件。事件里没有 shared_secret、peer_api_url、invite 等字段。
 - **游标**：就是 `events.id`（`AUTOINCREMENT`）——严格递增、删除后也不复用；同一个游标重放得到同一页（稳定）。省略 `since` 等同 `since=0`（从头读）。`since` / `limit` 只能各出现一次，必须是非负十进制整数，其他参数一律 400。
 - `has_more=false` 时 `next_cursor` 会直接跳到当前最新事件 id（包括非配对类的审计事件），所以网关只要按 5–10 秒轮询，游标就不会因为长期没有配对变化而落到保留期之外。
 - **保留期 30 天的后果**：`events` 每小时清理 30 天前的行（invites 同理），清理时记下删掉的最大 id（`meta.events_pruned_through`）。
   - 游标 < 该水位：中间的事件可能已经删掉，无法保证不丢，返回 `410 {"errcode": "BV_CURSOR_EXPIRED", "reason": "cursor_pruned", "resync_cursor": N}`。
-  - 游标 > 当前最新 id（比如从旧备份恢复了 pairing 库）：同样返回 410，`reason` 是 `cursor_ahead_of_log`。
-  - 收到 410 时，网关先记下 `resync_cursor`，再对自己关心的每个服务器调 `peers/{name}` 重建状态，然后从 `resync_cursor` 继续轮询。这期间新到的事件会再处理一次，所以网关侧必须幂等。
+  - 游标 > 当前最新 id（比如从旧备份恢复或重建了 pairing 库）：同样返回 410，`reason` 是 `cursor_ahead_of_log`。
+  - 两种情况的 `resync_cursor` 都是**清理水位**（`meta.events_pruned_through`，从未清理过时为 0），不是最新 id：水位之后的事件都还在库里，从它继续读能拿到全部仍保留的事实，一条不跳（#243 审查第 1 条修正；之前取最新 id 会跳过水位到最新之间未删的事件）。
+  - 收到 410 时，网关先记下 `resync_cursor`，再对自己关心的每个服务器调 `peers/{name}` 重建状态，然后从 `resync_cursor` 继续轮询。水位之后的事件会被重放一遍（可能与刚查到的状态重复），所以网关侧必须幂等。
   - 网关停机超过 30 天、且期间有清理时一定会遇到 410；按上述步骤自愈即可。
 
 fedgate 路由规则：

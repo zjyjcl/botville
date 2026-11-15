@@ -99,9 +99,13 @@ class CursorExpired(Exception):
 
     Raised by fact_events() when events after the cursor were pruned
     (retention, 30 days) or when the cursor is ahead of the newest event
-    (e.g. the database was restored from an older backup). `resync_cursor`
-    is the newest event id: resync the peers you care about via
-    peer_fact(), then continue from it.
+    (e.g. the database was restored from an older backup or rebuilt).
+    `resync_cursor` is the prune watermark (`events_pruned_through`, 0 if
+    nothing was ever pruned): every event after it is still in the log,
+    so resync the peers you care about via peer_fact(), then continue
+    from it -- nothing still retained is skipped (#243 review 1; the
+    newest id would have skipped every retained fact in between). Facts
+    re-read this way are replayed, so consumers must be idempotent.
     """
 
     def __init__(self, reason, resync_cursor):
@@ -263,7 +267,7 @@ class PairingStore:
                 # between check_invite() / peer-key fetch and a concurrent
                 # local sever).
                 peer = self._conn.execute(
-                    "SELECT last_local_sever_at, state FROM peers"
+                    "SELECT last_local_sever_at FROM peers"
                     " WHERE server_name = ?",
                     (server_name,)).fetchone()
                 reason = None
@@ -385,22 +389,28 @@ class PairingStore:
         now = time.time() if now is None else now
         server_name = server_name.lower()
         with self._lock:
-            previous = self._conn.execute(
-                "SELECT state FROM peers WHERE server_name = ?",
-                (server_name,)).fetchone()
-            self._conn.execute(
-                "INSERT INTO peers (server_name, state, paired_at,"
-                " severed_at, severed_by, peer_api_url, shared_secret)"
-                " VALUES (?, 'active', ?, NULL, NULL, ?, ?)"
-                " ON CONFLICT(server_name) DO UPDATE SET"
-                "   state = 'active', paired_at = excluded.paired_at,"
-                "   severed_at = NULL, severed_by = NULL,"
-                "   peer_api_url = excluded.peer_api_url,"
-                "   shared_secret = excluded.shared_secret",
-                (server_name, now, api_url, shared_secret),
-            )
-            self._insert_paired_event(server_name, previous, now)
-            self._conn.commit()
+            try:
+                previous = self._conn.execute(
+                    "SELECT 1 FROM peers WHERE server_name = ?",
+                    (server_name,)).fetchone()
+                self._conn.execute(
+                    "INSERT INTO peers (server_name, state, paired_at,"
+                    " severed_at, severed_by, peer_api_url, shared_secret)"
+                    " VALUES (?, 'active', ?, NULL, NULL, ?, ?)"
+                    " ON CONFLICT(server_name) DO UPDATE SET"
+                    "   state = 'active', paired_at = excluded.paired_at,"
+                    "   severed_at = NULL, severed_by = NULL,"
+                    "   peer_api_url = excluded.peer_api_url,"
+                    "   shared_secret = excluded.shared_secret",
+                    (server_name, now, api_url, shared_secret),
+                )
+                self._insert_paired_event(server_name, previous, now)
+                self._conn.commit()
+            except Exception:
+                # Never leave the row change pending without its event: the
+                # next unrelated commit on this connection would publish it.
+                self._conn.rollback()
+                raise
 
     def sever_peer(self, server_name, by, now=None, only_if_active=False):
         """Mark a peer severed (`by` is 'local' or 'remote').
@@ -427,18 +437,22 @@ class PairingStore:
         if only_if_active:
             query += " AND state = 'active'"
         with self._lock:
-            cur = self._conn.execute(query, params)
-            changed = cur.rowcount > 0
-            if changed:
-                # Same commit as the state change (A-R1 facts feed): a
-                # reader never sees a severed row without its event.
-                self._conn.execute(
-                    "INSERT INTO events (at, kind, detail) VALUES (?, ?, ?)",
-                    (now, "peer_severed",
-                     json.dumps({"server_name": server_name,
-                                 "severed_by": by}, sort_keys=True)),
-                )
-            self._conn.commit()
+            try:
+                cur = self._conn.execute(query, params)
+                changed = cur.rowcount > 0
+                if changed:
+                    # Same commit as the state change (A-R1 facts feed): a
+                    # reader never sees a severed row without its event.
+                    self._conn.execute(
+                        "INSERT INTO events (at, kind, detail) VALUES (?, ?, ?)",
+                        (now, "peer_severed",
+                         json.dumps({"server_name": server_name,
+                                     "severed_by": by}, sort_keys=True)),
+                    )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
         return changed
 
     def invalidate_unused_invites(self, now=None):
@@ -533,10 +547,12 @@ class PairingStore:
         with self._lock:
             latest = self._latest_event_id()
             pruned = self._pruned_through()
+            # Both cases resume from the watermark: everything after it is
+            # still retained, so nothing still in the log is skipped.
             if since > latest:
-                raise CursorExpired("cursor_ahead_of_log", latest)
+                raise CursorExpired("cursor_ahead_of_log", pruned)
             if since < pruned:
-                raise CursorExpired("cursor_pruned", latest)
+                raise CursorExpired("cursor_pruned", pruned)
             rows = self._conn.execute(
                 "SELECT id, at, kind, detail FROM events"
                 " WHERE id > ? AND id <= ? AND kind IN ({})"
