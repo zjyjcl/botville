@@ -8,12 +8,12 @@ import unittest
 from unittest.mock import Mock, patch
 from urllib.parse import quote
 
-from botville_gateway.config import load_config
+from botville_gateway.config import ConfigError, load_config
 from botville_gateway.memory.owner_http import HTTPError
 from botville_gateway.memory.store import MemoryStore
 from botville_gateway.relations import Relations, WEEK
 from botville_gateway.relations_federation import ulid
-from botville_gateway.relations_outbound import (BACKOFF, OUTBOUND_TOKEN_ENV, OUTBOUND_URL_ENV,
+from botville_gateway.relations_outbound import (ADMIN_TOKEN_ENV, ALLOW_PRIVATE_ENV, BACKOFF, OUTBOUND_TOKEN_ENV, OUTBOUND_URL_ENV, SERVICE_TOKEN_ENV,
                                                OutboundWorker, transport)
 from test_relations_inbound import Fixture, REMOTE, RID, TOKEN
 from test_relations_store import A, B, SERVER, SECRET, personas
@@ -239,15 +239,55 @@ class OutboundTests(Fixture):
         for table in ('relations', 'relation_federation', 'relation_outbox', 'relation_events'):
             self.assertEqual(self.count(table), 0)
 
-    def test_placeholder_names_defined_once_and_config_uses_them(self):
+    def test_outbound_env_names_defined_once_and_config_uses_them(self):
         src = Path(__file__).resolve().parents[1]/'src'
-        contents = [p.read_text() for p in src.rglob('*.py')]
-        for name in (OUTBOUND_TOKEN_ENV, OUTBOUND_URL_ENV):
+        contents = [path.read_text() for path in src.rglob('*.py')]
+        for name in (OUTBOUND_TOKEN_ENV, OUTBOUND_URL_ENV, ALLOW_PRIVATE_ENV,
+                     ADMIN_TOKEN_ENV, SERVICE_TOKEN_ENV):
             self.assertEqual(sum(s.count(name) for s in contents), 1)
+        self.assertEqual(OUTBOUND_TOKEN_ENV, 'PAIRING_RELATIONS_SEND_TOKEN')
+        self.assertEqual(OUTBOUND_URL_ENV, 'GATEWAY_PAIRING_RELATIONS_URL')
         config = load_config({'GATEWAY_DEV_MODE':'true', OUTBOUND_URL_ENV:'http://pairing.invalid', OUTBOUND_TOKEN_ENV:TOKEN})
         self.assertEqual(config.pairing_relations_url, 'http://pairing.invalid')
         self.assertEqual(config.pairing_relations_token, TOKEN)
+        self.assertFalse(config.pairing_relations_allow_private)
         self.assertNotIn(TOKEN, repr(config))
+
+    def test_send_token_constraints_and_private_url_gate(self):
+        base = {'GATEWAY_DEV_MODE':'true', OUTBOUND_URL_ENV:'http://pairing:8090',
+                OUTBOUND_TOKEN_ENV:TOKEN}
+        config = load_config(base)
+        self.assertEqual(config.pairing_relations_url, 'http://pairing:8090')
+
+        short = dict(base, **{OUTBOUND_TOKEN_ENV:'too-short-to-be-valid'})
+        with self.assertRaises(ConfigError) as raised:
+            load_config(short)
+        self.assertIn(OUTBOUND_TOKEN_ENV, str(raised.exception))
+        self.assertNotIn('too-short-to-be-valid', str(raised.exception))
+
+        for other in (ADMIN_TOKEN_ENV, SERVICE_TOKEN_ENV):
+            env = dict(base, **{other: TOKEN})
+            with self.assertRaises(ConfigError) as raised:
+                load_config(env)
+            self.assertIn(other, str(raised.exception))
+            self.assertNotIn(TOKEN, str(raised.exception))
+
+        private = dict(base, **{OUTBOUND_URL_ENV:'http://127.0.0.1:8090'})
+        with self.assertRaises(ConfigError) as raised:
+            load_config(private)
+        self.assertIn(ALLOW_PRIVATE_ENV, str(raised.exception))
+        allowed = dict(private, **{ALLOW_PRIVATE_ENV:'true'})
+        config = load_config(allowed)
+        self.assertTrue(config.pairing_relations_allow_private)
+        self.assertEqual(config.pairing_relations_url, 'http://127.0.0.1:8090')
+
+        inbound_only = {'GATEWAY_DEV_MODE':'true',
+                        'GATEWAY_RELATIONS_INBOUND_BIND':'127.0.0.1:0',
+                        'GATEWAY_RELATIONS_INBOUND_TOKEN':TOKEN}
+        config = load_config(inbound_only)
+        self.assertEqual(config.pairing_relations_url, '')
+        self.assertEqual(config.pairing_relations_token, '')
+        self.assertFalse(config.pairing_relations_allow_private)
 
 
 class OwnerFederationTests(Fixture):

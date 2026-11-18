@@ -334,10 +334,11 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_AS_TXN_PURGE_INTERVAL_SECONDS` | `86400` | AS 事务保留期清理间隔（秒）：启动先跑一次，之后后台按间隔跑，失败只记日志（不记 token / 事件体）。`0` = 关闭（启动不跑、不起线程，库会持续增长）；非 0 时 **≥60**，否则拒绝启动。**校验与 `GATEWAY_AS_TXN_DB_PATH` 是否配置无关**。见 [docs/contract.md](docs/contract.md) §1.7.7 |
 | `GATEWAY_GROUP_MAX_RESPONDERS` | `3` | 每条群聊人类消息最多回复的 AI 数，按提及顺序；int，范围 1–20，非法/越界拒绝启动且错误不回显值。超出者跳过并计数，DM 不受影响 |
 | `GATEWAY_CONSUMER_ENABLED` | `false` | 进程内 AS 事务消费者（B 线 PR1，契约 §1.7.8）总开关。**默认 false = 行为与之前完全一致**（不起线程、不唤醒）。开启后：事务落库立即唤醒 + 5 秒兜底轮询，按 rowid 顺序消费，做事件分类 / trust / 防循环 / 计数并调用钩子。开启但 `GATEWAY_AS_TXN_DB_PATH` 未配置 → 启动 warning 且不起线程（不拒绝启动）；开启但未配置模型/人设 → 只记录计数，`/health` 不 degraded |
-| `GATEWAY_RELATIONS_INBOUND_BIND` | 空（关闭） | B-R2 独立入站监听 host:port；主端口 /_internal 始终 404 |
-| `GATEWAY_RELATIONS_INBOUND_TOKEN` | 空 | ≥32 字符；未配置或过短时入站一律 401，启动 warning 不含值 |
-| `GATEWAY_PAIRING_RELATIONS_URL` | 空 | 出站占位变量，待 A 线定名；http/https 基址，例如 http://pairing:8090 |
-| `GATEWAY_PAIRING_RELATIONS_TOKEN` | 空 | 出站占位变量，待 A 线拆分 PAIRING_SERVICE_TOKEN 后定名；与 URL 均非空才投递，未配置时保留已有 outbox，跨服手动添加返回 400 |
+| `GATEWAY_RELATIONS_INBOUND_BIND` | 空（关闭） | B-R2 独立入站监听 host:port；主端口 /_internal 始终 404。只给网关入站用，不要猜测或把这对变量透传给 pairing。pairing 的 `PAIRING_RELATIONS_GATEWAY=http` 目前仍拒绝启动（A 线尚未合入真正的 HTTP 客户端）。 |
+| `GATEWAY_RELATIONS_INBOUND_TOKEN` | 空 | ≥32 字符；未配置或过短时入站一律 401，启动 warning 不含值。不是出站令牌，也不要交给 pairing。 |
+| `GATEWAY_PAIRING_RELATIONS_URL` | 空 | 出站基址（A 线没有另定正式名，沿用此占位变量）。应指向 **pairing 进程本身**，不要填 `PAIRING_API_URL`（那是对端看到的公网 `/_matrix/pairing` 前缀）。主 compose 容器间用 `http://pairing:8090`，宿主机用 `http://127.0.0.1:${BOTVILLE_PAIRING_PORT:-8090}`。网关会再拼接 `/v1/pairing/internal/relations/<kind>`。仅 http/https，拒绝内嵌凭证、query、fragment。未配置时不投递、跨服手动添加仍返回 400。 |
+| `PAIRING_RELATIONS_SEND_TOKEN` | 空 | 出站发送令牌的正式名（A 线已定）。只用于 `Authorization: Bearer` 调 pairing 出站端点；≥32 字符，且不得等于 `PAIRING_ADMIN_TOKEN` 或 `PAIRING_SERVICE_TOKEN`（常量时间比较，错误信息不含值）。读配对事实仍用 `PAIRING_SERVICE_TOKEN`。与 URL 均非空才投递。联邦测试栈对应 `PAIRING_RELATIONS_SEND_TOKEN_A/B`。 |
+| `PAIRING_RELATIONS_ALLOW_PRIVATE` | `false` | 默认 false。`GATEWAY_PAIRING_RELATIONS_URL` 指向 loopback 或私网地址时必须设为 true，否则拒绝启动；只有联邦 CI 栈（以及宿主机访问 `127.0.0.1`）应打开。容器名 `http://pairing:8090` 不是字面私网 IP，默认允许。 |
 | `GATEWAY_MEMORY_DB_PATH` | 空 | 可选记忆 SQLite 路径；空 = 关闭，继续 ring buffer；新库 0600、WAL，备份敏感 |
 | `GATEWAY_MEMORY_OWNER_CAN_READ_DM` | `false` | 主人是否可读 DM 正文/事实值；严格布尔解析，关闭仍可管理元数据和写入 |
 | `GATEWAY_MEMORY_RETENTION_DAYS` | `90` | 保留天数 ≥1；pinned 不到期，撤回仍删除 |

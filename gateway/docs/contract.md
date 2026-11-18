@@ -1675,12 +1675,22 @@ r_in < r_local → 取消旧 outbox，把行换为 incoming pending(r_in)，返�
 mark_peer_active 或一次 delivered:true 恢复 active。未知服务器无本地 severed 记录时允许尝试，
 实际配对 active 校验仍由 pairing 执行；当前不新增 pairing facts 网络客户端。
 
-**出站。** `relations_outbound.py` 唯一定义占位常量：
-`OUTBOUND_TOKEN_ENV="GATEWAY_PAIRING_RELATIONS_TOKEN"`（待 A 线拆分 PAIRING_SERVICE_TOKEN 后定名），
-`OUTBOUND_URL_ENV="GATEWAY_PAIRING_RELATIONS_URL"`（例如 http://pairing:8090）。两者默认空，均非空
-才已配置，config.py 引用常量；URL 仅 http/https，拒绝内嵌凭证及重定向转发。
-POST `{URL}/v1/pairing/internal/relations/<kind>`，Bearer 鉴权，body 恰好
-`{destination,request_id,payload}`，urllib 超时默认 10s 可注入。pairing 返回按
+**出站。** 环境变量名集中在 `relations_outbound.py` 定义一次，config.py 只引用常量。
+出站令牌正式名是 `PAIRING_RELATIONS_SEND_TOKEN`：只用于发送，默认空，设置后必须
+≥32 字符，且不得等于 `PAIRING_ADMIN_TOKEN` 或 `PAIRING_SERVICE_TOKEN`（常量时间比较，
+错误与日志不含值）。读配对事实仍用 `PAIRING_SERVICE_TOKEN`。
+出站基址仍用网关占位名 `GATEWAY_PAIRING_RELATIONS_URL`（A 线没有单独的出站地址变量，也不另定正式名），
+默认空；应指向 pairing **进程本身** 的基址，不要用 `PAIRING_API_URL`（那是对端看到的公网
+`/_matrix/pairing` 前缀）。主 compose 容器间填 `http://pairing:8090`，宿主机填
+`http://127.0.0.1:${BOTVILLE_PAIRING_PORT:-8090}`。网关再拼接
+`/v1/pairing/internal/relations/<kind>`。URL 仅 http/https，拒绝内嵌凭证、query、fragment 及重定向转发。
+`PAIRING_RELATIONS_ALLOW_PRIVATE` 默认 false：字面 loopback/私网地址需显式打开（联邦 CI 或宿主机
+访问 127.0.0.1）；容器名 `pairing` 默认允许。令牌与 URL 均非空才已配置。
+反方向（pairing 把入站关系交给网关）只用 `GATEWAY_RELATIONS_INBOUND_BIND` /
+`GATEWAY_RELATIONS_INBOUND_TOKEN`，网关不得猜测或把这对变量透传给 pairing。
+pairing 的 `PAIRING_RELATIONS_GATEWAY=http` 目前仍拒绝启动。
+POST `{URL}/v1/pairing/internal/relations/<kind>`，`Authorization: Bearer` 使用
+`PAIRING_RELATIONS_SEND_TOKEN`，body 恰好 `{destination,request_id,payload}`，urllib 超时默认 10s 可注入。pairing 返回按
 `{delivered,peer_status,body}` 读取对端业务结果。outbox 与触发它的变更同事务；
 后台可停止，每轮最多投递一条；测试用 run_once(now)，不 sleep。未配置每轮跳过，不报错、不丢队列。
 
@@ -2267,7 +2277,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
-| 0.8.1 | 2026-11-18 | [B-R2] 新增跨服关系内部入站、出站和 schema 13。owner 跨服手动添加在出站未配置时仍返回 400，已配置且对端可用时新建返回 201 pending 并写入 outbox，对端 severed 返回 409 `relation.peer_inactive`。延续 `relations.manage`，manifest 升至 1.5.1 并同步 App mock。并入 #252 审查 nit 与 #246 遗留文档 nit。 |
+| 0.8.1 | 2026-11-18 | [B-R2] 新增跨服关系内部入站、出站和 schema 13。出站令牌正式名为 `PAIRING_RELATIONS_SEND_TOKEN`（≥32 字符，且不得等于 admin / `PAIRING_SERVICE_TOKEN`）；出站基址沿用占位名 `GATEWAY_PAIRING_RELATIONS_URL`，指向 pairing 进程（容器间 `http://pairing:8090`，宿主机 `http://127.0.0.1:${BOTVILLE_PAIRING_PORT:-8090}`），不要用 `PAIRING_API_URL`。`PAIRING_RELATIONS_ALLOW_PRIVATE` 默认 false。owner 跨服手动添加在出站未配置时仍返回 400，已配置且对端可用时新建返回 201 pending 并写入 outbox，对端 severed 返回 409 `relation.peer_inactive`。延续 `relations.manage`，manifest 升至 1.5.1 并同步 App mock。并入 #252 审查 nit 与 #246 遗留文档 nit。 |
 | 0.8.0 | 2026-11-15 | [B-R1] 新增 owner `/relations/*`、schema 12 关系存储、关系默认值与同服新增 AI 默认好友差集；新增 `relations.manage`，manifest 1.5.0，并同步 App mock。 |
 | 0.7.0 | 2026-11-15 | [B2.8f] 新增 owner POST rooms/lookup：严格本服批量映射、只读限流、按下标返回且不回显 ID；新增部署级 groups.manage 与 room_lookup，manifest_version 1.4.0，三态映射及 C 线 mock 同步；room_ref 跨 owner 可关联的既有语义不变。 B2.8g 文档：删除实现未输出的 instance 示例并对齐 title/detail，说明 /state 503 的 mood.unavailable 与 memory.unavailable 两种 code，更新关系归属与 POST /conversations 调用方措辞，ModuleStatus.name 加 groups，补充 lookup 读体错误统一 400 及字面路径 rooms/lookup 的 PATCH 从 404 room.not_found 变为非 POST 统一 405 request.invalid（Allow: POST）的说明；纯文档，不升版本。 |
 | 0.6.0 | 2026-11-13 | [B2.8d] 新增 owner GET /personas/{id}/rooms 与 PATCH /personas/{id}/rooms/{room_ref}；owner 详情和 UpdatePersonaRequest 增加 groups；mention_only/muted 模式与退群、leave_pending 确认状态及 owner leave 持久清理；新增 room.not_found / room.state_conflict；group.replies_per_hour.exceeded 原因码正式纳入。汇总 B2.8 行为：严格双人 DM、群仅被提及/回复才发言、AI 不触发 AI、群节流与熔断、加密群 403 conversation.e2ee、HMAC 密钥轮换隔离及退出后禁止发送自动 rejoin；群节流/熔断计数以规范 persona 与规范 room 为键，别名与裸 id 不能绕过，key_id 回填先于 forget。 B2.8d2 评审清理：evaluate 解析失败 404/400 替代 500；rooms 错误方法鉴权后 405 + Allow；record_group_send 复用已解析 id；示例 title 与 0.5.0 残留表述修正；群功能关闭时引擎群回复 fail-closed、PATCH 仅 muted/leave、有 DB 的 GET 仍列出现有房间；无字段变化、不升版本。 B2.8d3：错误码表补 mood.unavailable/mood.disabled、/state 503 示例、rooms 405 响应、群关闭时仍记录群记忆说明、evaluate 404 示例 instance 修正；纯文档。 |

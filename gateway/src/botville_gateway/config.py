@@ -26,7 +26,14 @@ from .as_txn_store import (
     INVITE_LEDGER_TTL_MIN_SECONDS,
 )
 from .memory.store import MEMORY_PURGE_INTERVAL_MIN_SECONDS
-from .relations_outbound import OUTBOUND_TOKEN_ENV, OUTBOUND_URL_ENV
+from .relations_outbound import (
+    ADMIN_TOKEN_ENV,
+    ALLOW_PRIVATE_ENV,
+    OUTBOUND_TOKEN_ENV,
+    OUTBOUND_URL_ENV,
+    SERVICE_TOKEN_ENV,
+    validate_outbound_settings,
+)
 
 GATEWAY_VERSION = "0.1.0"
 CONTRACT_VERSION = "0.8.1"
@@ -483,6 +490,7 @@ class Config:
     relations_inbound_token: str = field(default='', repr=False)
     pairing_relations_url: str = ''
     pairing_relations_token: str = field(default='', repr=False)
+    pairing_relations_allow_private: bool = False
     # as_token 等同 @ai_* 命名空间管理员凭据：不进 repr（日志/断言消息不泄露）。
     as_token: Optional[str] = field(default=None, repr=False)
     # #114 PR-a：部署密钥，用于 txnId / text_sha256 的 HMAC。同样不进 repr。
@@ -613,17 +621,14 @@ class Config:
 
     def __post_init__(self) -> None:
         parse_relations_bind(self.relations_inbound_bind)
-        if self.pairing_relations_url:
-            try:
-                parsed = urllib.parse.urlsplit(self.pairing_relations_url)
-                valid = (parsed.scheme in ('http', 'https') and parsed.hostname
-                         and not parsed.username and not parsed.password
-                         and not parsed.query and not parsed.fragment)
-                parsed.port
-            except ValueError:
-                valid = False
-            if not valid:
-                raise ConfigError('Invalid pairing relations URL: expected http/https base URL')
+        try:
+            validate_outbound_settings(
+                self.pairing_relations_url,
+                self.pairing_relations_token,
+                allow_private=self.pairing_relations_allow_private,
+            )
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
         # KEEP IN SYNC: deploy-side BOOLS in server/tests/test_compose_gateway_mood_proactive.py
         if not isinstance(self.group_forget_stale_keys, bool):
             raise ConfigError("GATEWAY_GROUP_FORGET_STALE_KEYS must be a boolean")
@@ -1258,7 +1263,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
     if server_name is not None:
         # 统一小写 + 形状校验（大小写漂移会让 @ai_* 命名空间两侧对不上）。
         server_name = normalize_matrix_server_name(server_name)
-    return Config(
+    config = Config(
         host=_env_str(source, "GATEWAY_HOST", "127.0.0.1"),
         # 环境变量里的 0 会随机选端口，对部署是事故；仅测试直接构造 Config(port=0)。
         port=_env_int_range(
@@ -1293,6 +1298,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         relations_inbound_token=_env_str(source, "GATEWAY_RELATIONS_INBOUND_TOKEN", ""),
         pairing_relations_url=_env_str(source, OUTBOUND_URL_ENV, ""),
         pairing_relations_token=_env_str(source, OUTBOUND_TOKEN_ENV, ""),
+        pairing_relations_allow_private=_env_bool(source, ALLOW_PRIVATE_ENV, False),
         as_token=None if as_token in _INSECURE_TOKENS else as_token,
         hmac_secret=hmac_secret,
         room_alias_prefix=(
@@ -1498,3 +1504,14 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         mood_enabled=_env_bool(source, "GATEWAY_MOOD_ENABLED", False),
         mood_half_life_minutes=_env_mood_half_life(source),
     )
+    try:
+        validate_outbound_settings(
+            config.pairing_relations_url,
+            config.pairing_relations_token,
+            allow_private=config.pairing_relations_allow_private,
+            admin_token=_env_str(source, ADMIN_TOKEN_ENV, ""),
+            service_token=_env_str(source, SERVICE_TOKEN_ENV, ""),
+        )
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    return config
