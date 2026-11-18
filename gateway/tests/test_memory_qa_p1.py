@@ -39,7 +39,7 @@ class ManifestTests(unittest.TestCase):
         expected.append(dict(RELATIONS_MANAGE))
         self.assertEqual(expected, example['capabilities'])
         self.assertEqual(DEFAULTS, example['defaults'])
-        self.assertEqual('1.5.0', example['manifest_version'])
+        self.assertEqual('1.5.1', example['manifest_version'])
 
     def test_complete_manifest_enabled_disabled_and_switch(self):
         base_ids = {'chat.direct', 'memory.search', 'notify.approvals', 'town.enter'}
@@ -49,7 +49,7 @@ class ManifestTests(unittest.TestCase):
                     enabled=enabled, owner_can_read_dm=dm) as app:
                 status, _, manifest = app.request('GET', '/v1/capabilities')
                 self.assertEqual(status, 200)
-                self.assertEqual(manifest['manifest_version'], '1.5.0')
+                self.assertEqual(manifest['manifest_version'], '1.5.1')
                 self.assertEqual(manifest['contract_version'], app.server.config.contract_version)
                 self.assertEqual(manifest['cache_ttl_seconds'], 300)
                 self.assertEqual(manifest['defaults'], DEFAULTS)

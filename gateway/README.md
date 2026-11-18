@@ -115,7 +115,7 @@ continuwuity 仍用 `memory`（尚无文件注册）。运维注意见
 | GET | `/v1/personas/{id}` | `getPersona` | 0.4.0：owner 详情 / 本服非 owner 最小视图，含 bio 与 mood；列表项不加 mood |
 | GET/PATCH | `/v1/personas/{id}/state` | `getPersonaState` / `updatePersonaState` | 0.4.0：仅 owner 的 mood 与 mood_public，关闭时 404 `mood.disabled`，响应 no-store |
 | POST | `/v1/personas/{id}/rooms/lookup` | `lookupPersonaRooms` | 0.7.0：owner 批量查询本地已知 room_id，按下标返回 GroupRoom/null；只读、不回显 ID |
-| GET/POST | `/v1/personas/{id}/relations` | `listPersonaRelations` / `createPersonaRelation` | 0.8.0：owner 关系列表与手动添加；AI 为双行、人类为单行 |
+| GET/POST | `/v1/personas/{id}/relations` | `listPersonaRelations` / `createPersonaRelation` | owner 关系列表与手动添加；本服 AI 为双行、人类为单行；0.8.1 支持跨服请求入队 |
 | GET | `/v1/personas/{id}/relations/{relation_id}` | `getPersonaRelation` | 0.8.0：读取 owner 的单条关系 |
 | POST | `/v1/personas/{id}/relations/{relation_id}/{action}` | `actOnPersonaRelation` | 0.8.0：approve/reject/revoke/block/unblock，携带 revision |
 | GET | `/health` | `getHealth` | 免鉴权；返回 Health 形态 |
@@ -337,7 +337,7 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_RELATIONS_INBOUND_BIND` | 空（关闭） | B-R2 独立入站监听 host:port；主端口 /_internal 始终 404 |
 | `GATEWAY_RELATIONS_INBOUND_TOKEN` | 空 | ≥32 字符；未配置或过短时入站一律 401，启动 warning 不含值 |
 | `GATEWAY_PAIRING_RELATIONS_URL` | 空 | 出站占位变量，待 A 线定名；http/https 基址，例如 http://pairing:8090 |
-| `GATEWAY_PAIRING_RELATIONS_TOKEN` | 空 | 出站占位变量，待 A 线拆分 PAIRING_SERVICE_TOKEN 后定名；与 URL 均非空才投递，未配置仍保存 outbox |
+| `GATEWAY_PAIRING_RELATIONS_TOKEN` | 空 | 出站占位变量，待 A 线拆分 PAIRING_SERVICE_TOKEN 后定名；与 URL 均非空才投递，未配置时保留已有 outbox，跨服手动添加返回 400 |
 | `GATEWAY_MEMORY_DB_PATH` | 空 | 可选记忆 SQLite 路径；空 = 关闭，继续 ring buffer；新库 0600、WAL，备份敏感 |
 | `GATEWAY_MEMORY_OWNER_CAN_READ_DM` | `false` | 主人是否可读 DM 正文/事实值；严格布尔解析，关闭仍可管理元数据和写入 |
 | `GATEWAY_MEMORY_RETENTION_DAYS` | `90` | 保留天数 ≥1；pinned 不到期，撤回仍删除 |
@@ -594,8 +594,10 @@ persona 可配置 `"groups": {"enabled": true, "invite_policy": "owner"}`；
 邀请台账的主动/HTTP 发言）；已确认 DM 的 `allow_auto_join=true` 不受影响。设置
 `GATEWAY_GROUP_FORGET_STALE_KEYS=true` 后，启动时会永久删除旧 key_id 行并解除隔离；代价是旧
 left/encrypted_disabled 记录丢失，被踢/退出的群取得新的合格邀请后可以再次接受。
-升级到 0.8.0 / schema 12 时，存量 AI 不会自动互为好友，owner 可手动添加；只有之后新入驻的
-AI 才按同服默认规则建立关系。关系 ID 随 HMAC 密钥轮换而变化，旧 ID 不可再查询。
+首次启用关系存储时，存量 AI 不会自动互为好友，owner 可手动添加；之后新入驻的 AI 才按同服默认
+规则建立关系。关系 ID 随 HMAC 密钥轮换而变化，旧 ID 不可再查询。
+0.8.1 / schema 13 新增跨服关系元数据和队列。跨服手动添加在出站未配置时返回 400；出站已配置时，
+新请求创建 outgoing pending 并写入 outbox，返回 201。对端已断开配对时返回 409 `relation.peer_inactive`。
 
 从 schema 10 首次升级到 11 时，旧行会按**该次启动的当前密钥**回填 key_id；因此应先使用原密钥完成
 迁移，再轮换密钥，才能保留可靠的轮换检测。

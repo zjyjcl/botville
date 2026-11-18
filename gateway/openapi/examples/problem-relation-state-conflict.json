@@ -1,6 +1,6 @@
 {
   "type": "urn:botville:error:relation.state_conflict",
-  "title": "Relation state conflict",
+  "title": "relation.state_conflict",
   "status": 409,
   "code": "relation.state_conflict",
   "request_id": "example-request"

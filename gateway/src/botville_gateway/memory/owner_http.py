@@ -73,7 +73,7 @@ def sliding_rate(rates, key, cap, now, window):
 
 
 def _remember_idempotency(state, caller, key, value):
-    """Store a fact replay entry without letting one owner evict another."""
+    """Store an owner replay entry without letting one owner evict another."""
     state.idempotency[key] = value
     state.idempotency.move_to_end(key)
     owner_keys = [entry_key for entry_key in state.idempotency if entry_key[0] == caller]
@@ -113,7 +113,7 @@ def capabilities(server, query):
     for name in ('module', 'status'):
         if name in params:
             entries = [entry for entry in entries if entry[name] == params[name][-1]]
-    return dict(manifest_version='1.5.0', contract_version=server.config.contract_version,
+    return dict(manifest_version='1.5.1', contract_version=server.config.contract_version,
                 generated_at=datetime.now(timezone.utc).isoformat(),
                 cache_ttl_seconds=300, defaults=deepcopy(DEFAULTS), capabilities=entries)
 
@@ -252,7 +252,8 @@ def _route(handler, state, caller, params, rest, audit):
         if not isinstance(value, str) or not 1 <= len(value) <= 500 or visibility not in ('dm_only', 'shared'):
             raise HTTPError(422, 'request.invalid')
         idem = handler._idempotency_key()
-        fingerprint = hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+        digest = hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+        fingerprint = ('memory', digest)
         idem_key = (caller, hmac.new(state._secret, b"idempotency\x00" + idem.encode("utf-8"),
                                      hashlib.sha256).hexdigest()) if idem else None
         with state.lock:

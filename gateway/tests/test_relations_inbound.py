@@ -180,7 +180,12 @@ class BusinessTests(Fixture):
         self.assertEqual(self.count('relation_tombstones'), 0)
 
     def test_block_and_policy_hide_target(self):
-        self.receive(); self.action('block')
+        first = self.receive()
+        self.assertEqual(first[0], 202)
+        self.action('block')
+        blocked = dict(self.row())
+        self.assertEqual(self.receive(), first)
+        self.assertEqual(dict(self.row()), blocked)
         result = self.receive(self.body(rid='B'*26))
         self.assertEqual((result[0], result[1]['errcode']), (404, 'relation.unknown_user'))
         self.fed.policy_allows = lambda *args: False
@@ -284,11 +289,17 @@ class BusinessTests(Fixture):
 
     def test_sever_and_reactivate_do_not_restore(self):
         self.outgoing()
-        self.receive(self.body(to_user=B)); row = self.service._row(B, REMOTE)
+        inbound = self.body(to_user=B)
+        first = self.receive(inbound)
+        self.assertEqual(first[0], 202)
+        row = self.service._row(B, REMOTE)
         self.service.action(B, row['relation_id'], 'approve', {'revision': row['revision']})
         self.service.mark_peer_severed('REMOTE.INVALID')
         self.assertEqual([r[0] for r in self.store._db.execute('SELECT state FROM relations')], ['stranger', 'stranger'])
         self.assertFalse(self.store._db.execute("SELECT 1 FROM relation_outbox WHERE status='pending'").fetchone())
+        severed = dict(self.service._row(B, REMOTE))
+        self.assertEqual(self.receive(inbound), first)
+        self.assertEqual(dict(self.service._row(B, REMOTE)), severed)
         result = self.receive(self.body(rid='B'*26))
         self.assertEqual((result[0], result[1]['errcode']), (403, 'relation.peer_inactive'))
         self.service.mark_peer_active('remote.invalid')

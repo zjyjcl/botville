@@ -324,11 +324,11 @@ class RoomsAPITests(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         example = root / 'gateway/openapi/examples/capability-manifest.json'
         mock = root / 'app-apple/Sources/BotvilleCore/Resources/mock-capability-manifest.json'
-        self.assertEqual(CONTRACT_VERSION, '0.8.0')
+        self.assertEqual(CONTRACT_VERSION, '0.8.1')
         self.assertEqual(json.loads(example.read_bytes())['contract_version'], CONTRACT_VERSION)
         self.assertEqual(example.read_bytes(), mock.read_bytes())
         with MemoryHTTPServer() as app:
-            self.assertEqual(app.request('GET', '/v1/capabilities')[2]['contract_version'], '0.8.0')
+            self.assertEqual(app.request('GET', '/v1/capabilities')[2]['contract_version'], '0.8.1')
         for name, bounds in [('GROUP_MAX_ROOMS_PER_PERSONA', '1–200'),
                 ('GROUP_COOLDOWN_SECONDS', '0–3600'), ('PROACTIVE_TICK_SECONDS', '30–86400'),
                 ('GROUP_MAX_RESPONDERS', '1–20'), ('MOOD_HALF_LIFE_MINUTES', '1–10080'),

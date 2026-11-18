@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import sqlite3
 import time
 from urllib.parse import unquote, urlparse
 
@@ -51,7 +52,7 @@ def _fingerprint(persona_id, relation_id, action, body):
 def _write(handler, state, caller, persona_id, relation_id, action, body):
     raw_key = handler._idempotency_key()
     key = _idem_key(state, caller, raw_key)
-    fingerprint = _fingerprint(persona_id, relation_id, action, body)
+    fingerprint = ('relations', _fingerprint(persona_id, relation_id, action, body))
     with state.lock:
         now = time.monotonic()
         _expire_idempotency(state, now)
@@ -99,8 +100,6 @@ def handle(handler, encoded_id, encoded_ref=None, action=None):
                 result = service.list(persona_id, urlparse(handler.path).query)
             else:
                 result = service.get(persona_id, unquote(encoded_ref, errors='strict'))
-                if result is None:
-                    raise HTTPError(404, 'relation.not_found')
             handler._send_json(200, result)
             return
         body, error = handler._read_json()
@@ -121,5 +120,7 @@ def handle(handler, encoded_id, encoded_ref=None, action=None):
         _failure(handler, HTTPError(400, 'request.invalid'))
     except HTTPError as exc:
         _failure(handler, exc)
-    except Exception:
+    except sqlite3.Error:
         _unavailable(handler)
+    except Exception:
+        _failure(handler, HTTPError(500, 'internal.error'))
