@@ -31,7 +31,8 @@ Endpoints (JSON everywhere; errors are `{"errcode", "error"}`):
          IP; every failure is a bare 401 and writes no events.
   GET  /v1/pairing/allowed               admin  active server names (for
          debugging; fedgate reads the SQLite file directly).
-  GET  /health                           any    liveness probe.
+  GET  /health                           any    liveness probe:
+         {ok: true, relations_gateway: none|test-recorder} (A-R4).
 
 Pairing facts for the gateway (A-R1; service token, read-only):
 
@@ -69,7 +70,13 @@ Admin auth: `Authorization: Bearer $PAIRING_ADMIN_TOKEN` (constant-time
 compare); the service refuses to start without it. PAIRING_SERVICE_TOKEN
 is optional (internal endpoints answer 401 without it) but, when set,
 must be at least 32 characters and differ from the admin token, or the
-service refuses to start. Secrets/tokens are never written to the log.
+service refuses to start. A-R4: the outbound relation send API
+(/v1/pairing/internal/relations/*) takes its own PAIRING_RELATIONS_SEND_TOKEN
+(same rules, and it must also differ from the service token); the facts
+token gets 401 there and the send token gets 401 on the facts endpoints.
+Outbound targets must be https with only public addresses unless
+PAIRING_RELATIONS_ALLOW_PRIVATE=true (test stacks; every such send is
+logged as AUDIT). Secrets/tokens are never written to the log.
 """
 
 import base64
@@ -93,6 +100,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
+from . import relations
 from .store import (
     CursorExpired,
     REDEEM_BAD_SECRET,
@@ -102,7 +110,6 @@ from .store import (
     REDEEM_USED,
     PairingStore,
 )
-from . import relations
 from .hswhitelist import HsWhitelistWriter
 from .hswhitelist import MarkerWriteError as HsMarkerWriteError
 from .validate import (
@@ -440,7 +447,8 @@ class PairingConfig:
                  insecure_tls=False, host="127.0.0.1", port=8090,
                  trusted_proxies=(), service_token=None,
                  hs_whitelist_path=None, hs_restart_marker=None,
-                 relations_gateway="none", relations_test_record=None):
+                 relations_gateway="none", relations_test_record=None,
+                 relations_send_token=None, relations_allow_private=False):
         self.db_path = db_path
         self.admin_token = admin_token
         if service_token:
@@ -453,6 +461,29 @@ class PairingConfig:
                 raise ConfigError(
                     "PAIRING_SERVICE_TOKEN must differ from PAIRING_ADMIN_TOKEN")
         self.service_token = service_token or None
+        # A-R4: the outbound relation send endpoint has its OWN token, so
+        # the read-only facts token (PAIRING_SERVICE_TOKEN) can never send
+        # anything. Same rules: >= 32 chars, distinct from the admin token
+        # and from the facts token; unset = the send endpoint refuses all.
+        if relations_send_token:
+            if len(relations_send_token) < SERVICE_TOKEN_MIN_CHARS:
+                raise ConfigError(
+                    "PAIRING_RELATIONS_SEND_TOKEN must be at least {}"
+                    " characters".format(SERVICE_TOKEN_MIN_CHARS))
+            for other, name in ((admin_token, "PAIRING_ADMIN_TOKEN"),
+                                (service_token, "PAIRING_SERVICE_TOKEN")):
+                if other and hmac.compare_digest(
+                        relations_send_token.encode("utf-8"),
+                        other.encode("utf-8")):
+                    raise ConfigError(
+                        "PAIRING_RELATIONS_SEND_TOKEN must differ from"
+                        " {}".format(name))
+        self.relations_send_token = relations_send_token or None
+        # A-R4 (#249 review 2): outbound relation targets must be https on a
+        # public address unless this explicit switch is on (test stacks with
+        # private compose addresses); every private/plain-http send is then
+        # audit-logged.
+        self.relations_allow_private = bool(relations_allow_private)
         # A-R3: how verified inbound relation messages reach the local
         # gateway. "none" (default) refuses them with 503; "test-recorder"
         # is for tests/CI only. The real HTTP gateway client is not part
@@ -544,6 +575,10 @@ class PairingConfig:
             trusted_proxies=_parse_trusted_proxies(
                 env.get("PAIRING_TRUSTED_PROXIES", "")),
             service_token=env.get("PAIRING_SERVICE_TOKEN", "") or None,
+            relations_send_token=env.get(
+                "PAIRING_RELATIONS_SEND_TOKEN", "") or None,
+            relations_allow_private=_env_flag(
+                env, "PAIRING_RELATIONS_ALLOW_PRIVATE", False),
             relations_gateway=(env.get("PAIRING_RELATIONS_GATEWAY", "").strip()
                                or "none"),
             relations_test_record=env.get(
@@ -603,10 +638,16 @@ class PairingApp:
             self.internal_rejected += 1
             return self.internal_rejected
 
+    def _hs_whitelist_failure_gap(self):
+        """Test hook between the counter read and write (N1 / #253 nit 5)."""
+
     def _note_hs_whitelist_failure(self):
+        # Return value unused (#253 review nit 12); the lock covers a
+        # split read-modify-write so tests can stretch the gap.
         with self._hs_whitelist_failures_lock:  # #247 review N1
-            self.hs_whitelist_failures += 1
-            return self.hs_whitelist_failures
+            current = self.hs_whitelist_failures
+            self._hs_whitelist_failure_gap()
+            self.hs_whitelist_failures = current + 1
 
     def sync_hs_whitelist(self):
         """Re-render the homeserver whitelist from the peers table (A-R2).
@@ -618,6 +659,8 @@ class PairingApp:
         fedgate enforces it regardless, so a failure is logged and retried
         on the next call. Returns True when a restart marker was written.
         The peers table is read under the writer lock (review S1).
+        Lock order is writer -> store (#253 review nit 10): this method
+        must not be called while holding the store lock.
         """
         if self.hs_whitelist is None:
             return False
@@ -754,11 +797,29 @@ class PairingHandler(BaseHTTPRequestHandler):
         return hmac.compare_digest(auth.encode("utf-8"),
                                    ("Bearer " + token).encode("utf-8"))
 
+    def _is_relation_sender(self):
+        """Send-token check for the outbound relations endpoint (A-R4;
+        fail-closed like _is_service)."""
+        token = self.config.relations_send_token
+        if not token:
+            return False
+        auth = self.headers.get("Authorization") or ""
+        return hmac.compare_digest(auth.encode("utf-8"),
+                                   ("Bearer " + token).encode("utf-8"))
+
     def _handle_internal(self, method, path, query):
-        """A-R1 pairing facts (read-only) + A-R3 relation send
-        (relations/<kind>, POST). Auth first, uniformly 401, so an
-        unauthenticated caller learns nothing about routes or peers."""
-        if not self._is_service():
+        """A-R1 pairing facts (read-only, PAIRING_SERVICE_TOKEN) + A-R3
+        relation send (relations/<kind>, POST, PAIRING_RELATIONS_SEND_TOKEN
+        since A-R4). Auth first, uniformly 401, so an unauthenticated
+        caller learns nothing about routes or peers; each token opens only
+        its own namespace (the facts token cannot send, the send token
+        cannot read facts)."""
+        rest = path[len(INTERNAL_PREFIX):] if path.startswith(INTERNAL_PREFIX) \
+            else ""  # the bare INTERNAL_ROOT names no endpoint
+        is_send_route = rest.startswith("relations/")
+        authorized = self._is_relation_sender() if is_send_route \
+            else self._is_service()
+        if not authorized:
             total = self.app.note_internal_rejected()
             allowed, suppressed = self.app.internal_reject_log.allow()
             if allowed:
@@ -771,9 +832,7 @@ class PairingHandler(BaseHTTPRequestHandler):
             self._error(401, "M_UNKNOWN_TOKEN",
                         "internal endpoints need the pairing service token")
             return
-        rest = path[len(INTERNAL_PREFIX):] if path.startswith(INTERNAL_PREFIX) \
-            else ""  # the bare INTERNAL_ROOT names no endpoint
-        if rest.startswith("relations/"):
+        if is_send_route:
             self._handle_relation_outbound(method, rest[len("relations/"):])
             return
         if rest == "events":
@@ -885,7 +944,10 @@ class PairingHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/health":
-            self._send_json(200, {"ok": True})
+            # A-R4 (#249 review 3): the relations gateway mode is visible
+            # so a test-recorder left on in production is easy to spot.
+            self._send_json(200, {"ok": True, "relations_gateway":
+                                  self.config.relations_gateway})
             return
 
         if path == "/v1/pairing/redeem" and method == "POST":
@@ -1367,13 +1429,19 @@ class PairingHandler(BaseHTTPRequestHandler):
             status, body = relations.checked_gateway_result(
                 self.app.relations_gateway.deliver(kind, envelope, meta))
         except relations.GatewayUnavailable as exc:
-            log.warning("relation %s from %s not delivered: %s", kind, origin,
-                        exc)
+            # Only the client's fixed reason code, never its message: a
+            # client may put request/response bodies in exception text
+            # (#249 review 4).
+            log.warning("relation %s from %s not delivered (%s)", kind,
+                        origin, relations.safe_reason(exc))
             self._error(503, "BV_RELATIONS_UNAVAILABLE",
                         "relations are not available on this server")
             return
-        except Exception:  # noqa: BLE001 - a buggy client must fail closed
-            log.exception("relations gateway client failed")
+        except Exception as exc:  # noqa: BLE001 - must fail closed
+            # Type name only -- no message, no traceback (both may carry
+            # the envelope or the gateway's answer).
+            log.error("relations gateway client failed (%s)",
+                      type(exc).__name__)
             self._error(503, "BV_RELATIONS_UNAVAILABLE",
                         "relations are not available on this server")
             return
@@ -1435,6 +1503,19 @@ class PairingHandler(BaseHTTPRequestHandler):
                         "destination is not an active paired server")
             return
         url = peer["peer_api_url"].rstrip("/") + "/relations/" + kind
+        verdict, detail = relations.target_policy(
+            url, self.config.relations_allow_private)
+        if verdict == relations.TARGET_REFUSED:
+            log.warning("relation %s to %s refused: peer_api_url %s (set"
+                        " PAIRING_RELATIONS_ALLOW_PRIVATE=true only on test"
+                        " stacks)", kind, destination, detail)
+            self._error(409, "BV_PEER_TARGET_REFUSED",
+                        "peer address not allowed for relations")
+            return
+        if verdict == relations.TARGET_AUDIT:
+            log.warning("AUDIT relation %s %s to %s via non-public target"
+                        " (%s; PAIRING_RELATIONS_ALLOW_PRIVATE=true)", kind,
+                        envelope["request_id"], destination, detail)
         try:
             peer_status, peer_body = relations.post_relation(
                 url, body, headers,
@@ -1479,13 +1560,19 @@ def start_pruner(app, interval=PRUNE_INTERVAL_SECONDS):
     return thread
 
 
-def start_hs_whitelist_loop(app, interval=HS_WHITELIST_RESYNC_SECONDS):
+def start_hs_whitelist_loop(app, interval=HS_WHITELIST_RESYNC_SECONDS,
+                            stop=None):
     """Re-render the homeserver whitelist every `interval` seconds (A-R2):
     retries a failed write and repairs an include someone edited or
-    deleted by hand. Unchanged content writes nothing. Daemon thread."""
+    deleted by hand. Unchanged content writes nothing. Daemon thread.
+    `stop` is an optional threading.Event used by tests to end the loop
+    (#253 review nit 11); production leaves it unset."""
     def run():
         while True:
-            time.sleep(interval)
+            if stop is None:
+                time.sleep(interval)
+            elif stop.wait(interval):
+                return
             try:  # #247 review S3: the loop must outlive any surprise
                 app.sync_hs_whitelist()
             except Exception:  # noqa: BLE001
@@ -1524,6 +1611,17 @@ def main(argv=None):
     if not config.service_token:
         log.warning("PAIRING_SERVICE_TOKEN is unset: the internal pairing-facts"
                     " endpoints refuse every request (401).")
+    if not config.relations_send_token:
+        log.warning("PAIRING_RELATIONS_SEND_TOKEN is unset: the internal"
+                    " relation send endpoint refuses every request (401).")
+    if config.relations_gateway != "none":
+        log.warning("PAIRING_RELATIONS_GATEWAY=%s: inbound relation messages"
+                    " are NOT refused; test-recorder accepts everything and is"
+                    " for tests/CI only", config.relations_gateway)
+    if config.relations_allow_private:
+        log.warning("PAIRING_RELATIONS_ALLOW_PRIVATE=true: relations may go"
+                    " to plain-http / private / loopback peer addresses"
+                    " (every such send is audit-logged); test stacks only")
     log.info("pairing service listening on %s:%s (db=%s, server_name=%s)",
              host, port, config.db_path, config.server_name)
     try:

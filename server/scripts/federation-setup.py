@@ -8,7 +8,8 @@ every run — no secrets or rendered configs ever ship in the repo):
                                                (SQLite, throwaway)
   federation.env                              random pairing admin tokens
                                                and (A-R1) separate pairing
-                                               service tokens, consumed by
+                                               service tokens and (A-R4)
+                                               relation send tokens, consumed by
                                                docker compose
                                                --env-file and server/tests/
                                                federation_e2e.py
@@ -125,6 +126,7 @@ def main():
 
     tokens = {}
     service_tokens = {}
+    send_tokens = {}
     for name in INSTANCES:
         config = HOMESERVER_TEMPLATE.format(
             server_name=name,
@@ -140,6 +142,8 @@ def main():
         # A-R1: the internal pairing-facts API uses its own token, never
         # the admin one (two independent draws).
         service_tokens[name.partition("-")[2].upper()] = secrets.token_hex(32)
+        # A-R4: outbound relation sends use a third independent token.
+        send_tokens[name.partition("-")[2].upper()] = secrets.token_hex(32)
         print("federation-setup.py: rendered {}/homeserver.yaml".format(name))
 
     env = "".join(
@@ -150,13 +154,17 @@ def main():
         "PAIRING_SERVICE_TOKEN_{}={}\n".format(suffix, token)
         for suffix, token in sorted(service_tokens.items())
     )
+    env += "".join(
+        "PAIRING_RELATIONS_SEND_TOKEN_{}={}\n".format(suffix, token)
+        for suffix, token in sorted(send_tokens.items())
+    )
     # Issue #134 PR2: the only other key compose interpolates from this
     # file; hostnames only, never a secret.
     no_proxy_extra = resolve_no_proxy_extra()
     env += "{}={}\n".format(NO_PROXY_EXTRA_KEY, no_proxy_extra)
     write_private(os.path.join(GENERATED_DIR, "federation.env"), env)
     print("federation-setup.py: wrote federation.env with fresh pairing admin"
-          " and service tokens (gitignored; never commit)")
+          ", service and relation send tokens (gitignored; never commit)")
     if no_proxy_extra:
         print("federation-setup.py: {}={} propagated (appended to the fixed"
               " NO_PROXY list by docker-compose.federation.yml)".format(

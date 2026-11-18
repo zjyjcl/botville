@@ -49,6 +49,7 @@ import collections
 import hashlib
 import http.client
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -58,6 +59,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 RELATION_KINDS = ("request", "respond", "revoke")
 ENVELOPE_VERSION = 1
@@ -228,7 +230,24 @@ def parse_envelope_bytes(raw, kind, origin, destination):
 # --- gateway client interface ------------------------------------------------
 
 class GatewayUnavailable(Exception):
-    """The local gateway cannot take relation messages right now."""
+    """The local gateway cannot take relation messages right now.
+
+    The first argument should be a short reason CODE ([a-z_], e.g.
+    "not_configured", "timeout"); pairing logs only that code, never free
+    text, because a client could put request/response bodies into it
+    (#249 review 4)."""
+
+
+SAFE_REASON_RE = re.compile(r"[a-z][a-z0-9_]{0,39}")
+
+
+def safe_reason(exc):
+    """Loggable reason for a GatewayUnavailable: its code if it is a short
+    [a-z0-9_] token, else the generic "unavailable"."""
+    code = exc.args[0] if getattr(exc, "args", None) else None
+    if isinstance(code, str) and SAFE_REASON_RE.fullmatch(code):
+        return code
+    return "unavailable"
 
 
 class GatewayResult:
@@ -254,7 +273,7 @@ class UnconfiguredRelationsGateway(RelationsGatewayClient):
     with an explicit 'unavailable' (fail-closed)."""
 
     def deliver(self, kind, envelope, meta):
-        raise GatewayUnavailable("relations gateway not configured")
+        raise GatewayUnavailable("not_configured")
 
 
 class RecordingRelationsGateway(RelationsGatewayClient):
@@ -273,8 +292,8 @@ class RecordingRelationsGateway(RelationsGatewayClient):
         try:
             with self._lock, open(self.path, "a", encoding="utf-8") as handle:
                 handle.write(line)
-        except OSError as exc:
-            raise GatewayUnavailable("recorder write failed: {}".format(exc))
+        except OSError:
+            raise GatewayUnavailable("recorder_write_failed") from None
         return GatewayResult(202, {"accepted": True,
                                    "request_id": envelope["request_id"]})
 
@@ -285,13 +304,13 @@ def checked_gateway_result(result):
             type(result.status) is not int or \
             result.status not in RELAYED_GATEWAY_STATUSES or \
             not isinstance(result.body, dict):
-        raise GatewayUnavailable("gateway returned an unusable result")
+        raise GatewayUnavailable("unusable_result")
     try:
         size = len(json.dumps(result.body).encode("utf-8"))
     except (TypeError, ValueError):
-        raise GatewayUnavailable("gateway body is not JSON") from None
+        raise GatewayUnavailable("body_not_json") from None
     if size > MAX_GATEWAY_BODY_BYTES:
-        raise GatewayUnavailable("gateway body too large")
+        raise GatewayUnavailable("body_too_large")
     return result.status, result.body
 
 
@@ -351,6 +370,71 @@ def post_relation(url, body, headers, ssl_context=None,
     except (ValueError, UnicodeDecodeError):
         parsed = None
     return status, parsed if isinstance(parsed, dict) else None
+
+
+# --- outbound target policy (A-R4, #249 review 2) ------------------------------
+
+TARGET_OK, TARGET_AUDIT, TARGET_REFUSED = "ok", "audit", "refused"
+
+
+# RFC 6598 shared address space. ipaddress.IPv4Address.is_private is
+# False for this range on Python 3.9–3.12 (the pairing image is 3.12),
+# so a hand-rolled private/loopback/reserved check would treat it as
+# public and allow it with no AUDIT.
+_SHARED_ADDRESS_SPACE = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _non_public(address):
+    ip = ipaddress.ip_address(address)
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    return (ip.is_private or ip.is_loopback or ip.is_link_local or
+            ip.is_reserved or ip.is_multicast or ip.is_unspecified or
+            (ip.version == 4 and ip in _SHARED_ADDRESS_SPACE))
+
+
+def target_policy(url, allow_private, resolve=socket.getaddrinfo):
+    """Where may an outbound relation go? Returns (verdict, detail).
+
+    Production rule: https only, and every address the host resolves to
+    must be public. With allow_private (PAIRING_RELATIONS_ALLOW_PRIVATE,
+    test stacks with compose-network addresses) plain http and
+    private/loopback/link-local addresses are allowed but reported as
+    TARGET_AUDIT so the caller logs every such send. Unresolvable hosts are
+    refused (fail closed). `detail` never contains credentials or the path.
+    Residual risk: urllib resolves the name again when connecting (DNS
+    rebinding between the two lookups); peer_api_url itself only comes
+    from an authenticated pairing (redeem/accept)."""
+    try:
+        parts = urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return TARGET_REFUSED, "unparsable url"
+    scheme = (parts.scheme or "").lower()
+    if scheme not in ("https", "http") or not host:
+        return TARGET_REFUSED, "scheme {!r} not allowed".format(scheme)
+    reasons = []
+    if scheme == "http":
+        reasons.append("plain http")
+    try:
+        infos = resolve(host, port or (443 if scheme == "https" else 80),
+                        proto=socket.IPPROTO_TCP)
+        addresses = sorted({info[4][0] for info in infos})
+    except (OSError, UnicodeError, ValueError):
+        return TARGET_REFUSED, "host {} does not resolve".format(host)
+    if not addresses:
+        return TARGET_REFUSED, "host {} does not resolve".format(host)
+    try:
+        private = [a for a in addresses if _non_public(a.split("%")[0])]
+    except ValueError:
+        return TARGET_REFUSED, "host {} resolves to a bad address".format(host)
+    if private:
+        reasons.append("non-public address {} for {}".format(
+            ",".join(private), host))
+    if not reasons:
+        return TARGET_OK, host
+    detail = "; ".join(reasons)
+    return (TARGET_AUDIT if allow_private else TARGET_REFUSED), detail
 
 
 def validate_outbound_request(obj):

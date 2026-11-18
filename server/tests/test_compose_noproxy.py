@@ -285,6 +285,8 @@ class FederationNoProxyConfigTest(ComposeNoProxyRenderCase):
         "PAIRING_ADMIN_TOKEN_B=test-only",
         "PAIRING_SERVICE_TOKEN_A=test-only-service",
         "PAIRING_SERVICE_TOKEN_B=test-only-service",
+        "PAIRING_RELATIONS_SEND_TOKEN_A=test-only-send",
+        "PAIRING_RELATIONS_SEND_TOKEN_B=test-only-send",
     )
 
     def test_defaults_on_every_federation_service(self):

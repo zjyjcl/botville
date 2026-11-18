@@ -24,6 +24,7 @@ import util as testutil  # noqa: E402
 
 ADMIN = "test-admin-token"
 SERVICE = "test-service-token-" + "s" * 24   # >= 32 chars
+SEND = "test-relations-send-token-" + "x" * 24   # >= 32 chars, != SERVICE
 SECRET = "ab" * 32
 RID = "01JREQUESTID000000000000AB"
 
@@ -213,15 +214,106 @@ class ConfigTest(unittest.TestCase):
         cfg = service.PairingConfig.from_env(env)
         self.assertEqual(cfg.relations_test_record, "/data/rec.jsonl")
 
+    def test_send_token_rules(self):
+        # A-R4: separate send token, same rules as the facts token.
+        cfg = service.PairingConfig.from_env(dict(self.BASE))
+        self.assertIsNone(cfg.relations_send_token)
+        self.assertFalse(cfg.relations_allow_private)
+        cfg = service.PairingConfig.from_env(dict(
+            self.BASE, PAIRING_SERVICE_TOKEN=SERVICE,
+            PAIRING_RELATIONS_SEND_TOKEN=SEND,
+            PAIRING_RELATIONS_ALLOW_PRIVATE="true"))
+        self.assertEqual(cfg.relations_send_token, SEND)
+        self.assertTrue(cfg.relations_allow_private)
+        for extra in ({"PAIRING_RELATIONS_SEND_TOKEN": "short"},
+                      {"PAIRING_RELATIONS_SEND_TOKEN": "y" * 31},
+                      {"PAIRING_ADMIN_TOKEN": "a" * 40,
+                       "PAIRING_RELATIONS_SEND_TOKEN": "a" * 40},
+                      {"PAIRING_SERVICE_TOKEN": SERVICE,
+                       "PAIRING_RELATIONS_SEND_TOKEN": SERVICE}):
+            with self.subTest(extra=sorted(extra)):
+                with self.assertRaises(service.ConfigError) as ctx:
+                    service.PairingConfig.from_env(dict(self.BASE, **extra))
+                for value in extra.values():
+                    if len(value) >= 8:
+                        self.assertNotIn(value, str(ctx.exception))
+
+
+class TargetPolicyTest(unittest.TestCase):
+    """#249 review 2: https + public only, unless explicitly allowed."""
+
+    @staticmethod
+    def resolver(*addresses):
+        def resolve(host, port, proto=0):
+            if not addresses:
+                raise OSError("nxdomain")
+            return [(2, 1, 6, "", (a, port)) for a in addresses]
+        return resolve
+
+    def check(self, url, allow, *addresses):
+        return relations.target_policy(url, allow, self.resolver(*addresses))
+
+    def test_production_rule(self):
+        self.assertEqual(self.check("https://hs-b.example/x", False,
+                                    "93.184.216.34")[0], relations.TARGET_OK)
+        for url, addrs in (
+                ("http://hs-b.example/x", ("93.184.216.34",)),
+                ("https://hs-b/x", ("172.30.81.11",)),
+                ("https://hs-b/x", ("127.0.0.1",)),
+                ("https://hs-b/x", ("10.0.0.5",)),
+                ("https://hs-b/x", ("169.254.169.254",)),
+                ("https://hs-b/x", ("::1",)),
+                ("https://hs-b/x", ("::ffff:127.0.0.1",)),
+                ("https://hs-b/x", ("fd00::1",)),
+                ("https://hs-b/x", ("93.184.216.34", "192.168.1.2")),
+                ("https://hs-b/x", ()),               # does not resolve
+                ("ftp://hs-b/x", ("93.184.216.34",)),
+                ("https:///x", ("93.184.216.34",))):
+            with self.subTest(url=url, addrs=addrs):
+                self.assertEqual(self.check(url, False, *addrs)[0],
+                                 relations.TARGET_REFUSED)
+
+    def test_rfc6598_shared_address_space_is_non_public(self):
+        # 100.64.0.0/10 must be refused in production and only AUDIT'd
+        # with the private-target switch (PR #256 review blocker).
+        inside = ("100.64.0.0", "100.64.0.1", "100.127.255.255",
+                  "100.100.100.200", "::ffff:100.64.0.1")
+        for addr in inside:
+            with self.subTest(addr=addr, allow=False):
+                self.assertEqual(self.check("https://hs-b/x", False, addr)[0],
+                                 relations.TARGET_REFUSED)
+            with self.subTest(addr=addr, allow=True):
+                verdict, detail = self.check("https://hs-b/x", True, addr)
+                self.assertEqual(verdict, relations.TARGET_AUDIT)
+                self.assertTrue(detail)
+        for addr in ("100.63.255.255", "100.128.0.0"):
+            with self.subTest(addr=addr):
+                self.assertEqual(self.check("https://hs-b/x", False, addr)[0],
+                                 relations.TARGET_OK)
+
+    def test_switch_allows_but_audits(self):
+        for url, addrs in (("http://127.0.0.1:9/x", ("127.0.0.1",)),
+                           ("https://hs-b/x", ("172.30.81.11",))):
+            verdict, detail = self.check(url, True, *addrs)
+            self.assertEqual(verdict, relations.TARGET_AUDIT)
+            self.assertTrue(detail)
+        # Unresolvable / bad scheme stay refused even with the switch.
+        self.assertEqual(self.check("https://hs-b/x", True)[0],
+                         relations.TARGET_REFUSED)
+        self.assertEqual(self.check("file:///etc/x", True, "127.0.0.1")[0],
+                         relations.TARGET_REFUSED)
+
 
 # --- HTTP: inbound ----------------------------------------------------------------
 
-def start_service(test, db_path, server_name, gateway=None):
+def start_service(test, db_path, server_name, gateway=None,
+                  allow_private=True):
     config = service.PairingConfig(
         db_path=db_path, admin_token=ADMIN, server_name=server_name,
         api_url="https://{}.example/_matrix/pairing".format(server_name),
         verify_peer_key=False, host="127.0.0.1", port=0,
-        service_token=SERVICE)
+        service_token=SERVICE, relations_send_token=SEND,
+        relations_allow_private=allow_private)
     httpd = service.build_server(config)
     if gateway is not None:
         httpd.app.relations_gateway = gateway
@@ -403,6 +495,41 @@ class InboundTest(unittest.TestCase):
             self.assertEqual(resp["errcode"], "BV_RELATIONS_UNAVAILABLE")
             self.assertNotIn("boom", json.dumps(resp))
 
+    def test_gateway_exception_text_never_logged(self):
+        # #249 review 4: a client may stuff bodies into exception text;
+        # pairing logs only a fixed reason code / the exception type.
+        leak = "LEAKED-BODY-" + "q" * 20
+        cases = [
+            (FakeGateway(exc=RuntimeError(leak)), "RuntimeError"),
+            (FakeGateway(exc=ValueError({"body": leak})), "ValueError"),
+            (FakeGateway(exc=relations.GatewayUnavailable(leak)),
+             "unavailable"),
+            (FakeGateway(exc=relations.GatewayUnavailable(
+                "response body: " + leak)), "unavailable"),
+            (FakeGateway(exc=relations.GatewayUnavailable("timeout")),
+             "timeout"),
+        ]
+        for gw, shown in cases:
+            with self.subTest(shown=shown):
+                self.app.relations_gateway = gw
+                with self.assertLogs("pairing.service", "WARNING") as logs:
+                    status, resp = self.send()
+                self.assertEqual(status, 503)
+                text = "\n".join(logs.output)
+                self.assertNotIn(leak, text)
+                self.assertNotIn("note", text)  # envelope payload {"note": "hi"}
+                self.assertNotIn("Traceback", text)
+                self.assertIn(shown, text)
+                self.assertNotIn(leak, json.dumps(resp))
+
+    def test_safe_reason(self):
+        G = relations.GatewayUnavailable
+        self.assertEqual(relations.safe_reason(G("not_configured")),
+                         "not_configured")
+        for exc in (G(), G(""), G("Has Caps"), G("a" * 41), G({"x": 1}),
+                    G("body: {...}")):
+            self.assertEqual(relations.safe_reason(exc), "unavailable")
+
     def test_default_build_is_fail_closed(self):
         httpd = service.build_server(service.PairingConfig(
             db_path=os.path.join(self._tmp.name, "c.db"),
@@ -483,7 +610,7 @@ class OutboundTest(unittest.TestCase):
         self.httpd_b.app.store.upsert_peer_active(
             "hs-a", self.base_a + "/_matrix/pairing", shared_secret=SECRET)
 
-    def send(self, kind="request", body=None, token=SERVICE, method="POST"):
+    def send(self, kind="request", body=None, token=SEND, method="POST"):
         if body is None:
             body = {"destination": "hs-b", "request_id": RID,
                     "payload": {"note": "hi"}}
@@ -540,7 +667,9 @@ class OutboundTest(unittest.TestCase):
         self.assertEqual(self.gw_b.calls, [])
 
     def test_auth_method_kind(self):
-        for token in (None, ADMIN, "wrong-" + SERVICE):
+        # A-R4: only the send token opens the send endpoint -- the
+        # read-only facts token (SERVICE) is refused like any other.
+        for token in (None, ADMIN, SERVICE, "wrong-" + SEND, SEND + "x"):
             self.assertEqual(self.send(token=token)[0], 401)
         self.assertEqual(self.send(method="GET")[0], 405)
         self.assertEqual(self.send(kind="block")[0], 404)
@@ -548,9 +677,55 @@ class OutboundTest(unittest.TestCase):
         status, _ = testutil.http_json(
             "POST", self.base_a + "/_matrix/pairing/internal/relations/request",
             body={"destination": "hs-b", "request_id": RID, "payload": {}},
-            token=SERVICE)
+            token=SEND)
         self.assertEqual(status, 404)
         self.assertEqual(self.gw_b.calls, [])
+
+    def test_private_target_refused_without_switch_and_audited_with(self):
+        self.httpd_a.app.config.relations_allow_private = False
+        with self.assertLogs("pairing.service", "WARNING") as logs:
+            status, resp = self.send()
+        self.assertEqual(status, 409)
+        self.assertEqual(resp["errcode"], "BV_PEER_TARGET_REFUSED")
+        self.assertIn("PAIRING_RELATIONS_ALLOW_PRIVATE", logs.output[-1])
+        self.assertEqual(self.gw_b.calls, [])
+        self.httpd_a.app.config.relations_allow_private = True
+        with self.assertLogs("pairing.service", "WARNING") as logs:
+            status, resp = self.send()
+        self.assertEqual(status, 200)
+        self.assertTrue(any("AUDIT relation request" in line and RID in line
+                            for line in logs.output))
+
+    def test_m1_boundaries_and_token_namespaces(self):
+        # #249 review 5 (M1): bare internal root and bare relations prefix
+        # are 404 once authenticated; each token opens only its namespace.
+        for path in ("/v1/pairing/internal", "/v1/pairing/internal/",
+                     "/v1/pairing/internal/relations"):
+            with self.subTest(path=path):
+                status, resp = testutil.http_json(
+                    "GET", self.base_a + path, token=SERVICE)
+                self.assertEqual(status, 404)
+                self.assertEqual(resp["errcode"], "M_UNRECOGNIZED")
+                status, _ = testutil.http_json(
+                    "GET", self.base_a + path, token=SEND)
+                self.assertEqual(status, 401)   # send token: facts side
+        status, _ = testutil.http_json(
+            "GET", self.base_a + "/v1/pairing/internal/events", token=SEND)
+        self.assertEqual(status, 401)
+        status, _ = testutil.http_json(
+            "GET", self.base_a + "/v1/pairing/internal/events",
+            token=SERVICE)
+        self.assertEqual(status, 200)
+        status, _ = testutil.http_json(
+            "POST", self.base_a + "/v1/pairing/internal/relations/",
+            body={}, token=SEND)
+        self.assertEqual(status, 404)
+
+    def test_health_reports_gateway_mode(self):
+        # #249 review 3
+        status, resp = testutil.http_json("GET", self.base_a + "/health")
+        self.assertEqual((status, resp),
+                         (200, {"ok": True, "relations_gateway": "none"}))
 
     def test_outbound_rate_limit(self):
         self.httpd_a.app.relations_out_limiter = service.RateLimiter(limit=1)

@@ -386,7 +386,9 @@ def main():
     facts_b = PairingFacts(args.b_admin, env["PAIRING_SERVICE_TOKEN_B"])
     rel = federation_relations.Relations(
         compose, args.a_admin, args.b_admin,
-        env["PAIRING_SERVICE_TOKEN_A"], env["PAIRING_SERVICE_TOKEN_B"])
+        env["PAIRING_RELATIONS_SEND_TOKEN_A"],
+        env["PAIRING_RELATIONS_SEND_TOKEN_B"],
+        env["PAIRING_SERVICE_TOKEN_A"])
     suffix = secrets.token_hex(3)
 
     # --- readiness + users ------------------------------------------------

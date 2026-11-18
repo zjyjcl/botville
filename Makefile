@@ -9,6 +9,8 @@
 #   make up GATEWAY=1    # also build + start the botville gateway (A2.2,
 #                        # `gateway` profile, gateway-data volume), any HS;
 #                        # synapse/tuwunel use appservice transport, continuwuity stays memory
+#   make up PAIRING=1    # also start the pairing service (A-R4, `pairing`
+#                        # profile, pairing-data volume; loopback 8090), any HS
 #   make gateway-hs-smoke # OpenID userinfo + startup whoami against a real HS
 #                        # (stack already up with GATEWAY=1 on synapse or tuwunel)
 #   make smoke           # run server/tests/smoke.py against the running stack
@@ -127,6 +129,13 @@ ifeq ($(strip $(GATEWAY_PORT)),)
 GATEWAY_PORT := 8020
 endif
 
+# Optional pairing service (A-R4 / #8): PAIRING=1 (also true/yes) on `up`
+# adds --profile pairing (pinned python image + read-only server/pairing bind
+# mount, pairing-data volume). `down`, `ps`, `logs` and `config` always carry
+# --profile pairing, like push and gateway; `down` never passes -v.
+PAIRING ?=
+PAIRING_PROFILE := $(if $(filter 1 true yes,$(PAIRING)),--profile pairing,)
+
 # Backup/restore/e2e knobs (A1.1).
 E2E_PHASE ?= seed
 E2E_STATE ?= backups/e2e-state.json
@@ -166,7 +175,7 @@ endif
 		esac; \
 		rm -f $(APPSERVICE_URL_MARKER); \
 	fi
-	$(GATEWAY_HS_ENV) $(COMPOSE) --profile $(HS) $(PUSH_PROFILE) $(GATEWAY_PROFILE) up -d
+	$(GATEWAY_HS_ENV) $(COMPOSE) --profile $(HS) $(PUSH_PROFILE) $(PAIRING_PROFILE) $(GATEWAY_PROFILE) up -d
 ifneq ($(PUSH_PROFILE),)
 	$(COMPOSE) --profile $(HS) --profile push up -d --force-recreate --no-deps sygnal
 endif
@@ -191,17 +200,17 @@ gateway-preflight:
 config:
 	@test -f $(ENV_FILE) || { echo "make config: $(ENV_FILE) not found; run 'make up' (or bash server/scripts/init.sh) first, or pass ENV_FILE=..." >&2; exit 1; }
 	bash server/scripts/gateway-preflight.sh $(ENV_FILE)
-	$(GATEWAY_HS_ENV) $(COMPOSE) --profile $(HS) --profile push --profile gateway config --quiet
+	$(GATEWAY_HS_ENV) $(COMPOSE) --profile $(HS) --profile push --profile pairing --profile gateway config --quiet
 	@echo "compose config OK ($(HS) + push + gateway)"
 
 down:
-	$(COMPOSE) --profile $(HS) --profile push --profile gateway down --remove-orphans
+	$(COMPOSE) --profile $(HS) --profile push --profile pairing --profile gateway down --remove-orphans
 
 logs:
-	$(COMPOSE) --profile $(HS) --profile push --profile gateway logs -f --tail=200
+	$(COMPOSE) --profile $(HS) --profile push --profile pairing --profile gateway logs -f --tail=200
 
 ps:
-	$(COMPOSE) --profile $(HS) --profile push --profile gateway ps
+	$(COMPOSE) --profile $(HS) --profile push --profile pairing --profile gateway ps
 
 smoke: init
 	python3 server/tests/smoke.py \
@@ -317,6 +326,7 @@ federation-down:
 	# down -v needs the env file for interpolation; regenerate it if this
 	# checkout never ran federation-e2e (cheap, no Docker involved).
 	# A-R1: env files from before the service tokens existed would fail
-	# interpolation (:?), so regenerate those too.
-	@grep -q '^PAIRING_SERVICE_TOKEN_A=' "$(FED_ENV)" 2>/dev/null || python3 server/scripts/federation-setup.py
+	# interpolation (:?), so regenerate those too (A-R4: same for the
+	# relation send tokens).
+	@grep -q '^PAIRING_RELATIONS_SEND_TOKEN_A=' "$(FED_ENV)" 2>/dev/null || python3 server/scripts/federation-setup.py
 	$(FED_COMPOSE) down -v --remove-orphans

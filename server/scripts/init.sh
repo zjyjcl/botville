@@ -404,6 +404,23 @@ if [[ "$(env_value APPSERVICE_AS_TOKEN)" == "$(env_value APPSERVICE_HS_TOKEN)" ]
     echo "init.sh: APPSERVICE_AS_TOKEN and APPSERVICE_HS_TOKEN in ${env_file} must be different values" >&2
     exit 1
 fi
+# --- pairing tokens (A-R4): admin / facts / send must be pairwise different.
+# Generated values always differ; this catches hand-copied ones. Empty values
+# are left alone (the pairing profile is optional; the service itself
+# refuses to start without its tokens). Values are never printed.
+pairing_token_keys=(PAIRING_ADMIN_TOKEN PAIRING_SERVICE_TOKEN PAIRING_RELATIONS_SEND_TOKEN)
+for ((i = 0; i < ${#pairing_token_keys[@]}; i++)); do
+    for ((j = i + 1; j < ${#pairing_token_keys[@]}; j++)); do
+        vi="$(env_value "${pairing_token_keys[i]}")"
+        vj="$(env_value "${pairing_token_keys[j]}")"
+        if [[ -n "${vi}" && "${vi}" == "${vj}" ]]; then
+            echo "init.sh: ${pairing_token_keys[i]} and ${pairing_token_keys[j]} in ${env_file} must be different values" >&2
+            exit 1
+        fi
+    done
+done
+unset vi vj
+
 # Unconditional: a hand-created .env may be 0644 even when nothing above
 # changed it.
 chmod 600 "${env_file}"
