@@ -279,6 +279,7 @@ final class RoomEncryptionServiceTests: XCTestCase {
         temporaryDirectories.append(baseDirectory)
         let directory = SessionStoreDirectory(baseURL: baseDirectory)
         let service = MatrixService(sessionStore: store, storeDirectory: directory, monitorNetwork: false, aiParticipantPolicy: policy, sharedRoomMuteStore: MemoryRoomMuteStore())
+        try directory.seedCryptoStoreForTesting(try XCTUnwrap(store.load()).storeID)
         service.clientFactory = { _, _, _ in client }
         await service.restoreSession()
         XCTAssertTrue(service.isLoggedIn)

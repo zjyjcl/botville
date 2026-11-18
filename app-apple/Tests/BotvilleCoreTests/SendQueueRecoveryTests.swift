@@ -102,6 +102,7 @@ final class SendQueueRecoveryTests: XCTestCase {
             storeDirectory: SessionStoreDirectory(baseURL: directory),
             discovery: FakeDiscovery(), monitorNetwork: false
         , sharedRoomMuteStore: MemoryRoomMuteStore())
+        try SessionStoreDirectory(baseURL: directory).seedCryptoStoreForTesting(credentials.storeID)
         service.clientFactory = { _, _, _ in client }
         await service.restoreSession()
         try await waitUntil { service.connectionStatus == .connected }

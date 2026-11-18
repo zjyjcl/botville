@@ -743,10 +743,10 @@ private struct MessageBubble: View {
                     .foregroundStyle(.secondary)
                 if message.isUndecryptable {
                     // Placeholder only; no body exists yet, so nothing to select.
-                    Label(message.body, systemImage: "lock")
+                    Label(MatrixMessage.undecryptablePlaceholder.body, systemImage: "lock")
                         .italic()
                         .foregroundStyle(.secondary)
-                        .accessibilityLabel("\(message.body)，等待密钥后自动显示")
+                        .accessibilityLabel(MatrixMessage.undecryptablePlaceholder.accessibilityLabel)
                 } else {
                     Text(message.body)
                         .textSelection(.enabled)

@@ -19,6 +19,12 @@ default) and the authoritative gate for Matrix server-server traffic:
   /_matrix/pairing/notify-...  service) so peers need only this one port;
   ...severed                   every other /_matrix/pairing/* path is 404
                               (admin endpoints stay off the public port).
+  /_matrix/pairing/relations/  (A-R3) POST only, {request,respond,revoke};
+    {request,respond,revoke}   forwarded to PAIRING_UPSTREAM only when the
+                              single X-Botville-Origin header names an
+                              *active* peer (403 otherwise, 503 when the
+                              pairing DB is unreadable). The pairing
+                              service then verifies the per-peer HMAC.
   anything else               404.
 
 Signature verification stays with the homeserver; fedgate only decides
@@ -96,6 +102,10 @@ PAIRING_FORWARD_PATHS = (
     "/_matrix/pairing/redeem",
     "/_matrix/pairing/notify-severed",
 )
+# A-R3 cross-server relation transport: POST only, active origins only.
+RELATIONS_FORWARD_PATHS = tuple(
+    "/_matrix/pairing/relations/" + kind
+    for kind in ("request", "respond", "revoke"))
 
 # Client-supplied forwarding hints are spoofable; never forwarded — when
 # proxying to the pairing service, fedgate writes its own (review B3).
@@ -504,6 +514,9 @@ class FedgateHandler(BaseHTTPRequestHandler):
                 self._reject(404, {"errcode": "M_NOT_FOUND",
                                    "error": "no well-known delegation"})
             return
+        if path in RELATIONS_FORWARD_PATHS:
+            self._forward_relation()
+            return
         if path.startswith(PAIRING_PREFIX):
             forwardable = path in PAIRING_FORWARD_PATHS
             if not forwardable or not self.config.pairing_upstream:
@@ -541,6 +554,37 @@ class FedgateHandler(BaseHTTPRequestHandler):
             return
         self._reject(404, {"errcode": "M_UNRECOGNIZED",
                            "error": "path not served by fedgate"})
+
+    def _forward_relation(self):
+        """A-R3 active gate in front of the pairing service: a cheap,
+        fail-closed pre-check (the header is not yet authenticated -- the
+        pairing service verifies the HMAC). Unpaired/severed senders never
+        reach the pairing service at all."""
+        if self.command != "POST":
+            self._reject(405, {"errcode": "M_UNRECOGNIZED",
+                               "error": "method not allowed"})
+            return
+        if not self.config.pairing_upstream:
+            self._reject(404, {"errcode": "M_UNRECOGNIZED",
+                               "error": "pairing endpoint not served by"
+                                        " fedgate"})
+            return
+        origins = self.headers.get_all("X-Botville-Origin") or []
+        origin = origins[0] if len(origins) == 1 else None
+        if origin is None or not is_valid_server_name(origin):
+            self._reject(403, {"errcode": "M_FORBIDDEN",
+                               "error": "server not paired"})
+            return
+        ok, names = self.server.allowed.refresh_if_stale()
+        if not ok:
+            self._reject(503, {"errcode": "M_UNAVAILABLE",
+                               "error": "pairing database unavailable"})
+            return
+        if origin not in names:
+            self._reject(403, {"errcode": "M_FORBIDDEN",
+                               "error": "server not paired"})
+            return
+        self._proxy(self.config.pairing_upstream, overwrite_forwarded=True)
 
     def _sink_transaction(self, origin):
         """Swallow a /send transaction from an unpaired/severed origin.

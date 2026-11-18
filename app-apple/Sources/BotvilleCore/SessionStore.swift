@@ -300,6 +300,24 @@ public struct SessionStoreDirectory: Sendable {
         guard fileManager.fileExists(atPath: directory.path) else { return }
         try fileManager.removeItem(at: directory)
     }
+    /// File name of the SDK's crypto database inside the store data path
+    /// (matrix-rust-sdk sqlite store; verified against matrix-rust-components-swift 26.10.27).
+    public static let cryptoDatabaseFileName = "matrix-sdk-crypto.sqlite3"
+
+    /// True only when the SDK crypto database for `storeID` exists as a non-empty
+    /// regular file. A missing directory (reinstall, cleared container), a missing
+    /// file or a zero-byte file all mean the Olm account for the saved device is
+    /// gone; building a client there would mint a new identity under the old
+    /// device ID (#81, #245). Never creates anything.
+    public func hasCryptoStore(for storeID: UUID, fileManager: FileManager = .default) -> Bool {
+        let file = url(for: storeID).appendingPathComponent(Self.cryptoDatabaseFileName)
+        guard let attributes = try? fileManager.attributesOfItem(atPath: file.path),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              let size = attributes[.size] as? NSNumber
+        else { return false }
+        return size.int64Value > 0
+    }
+
     /// Removes all app-owned encrypted stores, including ones whose Keychain
     /// metadata can no longer be decoded. The base URL is app-specific.
     public func removeAll(fileManager: FileManager = .default) throws {

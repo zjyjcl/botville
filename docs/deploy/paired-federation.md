@@ -25,6 +25,8 @@
                      │   │     （/send 未配对 → 200 sink，见「实测要点」）        │
                      │   ├─ /_matrix/pairing/{redeem,notify-severed}             │
                      │   │     → pairing-a :8090（覆写 X-Forwarded-For）          │
+                     │   ├─ /_matrix/pairing/relations/{request,respond,revoke}  │
+                     │   │     仅 POST + X-Botville-Origin ∈ active → pairing-a   │
                      │   │     其余 /_matrix/pairing/* → 404（admin 不出公网口）  │
                      │   └─ 其余 → 404                                             │
                      │ pairing-a :8090（内网/loopback）── SQLite /data/pairing.db │
@@ -85,6 +87,8 @@ pairing 服务（错误统一 `{"errcode","error"}`；`/_matrix/pairing/<x>` 是
 | `GET /health` | 无 | 存活探针 |
 | `GET /v1/pairing/internal/peers/{name}` | service | 配对事实（A-R1，供网关）：`{state, changed_at}`，见下节 |
 | `GET /v1/pairing/internal/events?since=&limit=` | service | 配对事实事件流（A-R1）：`peer_paired` / `peer_severed`，见下节 |
+| `POST /v1/pairing/internal/relations/{request,respond,revoke}` | service | A-R3 跨服关系**出站**：本地网关交来 `{destination, request_id, payload}`，pairing 签名后只发给 active 对端，见「跨服关系传输」 |
+| `POST /v1/pairing/relations/{request,respond,revoke}` | 对端（HMAC） | A-R3 跨服关系**入站**（经 fedgate `/_matrix/pairing/relations/*`）：验签 + 防重放 + active + 格式校验后交给本地网关客户端，见「跨服关系传输」 |
 
 ### 配对事实接口（A-R1，供网关只读）
 
@@ -95,7 +99,7 @@ pairing 服务（错误统一 `{"errcode","error"}`；`/_matrix/pairing/<x>` 是
 - 没配 `PAIRING_SERVICE_TOKEN` 时，内部端点对任何请求都返回 401（服务照常启动，启动日志 WARNING）。
 - 配了但短于 32 个字符、或与 admin token 相同 → 拒绝启动，报错不回显取值。
 - 鉴权在路由之前：缺 token / 错 token / 用 admin token，不论路径对不对，都是同一个 401 `M_UNKNOWN_TOKEN`，不泄露端点或对端是否存在。失败只计数（`internal_rejected`）并记 WARNING（含来源 IP，不含 token），日志每 60 秒最多一条、附带期间被压掉的条数（#243 审查第 2 条），不写 events。`/v1/pairing/internal`（无尾斜杠）同样先鉴权，通过后 404。
-- 内部端点**不走** `/_matrix/pairing/` 别名（别名路径一律 404，**在鉴权之前**、带不带正确 token 都一样：别名是 fedgate 转发的公共命名空间，那里不存在内部端点，回 401 反而暗示有个可以猜 token 的认证入口），fedgate 也只转发 redeem / notify-severed，所以对端永远够不着。只应在内网（compose 网络或 loopback）访问。
+- 内部端点**不走** `/_matrix/pairing/` 别名（别名路径一律 404，**在鉴权之前**、带不带正确 token 都一样：别名是 fedgate 转发的公共命名空间，那里不存在内部端点，回 401 反而暗示有个可以猜 token 的认证入口），fedgate 也只转发 redeem / notify-severed / relations/{request,respond,revoke}，所以对端永远够不着。只应在内网（compose 网络或 loopback）访问。
 
 **`GET /v1/pairing/internal/peers/{server_name}`** → `200 {"state": "active"|"severed"|"unpaired", "changed_at": ISO-8601|null}`
 - `changed_at`：active 取最近一次配对时间，severed 取切断时间，unpaired（从未配对）为 null。
@@ -115,6 +119,38 @@ pairing 服务（错误统一 `{"errcode","error"}`；`/_matrix/pairing/<x>` 是
   - 收到 410 时，网关先记下 `resync_cursor`，再对自己关心的每个服务器调 `peers/{name}` 重建状态，然后从 `resync_cursor` 继续轮询。水位之后的事件会被重放一遍（可能与刚查到的状态重复），所以网关侧必须幂等。
   - 网关停机超过 30 天、且期间有清理时一定会遇到 410；按上述步骤自愈即可。
 
+### 跨服关系传输（A-R3，只做联邦侧）
+
+A 线只负责「把消息安全送到对端网关、把对端网关的回答带回来」；请求 ID 的业务含义、幂等、过期、状态机都归 B 线网关。
+
+**信封**（canonical JSON：`sort_keys`、无空格、UTF-8；签名与发送的就是这串字节）：
+
+```json
+{"destination":"hs-b","kind":"request","origin":"hs-a","payload":{...},"request_id":"01J...","v":1}
+```
+
+- 键必须恰好是 `v, kind, origin, destination, request_id, payload`；`v` 为整数 1；`kind` 必须等于 URL 里的 kind；`origin` 必须等于验签通过的发送方；`destination` 必须是本服；`request_id` 为 16–64 位 `[0-9A-Za-z_-]`（建议 ULID）；`payload` 必须是 JSON 对象（内容不校验）；整个信封 ≤16 KiB。
+- 格式不符 → `400 BV_BAD_ENVELOPE`（只给原因，不回显内容）。
+
+**签名**（复用 notify-severed 的逐对端 shared_secret，加域分隔）：`HMAC-SHA256(shared_secret, "botville-relations-v1\nrelations/<kind>\n<origin>\n<ts>\n<nonce>\n<sha256hex(body)>")`，头同为 `X-Botville-Origin/-Ts/-Nonce/-Sig`。域前缀和 kind 进签名，notify-severed 的签名、或签给 `respond` 的消息都不能拿来打 `request`。
+
+**入站顺序（一切异常 fail-closed）**：
+
+1. fedgate：仅 POST（否则 405）；`X-Botville-Origin` 必须恰好一个、合法小写名、且在 active 配对表 → 否则 `403 server not paired`；配对库不可读 → 503。这一步只是便宜的预筛（头还没验签）。
+2. pairing：120/min/IP → 429；body ≤16 KiB → 413；未知/无 secret 的 origin、`|now-ts|>300s`、nonce 非 32–128 位小写 hex、签名不对 → 统一 `401 invalid relations authentication`（每次都计入 `relations_rejected`；WARNING 与内部 401 同样经 LogThrottle 每 60 秒最多一条、附带期间被压掉的条数；不写 events）。
+3. 60/min/origin → 429；nonce 防重放（按 origin+nonce，窗口 600s，**满了不淘汰而是 503**，避免被挤掉的 nonce 在窗口内被重放）→ 重放 401。
+4. 再读一次 peers：非 active → `403 BV_PEER_INACTIVE`。
+5. 信封格式 → 400。
+6. 交给网关客户端 `deliver(kind, envelope, meta)`（`meta = {origin, sent_at, received_at}`）：未配置 / 抛异常 / 返回不可用结果（状态码不在 `200,201,202,400,403,404,409,410,422,429`、body 非对象或 >16 KiB）→ `503 BV_RELATIONS_UNAVAILABLE`；否则**原样**把网关的状态码和 body 回给发送方。
+
+**出站**（`POST /v1/pairing/internal/relations/<kind>`，service token）：body 恰好 `{destination, request_id, payload}`；destination 不能是本服；destination 必须 active 且有 shared_secret 和 peer_api_url，否则 `409 BV_PEER_INACTIVE`；60/min/destination → 429；签名后 POST `peer_api_url + "/relations/<kind>"`（不跟随重定向、10s 超时、不重试，`PAIRING_INSECURE_TLS` 同样适用）。
+
+- 对端有回答 → `200 {"delivered": 2xx?, "peer_status": N, "peer_body": {...}|null}`（对端的业务拒绝也在这里，不会被误当成传输错误）；
+- 超时 → `504 BV_PEER_TIMEOUT`；连不上 / 畸形响应 → `502 BV_PEER_UNREACHABLE`。重试由网关用**同一个 request_id** 发起。
+- 注意：A-R1 的 service token 原本只读，现在也能触发出站发送；仍只应在内网使用。
+
+**网关客户端**：`PAIRING_RELATIONS_GATEWAY` 选择实现。默认 `none`：所有入站消息 503（明确的「不可用」）。`test-recorder` 只给测试/CI：把 `{kind, envelope, meta}` 逐行追加到 `PAIRING_RELATIONS_TEST_RECORD`（绝对路径）并回 202——它什么都收，**不得用于真实部署**。`http`（真正调网关）保留：双方对齐网关内部端点之前不合入，配了会拒绝启动。
+
 fedgate 路由规则：
 
 | 路径 | 规则 |
@@ -122,6 +158,7 @@ fedgate 路由规则：
 | `/_matrix/key/v2/server*` | 放行（本服公钥，不含房间内容） |
 | `/_matrix/federation/*`、`/_matrix/key/v2/query*`、`/_matrix/media/*` | 解析 `Authorization: X-Matrix origin=…`（引号/无引号均可）。**必须恰好一个 X-Matrix 头、参数名不得重复、origin/sig 必填、origin 必须是合法小写 DNS server_name**——与 Synapse v1.164.1 解析语义一致，但任何歧义（多头/重复参数/畸形）一律 403 fail-closed，杜绝"闸门查 A、HS 验签 B"的绕过。origin ∉ active 配对表 → `403 {"errcode":"M_FORBIDDEN","error":"server not paired"}`（未配对 `PUT /_matrix/federation/v1/send/*` 例外：200 sink，见「实测要点」）；配对库不可读 → `503 M_UNAVAILABLE` |
 | `/_matrix/pairing/redeem`、`/_matrix/pairing/notify-severed` | 转发到 `PAIRING_UPSTREAM`（对端只需暴露 8448 一个端口；剥掉客户端自带的 XFF/X-Real-IP/Forwarded，写入直连客户端 IP） |
+| `/_matrix/pairing/relations/{request,respond,revoke}` | A-R3：仅 POST（否则 405）；单个合法 `X-Botville-Origin` 且 ∈ active 配对表才转发到 `PAIRING_UPSTREAM`（同样重写 XFF），否则 403；配对库不可读 → 503。其他 `relations/*` 路径 404 |
 | 其余 `/_matrix/pairing/*` | 404（admin 端点不出公网口） |
 | 其余 | 404 |
 | `/health`、`/.well-known/matrix/server` | 本地应答（前者含配对库可读性，后者为委派名） |
@@ -149,7 +186,7 @@ fedgate 路由规则：
 - **闸门与 HS 解析一致性（B1）**：fedgate 遍历全部 Authorization 头，X-Matrix 头数量 ≠1 或任一参数名重复 → 403；参数切分/去引号/反斜杠转义与 Synapse v1.164.1 `_parse_auth_header` 一致；签名真伪由 HS 验签兜底。**HTTP 层**：Python 标准库与 Twisted 对折行（obs-fold）头的归一化不同（前者保留 `\r\n`+缩进，后者折成一个空格），任何跨解析器的归一化差异都是绕过面，所以闸门**不模拟**对方的归一化，而是在路由前拒绝任何折行头或含控制字符（HTAB 除外）的头名/头值（400），也顺带杜绝 CRLF 注入上游。**重复 Authorization**：在原始字节层面（不依赖 http.server/email 的合并结果）计数，`Authorization` 出现超过一次（不论是否 X-Matrix、不论大小写）、头名与冒号间有空白、或单个值内出现第二个凭证（第二个 `X-Matrix`/非法参数名）→ 400；转发时只转发那唯一一个已校验的值，绝不合并。不变量是「闸门解析的表示 == 转发给 HS 的表示」，任何偏离即绕过；「闸门放行的 origin == HS 认证的 origin」只在以上全部请求级检查成立时才成立（`parse_x_matrix_origin` 单独并不保证），由 raw socket 用例与差分单测（Twisted 折行语义 + 逐字照抄的 Synapse `_parse_auth_header` 参考实现，对照上游实际收到的头）守护。
 - **媒体访问的硬边界**：Synapse 对 `/_matrix/media/*`（联邦媒体下载）**不验联邦签名**，闸门也不验签（容器仅标准库，无 ed25519）；因此能伪造某 active 对端 origin 的请求方，只要知道 `media_id` 就能下载。**媒体访问的唯一保护是 media_id 的保密性**（Synapse media_id 约 24 位 62 进制，≈143 bit，不可猜）。A2.1 单配对部署下接受；**多配对或生产化前必须补令牌/签名（闸门验签）**。
 - **sink 的代价**：未配对 `/send` 回 `200 {"pdus":{}}` 并丢弃（读 body 上限 1 MiB，超限直接断开；日志按 origin 节流）。**切断期间的 EDU（to-device、E2EE 密钥包）永久丢失**（DAG 补不回、发送方收到 200 不再重试）；PDU 在重新配对后经 `get_missing_events`/`backfill` 补回——因此 sever 是"断流"而非"内容栅栏"，**重新配对后切断窗口内产生的事件会一并补回**；若需要"切断期内容永不再入"需后续做窗口栅栏。**产品决策（2026-11-10，B6，见 [pairing-qr.md §11](../contracts/pairing-qr.md)）**：首版**保留**这一行为——重新配对后补回切断期消息，App / 管理页在重新配对时须向用户说明「切断期间对方发出的消息会补回」；时间窗栅栏归 #118。
-- **管理面**：`Authorization: Bearer $PAIRING_ADMIN_TOKEN`，常量时间比对；token 缺失时服务**拒绝启动**；pairing 服务只应绑定内网/loopback（compose 只把 admin 端口映射到 `127.0.0.1`；fedgate 只转发 redeem/notify-severed，admin 端点不暴露公网口）。
+- **管理面**：`Authorization: Bearer $PAIRING_ADMIN_TOKEN`，常量时间比对；token 缺失时服务**拒绝启动**；pairing 服务只应绑定内网/loopback（compose 只把 admin 端口映射到 `127.0.0.1`；fedgate 只转发 redeem/notify-severed/relations（后者仅 active origin），admin 与内部端点不暴露公网口）。
 - **日志**：不打印 secret/token（qr_payload 只出现在请求体，永不落日志；shared_secret 同样只存 DB/响应体）。
 - **对端身份校验**（`PAIRING_VERIFY_PEER_KEY`，默认开）：redeem（invite 校验通过后）拉取对端 `/_matrix/key/v2/server` 并要求 server_name 一致，防止冒名配对；该校验比对的是对端声明字段，签名仍由联邦层验签保证。`PAIRING_PEER_KEY_URL_TEMPLATE`（默认 `https://{server_name}/_matrix/key/v2/server`）供测试/特殊拓扑改写；`PAIRING_INSECURE_TLS=true` 关闭证书校验，**仅限 CI/一次性测试栈**（自签证书场景）。
 - 审计与保留：`events` 表记录 invite 创建/兑换/拒绝原因、配对、切断、通知成败、限速与对端校验失败；`store.prune()`（启动时+每小时）删除 30 天前已消费/过期 invite 与旧事件。
@@ -186,9 +223,11 @@ pairing 服务：
 | `PAIRING_PEER_KEY_URL_TEMPLATE` | `https://{server_name}/_matrix/key/v2/server` | key 拉取模板（CI 经 fedgate 地址 + 端口） |
 | `PAIRING_INSECURE_TLS` | `false` | 关闭出站 TLS 校验（仅 CI） |
 | `PAIRING_TRUSTED_PROXIES` | 空 | 逗号分隔 IP/CIDR；仅当直连地址命中时才采信 `X-Forwarded-For` 最后一个值作为限速键（空=一律用直连 IP） |
-| `PAIRING_SERVICE_TOKEN` | 空（内部端点全部 401） | A-R1 配对事实接口的 service token；≥32 字符且不得等于 admin token，否则拒绝启动。联邦测试栈由 `federation-setup.py` 与 admin token 分别随机生成（`PAIRING_SERVICE_TOKEN_A/B`，写入 gitignored 的 `generated/federation.env`）。它是密钥，不要贴到文档、聊天或日志 |
+| `PAIRING_SERVICE_TOKEN` | 空（内部端点全部 401） | A-R1 配对事实接口的 service token；≥32 字符且不得等于 admin token，否则拒绝启动。联邦测试栈由 `federation-setup.py` 与 admin token 分别随机生成（`PAIRING_SERVICE_TOKEN_A/B`，写入 gitignored 的 `generated/federation.env`）。它是密钥，不要贴到文档、聊天或日志。A-R3 起它也能调出站关系发送端点 |
 | `PAIRING_HS_WHITELIST_PATH` | 空（关闭） | 绝对路径；设置后渲染 Synapse `federation_domain_whitelist` include（A-R2，见「HS 白名单与重启」） |
 | `PAIRING_HS_RESTART_MARKER` | `<PAIRING_HS_WHITELIST_PATH>.restart-required` | 「需要重启」标记的绝对路径；须先设 `PAIRING_HS_WHITELIST_PATH`，且不能与它相同 |
+| `PAIRING_RELATIONS_GATEWAY` | `none` | A-R3 入站关系消息交给谁：`none`（一律 503）、`test-recorder`（仅测试/CI）；`http` 保留，配了拒绝启动 |
+| `PAIRING_RELATIONS_TEST_RECORD` | 空 | `test-recorder` 的输出文件（必须是绝对路径，否则拒绝启动） |
 
 fedgate：
 
@@ -241,9 +280,13 @@ fedgate 是**实时的第一道闸**：配对表一变（≤1s），双方入站
 
    列表去重、排序（同一配对状态永远渲染出相同字节）；severed 对端不在其中；名字以 JSON 字符串写出（配对本就只接受裸 DNS 名）。启动时、以及之后每 60s 也会重算一次（重试失败的写入、修复被手改/删掉的文件）。
 2. **原子写入**：同目录临时文件 → fsync → `os.replace` → fsync 目录；Synapse 永远读不到半个文件；写失败时旧文件原样保留。文件权限 0644（不是密钥，homeserver 以其他 uid 读取）。
-3. **重启标记**：文件内容真的变了才写 `<path>.restart-required`（可用 `PAIRING_HS_RESTART_MARKER` 改路径），内容是 `{"reason","whitelist","at"}`。**内容没变（例如重复切断、同一状态的重算）不写文件也不写标记**，不会触发无谓重启。例外：进程**首次**同步时文件根本不存在 → 只建文件不写标记（homeserver 通过 `--config-path` 加载它，文件不存在时不可能在运行，首启无需重启）；之后若文件被删再重建，照常写标记。标记写失败会在下一次同步时重试，不会因为文件内容已是最新而漏掉重启。
+3. **重启标记**：文件内容真的变了才写 `<path>.restart-required`（可用 `PAIRING_HS_RESTART_MARKER` 改路径），内容是 `{"reason","whitelist","at"}`。**内容没变（例如重复切断、同一状态的重算）不写文件也不写标记**，不会触发无谓重启。
+   - **读表→渲染→写盘在同一把锁里**（#247 审查 S1）：并发的两次同步不会出现「慢的那次用旧快照覆盖新内容」。
+   - **标记写两次**（#247 审查 S2）：先写标记、再替换 include、再写一次标记。进程若在 include 与标记之间崩溃，标记已经在了（否则下次启动发现 include 已是最新、什么都不写，重启就丢了）；若 supervisor 恰好在 include 落盘前就认领了第一个标记并重启，第二个标记会让它再重启一次。最坏多重启一次，绝不漏。
+   - **标记写失败**（#247 审查 N3）：include 照常更新，重启记为待办；之后每次同步（含每 60s 的后台重算）都重写并重试标记，每次失败都记一条 ERROR（`restart marker could not be written`），直到写成为止。
+   - 例外：进程**首次**同步时文件根本不存在 → 只建文件不写标记（homeserver 通过 `--config-path` 加载它，文件不存在时不可能在运行，首启无需重启）。之后若文件被删再重建，照常写标记——**但这只在同一进程内成立**（#247 审查 S4）：「首次同步」是进程内状态，pairing 停机期间被删掉的文件，下次启动时按首启处理、重建但**不写标记**；运维若手动删过 include，请在 pairing 启动后自行重启一次 homeserver。
 4. **不自动重启**：pairing 不持有 docker socket，也不调用任何编排 API。Synapse 只在启动时读这个 include，**由运维或外部 supervisor/systemd 在看到标记后重启 Synapse，并在重启后删除标记**。在重启之前，新的配对状态仍由 fedgate 实时执行，只是本端 HS 还会白费力气地尝试出站。
-5. 写入失败不影响配对请求本身（状态已提交，fedgate 已生效）：记 ERROR 日志并在下一次同步重试。
+5. 写入失败不影响配对请求本身（状态已提交，fedgate 已生效）：任何异常（不只是 IO/SQLite 错误，#247 审查 S3）都只记 ERROR 日志、计入失败计数（加锁，N1），并在下一次同步重试；后台重算循环本身也包了一层异常保护，单次意外不会让循环线程退出。
 
 **Synapse 接入**：把 include 作为第二个 `--config-path` 传给 Synapse（后加载的文件覆盖同名键，所以**不要**在 homeserver.yaml 里再写 `federation_domain_whitelist`），并让 Synapse 在 pairing 健康之后再启动（pairing 先渲染再开始服务）。CI 栈的写法：
 
@@ -258,6 +301,12 @@ pairing-a:
 ```
 
 生产部署时把这个目录做成宿主机目录（bind mount），supervisor 才看得到标记。
+
+**目录属主与权限（#247 审查 S6）**：
+- pairing 需要对该目录**可写**（临时文件 + `os.replace` 发生在同一目录，只给文件写权限不够）；homeserver 只需**可读**（挂 `:ro`）；supervisor 需要在目录里 `mv` / `rm` 标记，所以也要可写。
+- 官方镜像里 pairing（`python:3.12-slim`）默认以 root 运行，Synapse 镜像以 UID 991 运行。推荐：宿主机建 `/srv/botville/hs`，属主 `root:991`、模式 `0750`（或 `0755`）；include 由 pairing 以 `0644` 写出，Synapse 能读、不能改。
+- 如果把 pairing 改成非 root 运行，目录属主改为该 UID（或给它组写权限 `0770`），否则每次渲染都会失败并只留下 ERROR 日志（fedgate 仍然生效）。
+- 不要把这个目录放在 homeserver 的数据卷里，也不要让 homeserver 可写：include 决定它能和谁联邦。
 
 **重启流程**（手工或 supervisor，顺序很重要）：
 
@@ -302,11 +351,15 @@ ExecStart=/bin/sh -c 'for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8008/h
 ExecStartPost=/bin/rm -f ${M}.processing
 ```
 
-启用：`systemctl daemon-reload && systemctl enable --now botville-hs-restart.path`。服务失败时 `.processing` 留在原地、不会被删除，便于排查；`PathExists` 会在新标记出现时再次触发。
+启用：`systemctl daemon-reload && systemctl enable --now botville-hs-restart.path`。
+
+**失败不会自愈（#247 审查 S5）**：服务任何一步失败（restart 失败、60 次健康检查都没过）时，`.processing` 留在原地、不会被删除，**也不会自动重试**——标记已经被 `mv` 走，`PathExists` 条件不再成立；之后只有 pairing 再写出**新**标记（下一次配对变化）才会再次触发，而在那之前 homeserver 可能一直运行着旧白名单（fedgate 仍然实时执行配对状态，安全上不受影响）。频繁失败时 systemd 还可能让 path unit 进入 `trigger-limit-hit` 失败态，之后连新标记都不再触发。请对 `botville-hs-restart.service` 的失败配置告警（如 `OnFailure=` 发通知），人工处理：确认 Synapse 状态后，`mv ….processing ….restart-required` 让它重跑，或手动重启并删除 `.processing`；必要时 `systemctl reset-failed botville-hs-restart.path`。
 
 **短暂停机的影响**：重启期间（CI 实测约 10–30s）本端用户的客户端请求失败/重连、推送与 appservice 事务延后；联邦方向上，对端发来的事务在本端闸门后得不到应答，对端 Synapse 会退避重试，之后补齐 PDU；**重启窗口内对端发来的 EDU（输入提示、已读回执、to-device）可能丢失**。因此重启应在配对变更后尽快、但可以择时进行——在此之前 fedgate 已经执行了新状态，安全上不依赖重启的时机。
 
 **验收**（`make federation-e2e`，e2e 脚本自己扮演 supervisor，执行上面的认领→`docker compose restart`→删除流程）：首启双方白名单只有自己且无标记；配对后两边列表都含双方、双方都有标记，重启后互通；切断后**重启前**本端 HS 仍在出站、由对端 fedgate 拦下（对端闸门访问日志里能看到请求，作为对照）；**切断并重启后**本端 HS 向对端发出的 `/_matrix/federation|key` 请求为 0（对端闸门访问日志计数不变），向对端用户发邀请在本端直接失败；重新配对并重启后双向恢复；重复切断不写标记。
+
+**负向断言的局限（#247 审查 N4）**：「没有出站」「消息没送到」这类断言是在一个有限窗口里观察的（`NEGATIVE_TIMEOUT` 20 秒，切断后另加闸门刷新的宽限），它们证明的是「窗口内没有发生」，**不是**「永远不会发生」。Synapse 的事务重试退避可能长于 20 秒，所以窗口之后才出现的延迟出站在 e2e 里观察不到；这一层的保证来自代码路径（白名单在 Synapse 启动时加载、fedgate 实时拦截）和单元测试，e2e 只是在合理时长内的抽样验证。
 
 **Conduit 系不在本 PR**：Tuwunel（`allowed_remote_server_names_experimental` / `forbidden_remote_server_names`）与 continuwuity（`allowed_remote_server_names` / `forbidden_remote_server_names`）的配置面与 Synapse 不同，联邦栈也只有 Synapse；留到 A-R3 之后单独做。在此之前这两家只靠 fedgate。
 

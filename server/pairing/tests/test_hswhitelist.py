@@ -5,6 +5,7 @@ import os
 import stat
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -148,6 +149,91 @@ class WriterTest(unittest.TestCase):
         os.unlink(self.marker)
         self.assertFalse(self.writer.sync(["hs-b"]))
 
+    # --- #247 review follow-ups (A-R4) ---------------------------------------
+
+    def test_peers_are_read_under_the_writer_lock(self):
+        # S1: read -> render -> write is one critical section, so a slow
+        # sync can never write an older snapshot over a newer one.
+        seen = []
+
+        def loader():
+            seen.append(self.writer._lock.locked())
+            return ["hs-b"]
+
+        self.writer.sync(loader)
+        self.assertEqual(seen, [True])
+        self.assertEqual(listed(self.read(self.path)), ["hs-a", "hs-b"])
+
+    def test_crash_between_include_and_marker_keeps_the_restart(self):
+        # S2: the marker is written BEFORE the include, so a crash after
+        # the include write cannot lose it -- the next process finds the
+        # include current and writes nothing, but the marker is there.
+        self.writer.sync([])  # first boot
+        real_write = hswhitelist._atomic_write
+        calls = []
+
+        class Crash(BaseException):
+            pass
+
+        def crash_after_include(path, text):
+            calls.append(path)
+            if path == self.marker and self.path in calls:
+                raise Crash()  # process dies before the second marker
+            real_write(path, text)
+
+        with mock.patch.object(hswhitelist, "_atomic_write",
+                               crash_after_include):
+            with self.assertRaises(Crash):
+                self.writer.sync(["hs-b"])
+        self.assertEqual(calls, [self.marker, self.path, self.marker])
+        self.assertEqual(listed(self.read(self.path)), ["hs-a", "hs-b"])
+        self.assertTrue(os.path.exists(self.marker))
+        restarted = hswhitelist.HsWhitelistWriter(self.path, "hs-a")
+        self.assertFalse(restarted.sync(["hs-b"]))
+        self.assertTrue(os.path.exists(self.marker))
+
+    def test_marker_consumed_before_include_lands_is_rewritten(self):
+        # S2: a supervisor that claims the first marker and restarts before
+        # the include is replaced gets a second marker afterwards.
+        self.writer.sync([])
+        real_write = hswhitelist._atomic_write
+
+        def supervisor_races(path, text):
+            if path == self.path and os.path.exists(self.marker):
+                os.unlink(self.marker)  # claimed + restarted on old content
+            real_write(path, text)
+
+        with mock.patch.object(hswhitelist, "_atomic_write", supervisor_races):
+            self.assertTrue(self.writer.sync(["hs-b"]))
+        self.assertTrue(os.path.exists(self.marker))
+
+    def test_persistent_marker_failure_raises_every_time(self):
+        # N3: include written, marker failing -> MarkerWriteError on every
+        # sync (the service logs ERROR each time) until it works.
+        self.writer.sync([])
+        real_write = hswhitelist._atomic_write
+
+        def fail_marker(path, text):
+            if path == self.marker:
+                raise OSError("read-only marker dir")
+            real_write(path, text)
+
+        with mock.patch.object(hswhitelist, "_atomic_write", fail_marker):
+            for _ in range(3):
+                with self.assertRaises(hswhitelist.MarkerWriteError):
+                    self.writer.sync(["hs-b"])
+        self.assertEqual(listed(self.read(self.path)), ["hs-a", "hs-b"])
+        self.assertTrue(self.writer.sync(["hs-b"]))
+        self.assertTrue(os.path.exists(self.marker))
+
+    def test_restart_of_process_after_delete_recreates_without_marker(self):
+        # S4 (documented limit): "recreated with a marker" is per process.
+        self.writer.sync(["hs-b"])
+        os.unlink(self.path)
+        restarted = hswhitelist.HsWhitelistWriter(self.path, "hs-a")
+        self.assertFalse(restarted.sync(["hs-b"]))
+        self.assertFalse(os.path.exists(self.marker))
+
     def test_custom_marker_path(self):
         marker = os.path.join(self.dir, "restart-me")
         writer = hswhitelist.HsWhitelistWriter(self.path, "hs-a", marker)
@@ -262,6 +348,68 @@ class ServiceWhitelistTest(ServiceTestBase):
         os.chmod(self.wl_dir, 0o700)
         self.assertTrue(self.app.sync_hs_whitelist())  # the retry loop's call
         self.assertEqual(self.names(), ["hs-a"])
+
+    # --- #247 review follow-ups (A-R4) ---------------------------------------
+
+    def test_any_exception_is_contained_and_counted(self):
+        # S3: "never raises" holds for any Exception, not only OSError.
+        with mock.patch.object(self.app.store, "active_server_names",
+                               side_effect=RuntimeError("surprise")):
+            with self.assertLogs("pairing.service", "ERROR") as logs:
+                self.assertFalse(self.app.sync_hs_whitelist())
+        self.assertIn("RuntimeError", logs.output[0])
+        self.assertEqual(self.app.hs_whitelist_failures, 1)
+
+    def test_marker_failure_logs_error_on_every_retry(self):
+        # N3: each retry (the 60s loop) rewrites and reports ERROR.
+        self.app.sync_hs_whitelist()
+        self.app.store.upsert_peer_active("hs-b", "https://hs-b/x")
+        real_write = hswhitelist._atomic_write
+
+        def fail_marker(path, text):
+            if path == self.marker:
+                raise OSError("read-only marker dir")
+            real_write(path, text)
+
+        with mock.patch.object(hswhitelist, "_atomic_write", fail_marker):
+            for attempt in (1, 2):
+                with self.assertLogs("pairing.service", "ERROR") as logs:
+                    self.assertFalse(self.app.sync_hs_whitelist())
+                self.assertIn("restart marker could not be written",
+                              logs.output[0])
+                self.assertEqual(self.app.hs_whitelist_failures, attempt)
+        self.assertTrue(self.app.sync_hs_whitelist())
+        self.assertTrue(self.take_marker())
+
+    def test_failure_counter_is_thread_safe(self):
+        # N1
+        def bump():
+            for _ in range(500):
+                self.app._note_hs_whitelist_failure()
+
+        threads = [threading.Thread(target=bump) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(self.app.hs_whitelist_failures, 4000)
+
+    def test_loop_survives_an_exception(self):
+        # S3: the background loop keeps going after a surprise.
+        calls = []
+        done = threading.Event()
+
+        class FlakyApp:
+            def sync_hs_whitelist(self):
+                calls.append(1)
+                if len(calls) == 1:
+                    raise RuntimeError("bug")
+                done.set()
+
+        with self.assertLogs("pairing.service", "ERROR"):
+            service.start_hs_whitelist_loop(FlakyApp(), interval=0.01)
+            self.assertTrue(done.wait(5))
+        self.assertGreaterEqual(len(calls), 2)
 
     def test_feature_off_without_path(self):
         app = service.PairingApp(service.PairingConfig(
