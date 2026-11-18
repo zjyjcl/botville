@@ -143,13 +143,14 @@ A 线只负责「把消息安全送到对端网关、把对端网关的回答带
 5. 信封格式 → 400。
 6. 交给网关客户端 `deliver(kind, envelope, meta)`（`meta = {origin, sent_at, received_at}`）：未配置 / 抛异常 / 返回不可用结果（状态码不在 `200,201,202,400,403,404,409,410,422,429`、body 非对象或 >16 KiB）→ `503 BV_RELATIONS_UNAVAILABLE`；否则**原样**把网关的状态码和 body 回给发送方。
 
-**出站**（`POST /v1/pairing/internal/relations/<kind>`，service token）：body 恰好 `{destination, request_id, payload}`；destination 不能是本服；destination 必须 active 且有 shared_secret 和 peer_api_url，否则 `409 BV_PEER_INACTIVE`；60/min/destination → 429；签名后 POST `peer_api_url + "/relations/<kind>"`（不跟随重定向、10s 超时、不重试，`PAIRING_INSECURE_TLS` 同样适用）。
+**出站**（`POST /v1/pairing/internal/relations/<kind>`，A-R4 起只认 **send token** `PAIRING_RELATIONS_SEND_TOKEN`；facts 的 service token 在这里 401，send token 在 facts 端点也 401；裸 `/v1/pairing/internal`、`/v1/pairing/internal/relations` 带 service token → 404）：body 恰好 `{destination, request_id, payload}`；destination 不能是本服；destination 必须 active 且有 shared_secret 和 peer_api_url，否则 `409 BV_PEER_INACTIVE`；60/min/destination → 429；签名后 POST `peer_api_url + "/relations/<kind>"`（不跟随重定向、10s 超时、不重试，`PAIRING_INSECURE_TLS` 同样适用）。
 
 - 对端有回答 → `200 {"delivered": 2xx?, "peer_status": N, "peer_body": {...}|null}`（对端的业务拒绝也在这里，不会被误当成传输错误）；
 - 超时 → `504 BV_PEER_TIMEOUT`；连不上 / 畸形响应 → `502 BV_PEER_UNREACHABLE`。重试由网关用**同一个 request_id** 发起。
-- 注意：A-R1 的 service token 原本只读，现在也能触发出站发送；仍只应在内网使用。
+- A-R4：send token 与 facts token 分开（#249 review 1）：≥32 字符、不得等于 admin token 或 service token（常量时间比较），否则拒绝启动；未配置时发送端点一律 401（启动 WARNING）。
+- **目标策略**（#249 review 2）：`peer_api_url` 必须是 `https`，且主机解析出的**所有**地址都是公网地址；否则 `409 BV_PEER_TARGET_REFUSED`（WARNING 日志，不回显 URL 以外的内容）。私有/环回/链路本地/保留地址只有在 `PAIRING_RELATIONS_ALLOW_PRIVATE=true` 时放行，每次发送记一条 `AUDIT` WARNING（启动时也有 WARNING）；无法解析或非 http(s) 的目标即使开了开关也拒绝。残余风险：解析与真正连接之间可能被 DNS rebinding 换地址（检查与连接不是同一次解析），生产上应保持开关关闭并让 peer 主机名由可信 DNS 解析。
 
-**网关客户端**：`PAIRING_RELATIONS_GATEWAY` 选择实现。默认 `none`：所有入站消息 503（明确的「不可用」）。`test-recorder` 只给测试/CI：把 `{kind, envelope, meta}` 逐行追加到 `PAIRING_RELATIONS_TEST_RECORD`（绝对路径）并回 202——它什么都收，**不得用于真实部署**。`http`（真正调网关）保留：双方对齐网关内部端点之前不合入，配了会拒绝启动。
+**网关客户端**：`PAIRING_RELATIONS_GATEWAY` 选择实现。默认 `none`：所有入站消息 503（明确的「不可用」）。`test-recorder` 只给测试/CI：把 `{kind, envelope, meta}` 逐行追加到 `PAIRING_RELATIONS_TEST_RECORD`（绝对路径）并回 202——它什么都收，**不得用于真实部署**。`http`（真正调网关）保留：双方对齐网关内部端点之前不合入，配了会拒绝启动（网关侧 `GATEWAY_RELATIONS_INBOUND_*` 变量名由 B 线定，A 线不猜测透传）。模式不是 `none` 时启动打 WARNING，`/health` 返回 `{"ok": true, "relations_gateway": "<mode>"}`（#249 review 3）。网关客户端抛出的异常只按原因码记日志（`not_configured`、`recorder_write_failed` 等），绝不包含请求或响应 body（#249 review 4）。
 
 fedgate 路由规则：
 
@@ -206,6 +207,16 @@ make federation-down  # 只 down -v 该项目
 - CI-only 配置叠加（写在生成的 homeserver.yaml 里，勿抄进生产）：`federation_verify_certificates: false`、`federation_ip_range_blacklist: []`、`enable_registration: true`、`trusted_key_servers: []`；pairing/fedgate 的 `PAIRING_INSECURE_TLS: "true"`。
 - 白名单卷（A-R2）：`fed-hs-a-whitelist` / `fed-hs-b-whitelist`，pairing 读写、synapse 只读挂在 `/hs`；synapse 以第二个 `--config-path /hs/federation-whitelist.yaml` 加载并 `depends_on` pairing 健康。e2e 用 `docker compose exec/restart` 检查列表与标记并重启 synapse（`--compose`，Makefile 传入 `FED_COMPOSE`）。
 - 单测（无需 Docker）：`python3 -m unittest discover -s server/pairing/tests`。
+- A-R4：e2e 用 send token 发送，并断言 facts token 调发送端点得 401；联邦 compose 的两台 pairing 都设 `PAIRING_RELATIONS_ALLOW_PRIVATE: "true"`（仅 CI）。
+
+### 主 compose 中的 pairing（A-R4）
+
+`make up PAIRING=1`（任一 HS）在主栈里起 `pairing` 服务（profile `pairing`）：镜像 `PAIRING_IMAGE`（与 `gateway/Dockerfile` 同一 python:3.12-slim digest）、只读挂载 `server/pairing`、状态在 `pairing-data` 卷（`/data/pairing.db`）、宿主端口只绑 `127.0.0.1:${BOTVILLE_PAIRING_PORT:-8090}`，不挂 docker socket。`make down/ps/logs/config` 恒带 `--profile pairing`。
+
+- 三个 token：`PAIRING_ADMIN_TOKEN`、`PAIRING_SERVICE_TOKEN`、`PAIRING_RELATIONS_SEND_TOKEN`，在 `server/compose/.env.example` 与根 `.env.example` 中均为 `<change-me>`，由 `init.sh` 生成 64 位 hex 并检查两两不同（相同直接退出，不打印值）。网关侧接收 service/send token 的变量名属 B 线（`gateway/.env.example`），本 PR 不往 gateway 服务透传。
+- `PAIRING_SERVER_NAME` 取 `BOTVILLE_SERVER_NAME`：必须是真实 DNS 名，默认的 `localhost` 会让服务拒绝启动（fail-closed）。
+- `PAIRING_API_URL` 默认 `https://<BOTVILLE_SERVER_NAME>/_matrix/pairing`；`PAIRING_RELATIONS_GATEWAY` 默认 `none`，`PAIRING_RELATIONS_ALLOW_PRIVATE` 默认 `false`。
+- 尚未接入（后续）：主栈的 fedgate 与 Synapse `federation_domain_whitelist` include。要接上需要：共享卷（pairing 读写、synapse 以 `:ro` 挂到 `/hs`）、pairing 的 `PAIRING_HS_WHITELIST_PATH=/hs/federation-whitelist.yaml`、synapse 增加 `--config-path /hs/federation-whitelist.yaml`（homeserver.yaml 里不要再写同名键）。在接入之前，主栈 pairing 只提供管理/事实/发送接口，不改变 HS 的联邦行为。
 
 ### 环境变量
 
@@ -223,7 +234,9 @@ pairing 服务：
 | `PAIRING_PEER_KEY_URL_TEMPLATE` | `https://{server_name}/_matrix/key/v2/server` | key 拉取模板（CI 经 fedgate 地址 + 端口） |
 | `PAIRING_INSECURE_TLS` | `false` | 关闭出站 TLS 校验（仅 CI） |
 | `PAIRING_TRUSTED_PROXIES` | 空 | 逗号分隔 IP/CIDR；仅当直连地址命中时才采信 `X-Forwarded-For` 最后一个值作为限速键（空=一律用直连 IP） |
-| `PAIRING_SERVICE_TOKEN` | 空（内部端点全部 401） | A-R1 配对事实接口的 service token；≥32 字符且不得等于 admin token，否则拒绝启动。联邦测试栈由 `federation-setup.py` 与 admin token 分别随机生成（`PAIRING_SERVICE_TOKEN_A/B`，写入 gitignored 的 `generated/federation.env`）。它是密钥，不要贴到文档、聊天或日志。A-R3 起它也能调出站关系发送端点 |
+| `PAIRING_SERVICE_TOKEN` | 空（内部端点全部 401） | A-R1 配对事实接口的 service token；≥32 字符且不得等于 admin token，否则拒绝启动。联邦测试栈由 `federation-setup.py` 与 admin token 分别随机生成（`PAIRING_SERVICE_TOKEN_A/B`，写入 gitignored 的 `generated/federation.env`）。它是密钥，不要贴到文档、聊天或日志。A-R4 起它**不能**调出站发送端点（401） |
+| `PAIRING_RELATIONS_SEND_TOKEN` | 空（发送端点全部 401） | A-R4 出站关系发送专用 token；≥32 字符，不得等于 admin / service token，否则拒绝启动。联邦测试栈为 `PAIRING_RELATIONS_SEND_TOKEN_A/B`（`federation-setup.py` 独立随机生成）。密钥，同样不得外泄 |
+| `PAIRING_RELATIONS_ALLOW_PRIVATE` | `false` | A-R4：`true` 时出站目标可以是 http / 私有 / 环回地址（每次 AUDIT WARNING）；仅测试栈（联邦 CI 栈的 hs-b 解析到 172.30.81.x，因此设为 `true`） |
 | `PAIRING_HS_WHITELIST_PATH` | 空（关闭） | 绝对路径；设置后渲染 Synapse `federation_domain_whitelist` include（A-R2，见「HS 白名单与重启」） |
 | `PAIRING_HS_RESTART_MARKER` | `<PAIRING_HS_WHITELIST_PATH>.restart-required` | 「需要重启」标记的绝对路径；须先设 `PAIRING_HS_WHITELIST_PATH`，且不能与它相同 |
 | `PAIRING_RELATIONS_GATEWAY` | `none` | A-R3 入站关系消息交给谁：`none`（一律 503）、`test-recorder`（仅测试/CI）；`http` 保留，配了拒绝启动 |
@@ -282,8 +295,9 @@ fedgate 是**实时的第一道闸**：配对表一变（≤1s），双方入站
 2. **原子写入**：同目录临时文件 → fsync → `os.replace` → fsync 目录；Synapse 永远读不到半个文件；写失败时旧文件原样保留。文件权限 0644（不是密钥，homeserver 以其他 uid 读取）。
 3. **重启标记**：文件内容真的变了才写 `<path>.restart-required`（可用 `PAIRING_HS_RESTART_MARKER` 改路径），内容是 `{"reason","whitelist","at"}`。**内容没变（例如重复切断、同一状态的重算）不写文件也不写标记**，不会触发无谓重启。
    - **读表→渲染→写盘在同一把锁里**（#247 审查 S1）：并发的两次同步不会出现「慢的那次用旧快照覆盖新内容」。
-   - **标记写两次**（#247 审查 S2）：先写标记、再替换 include、再写一次标记。进程若在 include 与标记之间崩溃，标记已经在了（否则下次启动发现 include 已是最新、什么都不写，重启就丢了）；若 supervisor 恰好在 include 落盘前就认领了第一个标记并重启，第二个标记会让它再重启一次。最坏多重启一次，绝不漏。
-   - **标记写失败**（#247 审查 N3）：include 照常更新，重启记为待办；之后每次同步（含每 60s 的后台重算）都重写并重试标记，每次失败都记一条 ERROR（`restart marker could not be written`），直到写成为止。
+   - **标记写两次**（#247 审查 S2）：先写标记、再替换 include、再写一次标记。进程若在 include 与标记之间崩溃，标记已经在了（否则下次启动发现 include 已是最新、什么都不写，重启就丢了）；若 supervisor 恰好在 include 落盘前就认领了第一个标记并重启，第二个标记会让它再重启一次。正常路径下最坏多一次重启；若 supervisor 在 include 替换前就认领了预标记，随后进程在 include 已替换、后标记写成功之前崩溃（或后标记持续失败后进程重启），仍有极小概率丢失这一次重启（#253 审查 nit 4），并不是「绝不漏」。
+   - **标记写失败**（#247 审查 N3）：include 照常更新，重启记为待办；之后每次同步（含每 60s 的后台重算）都重写并重试标记，每次失败都记一条 ERROR（`restart marker could not be written`），直到写成为止。待办标志只在进程内存里（#253 审查 nit 3）：若标记一直写失败期间 pairing 进程重启，新进程看到 include 已是最新、待办为假，不会再每 60s 重试或记 ERROR，直到下一次配对变化。运维若已经看到这些 ERROR 随后又重启了 pairing，应手工重启一次 homeserver。
+   - **include 写失败**（#253 审查建议 2）：预标记在 include 替换前落盘；若这次同步新建了预标记（磁盘上原先没有标记）而 include 最终没写成功，会删掉这次预标记，避免 include 持续失败时每 60s 都留下一个新标记、让 supervisor 反复重启 Synapse。崩溃在 include 写入中途仍保留预标记（S2）。原先就在盘上的标记不会被删。
    - 例外：进程**首次**同步时文件根本不存在 → 只建文件不写标记（homeserver 通过 `--config-path` 加载它，文件不存在时不可能在运行，首启无需重启）。之后若文件被删再重建，照常写标记——**但这只在同一进程内成立**（#247 审查 S4）：「首次同步」是进程内状态，pairing 停机期间被删掉的文件，下次启动时按首启处理、重建但**不写标记**；运维若手动删过 include，请在 pairing 启动后自行重启一次 homeserver。
 4. **不自动重启**：pairing 不持有 docker socket，也不调用任何编排 API。Synapse 只在启动时读这个 include，**由运维或外部 supervisor/systemd 在看到标记后重启 Synapse，并在重启后删除标记**。在重启之前，新的配对状态仍由 fedgate 实时执行，只是本端 HS 还会白费力气地尝试出站。
 5. 写入失败不影响配对请求本身（状态已提交，fedgate 已生效）：任何异常（不只是 IO/SQLite 错误，#247 审查 S3）都只记 ERROR 日志、计入失败计数（加锁，N1），并在下一次同步重试；后台重算循环本身也包了一层异常保护，单次意外不会让循环线程退出。
@@ -304,7 +318,7 @@ pairing-a:
 
 **目录属主与权限（#247 审查 S6）**：
 - pairing 需要对该目录**可写**（临时文件 + `os.replace` 发生在同一目录，只给文件写权限不够）；homeserver 只需**可读**（挂 `:ro`）；supervisor 需要在目录里 `mv` / `rm` 标记，所以也要可写。
-- 官方镜像里 pairing（`python:3.12-slim`）默认以 root 运行，Synapse 镜像以 UID 991 运行。推荐：宿主机建 `/srv/botville/hs`，属主 `root:991`、模式 `0750`（或 `0755`）；include 由 pairing 以 `0644` 写出，Synapse 能读、不能改。
+- 官方镜像**默认配置下**：pairing（`python:3.12-slim`）以 root 运行；Synapse 镜像的 `Config.User` 为空、entrypoint 以 root 启动后用 `gosu 991:991` 跑 Synapse 进程，所以 Synapse 以 UID 991 运行。若部署改了 `UID` 环境变量或 compose 的 `user:`，下面的属主建议要跟着改。推荐：宿主机建 `/srv/botville/hs`，属主 `root:991`、模式 `0750`（或 `0755`）；include 由 pairing 以 `0644` 写出，Synapse 能读、不能改。
 - 如果把 pairing 改成非 root 运行，目录属主改为该 UID（或给它组写权限 `0770`），否则每次渲染都会失败并只留下 ERROR 日志（fedgate 仍然生效）。
 - 不要把这个目录放在 homeserver 的数据卷里，也不要让 homeserver 可写：include 决定它能和谁联邦。
 
@@ -322,7 +336,9 @@ until curl -fsS http://127.0.0.1:8008/health >/dev/null; do sleep 2; done
 rm -f /srv/botville/hs/federation-whitelist.yaml.restart-required.processing
 ```
 
-**可选 systemd path unit 示例**（宿主机上运行；路径与 compose 项目名按部署修改；pairing 本身不需要任何额外权限）：
+**可选 systemd path unit 示例**（宿主机上运行；路径与 compose 项目名按部署修改；pairing 本身不需要任何额外权限）。
+
+当前已经接好白名单卷与 Synapse 第二个 `--config-path` 的参考，是联邦测试栈 `server/compose/federation/docker-compose.federation.yml`（见上面的 CI 栈写法）。主 compose（`server/compose/docker-compose.yml`）虽然已有可选的 `pairing` profile（`make up PAIRING=1`），但**还没有**接上白名单：没有共享 `/hs` 卷，Synapse 也没有第二个 `--config-path`。要在主栈用这个 unit，需要先补这几处：共享卷（pairing 读写、synapse 以 `:ro` 挂到 `/hs`）、pairing 的 `PAIRING_HS_WHITELIST_PATH=/hs/federation-whitelist.yaml`、synapse 增加 `--config-path /hs/federation-whitelist.yaml`（并且不要在 homeserver.yaml 里再写同名键）。未接之前，下面示例里的 compose 命令应指向已经接好卷的部署（例如联邦栈的 `synapse-a` / `synapse-b`），不要直接 `restart` 主栈那个还没挂 include 的 `synapse`（#253 审查 nit 8）。
 
 ```ini
 # /etc/systemd/system/botville-hs-restart.path
@@ -346,14 +362,14 @@ Description=Restart Synapse for a new botville federation whitelist
 Type=oneshot
 Environment=M=/srv/botville/hs/federation-whitelist.yaml.restart-required
 ExecStart=/bin/mv ${M} ${M}.processing
-ExecStart=/usr/bin/docker compose -p botville -f /srv/botville/server/compose/docker-compose.yml restart synapse
+ExecStart=/usr/bin/docker compose -p botville-fed -f /srv/botville/server/compose/federation/docker-compose.federation.yml --env-file /srv/botville/server/compose/federation/generated/federation.env restart synapse-a
 ExecStart=/bin/sh -c 'for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8008/health >/dev/null && exit 0; sleep 2; done; exit 1'
 ExecStartPost=/bin/rm -f ${M}.processing
 ```
 
 启用：`systemctl daemon-reload && systemctl enable --now botville-hs-restart.path`。
 
-**失败不会自愈（#247 审查 S5）**：服务任何一步失败（restart 失败、60 次健康检查都没过）时，`.processing` 留在原地、不会被删除，**也不会自动重试**——标记已经被 `mv` 走，`PathExists` 条件不再成立；之后只有 pairing 再写出**新**标记（下一次配对变化）才会再次触发，而在那之前 homeserver 可能一直运行着旧白名单（fedgate 仍然实时执行配对状态，安全上不受影响）。频繁失败时 systemd 还可能让 path unit 进入 `trigger-limit-hit` 失败态，之后连新标记都不再触发。请对 `botville-hs-restart.service` 的失败配置告警（如 `OnFailure=` 发通知），人工处理：确认 Synapse 状态后，`mv ….processing ….restart-required` 让它重跑，或手动重启并删除 `.processing`；必要时 `systemctl reset-failed botville-hs-restart.path`。
+**失败不会自愈（#247 审查 S5）**：服务任何一步失败（restart 失败、60 次健康检查都没过）时，`.processing` 留在原地、不会被删除，**也不会自动重试**——标记已经被 `mv` 走，`PathExists` 条件不再成立；之后只有 pairing 再写出**新**标记（下一次配对变化）才会再次触发，而在那之前 homeserver 可能一直运行着旧白名单（fedgate 仍然实时执行配对状态，安全上不受影响）。单次失败本身不会让 path unit 进入 `trigger-limit-hit`，只有新标记出现/触发得过于密集才可能（更常见的是 service 自己撞上 start limit）。path unit 一旦进入 failed，`systemctl reset-failed` 只清除失败状态，通常还要再 `start` 才会继续监视。请对 `botville-hs-restart.service` 的失败配置告警（如 `OnFailure=` 发通知），人工处理：确认 Synapse 状态后，`mv ….processing ….restart-required` 让它重跑，或手动重启并删除 `.processing`；恢复监视：先 `systemctl reset-failed botville-hs-restart.path`，再 `systemctl start botville-hs-restart.path`（#253 审查 nit 7）。
 
 **短暂停机的影响**：重启期间（CI 实测约 10–30s）本端用户的客户端请求失败/重连、推送与 appservice 事务延后；联邦方向上，对端发来的事务在本端闸门后得不到应答，对端 Synapse 会退避重试，之后补齐 PDU；**重启窗口内对端发来的 EDU（输入提示、已读回执、to-device）可能丢失**。因此重启应在配对变更后尽快、但可以择时进行——在此之前 fedgate 已经执行了新状态，安全上不依赖重启的时机。
 

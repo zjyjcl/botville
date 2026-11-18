@@ -4,7 +4,8 @@ The compose stack runs both pairing services with the CI-only TEST
 recorder (PAIRING_RELATIONS_GATEWAY=test-recorder) standing in for the
 gateway. Checked here:
 
-  * active:   hs-a's internal send API (service token) -> hs-a pairing
+  * active:   hs-a's internal send API (A-R4 send token; the facts token
+              is refused 401 there) -> hs-a pairing
               signs -> fedgate-b active gate -> pairing-b HMAC/nonce ->
               recorder; the recorder's 202 + request_id come back wrapped.
               A byte-identical replay of a signed message is refused (401).
@@ -63,17 +64,23 @@ def new_request_id(tag):
 
 
 class Relations:
-    def __init__(self, compose, a_admin, b_admin, token_a, token_b):
-        """`compose` is federation_e2e.Compose (built from --compose)."""
+    def __init__(self, compose, a_admin, b_admin, token_a, token_b,
+                 facts_token_a):
+        """`compose` is federation_e2e.Compose (built from --compose);
+        token_a/token_b are the relation SEND tokens (A-R4), facts_token_a
+        hs-a's facts token, used only to prove it cannot send."""
         self.compose = compose
         self.a_admin = a_admin.rstrip("/")
         self.b_admin = b_admin.rstrip("/")
         self.token_a = token_a
         self.token_b = token_b
+        self.facts_token_a = facts_token_a
 
-    def send(self, side, destination, request_id, kind="request"):
-        base, token = ((self.a_admin, self.token_a) if side == "a"
-                       else (self.b_admin, self.token_b))
+    def send(self, side, destination, request_id, kind="request",
+             token=None):
+        base, default = ((self.a_admin, self.token_a) if side == "a"
+                         else (self.b_admin, self.token_b))
+        token = token or default
         return request_json(
             "POST", base + "/v1/pairing/internal/relations/" + kind,
             body={"destination": destination, "request_id": request_id,
@@ -98,6 +105,11 @@ class Relations:
 
 
 def step_active(rel):
+    # A-R4: the facts (service) token must not open the send API.
+    rid_ft = new_request_id("ft")
+    status, resp = rel.send("a", "hs-b", rid_ft, token=rel.facts_token_a)
+    expect(status == 401, "send with facts token: HTTP {} {!r}".format(
+        status, resp))
     rid_ab = new_request_id("ab")
     status, resp = rel.send("a", "hs-b", rid_ab)
     expect(status == 200 and resp == {
@@ -116,11 +128,13 @@ def step_active(rel):
            "signed message + replay: {!r}".format(got))
 
     rec_b = rel.recorded("pairing-b")
-    expect(rec_b.count(rid_ab) == 1 and rec_b.count(rid_replay) == 1,
+    expect(rec_b.count(rid_ab) == 1 and rec_b.count(rid_replay) == 1
+           and rid_ft not in rec_b,
            "hs-b recorder: {!r}".format(rec_b))
     expect(rel.recorded("pairing-a").count(rid_ba) == 1,
            "hs-a recorder missing {}".format(rid_ba))
-    return "a->b and b->a delivered once each; replay refused 401"
+    return ("facts token refused 401 on send; a->b and b->a delivered"
+            " once each; replay refused 401")
 
 
 def step_inactive(rel):

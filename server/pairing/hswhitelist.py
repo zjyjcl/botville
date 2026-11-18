@@ -29,14 +29,31 @@ Guarantees (tests: server/pairing/tests/test_hswhitelist.py):
   never lose the restart (the next process would find the include already
   current and write nothing), and once AFTER, so a supervisor that
   consumed the first marker before the include landed restarts again with
-  the new content (worst case: one extra restart, never a missed one);
+  the new content (on the normal path the worst case is one extra
+  restart). A narrow crash window remains (#253 review nit 4): if a
+  supervisor claims the pre-marker before the include is replaced and
+  this process then dies after the include lands but before the
+  post-marker is written (or dies after a persistent post-marker
+  failure), a newly started process may see current content and no
+  in-memory pending flag, and skip a rewrite. The missed-restart
+  chance is small; it is not "never";
 - reading the peers table, rendering and writing all happen under one
   lock (#247 review S1), so a slower concurrent sync can never write an
   older snapshot over a newer one;
-- a marker that cannot be written stays pending: every later sync (the
-  service's 60s loop included) rewrites the include and retries the
-  marker, raising MarkerWriteError each time so the caller logs an ERROR
-  (#247 review N3);
+- a marker that cannot be written stays pending in this process: every
+  later sync (the service's 60s loop included) rewrites the include and
+  retries the marker, raising MarkerWriteError each time so the caller
+  logs an ERROR (#247 review N3). The pending flag is process-local
+  (#253 review nit 3): if this process exits while the marker is still
+  unwritable, the next process sees an already-current include and will
+  not retry or log ERROR until the next pairing change. An operator who
+  saw those errors and then restarted pairing should restart the
+  homeserver once by hand;
+- if the include write fails after this sync created a pre-marker and
+  no marker was already on disk, the pre-marker is removed so a
+  supervisor is not restarted every 60s for a write that never landed
+  (#253 review 2). A crash during the include write still leaves the
+  pre-marker (S2). A pre-existing marker is left in place;
 - exception: when this process's FIRST sync finds no include at all, the
   file is created without a marker. The homeserver loads the include via
   --config-path and cannot have started without it, so there is nothing
@@ -148,11 +165,14 @@ class HsWhitelistWriter:
     def sync(self, active_peers, now=None):
         """Render for `active_peers` -- an iterable of names, or a callable
         returning one (called under the writer lock, so read -> render ->
-        write is one critical section). True when the file and the restart
-        marker were written, False when nothing needs a restart (content
-        already current, or the first-boot creation above). Raises OSError
-        when the include cannot be written and MarkerWriteError when only
-        the marker failed (callers log and retry later)."""
+        write is one critical section). If the callable is
+        store.active_server_names, that takes the store lock next: the
+        lock order is always writer -> store (#253 review nit 10). True
+        when the file and the restart marker were written, False when
+        nothing needs a restart (content already current, or the
+        first-boot creation above). Raises OSError when the include
+        cannot be written and MarkerWriteError when only the marker
+        failed (callers log and retry later)."""
         with self._lock:
             peers = active_peers() if callable(active_peers) else active_peers
             text = render(self.server_name, peers)
@@ -160,16 +180,32 @@ class HsWhitelistWriter:
             first, self._first_sync = self._first_sync, False
             if current == text and not self._marker_pending:
                 return False
-            needs_restart = not (current is None and first
-                                 and not self._marker_pending)
+            # first + no include => first boot; _marker_pending cannot be
+            # set yet (#253 review nit 9).
+            needs_restart = not (current is None and first)
             stamp = time.time() if now is None else now
+            pre_marker_written = False
+            had_marker = os.path.exists(self.marker_path)
             if needs_restart:
                 self._marker_pending = True
                 try:
                     self._write_marker(stamp)  # before: crash-safe
+                    pre_marker_written = True
                 except OSError:
                     pass  # retried right after the include write below
-            _atomic_write(self.path, text)
+            try:
+                _atomic_write(self.path, text)
+            except Exception:
+                # Include is still the old content (replace is the last
+                # step that can raise). Drop a pre-marker this sync just
+                # created, so a 60s retry does not bounce Synapse
+                # (#253 review 2). Leave a marker that was already there.
+                if pre_marker_written and not had_marker:
+                    try:
+                        os.unlink(self.marker_path)
+                    except OSError:
+                        pass
+                raise
             if not needs_restart:
                 return False  # first boot: the homeserver is not running yet
             try:

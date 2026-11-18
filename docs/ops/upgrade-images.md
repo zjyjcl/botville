@@ -48,6 +48,13 @@ docker.io/library/python:3.12-slim@sha256:b18b261e1b4974b4f321451ad5251ded85abb2
 的 pin 检查单独校验这一行，`gateway-compose` job 实际构建时会解析该 digest。升级时
 只改 Dockerfile 这一处。
 
+配对服务镜像备注（A-R4 / #8）：compose 的 `pairing` 服务（`make up PAIRING=1`）
+用 `${PAIRING_IMAGE:-…}`，默认值与上面网关基础镜像是**同一个** python:3.12-slim
+tag@digest（直接跑 bind mount 进来的 stdlib-only 代码，不构建）。它受 CI 的
+compose == `.env.example` 相等检查约束：升级时同时改 `docker-compose.yml` 的默认值、
+`server/compose/.env.example` 的 `PAIRING_IMAGE`、CI「placeholders only」白名单里的
+`PAIRING_IMAGE`，并建议与 `gateway/Dockerfile` 的 `FROM` 一起升，保持同一 digest。
+
 版本口径与 [compat/homeserver-compat.md](../compat/homeserver-compat.md) §1.2
 一致（Synapse v1.164.1 即 matrix-docker-ansible-deploy defaults 当时停留的参考
 版本；Tuwunel tag 一律带 `v` 前缀，如 v1.9.4——不带 `v` 的 tag 在 GHCR 上不存在）。

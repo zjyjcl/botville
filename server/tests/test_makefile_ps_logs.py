@@ -48,6 +48,8 @@ class MakefilePsLogsProfilesTest(unittest.TestCase):
             recipe = "\n".join(target_recipe(target))
             self.assertIn("--profile push", recipe, target)
             self.assertIn("--profile gateway", recipe, target)
+            self.assertIn("--profile pairing", recipe, target)
+            self.assertNotIn("$(PAIRING_PROFILE)", recipe, target)
             # Not gated on the make-level PUSH=/GATEWAY= variables: those
             # still control only `up`.
             self.assertNotIn("$(PUSH_PROFILE)", recipe, target)
@@ -57,7 +59,9 @@ class MakefilePsLogsProfilesTest(unittest.TestCase):
         recipe = "\n".join(target_recipe("down"))
         self.assertIn("--profile push", recipe)
         self.assertIn("--profile gateway", recipe)
+        self.assertIn("--profile pairing", recipe)
         self.assertNotIn("$(PUSH_PROFILE)", recipe)
+        self.assertNotIn("$(PAIRING_PROFILE)", recipe)
         self.assertNotIn("$(GATEWAY_PROFILE)", recipe)
         self.assertNotIn(" -v", recipe)
         self.assertNotIn("\t-v", recipe)

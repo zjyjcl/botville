@@ -651,6 +651,10 @@ jobs:
             BOTVILLE_HOMESERVER="${hs}" GATEWAY_MATRIX_TRANSPORT="${transport}" \
               docker compose -f server/compose/docker-compose.yml \
               --env-file server/compose/.env --profile "${hs}" --profile gateway config --quiet
+            echo "== docker compose config --profile ${hs} --profile pairing (A-R4)"
+            BOTVILLE_HOMESERVER="${hs}" GATEWAY_MATRIX_TRANSPORT="${transport}" \
+              docker compose -f server/compose/docker-compose.yml \
+              --env-file server/compose/.env --profile "${hs}" --profile pairing config --quiet
           done
           echo "== docker compose config (federation, A2.1)"
           python3 server/scripts/federation-setup.py
@@ -756,6 +760,13 @@ jobs:
               # host port + secrets init.sh generates (64-hex).
               "BOTVILLE_GATEWAY_PORT": "8020",
               "BOTVILLE_GATEWAY_AUTH_TOKEN": "<change-me>",
+              # Pairing service (A-R4): three generated tokens + safe defaults.
+              "BOTVILLE_PAIRING_PORT": "8090",
+              "PAIRING_ADMIN_TOKEN": "<change-me>",
+              "PAIRING_SERVICE_TOKEN": "<change-me>",
+              "PAIRING_RELATIONS_SEND_TOKEN": "<change-me>",
+              "PAIRING_RELATIONS_GATEWAY": "none",
+              "PAIRING_RELATIONS_ALLOW_PRIVATE": "false",
               "BOTVILLE_GATEWAY_HMAC_SECRET": "<change-me>",
               # Persona engine pass-through (B line PR2): off / empty by
               # default; init.sh generates none of them (the API key is
@@ -806,6 +817,7 @@ jobs:
               "TUWUNEL_IMAGE": "ghcr.io/matrix-construct/tuwunel:v1.9.4@sha256:0e86c6164d6c9f5b60291938eb61ad8395021c37fe58d47a963ea7edddbedaec",
               "CONTINUWUITY_IMAGE": "ghcr.io/continuwuity/continuwuity:v26.9.1@sha256:c9c62bc5c0a641f3f713945c701b069c7bc30d2612b54d4a5de80a5be19d5420",
               "SYGNAL_IMAGE": "docker.io/matrixdotorg/sygnal:v0.17.0@sha256:141f5e72fdf99a28e29ca87f3a46c19ed1cf21d5074aa3ef9df7c067e0c1c46a",
+              "PAIRING_IMAGE": "docker.io/library/python:3.12-slim@sha256:b18b261e1b4974b4f321451ad5251ded85abb22c2b8b262da527dda1d031ab30",
           }
 
           problems = []

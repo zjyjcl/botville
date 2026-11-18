@@ -273,24 +273,29 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(self.db.check_invite("live", "s"), (True, None))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SafeRollbackTest(unittest.TestCase):
-    """#247 review N2: a failing rollback never masks the original error."""
+    """#247 review N2 / #253 review 1: a failing rollback never masks
+    the original error, and the connection is discarded so a later
+    commit cannot publish the failed writes."""
 
     def setUp(self):
         import tempfile as _tempfile
         self._tmp = _tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         import os as _os
-        self.store = store.PairingStore(_os.path.join(self._tmp.name, "p.db"))
+        self.db_path = _os.path.join(self._tmp.name, "p.db")
+        self.store = store.PairingStore(self.db_path)
         self.real = self.store._conn
-        self.addCleanup(self.real.close)
+        self.addCleanup(self._close_store)
 
-    def broken(self):
-        real = self.real
+    def _close_store(self):
+        try:
+            self.store.close()
+        except Exception:
+            pass
+
+    def broken(self, conn=None):
+        real = conn or self.real
 
         class BrokenConn:
             def execute(self, *args, **kwargs):
@@ -305,17 +310,41 @@ class SafeRollbackTest(unittest.TestCase):
             def commit(self):
                 real.commit()
 
+            def close(self):
+                real.close()
+
         return BrokenConn()
 
     def test_upsert_and_sever_reraise_the_original_error(self):
         self.store._conn = self.broken()
-        try:
-            with self.assertLogs("pairing.store", "ERROR"):
-                with self.assertRaises(ValueError):
-                    self.store.upsert_peer_active("hs-b", "https://hs-b/x")
-            with self.assertLogs("pairing.store", "ERROR"):
-                with self.assertRaises(ValueError):
-                    self.store.sever_peer("hs-b", "local")
-        finally:
-            self.store._conn = self.real
+        with self.assertLogs("pairing.store", "ERROR"):
+            with self.assertRaises(ValueError):
+                self.store.upsert_peer_active("hs-b", "https://hs-b/x")
+        # #253 review 1: the broken connection was discarded / replaced,
+        # so this later write cannot publish the failed hs-b row.
+        self.assertIsNone(self.store.get_peer("hs-b"))
+        self.store.upsert_peer_active("hs-c", "https://hs-c/x")
+        self.assertIsNone(self.store.get_peer("hs-b"))
+        self.assertIsNotNone(self.store.get_peer("hs-c"))
+        # sever on a fresh broken wrapper around the live connection
+        live = self.store._conn
+        self.store._conn = self.broken(live)
+        with self.assertLogs("pairing.store", "ERROR"):
+            with self.assertRaises(ValueError):
+                self.store.sever_peer("hs-c", "local")
+        self.assertEqual(self.store.get_peer("hs-c")["state"], "active")
+
+    def test_redeem_invite_uses_safe_rollback_and_discards(self):
+        self.store.create_invite("inv", "sec", 600)
+        self.store._conn = self.broken()
+        with self.assertLogs("pairing.store", "ERROR"):
+            with self.assertRaises(ValueError):
+                self.store.redeem_invite(
+                    "inv", "sec", "hs-b", "https://hs-b/x")
+        self.assertIsNone(self.store.get_peer("hs-b"))
+        self.assertEqual(self.store.check_invite("inv", "sec"), (True, None))
+
+
+if __name__ == "__main__":
+    unittest.main()
 

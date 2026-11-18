@@ -129,6 +129,9 @@ class WriterTest(unittest.TestCase):
                 self.writer.sync([])
         self.assertEqual(self.read(self.path), old)
         self.assertEqual([n for n in os.listdir(self.dir) if n.startswith(".tmp-")], [])
+        # os.replace is mocked for every write, so the pre-marker never
+        # landed either; nothing to clean up.
+        self.assertFalse(os.path.exists(self.marker))
 
     def test_marker_failure_is_retried_even_if_content_current(self):
         self.writer.sync([])  # first boot
@@ -206,6 +209,42 @@ class WriterTest(unittest.TestCase):
         with mock.patch.object(hswhitelist, "_atomic_write", supervisor_races):
             self.assertTrue(self.writer.sync(["hs-b"]))
         self.assertTrue(os.path.exists(self.marker))
+
+    def test_include_write_failure_removes_a_new_pre_marker(self):
+        # #253 review 2: include failed, no prior marker -> drop the
+        # pre-marker so a 60s retry does not bounce Synapse.
+        self.writer.sync([])
+        real_write = hswhitelist._atomic_write
+
+        def fail_include(path, text):
+            if path == self.path:
+                raise OSError("include volume full")
+            real_write(path, text)
+
+        with mock.patch.object(hswhitelist, "_atomic_write", fail_include):
+            with self.assertRaises(OSError):
+                self.writer.sync(["hs-b"])
+        self.assertEqual(listed(self.read(self.path)), ["hs-a"])
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_include_write_failure_keeps_an_existing_marker(self):
+        # #253 review 2: a marker that already belonged to a landed
+        # include must survive a later include-write failure.
+        self.writer.sync([])
+        self.assertTrue(self.writer.sync(["hs-b"]))
+        self.assertTrue(os.path.exists(self.marker))
+        real_write = hswhitelist._atomic_write
+
+        def fail_include(path, text):
+            if path == self.path:
+                raise OSError("include volume full")
+            real_write(path, text)
+
+        with mock.patch.object(hswhitelist, "_atomic_write", fail_include):
+            with self.assertRaises(OSError):
+                self.writer.sync(["hs-c"])
+        self.assertTrue(os.path.exists(self.marker))
+        self.assertEqual(listed(self.read(self.path)), ["hs-a", "hs-b"])
 
     def test_persistent_marker_failure_raises_every_time(self):
         # N3: include written, marker failing -> MarkerWriteError on every
@@ -382,22 +421,39 @@ class ServiceWhitelistTest(ServiceTestBase):
         self.assertTrue(self.take_marker())
 
     def test_failure_counter_is_thread_safe(self):
-        # N1
-        def bump():
-            for _ in range(500):
-                self.app._note_hs_whitelist_failure()
+        # N1 / #253 nit 5: stretch the read-modify-write window so a
+        # missing lock would lose an increment (both threads read the
+        # same value). This is not a smoke-only final-count check.
+        in_gap = threading.Event()
+        release = threading.Event()
 
-        threads = [threading.Thread(target=bump) for _ in range(8)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-        self.assertEqual(self.app.hs_whitelist_failures, 4000)
+        def gap():
+            in_gap.set()
+            self.assertTrue(release.wait(5))
+
+        self.app._hs_whitelist_failure_gap = gap
+        first = threading.Thread(target=self.app._note_hs_whitelist_failure)
+        first.start()
+        self.assertTrue(in_gap.wait(5))
+        second = threading.Thread(target=self.app._note_hs_whitelist_failure)
+        second.start()
+        # Without the lock, second would enter the gap too. Give it a
+        # moment: it must stay blocked on the lock, counter still 0.
+        second.join(0.2)
+        self.assertTrue(second.is_alive())
+        self.assertEqual(self.app.hs_whitelist_failures, 0)
+        release.set()
+        first.join(5)
+        second.join(5)
+        self.assertFalse(first.is_alive() or second.is_alive())
+        self.assertEqual(self.app.hs_whitelist_failures, 2)
 
     def test_loop_survives_an_exception(self):
         # S3: the background loop keeps going after a surprise.
+        # #253 nit 11: stop Event ends the daemon thread.
         calls = []
         done = threading.Event()
+        stop = threading.Event()
 
         class FlakyApp:
             def sync_hs_whitelist(self):
@@ -407,8 +463,12 @@ class ServiceWhitelistTest(ServiceTestBase):
                 done.set()
 
         with self.assertLogs("pairing.service", "ERROR"):
-            service.start_hs_whitelist_loop(FlakyApp(), interval=0.01)
+            thread = service.start_hs_whitelist_loop(
+                FlakyApp(), interval=0.01, stop=stop)
             self.assertTrue(done.wait(5))
+            stop.set()
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
         self.assertGreaterEqual(len(calls), 2)
 
     def test_feature_off_without_path(self):

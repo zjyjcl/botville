@@ -136,18 +136,29 @@ class PairingStore:
     One connection guarded by a lock (ThreadingHTTPServer handlers run in
     threads); WAL journaling so fedgate's read-only connections (separate
     process, same volume) never block on a write.
+
+    Lock order (#253 review nit 10): HsWhitelistWriter.sync takes its
+    writer lock first, then (when given store.active_server_names as a
+    callable) takes this store lock. Never call sync_hs_whitelist / the
+    writer from inside a store method or while holding this lock, or
+    the two locks deadlock (ABBA).
     """
 
     def __init__(self, path):
+        self._path = path
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
-        self._conn.row_factory = sqlite3.Row
+        self._conn = self._connect()
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.executescript(SCHEMA)
             self._migrate()
             self._conn.commit()
+
+    def _connect(self):
+        conn = sqlite3.connect(self._path, check_same_thread=False, timeout=30)
+        conn.row_factory = sqlite3.Row
+        return conn
 
     def _migrate(self):
         """Bring pre-B2 databases up to the current schema (idempotent).
@@ -316,10 +327,8 @@ class PairingStore:
                     self._insert_paired_event(server_name, peer, now)
                     self._conn.execute("COMMIT")
             except Exception:
-                try:
-                    self._conn.execute("ROLLBACK")
-                except sqlite3.Error:
-                    pass  # e.g. COMMIT itself failed; keep the original error
+                # Same helper as upsert/sever (#253 review 1 / #247 N2).
+                self._safe_rollback()
                 raise
         if reason is not None:
             self.record_event("redeem_rejected", now=now, invite_id=invite_id,
@@ -381,13 +390,33 @@ class PairingStore:
 
     def _safe_rollback(self):
         """Roll back after a failed write without masking the original
-        error (#247 review N2): a rollback that itself fails (closed or
-        broken connection) is logged and swallowed so the caller re-raises
-        the exception that actually caused it."""
+        error (#247 review N2): a rollback that itself fails is logged
+        and swallowed so the caller re-raises the exception that
+        actually caused it.
+
+        If rollback fails, this connection may still hold the failed
+        writes in an open transaction. Closing it (and opening a fresh
+        one) makes sure a later successful commit cannot publish them
+        (#253 review 1). Called only while holding self._lock.
+        """
         try:
             self._conn.rollback()
         except Exception:  # noqa: BLE001
             log.exception("rollback after a failed write also failed")
+            self._discard_connection()
+
+    def _discard_connection(self):
+        """Drop a connection that could not be rolled back."""
+        try:
+            self._conn.close()
+        except Exception:  # noqa: BLE001
+            log.exception("closing a connection after a failed rollback also failed")
+        try:
+            self._conn = self._connect()
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=5000")
+        except Exception:  # noqa: BLE001
+            log.exception("reopening the pairing database after a failed rollback also failed")
 
     def upsert_peer_active(self, server_name, api_url, shared_secret=None,
                            now=None):

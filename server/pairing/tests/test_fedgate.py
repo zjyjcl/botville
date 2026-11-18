@@ -709,8 +709,9 @@ class FedgateMatrixTest(unittest.TestCase):
 
     # --- A-R3 relation transport: active gate in front of pairing ------------
 
-    def relation(self, kind="request", method="POST", origins=("hs-a",)):
-        pairs = [("X-Botville-Origin", o) for o in origins]
+    def relation(self, kind="request", method="POST", origins=("hs-a",),
+                 extra=()):
+        pairs = [("X-Botville-Origin", o) for o in origins] + list(extra)
         pairs += [("X-Botville-Ts", "1"), ("X-Botville-Nonce", "0" * 32),
                   ("X-Botville-Sig", "0" * 64),
                   ("Content-Type", "application/json")]
@@ -746,6 +747,7 @@ class FedgateMatrixTest(unittest.TestCase):
             ("severed", ("hs-gone",)),
             ("missing", ()),
             ("duplicate", ("hs-a", "hs-a")),
+            ("duplicate-mixed-case-name", None),
             ("smuggled", ("hs-a", "hs-x")),
             ("upper-case", ("HS-A",)),
             ("invalid", ("hs a",)),
@@ -753,7 +755,14 @@ class FedgateMatrixTest(unittest.TestCase):
         for name, origins in cases:
             with self.subTest(name):
                 before = len(self.pairing_cls.received)
-                status, raw = self.relation(origins=origins)
+                if origins is None:
+                    # #249 review 5: the same header twice with differently
+                    # cased NAMES (X-Botville-Origin + x-botville-origin).
+                    status, raw = self.relation(origins=(), extra=[
+                        ("X-Botville-Origin", "hs-a"),
+                        ("x-botville-origin", "hs-a")])
+                else:
+                    status, raw = self.relation(origins=origins)
                 self.assertEqual(status, 403)
                 self.assertEqual(json.loads(raw)["errcode"], "M_FORBIDDEN")
                 self.assertEqual(len(self.pairing_cls.received), before)
