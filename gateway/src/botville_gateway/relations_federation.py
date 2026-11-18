@@ -8,6 +8,7 @@ import logging
 import math
 import secrets
 
+from .matrix_appservice import AI_NAMESPACE_PREFIX
 from .memory.owner_http import HTTPError, sliding_rate
 from .relations import WEEK, relation_item
 from .relations_outbound import BACKOFF
@@ -146,10 +147,15 @@ class FederationRelations:
             if row['state'] == 'pending' and row['direction'] == 'incoming':
                 raise HTTPError(409, 'relation.state_conflict')
             return 200, relation_item(row)
+        # Retain the stored kind on re-add since it may come from an inbound declaration.
+        if row is not None:
+            counterpart_kind = row['counterpart_kind']
+        else:
+            counterpart_kind = 'ai' if counterpart.startswith(AI_NAMESPACE_PREFIX) else 'human'
         rid, expiry = ulid(now), int(now) + WEEK
         self._cancel(persona, counterpart)
         self._metadata(persona, counterpart, rid, 'outgoing', 'pending', expiry)
-        self._set(persona, counterpart, 'pending', now, counterpart_kind='ai', actor='owner', kind='request')
+        self._set(persona, counterpart, 'pending', now, counterpart_kind=counterpart_kind, actor='owner', kind='request')
         self._enqueue(persona, counterpart, rid, 'request', dict(from_user=persona, to_user=counterpart,
             from_kind='ai', message='', created_at=int(now), expires_at=expiry), expiry, now)
         return 201, relation_item(self.relations._row(persona, counterpart))

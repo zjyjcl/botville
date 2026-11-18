@@ -179,6 +179,18 @@ class BusinessTests(Fixture):
         self.assertEqual(self.service._row(B, REMOTE)['counterpart_kind'], 'human')
         self.assertEqual(self.count('relation_tombstones'), 0)
 
+    def test_declared_counterpart_kind_overrides_mxid_prefix(self):
+        for rid, counterpart, declared_kind in ((RID, REMOTE, 'human'), ('B' * 26, '@bob:remote.invalid', 'ai')):
+            with self.subTest(counterpart=counterpart, declared_kind=declared_kind):
+                request = self.body(rid=rid, from_user=counterpart, from_kind=declared_kind)
+                self.assertEqual(self.receive(request)[0], 202)
+                self.assertEqual(self.service._row(A, counterpart)['counterpart_kind'], declared_kind)
+
+                self.assertEqual(self.receive(self.body('revoke', rid, from_user=counterpart))[0], 200)
+                status, item = self.service.create(A, {'counterpart_id': counterpart})
+                self.assertEqual(status, 201)
+                self.assertEqual(item['counterpart']['kind'], declared_kind)
+
     def test_block_and_policy_hide_target(self):
         first = self.receive()
         self.assertEqual(first[0], 202)
@@ -276,6 +288,15 @@ class BusinessTests(Fixture):
         result = self.receive(self.body(rid='Z'*26))
         self.assertEqual(result, (409, dict(errcode='relation.state_conflict', error='Relation state conflicts with operation', request_id=rid, state='pending')))
         self.assertEqual(self.row()['direction'], 'outgoing')
+        self.assertEqual(self.store._db.execute('SELECT status FROM relation_outbox').fetchone()[0], 'pending')
+
+    def test_simultaneous_same_request_id_conflicts(self):
+        rid = self.outgoing()
+        result = self.receive(self.body(rid=rid, from_kind='human'))
+        self.assertEqual(result[0], 409)
+        self.assertEqual((result[1]['errcode'], result[1]['request_id'], result[1]['state']),
+                         ('relation.state_conflict', rid, 'pending'))
+        self.assertEqual((self.row()['direction'], self.row()['counterpart_kind']), ('outgoing', 'ai'))
         self.assertEqual(self.store._db.execute('SELECT status FROM relation_outbox').fetchone()[0], 'pending')
 
     def test_simultaneous_inbound_wins_even_autonomous(self):

@@ -335,6 +335,18 @@ class OwnerFederationTests(Fixture):
         self.assertEqual((status,item['state'],item['direction']), (201,'pending','outgoing'))
         self.assertEqual(self.count('relation_outbox'), 1)
 
+    def test_owner_remote_counterpart_kind_uses_mxid_prefix(self):
+        self.outgoing()
+        self.assertEqual(self.row()['counterpart_kind'], 'ai')
+
+        human = '@bob:remote.invalid'
+        status, item = self.service.create(A, {'counterpart_id': human})
+        self.assertEqual(status, 201)
+        self.assertEqual(item['counterpart']['kind'], 'human')
+        self.assertEqual(self.service._row(A, human)['counterpart_kind'], 'human')
+        job = self.store._db.execute('SELECT payload FROM relation_outbox WHERE counterpart_id=?', (human,)).fetchone()
+        self.assertEqual(json.loads(job['payload'])['from_kind'], 'ai')
+
     def test_owner_http_add_and_actions(self):
         path = '/v1/personas/'+quote(PERSONA,safe='')+'/relations'
         with MemoryHTTPServer() as app:

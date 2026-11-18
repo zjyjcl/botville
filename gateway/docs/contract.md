@@ -1474,6 +1474,7 @@ RFC3339 UTC `Z`。变更在一个事务中 revision +1、写不含正文/密钥�
 对端 severed 返回 409 `relation.peer_inactive`（与既有 problem 示例一致），冷却期内返回
 409 `relation.state_conflict`，否则创建 outgoing pending（ULID request_id、7 天有效期），同事务
 写入 outbox request，返回 201 + 原有 `PersonaRelation`。已 friend/outgoing pending 仍为 200。
+跨服手动添加沿用已保存的 `counterpart.kind`，首次添加按 MXID 前缀判定：以 `@ai_` 开头为 `ai`，其余为 `human`。
 不新增 owner 请求字段，出站 message 固定空串。跨服元数据与队列见 §2.5。本服 AI 按对方
 `relation_defaults.friend_request_policy`：autonomous 直接双向 friend；approval_required 建立
 outgoing/incoming pending（7 天过期）。人类直接单边 friend。已 friend 或 outgoing pending 返回
@@ -1617,6 +1618,7 @@ request_id 为 16–64 位 `[0-9A-Za-z_-]`；本方生成 26 位 Crockford base3
 | respond | from_user, to_user, decision | decision=accept/reject；其他字符串 422，错误类型 400 |
 | revoke | from_user, to_user, reason | reason=withdrawn/unfriend；其他字符串 422，错误类型 400 |
 
+入站 request 采用 `payload.from_kind` 作为 `counterpart.kind`，优先于 MXID 前缀推断。
 respond/revoke 的 from_user 仍是对端用户，to_user 是本服 persona。所有 payload 多余字段或类型错
 均 400。sent_at > now+300、created_at > sent_at+300 为 400；expiry=min(expires_at,sent_at+7 天)，
 now > expiry 为 410（等于 expiry 尚有效）；respond/revoke 使用已保存的请求 expiry。
