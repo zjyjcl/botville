@@ -1676,7 +1676,7 @@ r_in < r_local → 取消旧 outbox，把行换为 incoming pending(r_in)，返�
 **对端切断。** relation_peers 保存 server_name→active/severed 与 changed_at；
 `mark_peer_severed` 把该服务器 pending/friend 全变 stranger、取消待投递；
 `mark_peer_active` 只改状态，不恢复关系。出站 409 BV_PEER_INACTIVE 或
-200 delivered:false + peer_status=403（BV_PEER_INACTIVE/M_FORBIDDEN）触发 severed；
+200 delivered:false + peer_status=403（`peer_body.errcode` 为 BV_PEER_INACTIVE 或 M_FORBIDDEN）触发 severed；
 mark_peer_active 或一次 delivered:true 恢复 active。未知服务器无本地 severed 记录时允许尝试，
 实际配对 active 校验仍由 pairing 执行；当前不新增 pairing facts 网络客户端。
 
@@ -1696,7 +1696,7 @@ mark_peer_active 或一次 delivered:true 恢复 active。未知服务器无本�
 pairing 的 `PAIRING_RELATIONS_GATEWAY=http` 目前仍拒绝启动。
 POST `{URL}/v1/pairing/internal/relations/<kind>`，`Authorization: Bearer` 使用
 `PAIRING_RELATIONS_SEND_TOKEN`，body 恰好 `{destination,request_id,payload}`，urllib 超时默认 10s 可注入。pairing 返回按
-`{delivered,peer_status,body}` 读取对端业务结果。outbox 与触发它的变更同事务；
+`{delivered, peer_status, peer_body}` 读取对端业务结果。outbox 与触发它的变更同事务；
 后台可停止，每轮最多投递一条；测试用 run_once(now)，不 sleep。未配置每轮跳过，不报错、不丢队列。
 
 | pairing 返回 | 处理 |
@@ -1706,8 +1706,8 @@ POST `{URL}/v1/pairing/internal/relations/<kind>`，`Authorization: Bearer` 使�
 | 401；200 delivered:false + peer_status=401 | 不重试，warning 提示检查凭证/重新配对 |
 | 409 BV_PEER_INACTIVE；delivered:false + peer 403 指定切断码 | 不重试，标记 severed |
 | 400；其它未列的传输错误 | 不重试 |
-| delivered:true，peer_status=202 / 201 / 200 | 保持 pending / friend / 按 body.state 同步 |
-| delivered:false，peer_status=409 | 按 state 同步；不同 request_id 的同时发起例外见上 |
+| delivered:true，peer_status=202 / 201 / 200 | 保持 pending / friend / 按 `peer_body.state` 同步 |
+| delivered:false，peer_status=409 | 按 `peer_body.state` 同步；不同 `peer_body.request_id` 的同时发起例外见上 |
 | delivered:false，peer_status=410 / 404 unknown_user / 429 cooldown | expired / stranger / stranger+冷却 |
 | 其它 delivered:false | 不重试，保留当前本地状态 |
 

@@ -50,7 +50,7 @@ class OutboundTests(Fixture):
             envelope, meta = validate(kind, packet, receiver.server_name, receiver.clock())
             status, result = receiver.federation.inbound(kind, envelope, meta)
             responses.append((status, result))
-            return 200, dict(delivered=200 <= status < 300, peer_status=status, body=result)
+            return 200, dict(delivered=200 <= status < 300, peer_status=status, peer_body=result)
 
         self.fed.worker.transport = forward
         peer.federation.worker = OutboundWorker(peer.federation, url='http://pairing.invalid',
@@ -167,14 +167,14 @@ class OutboundTests(Fixture):
     def test_peer_401_no_retry_sanitized_warning(self):
         self.outgoing()
         with self.assertLogs('botville_gateway.relations_federation', level='WARNING') as logs:
-            self.deliver(200, dict(delivered=False, peer_status=401, body={'error': TOKEN}))
+            self.deliver(200, dict(delivered=False, peer_status=401, peer_body={'error': TOKEN}))
         self.assertNotIn(TOKEN, '\n'.join(logs.output))
         self.assertEqual(self.job()['status'], 'done')
 
     def test_non_retry_statuses(self):
         for status, result in ((400, {}), (500, {}), (503, {}), (429, {}),
                                (200, dict(delivered=False, peer_status=400)),
-                               (200, dict(delivered=False, peer_status=429, body={'errcode':'relation.rate_limited'}))):
+                               (200, dict(delivered=False, peer_status=429, peer_body={'errcode':'relation.rate_limited'}))):
             with self.subTest(status=status, result=result):
                 # New independent pair for each terminal outcome.
                 counterpart = '@ai_test'+str(status)+str(len(str(result)))+':remote.invalid'
@@ -190,11 +190,11 @@ class OutboundTests(Fixture):
         self.assertTrue(all(r[0] == 'stranger' for r in self.store._db.execute('SELECT state FROM relations')))
         self.assertEqual(self.job()['status'], 'cancelled')
 
-    def test_delivered_false_peer_403_severs(self):
+    def test_delivered_false_peer_403_severs_from_peer_body(self):
         for code in ('BV_PEER_INACTIVE', 'M_FORBIDDEN'):
             self.service.mark_peer_active('remote.invalid')
             self.outgoing()
-            self.deliver(200, dict(delivered=False, peer_status=403, body={'errcode':code}))
+            self.deliver(200, dict(delivered=False, peer_status=403, peer_body={'errcode':code}))
             self.assertTrue(self.fed.peer_severed('remote.invalid'))
             self.assertEqual(self.row()['state'], 'stranger')
 
@@ -207,13 +207,24 @@ class OutboundTests(Fixture):
         self.deliver(200, dict(delivered=True, peer_status=201))
         self.assertEqual(self.service._row(B, REMOTE)['state'], 'friend')
 
-    def test_delivered_200_syncs_body_state(self):
+    def test_delivered_200_syncs_peer_body_state(self):
         self.receive(); self.action('approve')
-        self.deliver(200, dict(delivered=True, peer_status=200, body={'state':'accepted'}))
+        self.deliver(200, dict(delivered=True, peer_status=200, peer_body={'state':'accepted'}))
         self.assertEqual(self.row()['state'], 'friend')
         self.action('revoke')
-        self.deliver(200, dict(delivered=True, peer_status=200, body={'state':'revoked'}))
+        self.deliver(200, dict(delivered=True, peer_status=200, peer_body={'state':'revoked'}))
         self.assertEqual(self.row()['state'], 'stranger')
+
+    def test_delivered_200_peer_body_moves_pending_to_friend(self):
+        self.outgoing()
+        self.assertEqual(self.row()['state'], 'pending')
+        self.deliver(200, dict(delivered=True, peer_status=200, peer_body={'state': 'accepted'}))
+        self.assertEqual(self.row()['state'], 'friend')
+
+    def test_delivered_200_accepts_legacy_body(self):
+        self.outgoing()
+        self.deliver(200, dict(delivered=True, peer_status=200, body={'state': 'accepted'}))
+        self.assertEqual(self.row()['state'], 'friend')
 
     def test_business_answers_sync_state(self):
         for peer_status, body, expected in (
@@ -223,7 +234,7 @@ class OutboundTests(Fixture):
                 (429, {'errcode':'relation.cooldown','retry_after_s':500}, 'rejected')):
             counterpart = '@ai_status'+str(peer_status)+':remote.invalid'
             self.service.create(A, {'counterpart_id':counterpart})
-            self.deliver(200, dict(delivered=False, peer_status=peer_status, body=body))
+            self.deliver(200, dict(delivered=False, peer_status=peer_status, peer_body=body))
             meta = self.fed.metadata(A, counterpart)
             self.assertEqual(meta['wire_state'], expected)
             self.assertEqual(self.service._row(A, counterpart)['state'], 'friend' if expected == 'accepted' else 'stranger')
@@ -231,7 +242,7 @@ class OutboundTests(Fixture):
 
     def test_simultaneous_conflict_stops_without_local_change(self):
         self.outgoing(); before = dict(self.row())
-        self.deliver(200, dict(delivered=False, peer_status=409, body={'state':'pending','request_id':'0'*26}))
+        self.deliver(200, dict(delivered=False, peer_status=409, peer_body={'state':'pending','request_id':'0'*26}))
         self.assertEqual(dict(self.row()), before)
         self.assertEqual(self.job()['status'], 'done')
 
@@ -254,7 +265,7 @@ class OutboundTests(Fixture):
 
     def test_malformed_remote_state_does_not_retry(self):
         self.outgoing()
-        self.deliver(200, dict(delivered=False, peer_status=409, body={'state':[]}))
+        self.deliver(200, dict(delivered=False, peer_status=409, peer_body={'state':[]}))
         self.assertEqual(self.job()['status'], 'done')
         self.assertEqual(self.row()['state'], 'pending')
 

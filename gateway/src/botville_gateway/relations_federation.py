@@ -283,8 +283,10 @@ class FederationRelations:
             if not live or live['status'] != 'pending' or not meta or meta['request_id'] != job['request_id']:
                 return
             peer_status = result.get('peer_status')
-            body = result.get('body', {})
-            body = body if isinstance(body, dict) else {}
+            body = result.get('peer_body')
+            if not isinstance(body, dict):
+                body = result.get('body')
+                body = body if isinstance(body, dict) else {}
             undelivered = status == 200 and result.get('delivered') is False
             if (status == 409 and result.get('errcode') == 'BV_PEER_INACTIVE') or (
                     undelivered and peer_status == 403 and body.get('errcode') in ('BV_PEER_INACTIVE', 'M_FORBIDDEN')):
