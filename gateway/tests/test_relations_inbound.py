@@ -232,6 +232,27 @@ class BusinessTests(Fixture):
         self.assertEqual(self.receive(self.body('revoke', 'B'*26, reason='unfriend'))[0], 200)
         self.assertEqual(self.row()['state'], 'stranger')
 
+    def test_respond_after_request_expiry_preserves_lazy_expiration(self):
+        rid = self.outgoing()
+        self.now += WEEK + 1
+        status, result = self.receive(self.body('respond', rid))
+        self.assertEqual((status, result['errcode'], result['state']), (410, 'relation.expired', 'expired'))
+        self.assertEqual(self.row()['state'], 'stranger')
+        self.assertEqual(self.fed.metadata(A, REMOTE)['wire_state'], 'expired')
+        self.assertEqual(self.store._db.execute('SELECT status FROM relation_outbox').fetchone()[0], 'expired')
+
+    def test_unfriend_expires_using_its_own_sent_at(self):
+        self.assertEqual(self.receive()[0], 202)
+        self.assertEqual(self.action('approve')['state'], 'friend')
+        self.now += WEEK + 1
+        revoke = self.body('revoke', reason='unfriend')
+        self.now += WEEK + 1
+        revoke['meta']['received_at'] = self.now
+        status, result = self.receive(revoke)
+        self.assertEqual((status, result['errcode'], result['state']), (410, 'relation.expired', 'expired'))
+        self.assertEqual(self.row()['state'], 'friend')
+        self.assertEqual(self.fed.metadata(A, REMOTE)['wire_state'], 'accepted')
+
     def test_unknown_request_and_conflicts(self):
         for kind in ('respond', 'revoke'):
             result = self.receive(self.body(kind))

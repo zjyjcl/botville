@@ -13,6 +13,7 @@ from botville_gateway.memory.owner_http import HTTPError
 from botville_gateway.memory.store import MemoryStore
 from botville_gateway.relations import Relations, WEEK
 from botville_gateway.relations_federation import ulid
+from botville_gateway.relations_inbound import validate
 from botville_gateway.relations_outbound import (ADMIN_TOKEN_ENV, ALLOW_PRIVATE_ENV, BACKOFF, OUTBOUND_TOKEN_ENV, OUTBOUND_URL_ENV, SERVICE_TOKEN_ENV,
                                                OutboundWorker, transport)
 from test_relations_inbound import Fixture, REMOTE, RID, TOKEN
@@ -30,6 +31,86 @@ class OutboundTests(Fixture):
         self.fed.worker.transport = mock
         self.fed.worker.run_once(self.now)
         return mock
+
+    def connect_peer(self, clock_offset=0):
+        peer_name = REMOTE.partition(':')[2]
+        peer_store = MemoryStore(':memory:', hmac_secret=SECRET)
+        self.addCleanup(peer_store.close)
+        peer = Relations(peer_store, personas(REMOTE), server_name=peer_name,
+                         clock=lambda: self.now + clock_offset)
+        responses = []
+
+        def forward(url, token, body, timeout):
+            kind = url.rsplit('/', 1)[-1]
+            destination = body['destination']
+            sender, receiver = (self.service, peer) if destination == peer_name else (peer, self.service)
+            packet = dict(kind=kind, envelope=dict(v=1, kind=kind, origin=sender.server_name, **body),
+                          meta=dict(origin=sender.server_name, sent_at=int(sender.clock()),
+                                    received_at=int(receiver.clock())))
+            envelope, meta = validate(kind, packet, receiver.server_name, receiver.clock())
+            status, result = receiver.federation.inbound(kind, envelope, meta)
+            responses.append((status, result))
+            return 200, dict(delivered=200 <= status < 300, peer_status=status, body=result)
+
+        self.fed.worker.transport = forward
+        peer.federation.worker = OutboundWorker(peer.federation, url='http://pairing.invalid',
+            token='fake-outbound-token', transport=forward, clock=peer.clock)
+        return peer, responses
+
+    def test_unfriend_after_original_request_expiry_reaches_both_servers(self):
+        peer, responses = self.connect_peer()
+        rid = self.outgoing()
+        request_expiry = self.job()['expiry']
+        self.fed.worker.run_once()
+        self.assertEqual(responses[-1][0], 202)
+
+        self.now = request_expiry - 1
+        peer_row = peer._row(REMOTE, A)
+        peer.action(REMOTE, peer_row['relation_id'], 'approve', {'revision': peer_row['revision']})
+        respond = peer.federation.next_job(self.now)
+        self.assertEqual((respond['kind'], respond['expiry']), ('respond', self.now + WEEK))
+        peer.federation.worker.run_once()
+        self.assertEqual(responses[-1], (200, dict(request_id=rid, state='accepted')))
+        self.assertEqual((self.row()['state'], peer._row(REMOTE, A)['state']), ('friend', 'friend'))
+        self.assertEqual(self.fed.metadata(A, REMOTE)['expiry'], request_expiry)
+        self.assertEqual(peer.federation.metadata(REMOTE, A)['expiry'], request_expiry)
+
+        self.now += 30 * 24 * 60 * 60
+        self.assertEqual(self.action('revoke')['state'], 'stranger')
+        revoke = self.job()
+        self.assertEqual((revoke['kind'], revoke['status'], revoke['expiry']),
+                         ('revoke', 'pending', self.now + WEEK))
+        self.assertEqual(self.fed.next_job(self.now), revoke)
+        self.fed.worker.run_once()
+        self.assertEqual(responses[-1], (200, dict(request_id=rid, state='revoked')))
+        self.assertEqual(self.job()['status'], 'done')
+        self.assertEqual((self.row()['state'], peer._row(REMOTE, A)['state']), ('stranger', 'stranger'))
+
+    def test_withdrawn_delivery_after_original_request_expiry(self):
+        for clock_offset, expected_status, expected_state in ((0, 410, 'expired'), (-2, 200, 'revoked')):
+            with self.subTest(clock_offset=clock_offset):
+                peer, responses = self.connect_peer(clock_offset)
+                rid = self.outgoing()
+                request_expiry = self.job()['expiry']
+                self.fed.worker.run_once()
+                self.assertEqual(responses[-1][0], 202)
+
+                self.now = request_expiry
+                self.assertEqual(self.action('revoke')['state'], 'stranger')
+                withdraw = self.job()
+                self.assertEqual((withdraw['status'], withdraw['expiry']), ('pending', self.now + WEEK))
+                self.assertEqual(json.loads(withdraw['payload'])['reason'], 'withdrawn')
+
+                self.now += 1
+                self.assertEqual(peer._row(REMOTE, A)['state'], 'pending')
+                self.fed.worker.run_once()
+                status, result = responses[-1]
+                self.assertEqual((status, result['request_id'], result['state']),
+                                 (expected_status, rid, expected_state))
+                self.assertEqual(self.job()['status'], 'done')
+                self.assertEqual((self.row()['state'], peer._row(REMOTE, A)['state']), ('stranger', 'stranger'))
+                self.assertEqual(self.fed.metadata(A, REMOTE)['wire_state'], expected_state)
+                self.assertEqual(peer.federation.metadata(REMOTE, A)['wire_state'], expected_state)
 
     def test_exact_body_authorization_and_timeout(self):
         rid = self.outgoing()

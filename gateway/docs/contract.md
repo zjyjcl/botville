@@ -1620,9 +1620,12 @@ request_id 为 16–64 位 `[0-9A-Za-z_-]`；本方生成 26 位 Crockford base3
 
 入站 request 采用 `payload.from_kind` 作为 `counterpart.kind`，优先于 MXID 前缀推断。
 respond/revoke 的 from_user 仍是对端用户，to_user 是本服 persona。所有 payload 多余字段或类型错
-均 400。sent_at > now+300、created_at > sent_at+300 为 400；expiry=min(expires_at,sent_at+7 天)，
-now > expiry 为 410（等于 expiry 尚有效）；respond/revoke 使用已保存的请求 expiry。
-请求过期沿用 B-R1 惰性过期，本地变 stranger，wire state 变 expired，不写 tombstone。
+均 400。sent_at > now+300、created_at > sent_at+300 为 400。request 的有效期截止于
+`min(expires_at, sent_at + 7 天)`，respond 沿用已保存的原请求截止时间。pending 请求过期沿用
+B-R1 惰性过期，本地变 stranger，wire state 变 expired，不写 tombstone。
+已建立的好友关系可在原请求窗口结束后撤销。入站 revoke 的有效期截止于该次 revoke 的
+`sent_at + 7 天`。withdrawn 到达时仍为 incoming pending 则撤回成功，已惰性过期则返回 410。
+超过对应截止时间返回 410（等于截止时间尚有效）。
 
 **响应与状态。** wire state 仅 pending/accepted/rejected/revoked/expired，由一个集中函数映射
 本地 B-R1 状态（friend→accepted，pending→pending，其余使用跨服元数据）。错误体为
@@ -1639,7 +1642,7 @@ now > expiry 为 410（等于 expiry 尚有效）；respond/revoke 使用已保�
 | 404 | relation.unknown_user | 目标不存在、目标已拉黑发送者或策略拒收，统一隐藏原因 |
 | 404 | relation.unknown_request | respond/revoke 不匹配该对端用户与 request_id |
 | 409 | relation.state_conflict | 状态机不允许，带当前 wire state |
-| 410 | relation.expired | 请求已过期，state=expired |
+| 410 | relation.expired | 请求或撤销已过期，state=expired |
 | 422 | relation.unsupported | kind/decision/reason 不支持 |
 | 429 | relation.cooldown / relation.rate_limited | 带 retry_after_s |
 
@@ -1651,7 +1654,7 @@ now > expiry 为 410（等于 expiry 尚有效）；respond/revoke 使用已保�
 
 **幂等与事务。** schema 13 新增 relation_federation、relation_inbound_idempotency、
 relation_peers、relation_outbox，不改变 B-R1 列含义和公开字段。幂等键为 (origin,request_id,kind)，
-存 payload canonical SHA-256、首次状态码/响应体及 expires_at=请求 expiry+7 天；同 payload
+存 payload canonical SHA-256、首次状态码/响应体及 expires_at=该入站操作的截止时间+7 天；同 payload
 原样重放（202/201/业务错误也不变），不同 payload 409。已成功接收并返回 202 的入站请求，在对方被拉黑
 或配对断开后仍原样重放，不改变关系状态；新请求按门禁返回 404 或 403。过期记录惰性清理。400/401/422 不落键；
 通过身份检查后的 404/409/410/429 等业务回答都缓存。未知 request 的保留期使用 sent_at+7 天再加 7 天。
@@ -1708,7 +1711,9 @@ POST `{URL}/v1/pairing/internal/relations/<kind>`，`Authorization: Bearer` 使�
 | delivered:false，peer_status=410 / 404 unknown_user / 429 cooldown | expired / stranger / stranger+冷却 |
 | 其它 delivered:false | 不重试，保留当前本地状态 |
 
-请求有效期结束后停止投递，outbox 标 expired；仍 pending 的关系变 expired。
+出站 request 作业使用原请求截止时间。respond 和 revoke 作业各自在入队时取得 7 天投递窗口，
+截止于入队时间（整数秒）+7 天。超过作业截止时间后停止投递，outbox 标 expired。
+request 作业过期时，仍 pending 的对应关系变 expired。
 已取消、被新 request_id 替代或已完成的投递，其迟到结果不能覆盖新关系或解除 block。
 
 ## 3. 功能清单（Capability Manifest）规范

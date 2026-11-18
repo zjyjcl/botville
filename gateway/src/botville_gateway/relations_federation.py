@@ -181,7 +181,7 @@ class FederationRelations:
                 payload['decision'] = 'accept' if action == 'approve' else 'reject'
             else:
                 payload['reason'] = 'withdrawn' if row['state'] == 'pending' else 'unfriend'
-            self._enqueue(persona, counterpart, meta['request_id'], kind, payload, meta['expiry'], now)
+            self._enqueue(persona, counterpart, meta['request_id'], kind, payload, int(now) + WEEK, now)
         return relation_item(self.relations._row(persona, counterpart))
 
     def inbound(self, kind, envelope, meta):
@@ -207,8 +207,11 @@ class FederationRelations:
                 return cached['status'], json.loads(cached['response'])
             self.relations._expire(persona, now)
             current = self.metadata(persona, counterpart)
-            expiry = (min(payload['expires_at'], meta['sent_at'] + WEEK) if kind == 'request'
-                      else current['expiry'] if current and current['request_id'] == rid else meta['sent_at'] + WEEK)
+            expiry = meta['sent_at'] + WEEK
+            if kind == 'request':
+                expiry = min(payload['expires_at'], expiry)
+            elif kind == 'respond' and current and current['request_id'] == rid:
+                expiry = current['expiry']
             result = self._inbound_business(kind, origin, rid, payload, expiry, now)
             self.db.execute('INSERT INTO relation_inbound_idempotency VALUES (?,?,?,?,?,?,?)',
                 (origin, rid, kind, digest, result[0], canonical(result[1]).decode('utf-8'), expiry + WEEK))
@@ -229,7 +232,9 @@ class FederationRelations:
             return failure(429, 'rate_limited', rid, retry=retry)
         if kind != 'request' and (current is None or current['request_id'] != rid):
             return failure(404, 'unknown_request', rid)
-        if now > expiry or (kind != 'request' and current['wire_state'] == 'expired'):
+        unfriending = (kind == 'revoke' and payload['reason'] == 'unfriend'
+                       and row is not None and row['state'] == 'friend')
+        if now > expiry or (kind != 'request' and current['wire_state'] == 'expired' and not unfriending):
             return failure(410, 'expired', rid, state='expired')
         if kind == 'request':
             if current and current['cooldown_until'] > now:
@@ -248,9 +253,8 @@ class FederationRelations:
                 202, dict(accepted=True, request_id=rid, state=state))
         allowed = row is not None and (
             (kind == 'respond' and current['direction'] == 'outgoing' and row['state'] == 'pending') or
-            (kind == 'revoke' and ((payload['reason'] == 'withdrawn' and row['state'] == 'pending'
-                                   and current['direction'] == 'incoming') or
-                                  (payload['reason'] == 'unfriend' and row['state'] == 'friend'))))
+            (kind == 'revoke' and payload['reason'] == 'withdrawn' and row['state'] == 'pending'
+             and current['direction'] == 'incoming') or unfriending)
         if not allowed:
             return failure(409, 'state_conflict', rid, state=wire_state(row, current))
         state = ('accepted' if payload['decision'] == 'accept' else 'rejected') if kind == 'respond' else 'revoked'
