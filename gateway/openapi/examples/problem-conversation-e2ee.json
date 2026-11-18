@@ -1,9 +1,8 @@
 {
   "type": "urn:botville:error:conversation.e2ee",
-  "title": "AI participation disabled for this conversation",
+  "title": "AI participation disabled",
   "status": 403,
-  "detail": "encryption=e2ee or ai_participation=disabled; gateway must not speak as AI here",
-  "instance": "/v1/conversations/conv_demo/messages",
+  "detail": "AI participation is disabled in encrypted conversations",
   "code": "conversation.e2ee",
   "request_id": "req_demo_e2ee_send"
 }

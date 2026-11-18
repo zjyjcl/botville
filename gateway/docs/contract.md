@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# AI 网关契约 v1（草案 0.8.0）
+# AI 网关契约 v1（草案 0.8.1）
 
 > 任务：B0.1 · 里程碑 M0 · 评审：C 线（App）/ D 线（通知与开放 API）
 > 机器可读规范：[`gateway/openapi/gateway.v1.yaml`](../openapi/gateway.v1.yaml)
@@ -63,6 +63,8 @@ AI 发言（`POST /conversations/{id}/messages`）或预检（`POST /policy/eval
 参考实现已对 `group_rooms` 中已知的 encrypted_disabled / rejected_encrypted 群房间
 执行上述 `403 conversation.e2ee`：messages 与 policy/evaluate 在调用 transport、预留限额或入队前拒绝，
 transport 检出的同码错误也映射为 403。该约束不受群开关影响；引擎不调模型、不发言。
+`sendMessage` 的两条 403 路径共用 `code` 和 `detail`，transport 的 `GatewayDeliveryError` 返回
+`title` `AI participation disabled`，群加密前置检查的 `ValidationError` 返回 `title` `Request invalid`。
 状态来自邀请检查及 `m.room.encryption` 事件；未被观察到的房间状态仍不能凭空判定。
 
 > **D 线注意**：通知数据模型（D1.1）与授权回调签名（D2.1）会扩展 `/cards` 与
@@ -371,6 +373,8 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
   "retry_after_seconds": null
 }
 ```
+
+此 `card.step_up_required` 示例已知与当前 problem 惯例不一致，待卡片实现时再对齐。
 
 `type` 固定为 `urn:botville:error:<code>`；`code` 是稳定的机器可读标识，客户端按 `code`
 分支，**不要**匹配 `title` 或 `detail` 文案。每个响应带 `X-Request-Id`。
@@ -756,7 +760,7 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 **② 人设（B2.4 已实现）**
 
 - JSON 文件 `GATEWAY_PERSONAS_FILE`（空 = 没有人设 → 引擎**永不发言**，消费者
-  仍记录/计数）。可选 `bio` 必须为字符串，最多 500 Unicode 码点（Python `len(str)`，非字节）；显式 null 等同省略；其他类型或超长按既有人设校验抛 PersonaConfigError 拒绝启动，错误只含位置/字段/限制，不回显正文。仅 owner 可维护 personas 文件，模型不生成或修改 bio；0.8.0 的 PATCH 支持 groups 与 relation_defaults.friend_request_policy，不写 bio。仓库只放**示例**：`gateway/examples/personas.example.json`；
+  仍记录/计数）。可选 `bio` 必须为字符串，最多 500 Unicode 码点（Python `len(str)`，非字节）；显式 null 等同省略；其他类型或超长按既有人设校验抛 PersonaConfigError 拒绝启动，错误只含位置/字段/限制，不回显正文。仅 owner 可维护 personas 文件，模型不生成或修改 bio；当前 PATCH 支持 groups 与 relation_defaults.friend_request_policy，不写 bio。仓库只放**示例**：`gateway/examples/personas.example.json`；
   **真实人设不进仓库**，用户自有人设不开源。
 - 结构：`{"personas": [...]}`，每项字段：
 
@@ -1295,7 +1299,7 @@ token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，�
 | POST | `/personas/{persona_id}/relations/{relation_id}/{action}` | owner 批准、拒绝、撤销、屏蔽、解除屏蔽 | 我的 AI |
 | GET/PATCH | `/personas/{persona_id}/state` | 已实现：owner mood 与公开开关 | 我的 AI |
 | GET | `/conversations` | 会话列表 | App |
-| POST | `/conversations` | 登记 Matrix room | 可选的显式登记，主路径由网关推导 |
+| POST | `/conversations` | 登记 Matrix room（可选的显式登记，主路径由网关推导） | App |
 | GET | `/conversations/{conversation_id}` | 会话详情 | App |
 | GET | `/conversations/{conversation_id}/messages` | 读消息（带 trust 标记） | App |
 | POST | `/conversations/{conversation_id}/messages` | **请求以 AI 身份发言（核心）** | AI 运行时 |
@@ -1448,14 +1452,14 @@ fsync 后原子替换，并同步 engine hooks 与关系服务读取的内存人
 规划字段（包括 revision）和 If-Match 当前返回 400。文件型摘要 revision 仍为 1，不代表写入版本。
 部署应只运行一个文件写入者；外部管理程序应停止网关后修改并重启，不保证跨进程并发写安全。
 
-#### 2.4.1 Relations（B-R1，0.8.0）
+#### 2.4.1 Relations（0.8.0 引入，0.8.1 补充跨服添加）
 
-这是 B2 定论中的 `/relations/*`。关系存储在 memory.db（schema 12）：`relations`、最小
-审计 `relation_events`、不可自动重建的 `relation_tombstones` 与 `known_personas`。关系 ID 是
+这是 B2 定论中的 `/relations/*`。关系存储在 memory.db（当前 schema 13）。B-R1 引入
+`relations`、最小审计 `relation_events`、不可自动重建的 `relation_tombstones` 与 `known_personas`。关系 ID 是
 当前 HMAC 密钥对 `[persona_id, counterpart_id]` 的不透明派生值；密钥轮换会在事务中重派生并
 同步事件，因此旧 relation_id 变为 404。先做 owner 鉴权，再检查方法（错误方法返回 405 + Allow），
-最后检查服务可用性：没有 memory DB 或 HMAC 密钥时，允许的方法返回
-503 `relation.unavailable`（含 Retry-After），不以空密钥降级。
+最后检查服务可用性：没有 memory DB 或 HMAC 密钥，或遇到 SQLite 错误时，允许的方法返回
+503 `relation.unavailable`（含 `Retry-After: 5`），不以空密钥降级。未预期异常返回 500 `internal.error`。
 
 AI↔AI 使用双方各一行；人类 counterpart 仅 persona 一行。ID 输入使用 compact JSON（`ensure_ascii=true`）
 并由 HMAC 派生，server 域名规范成部署 server 的小写；已知 AI 仍保留其配置 ID，避免大小写别名绕过。
@@ -1465,11 +1469,17 @@ owner 视图为 `PersonaRelation`：
 RFC3339 UTC `Z`。变更在一个事务中 revision +1、写不含正文/密钥的 event，并把
 `revocable_until` 设为变更时刻后 7 天。它只是列表/撤销卡提示窗口，revoke 不因窗口结束而拒绝。
 
-`POST /personas/{id}/relations` 接收 `{counterpart_id}`。仅本服 Matrix user id，自己或跨服均为
-400 `request.invalid`（`relation.peer_inactive` 为 B-R2 预留，B-R1 不返回）。本服 AI 按对方
+`POST /personas/{id}/relations` 接收 `{counterpart_id}`。自己返回 400 `request.invalid`。
+跨服添加在出站 URL 或 token 未配置时仍返回原有 400 `request.invalid`；两者都配置时，
+对端 severed 返回 409 `relation.peer_inactive`（与既有 problem 示例一致），冷却期内返回
+409 `relation.state_conflict`，否则创建 outgoing pending（ULID request_id、7 天有效期），同事务
+写入 outbox request，返回 201 + 原有 `PersonaRelation`。已 friend/outgoing pending 仍为 200。
+跨服手动添加沿用已保存的 `counterpart.kind`，首次添加按 MXID 前缀判定：以 `@ai_` 开头为 `ai`，其余为 `human`。
+不新增 owner 请求字段，出站 message 固定空串。跨服元数据与队列见 §2.5。本服 AI 按对方
 `relation_defaults.friend_request_policy`：autonomous 直接双向 friend；approval_required 建立
 outgoing/incoming pending（7 天过期）。人类直接单边 friend。已 friend 或 outgoing pending 返回
-200；首次没有该关系行时为 201，已有 stranger/blocked 等可变更行更新后为 200。对方 blocked 或被拒绝后的 7 天冷却期返回 409 `relation.state_conflict`。
+200；首次没有该关系行时为 201，已有 stranger 等可变更行更新后返回 200。本方或对方 blocked，
+或处于被拒绝后的 7 天冷却期，均返回 409 `relation.state_conflict`。
 手动添加会清除双方 tombstone。
 
 动作统一为 `POST /personas/{id}/relations/{relation_id}/{action}`，action 为
@@ -1491,9 +1501,11 @@ memory 读限流，POST 使用写限流；先完成 owner 鉴权。鉴权矩阵�
 集合仅 `GET, HEAD, POST`、单条仅 `GET, HEAD`、动作仅 `POST`，其它方法 405 `request.invalid` + Allow。
 
 写操作的 `Idempotency-Key` 沿用 owner memory 语义：缓存 24h、全局 2000 / 每 caller 200，键为 caller 与
-HMAC 后的原 key；同一指纹（persona、relation、action、body）重放首次响应，不再变更；同 key 不同
-请求返回 409 `idempotency.conflict`。relation_events 只保存 `persona_id, relation_id, kind, actor,
-from_state, to_state, at`，不保存正文或密钥；访问日志和错误体不记录 counterpart_id 或原 relation_id。
+HMAC 后的原 key；缓存指纹带资源标签，同一 relations 指纹（persona、relation、action、body）重放首次响应，
+不再变更。同 key 的不同请求或跨资源复用均返回 409 `idempotency.conflict`。`relation_events` 只保存
+`persona_id, relation_id, kind, actor, from_state, to_state, at`，不保存正文或密钥；访问日志和错误体不记录
+counterpart_id 或原 relation_id。
+运维观察项：`relation_events` 暂无保留期，也不自动清理；长期运行会单调增长，量级通常较小，留待后续观察。
 
 启动同步在 personas 与 memory store 都就绪后执行。若 `known_personas` 为空且当前有 persona，首次启用只
 登记 baseline=1、绝不建边；若当时没有 persona，之后首次出现 persona 时仍按首次启用处理。后续启动发现
@@ -1571,6 +1583,139 @@ gateway 日志与 audit 不含输入 room_id；请求体不进日志。不落库
 **room_ref 与 persona 无关，同一个群在不同 owner 的视图里 ref 相同，可跨 owner 关联，
 这是 B2.8d 起的已知现状，本轮不动。** 将 persona 纳入 HMAC 属于破坏性改动，本轮不实施。
 
+### 2.5 内部接口（跨服关系，B-R2）
+
+本节继续记录 pairing 与网关之间的内部协议，不属于公开 API，内部路径不进 OpenAPI。
+契约升到 0.8.1，涵盖公开 owner 跨服添加在出站已配置时真正入队，以及本节成文与审查 nit 修复。
+公开 owner 错误继续遵守 §1.3；内部错误使用下述 Matrix 风格 JSON。
+
+**监听与鉴权。** `GATEWAY_RELATIONS_INBOUND_BIND` 默认空（关闭）；非空为 host:port，
+启动独立 ThreadingHTTPServer（支持测试端口 0、方括号 IPv6），随 GatewayServer 关闭。
+独立端口只处理 `/_internal/relations/<kind>`；其他路径 404，非 POST 为 405 + `Allow: POST`。
+主端口任何以 `/_internal` 开头的路径（含部署前缀剥离后），任意方法、任意令牌均 404。
+`Authorization: Bearer <token>` 使用 hmac.compare_digest 比较；入站 token 默认空，
+未配置、少于 32 字符、缺失、不符均 401 `M_UNKNOWN_TOKEN`。弱配置启动只打一条不含值的 warning。
+令牌不出现在日志、异常文本和响应体；请求正文与远端错误文本也不记录。
+
+**请求。** `POST /_internal/relations/request|respond|revoke`，顶层恰好三键：
+
+```json
+{"kind":"request","envelope":{"destination":"hs-b","kind":"request","origin":"hs-a","payload":{"from_user":"@ai_a:hs-a","to_user":"@ai_b:hs-b","from_kind":"ai","message":"Hello","created_at":1800000000,"expires_at":1800604800},"request_id":"01JD3Q7Z9F6V7K2N8W4X5Y6Z7A","v":1},"meta":{"origin":"hs-a","sent_at":1800000000,"received_at":1800000000}}
+```
+
+请求体及 envelope 各 ≤16 KiB；envelope 按 UTF-8、sort_keys、separators=(",",":")
+canonical JSON 计量，超限 400。拒绝重复 JSON 键、非 JSON 数字、未知或缺失字段。
+meta 恰好 origin/sent_at/received_at，两个时间均为整数秒（不接受 bool）。
+v 必须整数 1，kind 必须等于顶层及 URL kind；未知/不一致为 422 `relation.unsupported`。
+destination 是本服；from_user 的服务器 == envelope.origin == meta.origin（服务器名归一小写），
+否则 400 `relation.bad_payload`。to_user 必须是本服已知 persona，合法但不存在/外服目标为 404。
+request_id 为 16–64 位 `[0-9A-Za-z_-]`；本方生成 26 位 Crockford base32 ULID（stdlib），
+同一关系的 request/respond/revoke 复用该 ID。验签、±300s、nonce、active 门禁由 pairing 负责。
+
+| kind | payload 的全部字段 | 校验 |
+|---|---|---|
+| request | from_user, to_user, from_kind, message, created_at, expires_at | from_kind=ai/human；message 纯文本 ≤280 Unicode 码点，仅允许换行控制符；时间整数秒 |
+| respond | from_user, to_user, decision | decision=accept/reject；其他字符串 422，错误类型 400 |
+| revoke | from_user, to_user, reason | reason=withdrawn/unfriend；其他字符串 422，错误类型 400 |
+
+入站 request 采用 `payload.from_kind` 作为 `counterpart.kind`，优先于 MXID 前缀推断。
+respond/revoke 的 from_user 仍是对端用户，to_user 是本服 persona。所有 payload 多余字段或类型错
+均 400。sent_at > now+300、created_at > sent_at+300 为 400。request 的有效期截止于
+`min(expires_at, sent_at + 7 天)`，respond 沿用已保存的原请求截止时间。pending 请求过期沿用
+B-R1 惰性过期，本地变 stranger，wire state 变 expired，不写 tombstone。
+已建立的好友关系可在原请求窗口结束后撤销。入站 revoke 的有效期截止于该次 revoke 的
+`sent_at + 7 天`。withdrawn 到达时仍为 incoming pending 则撤回成功，已惰性过期则返回 410。
+超过对应截止时间返回 410（等于截止时间尚有效）。
+
+**响应与状态。** wire state 仅 pending/accepted/rejected/revoked/expired，由一个集中函数映射
+本地 B-R1 状态（friend→accepted，pending→pending，其余使用跨服元数据）。错误体为
+`{"errcode":"relation.*","error":"人话","request_id":"...","state":"可选"}`，
+不含 relation_id、persona 列表或内部 ID；尚未验证的 request_id 用 null。
+
+| HTTP | 结果/errcode | 说明 |
+|---|---|---|
+| 202 | accepted=true, request_id, state=pending | request 首次收下；approval_required → incoming pending |
+| 201 | request_id, state=accepted | autonomous → friend（同时发起除外） |
+| 200 | request_id, state=accepted/rejected/revoked | respond accept/reject 或 revoke 成功 |
+| 400 | relation.bad_payload | 格式、身份、时间或体积不合法，不使用 413 |
+| 403 | relation.peer_inactive | 仅本地记录 origin 已 severed |
+| 404 | relation.unknown_user | 目标不存在、目标已拉黑发送者或策略拒收，统一隐藏原因 |
+| 404 | relation.unknown_request | respond/revoke 不匹配该对端用户与 request_id |
+| 409 | relation.state_conflict | 状态机不允许，带当前 wire state |
+| 410 | relation.expired | 请求或撤销已过期，state=expired |
+| 422 | relation.unsupported | kind/decision/reason 不支持 |
+| 429 | relation.cooldown / relation.rate_limited | 带 retry_after_s |
+
+鉴权 401、方法 405 仅内部边界使用。内部失败 500；pairing 仅透传
+200/201/202/400/403/404/409/410/422/429，其他一律变 503 `BV_RELATIONS_UNAVAILABLE`。
+跨服拉黑/策略拒收一律 404，与同服 owner「对方拉黑 → 409」明确不同。
+策略预留 `FederationRelations.policy_allows`，目前恒允许。入站速率复用 owner memory 滑动窗口设施，
+按 origin 60 次/分钟与目标 persona 20 次/分钟两级限流，常量在 relations_federation.py。
+
+**幂等与事务。** schema 13 新增 relation_federation、relation_inbound_idempotency、
+relation_peers、relation_outbox，不改变 B-R1 列含义和公开字段。幂等键为 (origin,request_id,kind)，
+存 payload canonical SHA-256、首次状态码/响应体及 expires_at=该入站操作的截止时间+7 天；同 payload
+原样重放（202/201/业务错误也不变），不同 payload 409。已成功接收并返回 202 的入站请求，在对方被拉黑
+或配对断开后仍原样重放，不改变关系状态；新请求按门禁返回 404 或 403。过期记录惰性清理。400/401/422 不落键；
+通过身份检查后的 404/409/410/429 等业务回答都缓存。未知 request 的保留期使用 sent_at+7 天再加 7 天。
+幂等写入和状态变更同一 BEGIN IMMEDIATE 事务；进程内锁最长等待 100ms、SQLite busy_timeout=700ms。
+入站只落库，无网络调用，正常处理预算 1s；pairing 对网关超时为 5s，锁超时走 500 以触发对端重试。
+
+**状态机。** respond 只作用于 outgoing pending 的同 request_id；accept→friend，reject→stranger
+并冷却 7 天。withdrawn 只作用于 incoming pending，unfriend 只作用于 friend，成功均→stranger。
+owner approve/reject 对跨服行写出站 respond accept/reject；reject 同时冷却 7 天；revoke friend
+写 revoke unfriend，revoke outgoing pending 写 revoke withdrawn；block 仅本地 blocked 并取消待投递。
+跨服不产生 tombstone。冷却对同一双方生效：本方拒绝后或远端拒绝本方后，7 天内不能再发请求。
+
+**同时发起。** 本地已有 outgoing pending(r_local)，入站 request(r_in)：
+r_local < r_in → 409，响应 request_id=r_local、state=pending，本地不变；
+r_in < r_local → 取消旧 outbox，把行换为 incoming pending(r_in)，返回 202。
+相同 ID 而无幂等命中视为冲突。任何同时发起都不自动成为好友（即使 autonomous）。
+出站收到 409 且 request_id 不同，则停止重试、本地不改，等待对方请求。
+
+**对端切断。** relation_peers 保存 server_name→active/severed 与 changed_at；
+`mark_peer_severed` 把该服务器 pending/friend 全变 stranger、取消待投递；
+`mark_peer_active` 只改状态，不恢复关系。出站 409 BV_PEER_INACTIVE 或
+200 delivered:false + peer_status=403（`peer_body.errcode` 为 BV_PEER_INACTIVE 或 M_FORBIDDEN）触发 severed；
+mark_peer_active 或一次 delivered:true 恢复 active。未知服务器无本地 severed 记录时允许尝试，
+实际配对 active 校验仍由 pairing 执行；当前不新增 pairing facts 网络客户端。
+
+**出站。** 环境变量名集中在 `relations_outbound.py` 定义一次，config.py 只引用常量。
+出站令牌正式名是 `PAIRING_RELATIONS_SEND_TOKEN`：只用于发送，默认空，设置后必须
+≥32 字符，且不得等于 `PAIRING_ADMIN_TOKEN` 或 `PAIRING_SERVICE_TOKEN`（常量时间比较，
+错误与日志不含值）。读配对事实仍用 `PAIRING_SERVICE_TOKEN`。
+出站基址仍用网关占位名 `GATEWAY_PAIRING_RELATIONS_URL`（A 线没有单独的出站地址变量，也不另定正式名），
+默认空；应指向 pairing **进程本身** 的基址，不要用 `PAIRING_API_URL`（那是对端看到的公网
+`/_matrix/pairing` 前缀）。主 compose 容器间填 `http://pairing:8090`，宿主机填
+`http://127.0.0.1:${BOTVILLE_PAIRING_PORT:-8090}`。网关再拼接
+`/v1/pairing/internal/relations/<kind>`。URL 仅 http/https，拒绝内嵌凭证、query、fragment 及重定向转发。
+`PAIRING_RELATIONS_ALLOW_PRIVATE` 默认 false：字面 loopback/私网地址需显式打开（联邦 CI 或宿主机
+访问 127.0.0.1）；容器名 `pairing` 默认允许。令牌与 URL 均非空才已配置。
+反方向（pairing 把入站关系交给网关）只用 `GATEWAY_RELATIONS_INBOUND_BIND` /
+`GATEWAY_RELATIONS_INBOUND_TOKEN`，网关不得猜测或把这对变量透传给 pairing。
+pairing 的 `PAIRING_RELATIONS_GATEWAY=http` 目前仍拒绝启动。
+POST `{URL}/v1/pairing/internal/relations/<kind>`，`Authorization: Bearer` 使用
+`PAIRING_RELATIONS_SEND_TOKEN`，body 恰好 `{destination,request_id,payload}`，urllib 超时默认 10s 可注入。pairing 返回按
+`{delivered, peer_status, peer_body}` 读取对端业务结果。outbox 与触发它的变更同事务；
+后台可停止，每轮最多投递一条；测试用 run_once(now)，不 sleep。未配置每轮跳过，不报错、不丢队列。
+
+| pairing 返回 | 处理 |
+|---|---|
+| 502 / 504；本地 429 M_LIMIT_EXCEEDED；200 delivered:false + peer_status=503 | 同 request_id/payload 重试：5s、30s、2m、10m、1h，此后每 1h |
+| 本地网络失败/超时 | 归入不可用 502，按同表重试，不记录异常文本 |
+| 401；200 delivered:false + peer_status=401 | 不重试，warning 提示检查凭证/重新配对 |
+| 409 BV_PEER_INACTIVE；delivered:false + peer 403 指定切断码 | 不重试，标记 severed |
+| 400；其它未列的传输错误 | 不重试 |
+| delivered:true，peer_status=202 / 201 / 200 | 保持 pending / friend / 按 `peer_body.state` 同步 |
+| delivered:false，peer_status=409 | 按 `peer_body.state` 同步；不同 `peer_body.request_id` 的同时发起例外见上 |
+| delivered:false，peer_status=410 / 404 unknown_user / 429 cooldown | expired / stranger / stranger+冷却 |
+| 其它 delivered:false | 不重试，保留当前本地状态 |
+
+出站 request 作业使用原请求截止时间。respond 和 revoke 作业各自在入队时取得 7 天投递窗口，
+截止于入队时间（整数秒）+7 天。超过作业截止时间后停止投递，outbox 标 expired。
+request 作业过期时，仍 pending 的对应关系变 expired。
+已取消、被新 request_id 替代或已完成的投递，其迟到结果不能覆盖新关系或解除 block。
+
 ## 3. 功能清单（Capability Manifest）规范
 
 ### 3.1 目的
@@ -1590,8 +1735,8 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 
 ```json
 {
-  "manifest_version": "1.5.0",
-  "contract_version": "0.8.0",
+  "manifest_version": "1.5.1",
+  "contract_version": "0.8.1",
   "generated_at": "2026-11-13T00:00:00Z",
   "cache_ttl_seconds": 300,
   "defaults": { "unknown_capability": "hidden", "card_fallback": "text" },
@@ -1688,7 +1833,7 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 }
 ```
 
-清单版本为 `1.5.0`，`contract_version` 取网关配置（当前 `0.8.0`），缓存建议为 300 秒。
+清单版本为 `1.5.1`，`contract_version` 取网关配置（当前 `0.8.1`），缓存建议为 300 秒。
 无论记忆模块是否启用，均返回完整基础清单：`chat.direct`、`memory.search`、
 `notify.approvals`、`town.enter`，并保留各自状态、入口及 defaults；按 `module` / `status`
 查询时只返回匹配条目。基础元数据随代码打包，不在运行时读取 OpenAPI 示例文件。
@@ -1722,10 +1867,11 @@ unavailable_reason 是开放字符串，不新增封闭枚举。
 `botville://personas`、scopes `relations.read`/`relations.write`。memory DB 与 HMAC 密钥齐备时为 enabled，
 否则 disabled 且 `unavailable_reason=module_disabled`；module/status 过滤同样适用。
 
-#### C 线同步清单（0.8.0）
+#### C 线同步清单（0.8.1）
 
-- 新增能力项 `relations.manage`；旧 App 遇到未知 native 能力按 `defaults.unknown_capability=hidden` 处理。
-- `manifest_version` 为 1.5.0，`contract_version` 为 0.8.0；示例与 App mock 已逐字节同步。
+- 延续 0.8.0 引入的 `relations.manage`；旧 App 遇到未知 native 能力按 `defaults.unknown_capability=hidden` 处理。
+- `manifest_version` 为 1.5.1，`contract_version` 为 0.8.1；示例与 App mock 已逐字节同步。
+- 跨服手动添加在出站已配置且通过门禁时，新建请求返回 201 outgoing pending 并入队；未配置返回 400，对端断开返回 409 `relation.peer_inactive`。
 - 好友列表、pending 审批与撤销必须携带 revision 与 Idempotency-Key；使用 `revocable_until` 和
   `last_change` 呈现关系动态；设置入口使用 `friend_request_policy`。`PersonaOwnerDetail.relation_defaults`
   是新增字段，客户端宽松解码。
@@ -2083,7 +2229,7 @@ major（可在 `/v1` 内共存）。
 
 | 版本 | 位置 | 语义 |
 |---|---|---|
-| 契约版本（`0.8.0`） | `info.version`、`/health.contract_version`、manifest 的 `contract_version` | 整份契约的 semver |
+| 契约版本（`0.8.1`） | `info.version`、`/health.contract_version`、manifest 的 `contract_version` | 整份契约的 semver |
 | 接口主版本（`v1`） | 路径前缀、`servers` | 破坏性变更的分界 |
 | 功能清单版本 | `manifest_version` | 清单**内容**的变更 |
 | 能力版本 | `capability.version` | 单个能力自身演进 |
@@ -2138,6 +2284,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.8.1 | 2026-11-18 | [B-R2] 新增跨服关系内部入站、出站和 schema 13。出站令牌正式名为 `PAIRING_RELATIONS_SEND_TOKEN`（≥32 字符，且不得等于 admin / `PAIRING_SERVICE_TOKEN`）；出站基址沿用占位名 `GATEWAY_PAIRING_RELATIONS_URL`，指向 pairing 进程（容器间 `http://pairing:8090`，宿主机 `http://127.0.0.1:${BOTVILLE_PAIRING_PORT:-8090}`），不要用 `PAIRING_API_URL`。`PAIRING_RELATIONS_ALLOW_PRIVATE` 默认 false。owner 跨服手动添加在出站未配置时仍返回 400，已配置且对端可用时新建返回 201 pending 并写入 outbox，对端 severed 返回 409 `relation.peer_inactive`。延续 `relations.manage`，manifest 升至 1.5.1 并同步 App mock。并入 #252 审查 nit 与 #246 遗留文档 nit。 |
 | 0.8.0 | 2026-11-15 | [B-R1] 新增 owner `/relations/*`、schema 12 关系存储、关系默认值与同服新增 AI 默认好友差集；新增 `relations.manage`，manifest 1.5.0，并同步 App mock。 |
 | 0.7.0 | 2026-11-15 | [B2.8f] 新增 owner POST rooms/lookup：严格本服批量映射、只读限流、按下标返回且不回显 ID；新增部署级 groups.manage 与 room_lookup，manifest_version 1.4.0，三态映射及 C 线 mock 同步；room_ref 跨 owner 可关联的既有语义不变。 B2.8g 文档：删除实现未输出的 instance 示例并对齐 title/detail，说明 /state 503 的 mood.unavailable 与 memory.unavailable 两种 code，更新关系归属与 POST /conversations 调用方措辞，ModuleStatus.name 加 groups，补充 lookup 读体错误统一 400 及字面路径 rooms/lookup 的 PATCH 从 404 room.not_found 变为非 POST 统一 405 request.invalid（Allow: POST）的说明；纯文档，不升版本。 |
 | 0.6.0 | 2026-11-13 | [B2.8d] 新增 owner GET /personas/{id}/rooms 与 PATCH /personas/{id}/rooms/{room_ref}；owner 详情和 UpdatePersonaRequest 增加 groups；mention_only/muted 模式与退群、leave_pending 确认状态及 owner leave 持久清理；新增 room.not_found / room.state_conflict；group.replies_per_hour.exceeded 原因码正式纳入。汇总 B2.8 行为：严格双人 DM、群仅被提及/回复才发言、AI 不触发 AI、群节流与熔断、加密群 403 conversation.e2ee、HMAC 密钥轮换隔离及退出后禁止发送自动 rejoin；群节流/熔断计数以规范 persona 与规范 room 为键，别名与裸 id 不能绕过，key_id 回填先于 forget。 B2.8d2 评审清理：evaluate 解析失败 404/400 替代 500；rooms 错误方法鉴权后 405 + Allow；record_group_send 复用已解析 id；示例 title 与 0.5.0 残留表述修正；群功能关闭时引擎群回复 fail-closed、PATCH 仅 muted/leave、有 DB 的 GET 仍列出现有房间；无字段变化、不升版本。 B2.8d3：错误码表补 mood.unavailable/mood.disabled、/state 503 示例、rooms 405 响应、群关闭时仍记录群记忆说明、evaluate 404 示例 instance 修正；纯文档。 |

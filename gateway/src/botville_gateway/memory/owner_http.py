@@ -50,22 +50,30 @@ class MemoryHTTPState:
     def rate(self, caller, read):
         now = time.monotonic()
         with self.lock:
-            for key in list(self.rates):
-                queue = self.rates[key]
-                while queue and queue[0] <= now - WINDOW_SECONDS:
-                    queue.popleft()
-                if not queue:
-                    del self.rates[key]
-            queue = self.rates.setdefault((caller, read), deque())
-            cap = READS_PER_MINUTE if read else WRITES_PER_MINUTE
-            if len(queue) >= cap:
-                raise HTTPError(429, 'rate_limited.transport',
-                                max(1, math.ceil(queue[0] + WINDOW_SECONDS - now)))
-            queue.append(now)
+            retry = sliding_rate(self.rates, (caller, read),
+                                 READS_PER_MINUTE if read else WRITES_PER_MINUTE,
+                                 now, WINDOW_SECONDS)
+            if retry:
+                raise HTTPError(429, 'rate_limited.transport', retry)
+
+
+def sliding_rate(rates, key, cap, now, window):
+    """Shared bounded sliding-window accounting; caller owns synchronization."""
+    for old_key in list(rates):
+        queue = rates[old_key]
+        while queue and queue[0] <= now - window:
+            queue.popleft()
+        if not queue:
+            del rates[old_key]
+    queue = rates.setdefault(key, deque())
+    if len(queue) >= cap:
+        return max(1, math.ceil(queue[0] + window - now))
+    queue.append(now)
+    return 0
 
 
 def _remember_idempotency(state, caller, key, value):
-    """Store a fact replay entry without letting one owner evict another."""
+    """Store an owner replay entry without letting one owner evict another."""
     state.idempotency[key] = value
     state.idempotency.move_to_end(key)
     owner_keys = [entry_key for entry_key in state.idempotency if entry_key[0] == caller]
@@ -105,7 +113,7 @@ def capabilities(server, query):
     for name in ('module', 'status'):
         if name in params:
             entries = [entry for entry in entries if entry[name] == params[name][-1]]
-    return dict(manifest_version='1.5.0', contract_version=server.config.contract_version,
+    return dict(manifest_version='1.5.1', contract_version=server.config.contract_version,
                 generated_at=datetime.now(timezone.utc).isoformat(),
                 cache_ttl_seconds=300, defaults=deepcopy(DEFAULTS), capabilities=entries)
 
@@ -244,7 +252,8 @@ def _route(handler, state, caller, params, rest, audit):
         if not isinstance(value, str) or not 1 <= len(value) <= 500 or visibility not in ('dm_only', 'shared'):
             raise HTTPError(422, 'request.invalid')
         idem = handler._idempotency_key()
-        fingerprint = hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+        digest = hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+        fingerprint = ('memory', digest)
         idem_key = (caller, hmac.new(state._secret, b"idempotency\x00" + idem.encode("utf-8"),
                                      hashlib.sha256).hexdigest()) if idem else None
         with state.lock:

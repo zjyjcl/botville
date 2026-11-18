@@ -115,7 +115,7 @@ continuwuity 仍用 `memory`（尚无文件注册）。运维注意见
 | GET | `/v1/personas/{id}` | `getPersona` | 0.4.0：owner 详情 / 本服非 owner 最小视图，含 bio 与 mood；列表项不加 mood |
 | GET/PATCH | `/v1/personas/{id}/state` | `getPersonaState` / `updatePersonaState` | 0.4.0：仅 owner 的 mood 与 mood_public，关闭时 404 `mood.disabled`，响应 no-store |
 | POST | `/v1/personas/{id}/rooms/lookup` | `lookupPersonaRooms` | 0.7.0：owner 批量查询本地已知 room_id，按下标返回 GroupRoom/null；只读、不回显 ID |
-| GET/POST | `/v1/personas/{id}/relations` | `listPersonaRelations` / `createPersonaRelation` | 0.8.0：owner 关系列表与手动添加；AI 为双行、人类为单行 |
+| GET/POST | `/v1/personas/{id}/relations` | `listPersonaRelations` / `createPersonaRelation` | owner 关系列表与手动添加；本服 AI 为双行、人类为单行；0.8.1 支持跨服请求入队 |
 | GET | `/v1/personas/{id}/relations/{relation_id}` | `getPersonaRelation` | 0.8.0：读取 owner 的单条关系 |
 | POST | `/v1/personas/{id}/relations/{relation_id}/{action}` | `actOnPersonaRelation` | 0.8.0：approve/reject/revoke/block/unblock，携带 revision |
 | GET | `/health` | `getHealth` | 免鉴权；返回 Health 形态 |
@@ -334,6 +334,11 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_AS_TXN_PURGE_INTERVAL_SECONDS` | `86400` | AS 事务保留期清理间隔（秒）：启动先跑一次，之后后台按间隔跑，失败只记日志（不记 token / 事件体）。`0` = 关闭（启动不跑、不起线程，库会持续增长）；非 0 时 **≥60**，否则拒绝启动。**校验与 `GATEWAY_AS_TXN_DB_PATH` 是否配置无关**。见 [docs/contract.md](docs/contract.md) §1.7.7 |
 | `GATEWAY_GROUP_MAX_RESPONDERS` | `3` | 每条群聊人类消息最多回复的 AI 数，按提及顺序；int，范围 1–20，非法/越界拒绝启动且错误不回显值。超出者跳过并计数，DM 不受影响 |
 | `GATEWAY_CONSUMER_ENABLED` | `false` | 进程内 AS 事务消费者（B 线 PR1，契约 §1.7.8）总开关。**默认 false = 行为与之前完全一致**（不起线程、不唤醒）。开启后：事务落库立即唤醒 + 5 秒兜底轮询，按 rowid 顺序消费，做事件分类 / trust / 防循环 / 计数并调用钩子。开启但 `GATEWAY_AS_TXN_DB_PATH` 未配置 → 启动 warning 且不起线程（不拒绝启动）；开启但未配置模型/人设 → 只记录计数，`/health` 不 degraded |
+| `GATEWAY_RELATIONS_INBOUND_BIND` | 空（关闭） | B-R2 独立入站监听 host:port；主端口 /_internal 始终 404。只给网关入站用，不要猜测或把这对变量透传给 pairing。pairing 的 `PAIRING_RELATIONS_GATEWAY=http` 目前仍拒绝启动（A 线尚未合入真正的 HTTP 客户端）。 |
+| `GATEWAY_RELATIONS_INBOUND_TOKEN` | 空 | ≥32 字符；未配置或过短时入站一律 401，启动 warning 不含值。不是出站令牌，也不要交给 pairing。 |
+| `GATEWAY_PAIRING_RELATIONS_URL` | 空 | 出站基址（A 线没有另定正式名，沿用此占位变量）。应指向 **pairing 进程本身**，不要填 `PAIRING_API_URL`（那是对端看到的公网 `/_matrix/pairing` 前缀）。主 compose 容器间用 `http://pairing:8090`，宿主机用 `http://127.0.0.1:${BOTVILLE_PAIRING_PORT:-8090}`。网关会再拼接 `/v1/pairing/internal/relations/<kind>`。仅 http/https，拒绝内嵌凭证、query、fragment。未配置时不投递、跨服手动添加仍返回 400。 |
+| `PAIRING_RELATIONS_SEND_TOKEN` | 空 | 出站发送令牌的正式名（A 线已定）。只用于 `Authorization: Bearer` 调 pairing 出站端点；≥32 字符，且不得等于 `PAIRING_ADMIN_TOKEN` 或 `PAIRING_SERVICE_TOKEN`（常量时间比较，错误信息不含值）。读配对事实仍用 `PAIRING_SERVICE_TOKEN`。与 URL 均非空才投递。联邦测试栈对应 `PAIRING_RELATIONS_SEND_TOKEN_A/B`。 |
+| `PAIRING_RELATIONS_ALLOW_PRIVATE` | `false` | 默认 false。`GATEWAY_PAIRING_RELATIONS_URL` 指向 loopback 或私网地址时必须设为 true，否则拒绝启动；只有联邦 CI 栈（以及宿主机访问 `127.0.0.1`）应打开。容器名 `http://pairing:8090` 不是字面私网 IP，默认允许。 |
 | `GATEWAY_MEMORY_DB_PATH` | 空 | 可选记忆 SQLite 路径；空 = 关闭，继续 ring buffer；新库 0600、WAL，备份敏感 |
 | `GATEWAY_MEMORY_OWNER_CAN_READ_DM` | `false` | 主人是否可读 DM 正文/事实值；严格布尔解析，关闭仍可管理元数据和写入 |
 | `GATEWAY_MEMORY_RETENTION_DAYS` | `90` | 保留天数 ≥1；pinned 不到期，撤回仍删除 |
@@ -590,8 +595,12 @@ persona 可配置 `"groups": {"enabled": true, "invite_policy": "owner"}`；
 邀请台账的主动/HTTP 发言）；已确认 DM 的 `allow_auto_join=true` 不受影响。设置
 `GATEWAY_GROUP_FORGET_STALE_KEYS=true` 后，启动时会永久删除旧 key_id 行并解除隔离；代价是旧
 left/encrypted_disabled 记录丢失，被踢/退出的群取得新的合格邀请后可以再次接受。
-升级到 0.8.0 / schema 12 时，存量 AI 不会自动互为好友，owner 可手动添加；只有之后新入驻的
-AI 才按同服默认规则建立关系。关系 ID 随 HMAC 密钥轮换而变化，旧 ID 不可再查询。
+首次启用关系存储时，存量 AI 不会自动互为好友，owner 可手动添加；之后新入驻的 AI 才按同服默认
+规则建立关系。关系 ID 随 HMAC 密钥轮换而变化，旧 ID 不可再查询。
+0.8.1 / schema 13 新增跨服关系元数据和队列。跨服手动添加在出站未配置时返回 400；出站已配置时，
+新请求创建 outgoing pending 并写入 outbox，返回 201。对端已断开配对时返回 409 `relation.peer_inactive`。
+入站 respond 仍须在原请求的 7 天窗口内到达。好友建立后可在原窗口结束后撤销，入站 revoke
+按该次撤销的发送时间起算 7 天。出站 respond 和 revoke 各自在入队时取得 7 天投递窗口。
 
 从 schema 10 首次升级到 11 时，旧行会按**该次启动的当前密钥**回填 key_id；因此应先使用原密钥完成
 迁移，再轮换密钥，才能保留可靠的轮换检测。

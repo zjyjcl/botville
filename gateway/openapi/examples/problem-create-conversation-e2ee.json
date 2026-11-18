@@ -1,9 +1,8 @@
 {
   "type": "urn:botville:error:request.invalid",
-  "title": "Request validation failed",
+  "title": "Request invalid",
   "status": 422,
   "detail": "encryption=e2ee cannot be combined with ai_participation=enabled",
-  "instance": "/v1/conversations",
   "code": "request.invalid",
   "request_id": "req_demo_e2ee_create",
   "errors": [

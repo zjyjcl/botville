@@ -1,6 +1,6 @@
 {
-  "manifest_version": "1.5.0",
-  "contract_version": "0.8.0",
+  "manifest_version": "1.5.1",
+  "contract_version": "0.8.1",
   "generated_at": "2026-11-13T00:00:00Z",
   "cache_ttl_seconds": 300,
   "defaults": {

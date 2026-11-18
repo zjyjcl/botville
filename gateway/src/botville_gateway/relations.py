@@ -49,6 +49,10 @@ class Relations:
     def __init__(self, store, personas, *, server_name=None, clock=time.time):
         self.store, self.personas = store, personas
         self.server_name, self.clock = server_name, clock
+        from .relations_federation import FederationRelations
+        self.federation = FederationRelations(self)
+        if store is not None:
+            store._db.execute('PRAGMA busy_timeout=700')
 
     @property
     def available(self):
@@ -75,10 +79,13 @@ class Relations:
                                   (new_id, key_id, row['relation_id']))
 
     @contextmanager
-    def _transaction(self, persona=None):
+    def _transaction(self, persona=None, *, bounded=False):
         if not self.available:
             raise HTTPError(503, 'relation.unavailable', 5)
-        with self.store._lock:
+        acquired = self.store._lock.acquire(timeout=0.1 if bounded else -1)
+        if not acquired:
+            raise RuntimeError('Relations store busy')
+        try:
             db = self.store._db
             db.execute('BEGIN IMMEDIATE')
             try:
@@ -97,6 +104,8 @@ class Relations:
                 raise
             else:
                 db.commit()
+        finally:
+            self.store._lock.release()
 
     def _row(self, persona, counterpart):
         return self.store._db.execute(
@@ -134,32 +143,38 @@ class Relations:
             expires_at=excluded.expires_at,revocable_until=excluded.revocable_until,
             revision=excluded.revision,last_change_kind=excluded.last_change_kind,
             last_change_at=excluded.last_change_at,rejected_at=excluded.rejected_at,
-            updated_at=excluded.updated_at''', values)
+            counterpart_kind=excluded.counterpart_kind,updated_at=excluded.updated_at''', values)
         self.store._db.execute('''INSERT INTO relation_events
             (persona_id,relation_id,kind,actor,from_state,to_state,at) VALUES (?,?,?,?,?,?,?)''',
             (persona, ref, kind, actor, old['state'] if old else None, state, now))
         return self._row(persona, counterpart)
 
     def _expire(self, persona, now):
-        rows = self.store._db.execute("SELECT * FROM relations WHERE persona_id=? AND state='pending' AND expires_at<=?",
-                                      (persona, now)).fetchall()
+        rows = self.store._db.execute("SELECT * FROM relations WHERE persona_id=? AND state='pending' AND (expires_at<? OR (origin!='cross_server' AND expires_at=?))",
+                                      (persona, now, now)).fetchall()
         for row in rows:
             for source, target in ((row['persona_id'], row['counterpart_id']),
                                    (row['counterpart_id'], row['persona_id'])):
                 current = self._row(source, target)
                 if current is not None and current['state'] == 'pending':
                     self._write(source, target, state='stranger', kind='expired', now=now, actor='system')
+                    self.federation.expired(source, target)
 
     def _counterpart(self, value):
         if not isinstance(value, str) or len(value) > 255 or not value.startswith('@'):
             raise HTTPError(400, 'request.invalid')
         local, sep, server = value[1:].partition(':')
         if (not sep or not _MATRIX_LOCALPART_RE.fullmatch(local) or not self.server_name
-                or server.lower() != self.server_name.lower()):
+                or (server.lower() != self.server_name.lower() and not self.federation.configured)):
             raise HTTPError(400, 'request.invalid')
         # Server aliases must not create a second relationship or disguise a
         # known AI as a human. Preserve the configured persona spelling.
-        canonical = '@' + local + ':' + self.server_name.lower()
+        from .config import normalize_matrix_server_name, ConfigError
+        try:
+            server = normalize_matrix_server_name(server)
+        except ConfigError:
+            raise HTTPError(400, 'request.invalid') from None
+        canonical = '@' + local + ':' + server.lower()
         for persona_id in self.personas:
             p_local, _, p_server = persona_id.partition(':')
             if p_local == '@' + local and p_server.lower() == server.lower():
@@ -173,6 +188,8 @@ class Relations:
         if counterpart == persona:
             raise HTTPError(400, 'request.invalid')
         with self._transaction(persona) as now:
+            if counterpart.partition(':')[2].lower() != self.server_name.lower():
+                return self.federation.create(persona, counterpart, now)
             row = self._row(persona, counterpart)
             reverse = self._row(counterpart, persona)
             if ((reverse is not None and reverse['state'] == 'blocked')
@@ -216,6 +233,8 @@ class Relations:
                        (action == 'unblock' and state == 'blocked'))
             if not allowed:
                 raise HTTPError(409, 'relation.state_conflict')
+            if row['origin'] == 'cross_server':
+                return self.federation.owner_action(row, action, now)
             counterpart = row['counterpart_id']
             reverse = self._row(counterpart, persona) if row['counterpart_kind'] == 'ai' else None
             if action in ('approve', 'reject') and (reverse is None or reverse['state'] != 'pending'
@@ -300,3 +319,9 @@ class Relations:
                         self._write(source, target, state='friend', origin='default', kind='default_friend',
                                     now=now, actor='system', counterpart_kind='ai')
                 self.store._db.execute('INSERT INTO known_personas VALUES (?,?,0)', (new, now))
+
+    def mark_peer_severed(self, server):
+        self.federation.mark_peer_severed(server)
+
+    def mark_peer_active(self, server):
+        self.federation.mark_peer_active(server)

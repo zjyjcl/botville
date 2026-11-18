@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import contextlib
 import io
+import sqlite3
 from types import SimpleNamespace
 from urllib.parse import quote
 import unittest
@@ -156,9 +157,19 @@ class RelationsAPITests(unittest.TestCase):
             self.assertEqual(headers['Retry-After'], '5')
         with MemoryHTTPServer() as app:
             with patch('botville_gateway.relations.Relations.available',
-                       new_callable=PropertyMock, side_effect=RuntimeError):
-                status, _, problem = app.request('GET', PATH)
+                       new_callable=PropertyMock, side_effect=sqlite3.OperationalError):
+                status, headers, problem = app.request('GET', PATH)
             self.assertEqual((status, problem['code']), (503, 'relation.unavailable'))
+            self.assertEqual(headers['Retry-After'], '5')
+
+    def test_unexpected_service_error_is_internal_error(self):
+        with MemoryHTTPServer() as app:
+            with patch('botville_gateway.relations.Relations.available',
+                       new_callable=PropertyMock, side_effect=RuntimeError):
+                status, headers, problem = app.request('GET', PATH)
+            self.assertEqual((status, problem['code']), (500, 'internal.error'))
+            self.assertNotIn('Retry-After', headers)
+            self.assertNotIn('retry_after_seconds', problem)
 
     def test_rate_limit_runs_after_owner_hiding(self):
         from botville_gateway.memory import owner_http
@@ -228,13 +239,30 @@ class RelationsAPITests(unittest.TestCase):
             self.assertNotEqual(fresh['revision'], first['revision'])
 
     def test_idempotency_key_is_shared_with_memory_resource(self):
+        from botville_gateway.relations_http import _idem_key
+
         with MemoryHTTPServer() as app:
-            key = 'cross-resource-idempotency'
-            status, _, _ = app.request('PUT', '/v1/memories/facts', headers={'Idempotency-Key': key},
-                body={'persona_id': PERSONA, 'counterpart': HUMAN, 'key': 'name',
-                      'value': 'test', 'visibility': 'dm_only'})
+            state = app.server.memory_http
+            fact = {'persona_id': PERSONA, 'counterpart': HUMAN, 'key': 'name',
+                    'value': 'test', 'visibility': 'dm_only'}
+            memory_key = 'memory-first-idempotency'
+            status, _, _ = app.request('PUT', '/v1/memories/facts', body=fact,
+                                       headers={'Idempotency-Key': memory_key})
             self.assertEqual(status, 201)
-            status, _, problem = self.create(app, headers={'Idempotency-Key': key})
+            memory_tag, digest = state.idempotency[_idem_key(state, OWNER, memory_key)][1]
+            self.assertEqual(memory_tag, 'memory')
+            # Even identical digests must not replay a different resource's response.
+            with patch('botville_gateway.relations_http._fingerprint', return_value=digest):
+                status, _, problem = self.create(app, headers={'Idempotency-Key': memory_key})
+            self.assertEqual((status, problem['code']), (409, 'idempotency.conflict'))
+
+            relations_key = 'relations-first-idempotency'
+            status, _, _ = self.create(app, headers={'Idempotency-Key': relations_key})
+            self.assertEqual(status, 201)
+            relations_tag, _ = state.idempotency[_idem_key(state, OWNER, relations_key)][1]
+            self.assertEqual(relations_tag, 'relations')
+            status, _, problem = app.request('PUT', '/v1/memories/facts', body=fact,
+                                             headers={'Idempotency-Key': relations_key})
             self.assertEqual((status, problem['code']), (409, 'idempotency.conflict'))
 
     def test_relation_defaults_patch_and_owner_detail(self):
