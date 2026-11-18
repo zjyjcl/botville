@@ -9,7 +9,8 @@ import urllib.request
 from unittest.mock import Mock
 
 from test_memory_owner_http import MemoryHTTPServer, PERSONA, HUMAN
-from botville_gateway.capability_manifest import BASE_CAPABILITIES, DEFAULTS, MEMORY_MANAGE, GROUPS_MANAGE
+from botville_gateway.capability_manifest import (BASE_CAPABILITIES, DEFAULTS, MEMORY_MANAGE,
+                                                  GROUPS_MANAGE, RELATIONS_MANAGE)
 from botville_gateway.caller_identity import CallerAuthenticator
 from botville_gateway.config import Config, CONTRACT_VERSION
 from botville_gateway.memory.owner_http import capabilities
@@ -35,9 +36,10 @@ class ManifestTests(unittest.TestCase):
         expected = list(BASE_CAPABILITIES)
         expected.insert(2, dict(MEMORY_MANAGE, owner_can_read_dm=False))
         expected.append(dict(GROUPS_MANAGE))
+        expected.append(dict(RELATIONS_MANAGE))
         self.assertEqual(expected, example['capabilities'])
         self.assertEqual(DEFAULTS, example['defaults'])
-        self.assertEqual('1.4.0', example['manifest_version'])
+        self.assertEqual('1.5.0', example['manifest_version'])
 
     def test_complete_manifest_enabled_disabled_and_switch(self):
         base_ids = {'chat.direct', 'memory.search', 'notify.approvals', 'town.enter'}
@@ -47,18 +49,19 @@ class ManifestTests(unittest.TestCase):
                     enabled=enabled, owner_can_read_dm=dm) as app:
                 status, _, manifest = app.request('GET', '/v1/capabilities')
                 self.assertEqual(status, 200)
-                self.assertEqual(manifest['manifest_version'], '1.4.0')
+                self.assertEqual(manifest['manifest_version'], '1.5.0')
                 self.assertEqual(manifest['contract_version'], app.server.config.contract_version)
                 self.assertEqual(manifest['cache_ttl_seconds'], 300)
                 self.assertEqual(manifest['defaults'], DEFAULTS)
                 datetime.fromisoformat(manifest['generated_at'])
                 entries = manifest['capabilities']
-                self.assertEqual(len(entries), len(base_ids) + int(enabled) + 1)
+                self.assertEqual(len(entries), len(base_ids) + int(enabled) + 2)
                 if enabled:
                     expected = list(BASE_CAPABILITIES)
                     expected.insert(2, dict(MEMORY_MANAGE, owner_can_read_dm=dm))
                     expected.append(dict(GROUPS_MANAGE, status='degraded',
                                          unavailable_reason='groups_disabled'))
+                    expected.append(dict(RELATIONS_MANAGE))
                     self.assertEqual(entries, expected)
                     self.assertEqual(entries[2]['entry']['deep_link'], 'botville://memories')
                 else:

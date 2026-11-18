@@ -237,8 +237,9 @@ class GroupsManifestTests(unittest.TestCase):
                 for persona_enabled in (False, True):
                     app.server.group_invites.personas[PERSONA].groups['enabled'] = persona_enabled
                     manifest = app.request('GET', '/v1/capabilities')[2]
-                    self.assertEqual(manifest['manifest_version'], '1.4.0')
-                    capability = manifest['capabilities'][-1]
+                    self.assertEqual(manifest['manifest_version'], '1.5.0')
+                    capability = next(item for item in manifest['capabilities']
+                                      if item['id'] == 'groups.manage')
                     self.assertEqual(set(capability), keys | ({'unavailable_reason'} if reason else set()))
                     expected = dict(GROUPS_MANAGE, status=status)
                     if reason:

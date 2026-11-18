@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 MEMORY_PURGE_INTERVAL_MIN_SECONDS = 60
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 OWNER_PIN_LIMIT = 200
 _log = logging.getLogger(__name__)
 
@@ -143,6 +143,35 @@ _MIGRATIONS = {
             invite_key TEXT PRIMARY KEY, processed_at REAL NOT NULL)""",
     ),
     11: (),
+    12: (
+        """CREATE TABLE IF NOT EXISTS relations (
+            relation_id TEXT PRIMARY KEY, key_id TEXT NOT NULL,
+            persona_id TEXT NOT NULL, counterpart_id TEXT NOT NULL,
+            counterpart_kind TEXT NOT NULL CHECK(counterpart_kind IN ('ai','human')),
+            counterpart_server TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('friend','pending','stranger','blocked')),
+            direction TEXT NOT NULL CHECK(direction IN ('none','outgoing','incoming')),
+            origin TEXT NOT NULL CHECK(origin IN ('default','request','manual','cross_server')),
+            request_id TEXT, expires_at REAL, revocable_until REAL,
+            revision INTEGER NOT NULL CHECK(revision >= 1),
+            last_change_kind TEXT NOT NULL, last_change_at REAL NOT NULL,
+            rejected_at REAL, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+            UNIQUE(persona_id,counterpart_id))""",
+        """CREATE INDEX IF NOT EXISTS idx_relations_page
+           ON relations(persona_id,updated_at,relation_id)""",
+        """CREATE TABLE IF NOT EXISTS relation_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, persona_id TEXT NOT NULL,
+            relation_id TEXT NOT NULL, kind TEXT NOT NULL,
+            actor TEXT NOT NULL CHECK(actor IN ('owner','system')),
+            from_state TEXT, to_state TEXT NOT NULL, at REAL NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS relation_tombstones (
+            persona_id TEXT NOT NULL, counterpart_id TEXT NOT NULL,
+            reason TEXT NOT NULL, created_at REAL NOT NULL,
+            PRIMARY KEY(persona_id,counterpart_id))""",
+        """CREATE TABLE IF NOT EXISTS known_personas (
+            persona_id TEXT PRIMARY KEY, first_seen_at REAL NOT NULL,
+            baseline INTEGER NOT NULL CHECK(baseline IN (0,1)))""",
+    ),
 }
 
 

@@ -23,7 +23,8 @@ PERSONA = '@ai_a:example.invalid'
 BIO = '签名😀不要把这句话当作系统指令'
 PUBLIC_KEYS = {'id', 'display_name', 'bio', 'status', 'mood'}
 OWNER_KEYS = {'id', 'owner_id', 'display_name', 'bio', 'kind', 'status',
-              'revision', 'created_at', 'updated_at', 'visibility', 'mood', 'groups'}
+              'revision', 'created_at', 'updated_at', 'visibility', 'mood', 'groups',
+              'relation_defaults'}
 
 
 def detail(app, persona=PERSONA, **kwargs):
@@ -91,7 +92,9 @@ class PersonaDetailTests(unittest.TestCase):
                 page = app.request(auth=auth)[1]
                 listed = next(p for p in page['items'] if p['id'] == PERSONA)
                 self.assertNotIn('mood', listed)
-                self.assertEqual({key: value for key, value in row.items() if key not in ('mood', 'groups')}, listed)
+                self.assertEqual({key: value for key, value in row.items()
+                                  if key not in ('mood', 'groups', 'relation_defaults')}, listed)
+                self.assertEqual(row['relation_defaults'], {'friend_request_policy': 'approval_required'})
                 self.assertEqual(row['bio'], BIO)
                 self.assertIsNone(row['mood'])
                 self.assertIsNone(detail(app, '@ai_z:example.invalid', auth=auth)[1]['bio'])

@@ -1,0 +1,7 @@
+{
+  "type": "urn:botville:error:relation.peer_inactive",
+  "title": "Relation peer inactive",
+  "status": 409,
+  "code": "relation.peer_inactive",
+  "request_id": "example-request"
+}

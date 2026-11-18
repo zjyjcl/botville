@@ -499,7 +499,12 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     def _route_persona(self, path: str) -> None:
         rest = path[len("/v1/personas/"):]
         parts = rest.split("/")
-        if len(parts) == 2 and parts[1] == "state" and self.command in ("GET", "HEAD", "PATCH"):
+        if (len(parts) in (2, 3, 4) and parts[1] == "relations"
+                and (len(parts) != 4 or parts[3] in ("approve", "reject", "revoke", "block", "unblock"))):
+            from .relations_http import handle
+            handle(self, parts[0], parts[2] if len(parts) >= 3 else None,
+                   parts[3] if len(parts) == 4 else None)
+        elif len(parts) == 2 and parts[1] == "state" and self.command in ("GET", "HEAD", "PATCH"):
             handle_mood(self, parts[0])
         elif len(parts) == 3 and parts[1:] == ["rooms", "lookup"]:
             from .group_rooms_http import handle_lookup, owner_persona
@@ -1497,6 +1502,10 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         self.memory_personas = load_personas(
             config.personas_file, server_name=config.matrix_server_name,
             max_message_chars=config.max_message_chars)
+        from .relations import Relations
+        self.relations = Relations(self.memory_store, self.memory_personas,
+                                   server_name=config.matrix_server_name)
+        self.relations.sync_known_personas(self.memory_personas)
         from .groups import GroupInvites
         self.group_invites = GroupInvites(
             self.memory_store, transport, self.memory_personas,

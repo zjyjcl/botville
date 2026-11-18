@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# AI 网关契约 v1（草案 0.7.0）
+# AI 网关契约 v1（草案 0.8.0）
 
 > 任务：B0.1 · 里程碑 M0 · 评审：C 线（App）/ D 线（通知与开放 API）
 > 机器可读规范：[`gateway/openapi/gateway.v1.yaml`](../openapi/gateway.v1.yaml)
@@ -380,13 +380,13 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 | 400 | `request.invalid` / `request.malformed_json` | 语法或参数错误 |
 | 401 | `auth.missing` / `auth.invalid_token` | 缺少或无效令牌（含一次性 code 重复使用） |
 | 403 | `persona.not_owned` / `relation.chat_denied` / `conversation.e2ee` / `card.step_up_required` / `card.assertion_invalid` | 身份有效但无权限 / 断言无效 |
-| 404 | `room.not_found` / `persona.not_found` / `conversation.not_found` / `capability.not_found` / `card.not_found` / `audit.not_found` / `moment.not_found` / `memory.disabled` / `memory.not_found` / `mood.disabled` | 不存在或对调用方不可见；记忆模块关闭为 `memory.disabled`；mood 模块关闭为 `mood.disabled` |
-| 409 | `room.state_conflict` / `persona.state_conflict` / `persona.in_use` / `conversation.exists_conflict` / `persona.revision_conflict` / `card.revision_conflict` / `moment.revision_conflict` / `idempotency.conflict` / `card.already_decided` / `card.challenge_invalid` / `memory.pin_limit` | 状态冲突 |
+| 404 | `room.not_found` / `relation.not_found` / `persona.not_found` / `conversation.not_found` / `capability.not_found` / `card.not_found` / `audit.not_found` / `moment.not_found` / `memory.disabled` / `memory.not_found` / `mood.disabled` | 不存在或对调用方不可见；记忆模块关闭为 `memory.disabled`；mood 模块关闭为 `mood.disabled` |
+| 409 | `room.state_conflict` / `relation.state_conflict` / `relation.revision_conflict` / `relation.peer_inactive` / `persona.state_conflict` / `persona.in_use` / `conversation.exists_conflict` / `persona.revision_conflict` / `card.revision_conflict` / `moment.revision_conflict` / `idempotency.conflict` / `card.already_decided` / `card.challenge_invalid` / `memory.pin_limit` | 状态冲突 |
 | 410 | `card.challenge_expired` | challenge 或一次性 code 已过期 |
 | 422 | `limit.out_of_range` / `card.invalid_block` / `card.missing_fallback_text` / `card.source_scope_mismatch` / `card.missing_event_id` / `card.missing_expires_at` / `state.invalid_value` / `request.invalid` / `memory.key_not_allowed` / `memory.counterpart_invalid` / `memory.not_pinnable` | 语义不合法 |
 | 429 | `rate_limited.transport` | 传输层限流（**不是**发言额度） |
 | 500 | `internal.error` | 网关内部错误 |
-| 503 | `memory.unavailable` / `room.unavailable` / `persona.unavailable` / `mood.unavailable` | 存储或外部依赖不可用；`/state` 失败审计写入遇到 SQLite 错误返回 `memory.unavailable`；memory/mood 错误带 `Retry-After` |
+| 503 | `memory.unavailable` / `room.unavailable` / `relation.unavailable` / `persona.unavailable` / `mood.unavailable` | 存储或外部依赖不可用；`/state` 失败审计写入遇到 SQLite 错误返回 `memory.unavailable`；memory/mood/relation 错误带 `Retry-After` |
 
 卡片操作相关错误码（C4 / D3）：
 
@@ -756,7 +756,7 @@ nonce 防重放包装**。缓解措施：短时令牌、TLS 传输、token 不�
 **② 人设（B2.4 已实现）**
 
 - JSON 文件 `GATEWAY_PERSONAS_FILE`（空 = 没有人设 → 引擎**永不发言**，消费者
-  仍记录/计数）。可选 `bio` 必须为字符串，最多 500 Unicode 码点（Python `len(str)`，非字节）；显式 null 等同省略；其他类型或超长按既有人设校验抛 PersonaConfigError 拒绝启动，错误只含位置/字段/限制，不回显正文。仅 owner 可维护 personas 文件，模型不生成或修改 bio；0.7.0 的 PATCH 只写 groups，不写 bio。仓库只放**示例**：`gateway/examples/personas.example.json`；
+  仍记录/计数）。可选 `bio` 必须为字符串，最多 500 Unicode 码点（Python `len(str)`，非字节）；显式 null 等同省略；其他类型或超长按既有人设校验抛 PersonaConfigError 拒绝启动，错误只含位置/字段/限制，不回显正文。仅 owner 可维护 personas 文件，模型不生成或修改 bio；0.8.0 的 PATCH 支持 groups 与 relation_defaults.friend_request_policy，不写 bio。仓库只放**示例**：`gateway/examples/personas.example.json`；
   **真实人设不进仓库**，用户自有人设不开源。
 - 结构：`{"personas": [...]}`，每项字段：
 
@@ -1285,11 +1285,14 @@ token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，�
 | GET | `/personas` | 已实现：仅 owner 的文件型人设摘要列表（见下文） | 我的 AI（C2.4） |
 | POST | `/personas` | 创建角色 | 简单接入、我的 AI |
 | GET | `/personas/{persona_id}` | 已实现：owner 详情 / 本服非 owner 展示视图（0.4.0，含 bio 与 mood） | 我的 AI |
-| PATCH | `/personas/{persona_id}` | 已实现 groups；其他字段仍为规划 | 我的 AI |
+| PATCH | `/personas/{persona_id}` | 已实现 groups 与 relation_defaults.friend_request_policy；其他字段仍为规划 | 我的 AI |
 | DELETE | `/personas/{persona_id}` | 规划：角色删除 | 我的 AI |
 | GET | `/personas/{persona_id}/rooms` | owner 群列表与分页 | 我的 AI |
 | POST | `/personas/{persona_id}/rooms/lookup` | 将已知 room_id 批量映射到 room_ref | 我的 AI |
 | PATCH | `/personas/{persona_id}/rooms/{room_ref}` | 安静模式 / 退群 | 我的 AI |
+| GET/POST | `/personas/{persona_id}/relations` | owner 关系分页 / 手动添加 | 我的 AI |
+| GET | `/personas/{persona_id}/relations/{relation_id}` | owner 单条关系 | 我的 AI |
+| POST | `/personas/{persona_id}/relations/{relation_id}/{action}` | owner 批准、拒绝、撤销、屏蔽、解除屏蔽 | 我的 AI |
 | GET/PATCH | `/personas/{persona_id}/state` | 已实现：owner mood 与公开开关 | 我的 AI |
 | GET | `/conversations` | 会话列表 | App |
 | POST | `/conversations` | 登记 Matrix room | 可选的显式登记，主路径由网关推导 |
@@ -1321,7 +1324,7 @@ token 用量记录；内部 memory 用量不列入公开 usage-events 枚举，�
 
 `GET /personas` 返回摘要视图，仅含 `id`（Matrix user_id，与记忆 persona_id 一致）、`owner_id`（owner_user_id）、`display_name`（为空回退 localpart）、`bio`（缺省 null）、`kind=custom`、`status=active`、`revision=1`、`created_at`、`updated_at`、`visibility=private`。时间取启动时文件 mtime（UTC RFC3339 Z），不可得则取网关启动时间，是文件型人设的近似时间。配置及其他扩展字段均省略，无 owner 的人设永不列出。
 
-`GET /personas/{persona_id}`（实际路径 `/v1/personas/{id}`）复用 §1.2.2 调用方鉴权与 /capabilities 的用户鉴权 helper。owner 返回列表十字段摘要加 `mood` 与 `groups`（列表项本身不增加该字段）；已认证本服（server name 大小写不敏感，可含端口）非 owner 仅返回 `id, display_name, bio, status, mood`。`mood` 是 `calm` / `happy` / `sad` / `excited` / `tired` 或 null。服务端只会输出这五个值；客户端必须容忍未知值（按缺省处理）。mood 模块关闭时均为 null；非 owner 还要求 `mood_public=true`。不得暴露 owner_id、model_binding、密钥、visibility 或时间戳。
+`GET /personas/{persona_id}`（实际路径 `/v1/personas/{id}`）复用 §1.2.2 调用方鉴权与 /capabilities 的用户鉴权 helper。owner 返回列表十字段摘要加 `mood`、`groups` 与 `relation_defaults`（后者目前仅有 `friend_request_policy`）；列表项不增加这些字段。已认证本服（server name 大小写不敏感，可含端口）非 owner 仅返回 `id, display_name, bio, status, mood`。`mood` 是 `calm` / `happy` / `sad` / `excited` / `tired` 或 null。服务端只会输出这五个值；客户端必须容忍未知值（按缺省处理）。mood 模块关闭时均为 null；非 owner 还要求 `mood_public=true`。不得暴露 owner_id、model_binding、密钥、visibility 或时间戳。
 
 跨服已验证调用方、未知/非法路径 id、无 owner 的 persona 均返回相同 `404 persona.not_found`，不泄露存在性；不因联邦配对放行。legacy/空 owner/dev 无身份与列表一致为 `403 persona.not_owned`；未认证为既有 401。详情专用用户验证器仅保留可信 homeserver 返回的跨服身份以作 404 拒绝，使用独立缓存；其他端点仍按原规则拒绝跨服用户（401）。bearer caller 的 owner_id 受现有配置格式限制，非 Matrix ID 无法访问详情（404），本 PR 不放宽 token 配置格式。`/state` 对非 owner（含跨服）、未知/非法 id 或无 owner persona 同样返回 `404 persona.not_found`；站点 token 或无 owner 身份为 `403 persona.not_owned`。其它未实现子路径返回 `404 not_found`。
 
@@ -1381,13 +1384,11 @@ AI 运行时                        网关                        Matrix
 - 跨会话如何汇总到「AI 资料」页（以及资料编辑权限、好友审批入口）**已拍板（2026-11-10，清单 B6）**：
   AI 资料页只使用**当前查看者与该 AI 的单聊** `Conversation.relation`；没有单聊则显示
   `stranger`；**不做跨群汇总**。AI 好友角标只在 `kind=ai` 且该查看者视角下
-  `relation.state=friend` 时出现。关系编辑与审批走 B2.8（#24）将来新增的 `/relations/*`
-  （清单 B2），**不在 `PATCH /personas` 里改关系**。本条同时禁止发明 `Persona.relation`。
-  关系存储、好友图、同服默认好友、撤销与 owner API 均归网关 B 线（B2.8 关系后续 PR，暂名 B-R1）；
-  挂在 `/v1/personas/{id}/relations*` 的方案待 B-R1 PR 定稿，本 PR 不定义接口。
+  `relation.state=friend` 时出现。关系编辑与审批已由 B-R1 的 `/relations/*` 提供（见 §2.4.1），
+  **不在 `PATCH /personas` 里改关系**。本条同时禁止发明 `Persona.relation`。
+  关系存储、好友图、同服默认好友、撤销与 owner API 均归网关 B 线（B-R1，本版本已实现）。
   A2.3 仅提供配对事实与经 fedgate 的跨服传输，并负责 #118 第 8 项出站切断、compose 透传加双服 e2e。
-  卡片服务归 D，网关作为来源模块建关系卡；D2.1 之前网关只用 pending 列表加 `revocable_until`，
-  此处只记录阶段边界，不新增字段或接口。
+  卡片服务归 D，网关作为来源模块建关系卡；D2.1 之前网关只用 pending 列表加 `revocable_until`。
 
 ---
 
@@ -1436,16 +1437,74 @@ rooms 集合仅支持 GET/HEAD，单项仅支持 PATCH，lookup 仅支持 POST�
   查询失败属于上述无法入队的例外，不能保证后台自动恢复。数据库不可用仍返回 503 room.unavailable。
 
 
-`PATCH /personas/{persona_id}` 的当前实现只接受 `{"groups":{...}}`，沿用 personas loader
-校验：enabled 必须 bool，invite_policy 只能 owner/local_humans，未知字段拒绝。groups 整体替换，
-省略子字段取 enabled=false / invite_policy=owner。owner GET 返回 groups，非 owner 视图不返回。
+`PATCH /personas/{persona_id}` 的当前实现接受 `groups`、`relation_defaults` 或两者；顶层与子字段
+未知均为 400。groups 沿用 personas loader 校验：enabled 必须 bool，invite_policy 只能 owner/local_humans，
+整体替换且省略子字段取 enabled=false / invite_policy=owner。relation_defaults 当前只接受
+friend_request_policy（approval_required/autonomous），空对象取 approval_required。owner GET 返回两者，
+非 owner 视图不返回。
 没有已有 proactive PATCH 写回机制可复用；本次采用进程内串行、完整文件校验、同目录临时文件
-fsync 后原子替换，并同步后续事件使用的内存人设。外部文件变化返回 409 `persona.state_conflict`，
+fsync 后原子替换，并同步 engine hooks 与关系服务读取的内存人设。外部文件变化返回 409 `persona.state_conflict`，
 文件不可写/不可用返回 503 `persona.unavailable`；失败不发布内存更新。其他 UpdatePersonaRequest
 规划字段（包括 revision）和 If-Match 当前返回 400。文件型摘要 revision 仍为 1，不代表写入版本。
 部署应只运行一个文件写入者；外部管理程序应停止网关后修改并重启，不保证跨进程并发写安全。
 
-#### 2.4.1 POST /personas/{persona_id}/rooms/lookup（B2.8f，0.7.0）
+#### 2.4.1 Relations（B-R1，0.8.0）
+
+这是 B2 定论中的 `/relations/*`。关系存储在 memory.db（schema 12）：`relations`、最小
+审计 `relation_events`、不可自动重建的 `relation_tombstones` 与 `known_personas`。关系 ID 是
+当前 HMAC 密钥对 `[persona_id, counterpart_id]` 的不透明派生值；密钥轮换会在事务中重派生并
+同步事件，因此旧 relation_id 变为 404。先做 owner 鉴权，再检查方法（错误方法返回 405 + Allow），
+最后检查服务可用性：没有 memory DB 或 HMAC 密钥时，允许的方法返回
+503 `relation.unavailable`（含 Retry-After），不以空密钥降级。
+
+AI↔AI 使用双方各一行；人类 counterpart 仅 persona 一行。ID 输入使用 compact JSON（`ensure_ascii=true`）
+并由 HMAC 派生，server 域名规范成部署 server 的小写；已知 AI 仍保留其配置 ID，避免大小写别名绕过。
+owner 视图为 `PersonaRelation`：
+`relation_id`、`counterpart {user_id,kind,server}`、`state`、`direction`、`origin`、`revision`、
+`expires_at`、`revocable_until`、`last_change {kind,at}`、`created_at`、`updated_at`，所有时间是
+RFC3339 UTC `Z`。变更在一个事务中 revision +1、写不含正文/密钥的 event，并把
+`revocable_until` 设为变更时刻后 7 天。它只是列表/撤销卡提示窗口，revoke 不因窗口结束而拒绝。
+
+`POST /personas/{id}/relations` 接收 `{counterpart_id}`。仅本服 Matrix user id，自己或跨服均为
+400 `request.invalid`（`relation.peer_inactive` 为 B-R2 预留，B-R1 不返回）。本服 AI 按对方
+`relation_defaults.friend_request_policy`：autonomous 直接双向 friend；approval_required 建立
+outgoing/incoming pending（7 天过期）。人类直接单边 friend。已 friend 或 outgoing pending 返回
+200；首次没有该关系行时为 201，已有 stranger/blocked 等可变更行更新后为 200。对方 blocked 或被拒绝后的 7 天冷却期返回 409 `relation.state_conflict`。
+手动添加会清除双方 tombstone。
+
+动作统一为 `POST /personas/{id}/relations/{relation_id}/{action}`，action 为
+`approve|reject|revoke|block|unblock`，体为必填 `{revision}`。revision 缺失/类型错为 400，旧值为
+409 `relation.revision_conflict`；非法状态为 409 `relation.state_conflict`。approve 只接受 incoming
+pending；reject 令双方 stranger 并对发起方记 7 天冷却；revoke friend 或 outgoing pending（默认好友
+还写双方 `revoked_default` tombstone）；block 令本方 blocked、对方非 blocked 时改为 stranger；
+unblock 只接受 blocked，仅令本方 stranger。对方已 blocked 时不改其行、不加 revision、不写事件；
+approve/reject 遇到这种不一致的配对返回 409 `relation.state_conflict`，revoke 只改变本方关系行。
+读和动作都惰性处理已过期 pending：在同一事务将双方转换 stranger，并写 `expired` 事件；动作先落地
+过期，再判断 revision，所以持有过期 revision 的调用者先得到 `relation.revision_conflict`，刷新后才是
+`relation.state_conflict`。
+
+集合 `GET /relations?state=&direction=&kind=&limit=&cursor=` 严格拒绝未知、重复或非法参数，limit
+1–200、默认 50，使用 `(updated_at, relation_id)` keyset 游标，只列当前 key_id。单条 relation_id
+必须是 64 位小写 hex，非法、不属于该 persona 与不存在均为 404 `relation.not_found`。GET 使用 owner
+memory 读限流，POST 使用写限流；先完成 owner 鉴权。鉴权矩阵同 `/rooms`：无认证 401、legacy/no owner
+403 `persona.not_owned`、跨服/非 owner/未知均 404 `persona.not_found`；鉴权失败不带 Allow，鉴权成功后
+集合仅 `GET, HEAD, POST`、单条仅 `GET, HEAD`、动作仅 `POST`，其它方法 405 `request.invalid` + Allow。
+
+写操作的 `Idempotency-Key` 沿用 owner memory 语义：缓存 24h、全局 2000 / 每 caller 200，键为 caller 与
+HMAC 后的原 key；同一指纹（persona、relation、action、body）重放首次响应，不再变更；同 key 不同
+请求返回 409 `idempotency.conflict`。relation_events 只保存 `persona_id, relation_id, kind, actor,
+from_state, to_state, at`，不保存正文或密钥；访问日志和错误体不记录 counterpart_id 或原 relation_id。
+
+启动同步在 personas 与 memory store 都就绪后执行。若 `known_personas` 为空且当前有 persona，首次启用只
+登记 baseline=1、绝不建边；若当时没有 persona，之后首次出现 persona 时仍按首次启用处理。后续启动发现
+新 persona 时，它与所有本服 AI（含同批新人）建立双向 default friend；任一 tombstone、任一既有行都会
+阻止建边。消失的 persona 不删除 known/关系，重新出现不算新人；默认好友被 revoke 的 tombstone 保证永不
+自动重建。无 DB 或密钥时跳过同步并仅写不含 ID 的 warning。
+
+B-R1 不包含：配对事实客户端与跨服内部端点（B-R2）、`/conversations`（B-R3）、private_chat 执行开关
+与迁移（B-R4）、卡片（B-R5；D2.1 前只用 pending 列表与 `revocable_until`），moments 人↔人好友仍使用静态文件。
+
+#### 2.4.2 POST /personas/{persona_id}/rooms/lookup（B2.8f，0.7.0）
 
 请求 `{"room_ids":["!known:example.invalid","!missing:example.invalid"]}`。
 响应 200（命中项与 GET rooms 列表中的 GroupRoom 完全相同）：
@@ -1531,8 +1590,8 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 
 ```json
 {
-  "manifest_version": "1.4.0",
-  "contract_version": "0.7.0",
+  "manifest_version": "1.5.0",
+  "contract_version": "0.8.0",
   "generated_at": "2026-11-13T00:00:00Z",
   "cache_ttl_seconds": 300,
   "defaults": { "unknown_capability": "hidden", "card_fallback": "text" },
@@ -1629,7 +1688,7 @@ App 不得硬编码模块列表。所有模块入口由网关下发，这样：
 }
 ```
 
-清单版本为 `1.4.0`，`contract_version` 取网关配置（当前 `0.7.0`），缓存建议为 300 秒。
+清单版本为 `1.5.0`，`contract_version` 取网关配置（当前 `0.8.0`），缓存建议为 300 秒。
 无论记忆模块是否启用，均返回完整基础清单：`chat.direct`、`memory.search`、
 `notify.approvals`、`town.enter`，并保留各自状态、入口及 defaults；按 `module` / `status`
 查询时只返回匹配条目。基础元数据随代码打包，不在运行时读取 OpenAPI 示例文件。
@@ -1656,6 +1715,20 @@ persona 自己的 `groups.enabled` 不进入能力清单：清单是部署级，
 才可设置 mention_only；仍须满足房间 state 允许设置 mode 的约束。degraded 时仅提供安静/退出。
 card source 的 module 开放枚举同步加入 groups，以遵守本章 module 对齐 Capability 的规则；
 unavailable_reason 是开放字符串，不新增封闭枚举。
+
+#### relations.manage（B-R1）
+
+`relations.manage` 位于 `groups.manage` 之后：module `social`、version `0.1.0`、native entry
+`botville://personas`、scopes `relations.read`/`relations.write`。memory DB 与 HMAC 密钥齐备时为 enabled，
+否则 disabled 且 `unavailable_reason=module_disabled`；module/status 过滤同样适用。
+
+#### C 线同步清单（0.8.0）
+
+- 新增能力项 `relations.manage`；旧 App 遇到未知 native 能力按 `defaults.unknown_capability=hidden` 处理。
+- `manifest_version` 为 1.5.0，`contract_version` 为 0.8.0；示例与 App mock 已逐字节同步。
+- 好友列表、pending 审批与撤销必须携带 revision 与 Idempotency-Key；使用 `revocable_until` 和
+  `last_change` 呈现关系动态；设置入口使用 `friend_request_policy`。`PersonaOwnerDetail.relation_defaults`
+  是新增字段，客户端宽松解码。
 
 #### C 线同步清单（0.7.0）
 
@@ -2010,7 +2083,7 @@ major（可在 `/v1` 内共存）。
 
 | 版本 | 位置 | 语义 |
 |---|---|---|
-| 契约版本（`0.7.0`） | `info.version`、`/health.contract_version`、manifest 的 `contract_version` | 整份契约的 semver |
+| 契约版本（`0.8.0`） | `info.version`、`/health.contract_version`、manifest 的 `contract_version` | 整份契约的 semver |
 | 接口主版本（`v1`） | 路径前缀、`servers` | 破坏性变更的分界 |
 | 功能清单版本 | `manifest_version` | 清单**内容**的变更 |
 | 能力版本 | `capability.version` | 单个能力自身演进 |
@@ -2065,6 +2138,7 @@ C 线/D 线评审时特别关注：**新增枚举值**（要求客户端容错�
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| 0.8.0 | 2026-11-15 | [B-R1] 新增 owner `/relations/*`、schema 12 关系存储、关系默认值与同服新增 AI 默认好友差集；新增 `relations.manage`，manifest 1.5.0，并同步 App mock。 |
 | 0.7.0 | 2026-11-15 | [B2.8f] 新增 owner POST rooms/lookup：严格本服批量映射、只读限流、按下标返回且不回显 ID；新增部署级 groups.manage 与 room_lookup，manifest_version 1.4.0，三态映射及 C 线 mock 同步；room_ref 跨 owner 可关联的既有语义不变。 B2.8g 文档：删除实现未输出的 instance 示例并对齐 title/detail，说明 /state 503 的 mood.unavailable 与 memory.unavailable 两种 code，更新关系归属与 POST /conversations 调用方措辞，ModuleStatus.name 加 groups，补充 lookup 读体错误统一 400 及字面路径 rooms/lookup 的 PATCH 从 404 room.not_found 变为非 POST 统一 405 request.invalid（Allow: POST）的说明；纯文档，不升版本。 |
 | 0.6.0 | 2026-11-13 | [B2.8d] 新增 owner GET /personas/{id}/rooms 与 PATCH /personas/{id}/rooms/{room_ref}；owner 详情和 UpdatePersonaRequest 增加 groups；mention_only/muted 模式与退群、leave_pending 确认状态及 owner leave 持久清理；新增 room.not_found / room.state_conflict；group.replies_per_hour.exceeded 原因码正式纳入。汇总 B2.8 行为：严格双人 DM、群仅被提及/回复才发言、AI 不触发 AI、群节流与熔断、加密群 403 conversation.e2ee、HMAC 密钥轮换隔离及退出后禁止发送自动 rejoin；群节流/熔断计数以规范 persona 与规范 room 为键，别名与裸 id 不能绕过，key_id 回填先于 forget。 B2.8d2 评审清理：evaluate 解析失败 404/400 替代 500；rooms 错误方法鉴权后 405 + Allow；record_group_send 复用已解析 id；示例 title 与 0.5.0 残留表述修正；群功能关闭时引擎群回复 fail-closed、PATCH 仅 muted/leave、有 DB 的 GET 仍列出现有房间；无字段变化、不升版本。 B2.8d3：错误码表补 mood.unavailable/mood.disabled、/state 503 示例、rooms 405 响应、群关闭时仍记录群记忆说明、evaluate 404 示例 instance 修正；纯文档。 |
 | 0.5.0 | 2026-11-13 | [B2.8c #228] accepted 群冷却与滚动小时回复限额、群 ai_loop / anti_spam 底线（群内连续计数在人类发言时归零；默认 30/h 为滚动一小时硬底线，人类发言不重置）；schema 10→11 的 HMAC key_id 与轮换隔离/可选忘记旧行、上限只计当前键、发送层独立加密拦截；严格本服 room id、accepted 房间忽略不合格再邀请、拒绝 leave 的 M_FORBIDDEN 视为完成，以及 Synapse /sync invite 过滤说明修正。无 API 字段变化、契约仍 0.5.0。 |
@@ -2750,10 +2824,9 @@ B 类清单的 12 项已于 **2026-11-10 由棉棉霸拍板**，逐项定论见 
    `Idempotency-Key`** 重放可拿到同一 `queue_id`（与 §1.5 一致）。卡片文案与跳转归 D/C。
    主动调度已在 0.5.0 实现，当前直接投递 Matrix，不创建通知卡片，也不向客户端暴露内部队列。
    上述通知卡片与 queue_id 是后续通知集成设计，仍依赖 D 线（#4），不代表当前 proactive 行为。
-3. **已拍板（2026-11-10，清单 B2）**：关系策略（B2.8 / #24）的审批以**独立的 minor 新增
-   `/relations/*`** 承载，**不塞进 `PATCH /conversations`**。**动作接口细节（具体路径、
-   请求/响应）仍未定义**，本轮不为它写任何动作接口；落地时按「只增不删」的 minor 扩展走。
-   身份验证方式见 [§1.2.3](#123-终端用户身份matrix-openid已拍板)。
+3. **已落地（B-R1）**：关系审批由独立的 `/relations/*` 承载，**不塞进
+   `PATCH /conversations`**；状态机、动作、请求/响应与身份验证见 §2.4.1 和
+   [§1.2.3](#123-终端用户身份matrix-openid已拍板)。
 4. **已拍板（2026-11-10，清单 B3）**：多 AI 群发言调度（B2.8 / #24）**v1 不加**独立的
    `/conversations/{id}/turn` 接口。调度作为网关内部状态，发言仍走
    `POST /policy/evaluate` + `POST /messages`，受既有 `anti_spam` / `ai_loop`
@@ -2775,7 +2848,7 @@ B 类清单的 12 项已于 **2026-11-10 由棉棉霸拍板**，逐项定论见 
 | 编号 | 定论 | 落地里程碑 / issue | 契约影响 |
 |---|---|---|---|
 | B1 | 主动发言 `queued` 之后复用 `Card type=notification` + D 线推送，不新开专用通道、客户端不轮询网关；同一 `Idempotency-Key` 重放拿到同一 `queue_id`。卡片文案/跳转归 D/C | 主动调度已在 0.5.0 实现；通知集成依赖 D 线（#4），当前不创建卡片 | 无字段/状态码变化 |
-| B2 | 关系审批由 B2.8 以独立的 minor 新增 `/relations/*` 承载，不塞进 `PATCH /conversations`；动作接口细节未定义，本轮不写。终端用户身份定为 Matrix OpenID token（见 §1.2.3） | B2.8（#24）；身份实现见 #124 / PR-D | 无字段/状态码变化 |
+| B2 | 关系审批由 B-R1 的独立 `/relations/*` 承载，不塞进 `PATCH /conversations`；动作接口、revision 与幂等语义见 §2.4.1。终端用户身份定为 Matrix OpenID token（见 §1.2.3） | B-R1；身份实现见 #124 / PR-D | 0.8.0：新增路径、字段与错误码 |
 | B3 | v1 不加 `/conversations/{id}/turn`；多 AI 群调度作为网关内部状态，发言仍走 `POST /policy/evaluate` + `POST /messages`，受 `anti_spam` / `ai_loop` 与 proactive 预算约束 | B2.8（#24） | 无字段/状态码变化 |
 | B4 | 小镇接口维持不纳入 v1，M4 再按「只增不删」扩展；`town.tokens_per_day` 已在限额模型里 | M4 / B4.2（#28） | 无字段/状态码变化 |
 | B5 | AI 签名用 `bio`，仅 owner 经 personas 文件写入；最多 500 Unicode 码点，缺省 null。模型不生成/修改，自身不注入 system；他人 bio 仅可进 derived/untrusted 区。mood 只在 derived/untrusted 区 | B2.4 / C2.2（#35）、PR4b | 0.4.0：列表含 bio 且不含 mood，分级 GET 详情含 mood；跨服/无 owner/未知 id 均 404 |

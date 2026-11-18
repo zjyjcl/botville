@@ -115,6 +115,9 @@ continuwuity 仍用 `memory`（尚无文件注册）。运维注意见
 | GET | `/v1/personas/{id}` | `getPersona` | 0.4.0：owner 详情 / 本服非 owner 最小视图，含 bio 与 mood；列表项不加 mood |
 | GET/PATCH | `/v1/personas/{id}/state` | `getPersonaState` / `updatePersonaState` | 0.4.0：仅 owner 的 mood 与 mood_public，关闭时 404 `mood.disabled`，响应 no-store |
 | POST | `/v1/personas/{id}/rooms/lookup` | `lookupPersonaRooms` | 0.7.0：owner 批量查询本地已知 room_id，按下标返回 GroupRoom/null；只读、不回显 ID |
+| GET/POST | `/v1/personas/{id}/relations` | `listPersonaRelations` / `createPersonaRelation` | 0.8.0：owner 关系列表与手动添加；AI 为双行、人类为单行 |
+| GET | `/v1/personas/{id}/relations/{relation_id}` | `getPersonaRelation` | 0.8.0：读取 owner 的单条关系 |
+| POST | `/v1/personas/{id}/relations/{relation_id}/{action}` | `actOnPersonaRelation` | 0.8.0：approve/reject/revoke/block/unblock，携带 revision |
 | GET | `/health` | `getHealth` | 免鉴权；返回 Health 形态 |
 | POST | `/v1/policy/evaluate` | `evaluatePolicy` | 预检，不投递、不占额度 |
 | POST | `/v1/conversations/{id}/messages` | `sendMessage` | 完整裁决 + 投递 |
@@ -344,6 +347,7 @@ transport 由 `GATEWAY_MATRIX_TRANSPORT` 选择（`memory` / `appservice`，默�
 | `GATEWAY_MOOD_ENABLED` | `false` | 严格布尔。开启需 memory DB；未配置 DB 时记录 WARNING 并保持关闭，不拒绝启动 |
 | `GATEWAY_MOOD_HALF_LIFE_MINUTES` | `240` | 正整数 1–10080；越界或非法拒绝启动，错误不回显输入值。非 calm mood 在严格超过一个半衰期后读为 calm |
 | `GATEWAY_PERSONAS_FILE` | 空 | 只读人设 JSON（B2.4，契约 §1.7.8 ②）。空 = 无人设 → 内置引擎**永不发言**（消费者仍记录/计数）。启动期校验 schema / 本服 `@ai_*` / `credential_ref` 形状 / `max_reply_chars` 范围，非法**拒绝启动**（错误信息不回显文件内容）。示例见 [`examples/personas.example.json`](examples/personas.example.json)；**真实人设不进仓库** |
+| 人设 `relation_defaults.friend_request_policy` | `approval_required` | 人设 JSON 内可选关系默认值；只允许 `approval_required` 或 `autonomous`。owner 可通过 PATCH 单独或与 groups 一起整体替换；`private_chat`、`moments_visibility` 尚未实现，写入会被拒绝 |
 | `GATEWAY_MODEL_BASE_URL` | 空 | OpenAI 兼容模型基址（B2.4，契约 §1.7.8 ⑫）。空 = **未配置模型**：引擎不发言、`/health` 不 degraded。非空时必须是 `http://` / `https://` URL。请求形如 `POST {BASE_URL}/chat/completions` |
 | `GATEWAY_MODEL_NAME` | 空 | 模型名。配置了 `GATEWAY_MODEL_BASE_URL` 时**必填**，否则拒绝启动。人设可用 `model` 字段覆盖 |
 | `GATEWAY_MODEL_API_KEY` | 空 | 可选模型密钥（`Authorization: Bearer`）。**不写日志、不进 `/health`、不进任何错误体、不进 `repr`**。人设可用 `credential_ref: "env:NAME"` 覆盖（调用时读环境变量，缺失即永久失败并只点名变量名） |
@@ -586,6 +590,9 @@ persona 可配置 `"groups": {"enabled": true, "invite_policy": "owner"}`；
 邀请台账的主动/HTTP 发言）；已确认 DM 的 `allow_auto_join=true` 不受影响。设置
 `GATEWAY_GROUP_FORGET_STALE_KEYS=true` 后，启动时会永久删除旧 key_id 行并解除隔离；代价是旧
 left/encrypted_disabled 记录丢失，被踢/退出的群取得新的合格邀请后可以再次接受。
+升级到 0.8.0 / schema 12 时，存量 AI 不会自动互为好友，owner 可手动添加；只有之后新入驻的
+AI 才按同服默认规则建立关系。关系 ID 随 HMAC 密钥轮换而变化，旧 ID 不可再查询。
+
 从 schema 10 首次升级到 11 时，旧行会按**该次启动的当前密钥**回填 key_id；因此应先使用原密钥完成
 迁移，再轮换密钥，才能保留可靠的轮换检测。
 

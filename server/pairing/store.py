@@ -40,9 +40,12 @@ __init__ (ALTER TABLE + lower-casing legacy server_name rows).
 import hashlib
 import hmac
 import json
+import logging
 import sqlite3
 import threading
 import time
+
+log = logging.getLogger("pairing.store")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS invites (
@@ -376,6 +379,16 @@ class PairingStore:
             ).fetchall()
         return [row["server_name"] for row in rows]
 
+    def _safe_rollback(self):
+        """Roll back after a failed write without masking the original
+        error (#247 review N2): a rollback that itself fails (closed or
+        broken connection) is logged and swallowed so the caller re-raises
+        the exception that actually caused it."""
+        try:
+            self._conn.rollback()
+        except Exception:  # noqa: BLE001
+            log.exception("rollback after a failed write also failed")
+
     def upsert_peer_active(self, server_name, api_url, shared_secret=None,
                            now=None):
         """Record a peer as active without consuming a local invite.
@@ -409,7 +422,7 @@ class PairingStore:
             except Exception:
                 # Never leave the row change pending without its event: the
                 # next unrelated commit on this connection would publish it.
-                self._conn.rollback()
+                self._safe_rollback()
                 raise
 
     def sever_peer(self, server_name, by, now=None, only_if_active=False):
@@ -451,7 +464,7 @@ class PairingStore:
                     )
                 self._conn.commit()
             except Exception:
-                self._conn.rollback()
+                self._safe_rollback()
                 raise
         return changed
 
