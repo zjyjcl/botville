@@ -377,12 +377,20 @@ def post_relation(url, body, headers, ssl_context=None,
 TARGET_OK, TARGET_AUDIT, TARGET_REFUSED = "ok", "audit", "refused"
 
 
+# RFC 6598 shared address space. ipaddress.IPv4Address.is_private is
+# False for this range on Python 3.9–3.12 (the pairing image is 3.12),
+# so a hand-rolled private/loopback/reserved check would treat it as
+# public and allow it with no AUDIT.
+_SHARED_ADDRESS_SPACE = ipaddress.ip_network("100.64.0.0/10")
+
+
 def _non_public(address):
     ip = ipaddress.ip_address(address)
     if getattr(ip, "ipv4_mapped", None):
         ip = ip.ipv4_mapped
     return (ip.is_private or ip.is_loopback or ip.is_link_local or
-            ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+            ip.is_reserved or ip.is_multicast or ip.is_unspecified or
+            (ip.version == 4 and ip in _SHARED_ADDRESS_SPACE))
 
 
 def target_policy(url, allow_private, resolve=socket.getaddrinfo):

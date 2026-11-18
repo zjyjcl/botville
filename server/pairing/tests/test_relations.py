@@ -273,6 +273,24 @@ class TargetPolicyTest(unittest.TestCase):
                 self.assertEqual(self.check(url, False, *addrs)[0],
                                  relations.TARGET_REFUSED)
 
+    def test_rfc6598_shared_address_space_is_non_public(self):
+        # 100.64.0.0/10 must be refused in production and only AUDIT'd
+        # with the private-target switch (PR #256 review blocker).
+        inside = ("100.64.0.0", "100.64.0.1", "100.127.255.255",
+                  "100.100.100.200", "::ffff:100.64.0.1")
+        for addr in inside:
+            with self.subTest(addr=addr, allow=False):
+                self.assertEqual(self.check("https://hs-b/x", False, addr)[0],
+                                 relations.TARGET_REFUSED)
+            with self.subTest(addr=addr, allow=True):
+                verdict, detail = self.check("https://hs-b/x", True, addr)
+                self.assertEqual(verdict, relations.TARGET_AUDIT)
+                self.assertTrue(detail)
+        for addr in ("100.63.255.255", "100.128.0.0"):
+            with self.subTest(addr=addr):
+                self.assertEqual(self.check("https://hs-b/x", False, addr)[0],
+                                 relations.TARGET_OK)
+
     def test_switch_allows_but_audits(self):
         for url, addrs in (("http://127.0.0.1:9/x", ("127.0.0.1",)),
                            ("https://hs-b/x", ("172.30.81.11",))):
