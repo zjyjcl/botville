@@ -196,6 +196,20 @@ public final class MatrixService: ObservableObject {
     private var pushOperation: Task<Void, Never>?
     private var authenticationAttempt: AuthenticationAttempt?
     var storeKeyFactory: () throws -> Data = SessionCredentials.makeStoreKey
+    /// #81 follow-up: one best-effort logout of a session whose store is lost.
+    var staleSessionLogout: any StaleSessionLoggingOut = MatrixStaleSessionLogout()
+    /// Upper bound for that logout; it never holds the restore/login flow longer.
+    var staleSessionLogoutTimeout: TimeInterval = 5
+    /// Before first unlock the store's metadata may be unreadable; never judge then.
+    var protectedDataAvailable: @MainActor () -> Bool = {
+#if os(iOS)
+        UIApplication.shared.isProtectedDataAvailable
+#else
+        true
+#endif
+    }
+    var storeFileManager: FileManager = .default
+    private static let sessionLogger = Logger(subsystem: "com.zjyjcl.botville", category: "Session")
     private var isLoggingOut = false
     private var softLogoutCredentials: SessionCredentials?
     private var paginationGeneration: UUID?
@@ -433,9 +447,7 @@ public final class MatrixService: ObservableObject {
                 }
                 // Re-authenticating with the old device ID is only safe while its
                 // Olm account still exists locally.
-                guard try directory().hasCryptoStore(for: previous.storeID) else {
-                    throw MatrixServiceError.cryptoStoreLost
-                }
+                try requireCryptoStore(previous.storeID)
             } else {
                 guard try sessionStore.load() == nil else { throw MatrixServiceError.storageUnavailable }
             }
@@ -540,6 +552,12 @@ public final class MatrixService: ObservableObject {
         } catch {
             if case MatrixServiceError.cryptoStoreLost? = error as? MatrixServiceError {
                 await discardSessionForLostCryptoStore()
+            } else if case MatrixServiceError.protectedDataUnavailable? = error as? MatrixServiceError {
+                // Not lost: keep everything and judge again once data is readable.
+                didAttemptRestore = false
+                canRetryRestore = true
+                canClearLocalSession = true
+                sessionError = MatrixServiceError.protectedDataUnavailable.localizedDescription
             } else if let securityError = error as? SessionRestoreSecurityError {
                 await clearSession()
                 canRetryRestore = false
@@ -572,9 +590,7 @@ public final class MatrixService: ObservableObject {
             guard let stored = try sessionStore.load() else { return }
             // Check before anything touches the store path: `create(for:)` and the
             // SDK would otherwise produce a fresh crypto store under the old device ID.
-            guard try directory().hasCryptoStore(for: stored.storeID) else {
-                throw MatrixServiceError.cryptoStoreLost
-            }
+            try requireCryptoStore(stored.storeID)
             credentials = stored
             // `allowLocalHTTP` is an old, persisted development choice.  A
             // Release binary must not inherit it from a Debug install.
@@ -1800,11 +1816,30 @@ public final class MatrixService: ObservableObject {
         isLoggingOut = false
     }
 
-    /// #81: the saved device's encrypted store is gone. Drop the Keychain
-    /// session, shared push credentials and any local leftovers so the next
-    /// login gets a server-assigned device ID. Only local state is discarded;
-    /// no server endpoint (logout / delete device) is called.
+    /// Throws `.cryptoStoreLost` only when the store is definitely gone and
+    /// `.protectedDataUnavailable` when that cannot be decided yet.
+    private func requireCryptoStore(_ storeID: UUID) throws {
+        guard protectedDataAvailable() else { throw MatrixServiceError.protectedDataUnavailable }
+        switch try directory().cryptoStoreState(for: storeID, fileManager: storeFileManager) {
+        case .present: return
+        case .missing: throw MatrixServiceError.cryptoStoreLost
+        case .undetermined: throw MatrixServiceError.protectedDataUnavailable
+        }
+    }
+
+    /// iOS posts this after first unlock; a deferred restore is judged again.
+    public func protectedDataDidBecomeAvailable() async {
+        guard !isLoggedIn, !requiresPasswordReauthentication else { return }
+        await restoreSession()
+    }
+
+    /// #81: the saved device's encrypted store is gone. First one bounded,
+    /// best-effort `/logout` with that session's own token (removes only that
+    /// device server-side), then drop the Keychain session, shared push
+    /// credentials and local leftovers so the next login gets a new device ID.
     private func discardSessionForLostCryptoStore() async {
+        let stale = softLogoutCredentials ?? credentials ?? (try? sessionStore.load())
+        await logOutStaleSession(stale)
         await clearSession()
         if !cleanupRequired {
             // Leftover directories of other store IDs (e.g. a half-written one) go too.
@@ -1817,6 +1852,24 @@ public final class MatrixService: ObservableObject {
         sessionError = cleanupRequired
             ? MatrixServiceError.storageUnavailable.localizedDescription
             : MatrixServiceError.cryptoStoreLost.localizedDescription
+    }
+
+    /// Never retried, no UIA, never blocks re-login; failures are DEBUG-logged
+    /// without token or identifiers.
+    private func logOutStaleSession(_ stale: SessionCredentials?) async {
+        guard let stale, !stale.accessToken.isEmpty,
+              let server = try? RestoredHomeserverPolicy(storedAllowLocalHTTP: stale.allowLocalHTTP)
+                .validatedURL(stale.homeserverURL)
+        else {
+            Self.sessionLogger.debug("Lost-store logout skipped")
+            return
+        }
+        let transport = staleSessionLogout
+        let token = stale.accessToken
+        let outcome = await BoundedWait.run(timeout: staleSessionLogoutTimeout) {
+            try await transport.logout(homeserver: server, accessToken: token)
+        }
+        Self.sessionLogger.debug("Lost-store logout \(outcome.rawValue, privacy: .public)")
     }
 
     private func clearSession() async {

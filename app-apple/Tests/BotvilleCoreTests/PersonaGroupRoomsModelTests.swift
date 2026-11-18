@@ -93,6 +93,75 @@ final class PersonaGroupRoomsModelTests: XCTestCase {
         XCTAssertEqual(batches.count, 2)
     }
 
+    /// #250 review: a lookup still in flight when a newer reload starts must not
+    /// overwrite the newer reload's mapping when it finally returns.
+    func testStaleLookupBatchFromOlderReloadNeverOverwritesNewerMapping() async {
+        let client = RoomsScriptClient(
+            pages: [
+                .success(page([room("a")], nil, false)),
+                .success(page([room("b")], nil, false)),
+            ],
+            lookups: [
+                .success(lookup(1, hits: [0: "a"])),  // Older batch, held until released.
+                .success(lookup(1, hits: [0: "b"])),
+            ],
+            holdFirstLookup: true)
+        let model = lookupModel(client, rooms: knownRooms(1))
+        let first = Task { await model.load() }
+        while await client.lookupCalls().isEmpty { await Task.yield() }
+        await model.refresh()
+        XCTAssertEqual(model.roomName(for: ref("b")), "群0")
+        await client.releaseHeldLookup()
+        await first.value
+        XCTAssertEqual(model.roomName(for: ref("b")), "群0")
+        XCTAssertNil(model.roomName(for: ref("a")))
+        XCTAssertEqual(model.rooms.map(\.roomRef), [ref("b")])
+        let batches = await client.lookupCalls()
+        XCTAssertEqual(batches.count, 2)
+    }
+
+    /// #250 review: a 409 reload keeps rows on failure but must not keep names of
+    /// refs that are no longer in the list.
+    func testConflictReloadPrunesNamesOfRoomsNoLongerListed() async {
+        let client = RoomsScriptClient(
+            pages: [
+                .success(page([room("a"), room("b")], nil, false)),
+                .success(page([room("a")], nil, false)),
+            ],
+            lookups: [
+                .success(lookup(2, hits: [0: "a", 1: "b"])),
+                .success(lookup(2, hits: [0: "a"])),
+            ],
+            modes: [.failure(.problem(status: 409, code: "room.state_conflict"))])
+        let model = lookupModel(client, rooms: knownRooms(2))
+        await model.load()
+        XCTAssertEqual(model.roomName(for: ref("b")), "群1")
+        await model.setMode(roomRef: ref("a"), mode: .muted)
+        XCTAssertEqual(model.rooms.map(\.roomRef), [ref("a")])
+        XCTAssertEqual(model.roomName(for: ref("a")), "群0")
+        XCTAssertNil(model.roomName(for: ref("b")))
+    }
+
+    /// Same, when the post-409 lookup itself fails: old names survive only for
+    /// refs still listed.
+    func testConflictReloadWithFailedLookupKeepsOnlyListedNames() async {
+        let client = RoomsScriptClient(
+            pages: [
+                .success(page([room("a"), room("b")], nil, false)),
+                .success(page([room("a")], nil, false)),
+            ],
+            lookups: [
+                .success(lookup(2, hits: [0: "a", 1: "b"])),
+                .failure(.problem(status: 503, code: "service.unavailable")),
+            ],
+            modes: [.failure(.problem(status: 409, code: "room.state_conflict"))])
+        let model = lookupModel(client, rooms: knownRooms(2))
+        await model.load()
+        await model.setMode(roomRef: ref("a"), mode: .muted)
+        XCTAssertEqual(model.roomName(for: ref("a")), "群0")
+        XCTAssertNil(model.roomName(for: ref("b")))
+    }
+
     func testDimmedCapabilityAllowsQuietAndLeaveButNeverMentionOnly() async {
         let client = RoomsScriptClient(
             pages: [.success(page([room("a", mode: "muted")], nil, false))],
@@ -578,16 +647,20 @@ private actor RoomsScriptClient: GatewayClient {
     private var personasRead = 0
     private var lookups: [Result<GroupRoomLookupResult, GatewayClientError>]
     private var lookupBatches: [[String]] = []
+    private var holdFirstLookup: Bool
+    private var heldLookup: CheckedContinuation<Void, Never>?
     init(
         pages: [Result<GroupRoomList, GatewayClientError>] = [],
         lookups: [Result<GroupRoomLookupResult, GatewayClientError>] = [],
         modes: [Result<GroupRoom, GatewayClientError>] = [],
         leaves: [Result<GroupRoom, GatewayClientError>] = [],
         personas: [Result<PersonaDetail, GatewayClientError>] = [],
-        updates: [Result<PersonaDetail, GatewayClientError>] = []
+        updates: [Result<PersonaDetail, GatewayClientError>] = [],
+        holdFirstLookup: Bool = false
     ) {
         self.pages = pages
         self.lookups = lookups
+        self.holdFirstLookup = holdFirstLookup
         self.modes = modes
         self.leaves = leaves
         self.personas = personas
@@ -603,9 +676,18 @@ private actor RoomsScriptClient: GatewayClient {
         -> GroupRoomLookupResult
     {
         lookupBatches.append(roomIDs)
-        return try lookups.removeFirst().get()
+        let reply = lookups.removeFirst()
+        if holdFirstLookup {
+            holdFirstLookup = false
+            await withCheckedContinuation { heldLookup = $0 }
+        }
+        return try reply.get()
     }
     func lookupCalls() -> [[String]] { lookupBatches }
+    func releaseHeldLookup() {
+        heldLookup?.resume()
+        heldLookup = nil
+    }
     func updateGroupRoomMode(personaID: String, roomRef: String, mode: GroupRoomMode) async throws
         -> GroupRoom
     {

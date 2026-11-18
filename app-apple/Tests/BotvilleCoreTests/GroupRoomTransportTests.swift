@@ -20,6 +20,8 @@ final class GroupRoomTransportTests: XCTestCase {
             ("PATCH", "personas/p%2Fq/rooms/ref%2Fpart"),
             ("GET", "personas/p"),  // Existing owner-detail route stays authorized.
             ("POST", "personas/p/rooms/lookup"), ("post", "personas/p%2Fq/rooms/lookup"),
+            // A room_ref that happens to be "lookup" is still a PATCH on the room.
+            ("PATCH", "personas/p/rooms/lookup"),
         ]
         let invalid: [(String, String)] = [
             ("GET", "personas/p/rooms/ref"), ("GET", "personas/p/rooms/"),
@@ -252,6 +254,27 @@ final class GroupRoomTransportTests: XCTestCase {
             XCTAssertEqual(error, .invalidResponse)
         }
         for ids in [[], (0...50).map { "!r\($0):local.test" }] {
+            GroupRoomURLProtocol.reset(status: 200, body: Data())
+            do {
+                _ = try await client.lookupGroupRooms(personaID: "p", roomIDs: ids)
+                XCTFail("Expected local rejection for \(ids.count) ids")
+            } catch let error as GatewayClientError {
+                XCTAssertEqual(error, .invalidResponse)
+            }
+            XCTAssertTrue(GroupRoomURLProtocol.requests.isEmpty)
+        }
+    }
+
+    /// #250 review: the HTTP client re-checks what the planner guarantees, so a
+    /// caller bypassing the planner never sends a batch the gateway 400s.
+    func testRoomLookupRejectsDuplicateOrNonCanonicalIDsWithoutRequest() async throws {
+        let client = try makeClient()
+        for ids in [
+            ["!a:local.test", "!a:local.test"],
+            ["!a:local.test", "!a:LOCAL.TEST"],  // Same identity after server case-folding.
+            ["!a:local.test", "#alias:local.test"],
+            ["!bad space:local.test"],
+        ] {
             GroupRoomURLProtocol.reset(status: 200, body: Data())
             do {
                 _ = try await client.lookupGroupRooms(personaID: "p", roomIDs: ids)

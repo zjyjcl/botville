@@ -223,6 +223,11 @@ public final class PersonaGroupRoomsModel: ObservableObject {
                 paginationNeedsRefresh = false
             }
             outcome.roomsRefreshed = apply(page, replacing: true)
+            if preservingRoomsOnFailure {
+                // Rows were replaced; names of refs no longer listed must go too.
+                let listed = Set(rooms.map(\.roomRef))
+                roomNames = roomNames.filter { listed.contains($0.key) }
+            }
             // Names are decoration: the list is usable before and without them.
             isLoading = false
             await resolveNames(generation: requestGeneration)
@@ -246,12 +251,13 @@ public final class PersonaGroupRoomsModel: ObservableObject {
         var nameByID: [String: String] = [:]
         for room in known where nameByID[room.id] == nil { nameByID[room.id] = room.name }
         var names: [String: String] = [:]
+        var completed = true
         for batch in GroupRoomLookupPlan.batches(ids) {
             guard let result = try? await client.lookupGroupRooms(
                 personaID: personaID, roomIDs: batch)
-            else { break }
+            else { completed = false; break }
             guard !Task.isCancelled, requestGeneration == generation else { return }
-            guard result.items.count == batch.count else { break }
+            guard result.items.count == batch.count else { completed = false; break }
             for (id, item) in zip(batch, result.items) {
                 guard let item, names[item.roomRef] == nil,
                     let name = nameByID[id]?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -261,6 +267,8 @@ public final class PersonaGroupRoomsModel: ObservableObject {
             }
             roomNames.merge(names) { _, new in new }
         }
+        // A full pass is authoritative: drop names this generation did not confirm.
+        if completed { roomNames = names }
     }
 
     public func loadMore() async {

@@ -75,6 +75,8 @@ public enum MatrixServiceError: LocalizedError {
     case encryptionConfirmationRequired, encryptedRoomParticipantNotAllowed
     /// Keychain still holds a session but this device's encrypted SDK store is gone.
     case cryptoStoreLost
+    /// The store could not be inspected yet (device locked / metadata unreadable).
+    case protectedDataUnavailable
 
     public var errorDescription: String? {
         switch self {
@@ -88,6 +90,7 @@ public enum MatrixServiceError: LocalizedError {
         case .sessionExpired: return "会话已失效，请重新登录。"
         case .operationFailed: return "操作失败，请稍后重试。"
         case .cryptoStoreLost: return "本机加密数据已丢失，需要重新登录"
+        case .protectedDataUnavailable: return "设备解锁后会继续恢复会话。"
         case .busy: return "操作正在进行，请稍候。"
         case .encryptionConfirmationRequired: return "开启加密需要重新确认；房间和成员状态可能已变化。"
         case .encryptedRoomParticipantNotAllowed: return "加密状态已启用或尚未确认；当前成员和受邀成员必须都能确认为真人，不能邀请 AI 或身份未确认的账号。"

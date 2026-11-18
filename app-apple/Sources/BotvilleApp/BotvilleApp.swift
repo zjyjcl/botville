@@ -160,6 +160,11 @@ struct BotvilleApp: App {
         .onReceive(pushRoute.$pendingRoute.compactMap { $0 }) { _ in
             selectedTab = 0
         }
+        // A launch before first unlock defers the crypto-store judgement;
+        // resume restore as soon as protected files become readable.
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.protectedDataDidBecomeAvailableNotification)) { _ in
+            Task { await matrixService.protectedDataDidBecomeAvailable() }
+        }
 #endif
 #if DEBUG
         .task { await pushDevice.prepare(service: matrixService) }

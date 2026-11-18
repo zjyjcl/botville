@@ -29,6 +29,7 @@ public struct GroupRoomLookupResult: Codable, Sendable, Equatable {
 /// duplicate, so the App filters exactly the same way before sending.
 public enum GroupRoomLookupPlan {
     public static let maxBatchSize = 50
+    /// Contract: ≤255 Unicode code points (not grapheme clusters).
     private static let maxLength = 255
     private static let localpartCharacters = CharacterSet(
         charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._~=-")
@@ -60,7 +61,7 @@ public enum GroupRoomLookupPlan {
     public static func duplicateKey(_ id: String) -> String? { parse(id)?.key }
 
     private static func parse(_ id: String) -> (server: String, key: String)? {
-        guard id.count <= maxLength, id.hasPrefix("!"),
+        guard id.unicodeScalars.count <= maxLength, id.hasPrefix("!"),
             id.unicodeScalars.allSatisfy({
                 !CharacterSet.whitespacesAndNewlines.contains($0)
                     && !CharacterSet.controlCharacters.contains($0)

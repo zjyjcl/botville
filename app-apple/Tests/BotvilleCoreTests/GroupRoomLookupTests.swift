@@ -35,6 +35,23 @@ final class GroupRoomLookupPlanTests: XCTestCase {
             ["!p:local.test:8448"])
     }
 
+    /// #250 review: the contract limit is 255 Unicode code points, not graphemes.
+    func testLengthLimitCountsCodePointsNotGraphemes() {
+        let prefix = "!" + String(repeating: "x", count: 200) + ":"
+        let tooLong = prefix + String(repeating: "e\u{301}", count: 30)
+        XCTAssertEqual(tooLong.count, 232)
+        XCTAssertEqual(tooLong.unicodeScalars.count, 262)
+        XCTAssertNil(GroupRoomLookupPlan.duplicateKey(tooLong))
+        let atLimit = prefix + String(repeating: "e\u{301}", count: 26) + "e"
+        XCTAssertEqual(atLimit.unicodeScalars.count, 255)
+        XCTAssertNotNil(GroupRoomLookupPlan.duplicateKey(atLimit))
+        XCTAssertNil(GroupRoomLookupPlan.duplicateKey(atLimit + "e"))
+        let server = String(tooLong.split(separator: ":")[1])
+        XCTAssertEqual(
+            GroupRoomLookupPlan.roomIDs(
+                from: [MatrixRoom(id: tooLong, name: "长")], localServerName: server), [])
+    }
+
     func testBatchesNeverExceedFifty() {
         let ids = (0..<120).map { "!r\($0):local.test" }
         XCTAssertEqual(GroupRoomLookupPlan.batches(ids).map(\.count), [50, 50, 20])

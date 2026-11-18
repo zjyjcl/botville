@@ -67,6 +67,29 @@ final class PasswordAuthenticationTests: XCTestCase {
         await authentication().discard(credentials)
     }
 
+    func testStaleSessionLogoutPostsOnlySingleDeviceLogoutAndThrowsOnFailure() async throws {
+        let server = uniqueServer()
+        var seen: [String] = []
+        register(server) { request in
+            seen.append("\(request.httpMethod ?? "") \(request.url?.path ?? "")")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer stale-access")
+            XCTAssertNil(request.url?.query)
+            return .json(200, "{}")
+        }
+        try await staleLogout().logout(homeserver: server, accessToken: "stale-access")
+        // Never /logout/all, never delete_devices.
+        XCTAssertEqual(seen, ["POST /_matrix/client/v3/logout"])
+
+        for status in [401, 403, 500] {
+            let failing = uniqueServer()
+            register(failing) { _ in .json(status, "{\"errcode\":\"M_UNKNOWN_TOKEN\"}") }
+            do {
+                try await staleLogout().logout(homeserver: failing, accessToken: "stale-access")
+                XCTFail("Expected failure for \(status)")
+            } catch {}
+        }
+    }
+
     func testHTTP429UsesRetryAfterSeconds() async {
         await assertLoginError(.rateLimited(retryAfter: 12), response: .json(429, "{\"errcode\":\"M_LIMIT_EXCEEDED\"}", headers: ["Retry-After": "12"]))
     }
@@ -140,6 +163,12 @@ final class PasswordAuthenticationTests: XCTestCase {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [LoginURLProtocol.self]
         return MatrixPasswordAuthentication(session: URLSession(configuration: configuration))
+    }
+
+    private func staleLogout() -> MatrixStaleSessionLogout {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [LoginURLProtocol.self]
+        return MatrixStaleSessionLogout(session: URLSession(configuration: configuration))
     }
 
     private func uniqueServer() -> URL {
