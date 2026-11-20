@@ -314,10 +314,82 @@ def checked_gateway_result(result):
     return result.status, result.body
 
 
-GATEWAY_MODES = ("none", "test-recorder")
+def validate_gateway_http(url, token):
+    """Local, trusted hop; deliberately not the peer target policy.
+
+    Reject ambiguous bases and header injection without echoing values.
+    http is valid on container/loopback networks; https uses default TLS.
+    """
+    try:
+        parts = urlsplit(url or "")
+        valid = (parts.scheme in ("http", "https") and parts.hostname
+                 and not parts.username and not parts.password
+                 and parts.path in ("", "/") and not parts.query
+                 and not parts.fragment and not any(c.isspace() for c in url))
+        parts.port
+    except (ValueError, TypeError):
+        valid = False
+    if not valid:
+        raise ValueError("PAIRING_RELATIONS_GATEWAY_URL requires an http(s) origin")
+    if not token or len(token) < 32 or any(ord(c) < 33 or ord(c) > 126 for c in token):
+        raise ValueError("GATEWAY_RELATIONS_INBOUND_TOKEN requires at least 32 printable ASCII characters")
 
 
-def build_gateway_client(mode, record_path=None):
+class HttpRelationsGateway(RelationsGatewayClient):
+    """#257 local inbound contract. Bounded I/O, no retries or redirects.
+
+    Never retain remote text in exceptions (including exception context).
+    Proxy environment settings are bypassed for this local trusted hop.
+    """
+    def __init__(self, url, token, timeout=10):
+        validate_gateway_http(url, token)
+        self.url = url.rstrip("/")
+        self._token = token
+        self.timeout = timeout
+
+    def deliver(self, kind, envelope, meta):
+        if kind not in RELATION_KINDS:
+            raise GatewayUnavailable("unsupported_kind")
+        try:
+            raw = json.dumps({"kind": kind, "envelope": envelope, "meta": meta},
+                             ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":"), allow_nan=False).encode("utf-8")
+            if len(raw) > MAX_GATEWAY_BODY_BYTES:
+                raise GatewayUnavailable("request_too_large")
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, *args, **kwargs):
+                    return None
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}), NoRedirect())
+            request = urllib.request.Request(
+                self.url + "/_internal/relations/" + kind, data=raw,
+                headers={"Authorization": "Bearer " + self._token,
+                         "Content-Type": "application/json"}, method="POST")
+            try:
+                response = opener.open(request, timeout=self.timeout)
+            except urllib.error.HTTPError as exc:
+                response = exc
+            with response:
+                if response.status not in RELAYED_GATEWAY_STATUSES:
+                    raise GatewayUnavailable("unusable_result")
+                body = response.read(MAX_GATEWAY_BODY_BYTES + 1)
+                if len(body) > MAX_GATEWAY_BODY_BYTES:
+                    raise GatewayUnavailable("body_too_large")
+                result = GatewayResult(response.status, json.loads(body.decode("utf-8")))
+                checked_gateway_result(result)
+                return result
+        except GatewayUnavailable:
+            raise
+        except Exception:
+            raise GatewayUnavailable("http_unavailable") from None
+
+
+GATEWAY_MODES = ("none", "test-recorder", "http")
+
+
+def build_gateway_client(mode, record_path=None, url=None, token=None):
+    if mode == "http":
+        return HttpRelationsGateway(url, token)
     if mode == "none":
         return UnconfiguredRelationsGateway()
     if mode == "test-recorder":

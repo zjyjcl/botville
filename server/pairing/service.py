@@ -32,7 +32,7 @@ Endpoints (JSON everywhere; errors are `{"errcode", "error"}`):
   GET  /v1/pairing/allowed               admin  active server names (for
          debugging; fedgate reads the SQLite file directly).
   GET  /health                           any    liveness probe:
-         {ok: true, relations_gateway: none|test-recorder} (A-R4).
+         {ok: true, relations_gateway: none|test-recorder|http} (A-R4).
 
 Pairing facts for the gateway (A-R1; service token, read-only):
 
@@ -448,7 +448,8 @@ class PairingConfig:
                  trusted_proxies=(), service_token=None,
                  hs_whitelist_path=None, hs_restart_marker=None,
                  relations_gateway="none", relations_test_record=None,
-                 relations_send_token=None, relations_allow_private=False):
+                 relations_send_token=None, relations_allow_private=False,
+                 relations_gateway_url=None, relations_gateway_token=None):
         self.db_path = db_path
         self.admin_token = admin_token
         if service_token:
@@ -486,14 +487,16 @@ class PairingConfig:
         self.relations_allow_private = bool(relations_allow_private)
         # A-R3: how verified inbound relation messages reach the local
         # gateway. "none" (default) refuses them with 503; "test-recorder"
-        # is for tests/CI only. The real HTTP gateway client is not part
-        # of this build (A/B have not aligned the gateway endpoints), so
-        # "http" is reserved and refused rather than silently ignored.
+        # is for tests/CI only.
+        # #257 aligns the real local HTTP endpoint; none stays the default.
         if relations_gateway == "http":
-            raise ConfigError(
-                "PAIRING_RELATIONS_GATEWAY=http is reserved: the gateway HTTP"
-                " client lands once the gateway's internal relation endpoints"
-                " are agreed; use none")
+            try:
+                relations.validate_gateway_http(relations_gateway_url,
+                                                relations_gateway_token)
+            except ValueError as exc:
+                raise ConfigError(str(exc)) from None
+        self.relations_gateway_url = relations_gateway_url
+        self.relations_gateway_token = relations_gateway_token
         if relations_gateway not in relations.GATEWAY_MODES:
             raise ConfigError(
                 "PAIRING_RELATIONS_GATEWAY must be one of: {}".format(
@@ -581,6 +584,8 @@ class PairingConfig:
                 env, "PAIRING_RELATIONS_ALLOW_PRIVATE", False),
             relations_gateway=(env.get("PAIRING_RELATIONS_GATEWAY", "").strip()
                                or "none"),
+            relations_gateway_url=env.get("PAIRING_RELATIONS_GATEWAY_URL", ""),
+            relations_gateway_token=env.get("GATEWAY_RELATIONS_INBOUND_TOKEN", ""),
             relations_test_record=env.get(
                 "PAIRING_RELATIONS_TEST_RECORD", "").strip() or None,
             hs_whitelist_path=env.get("PAIRING_HS_WHITELIST_PATH", "").strip(),
@@ -604,7 +609,8 @@ class PairingApp:
         self.internal_rejected = 0
         # A-R3 relation transport.
         self.relations_gateway = relations.build_gateway_client(
-            config.relations_gateway, config.relations_test_record)
+            config.relations_gateway, config.relations_test_record,
+            config.relations_gateway_url, config.relations_gateway_token)
         self.relation_nonces = relations.StrictNonceGuard()
         self.relations_ip_limiter = RateLimiter(limit=RELATIONS_PER_IP_PER_MINUTE)
         self.relations_origin_limiter = RateLimiter(
@@ -1615,9 +1621,9 @@ def main(argv=None):
         log.warning("PAIRING_RELATIONS_SEND_TOKEN is unset: the internal"
                     " relation send endpoint refuses every request (401).")
     if config.relations_gateway != "none":
-        log.warning("PAIRING_RELATIONS_GATEWAY=%s: inbound relation messages"
-                    " are NOT refused; test-recorder accepts everything and is"
-                    " for tests/CI only", config.relations_gateway)
+        log.warning("PAIRING_RELATIONS_GATEWAY=%s: inbound relation delivery"
+                    " enabled; test-recorder is for tests/CI only",
+                    config.relations_gateway)
     if config.relations_allow_private:
         log.warning("PAIRING_RELATIONS_ALLOW_PRIVATE=true: relations may go"
                     " to plain-http / private / loopback peer addresses"

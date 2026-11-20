@@ -150,7 +150,7 @@ A 线只负责「把消息安全送到对端网关、把对端网关的回答带
 - A-R4：send token 与 facts token 分开（#249 review 1）：≥32 字符、不得等于 admin token 或 service token（常量时间比较），否则拒绝启动；未配置时发送端点一律 401（启动 WARNING）。
 - **目标策略**（#249 review 2）：`peer_api_url` 必须是 `https`，且主机解析出的**所有**地址都是公网地址；否则 `409 BV_PEER_TARGET_REFUSED`（WARNING 日志，不回显 URL 以外的内容）。私有/环回/链路本地/保留地址只有在 `PAIRING_RELATIONS_ALLOW_PRIVATE=true` 时放行，每次发送记一条 `AUDIT` WARNING（启动时也有 WARNING）；无法解析或非 http(s) 的目标即使开了开关也拒绝。残余风险：解析与真正连接之间可能被 DNS rebinding 换地址（检查与连接不是同一次解析），生产上应保持开关关闭并让 peer 主机名由可信 DNS 解析。
 
-**网关客户端**：`PAIRING_RELATIONS_GATEWAY` 选择实现。默认 `none`：所有入站消息 503（明确的「不可用」）。`test-recorder` 只给测试/CI：把 `{kind, envelope, meta}` 逐行追加到 `PAIRING_RELATIONS_TEST_RECORD`（绝对路径）并回 202——它什么都收，**不得用于真实部署**。`http`（真正调网关）保留：双方对齐网关内部端点之前不合入，配了会拒绝启动（网关侧 `GATEWAY_RELATIONS_INBOUND_*` 变量名由 B 线定，A 线不猜测透传）。模式不是 `none` 时启动打 WARNING，`/health` 返回 `{"ok": true, "relations_gateway": "<mode>"}`（#249 review 3）。网关客户端抛出的异常只按原因码记日志（`not_configured`、`recorder_write_failed` 等），绝不包含请求或响应 body（#249 review 4）。
+**网关客户端**：`PAIRING_RELATIONS_GATEWAY` 选择实现。默认 `none`：所有入站消息 503（明确的「不可用」）。`test-recorder` 只给测试/CI：把 `{kind, envelope, meta}` 逐行追加到 `PAIRING_RELATIONS_TEST_RECORD`（绝对路径）并回 202——它什么都收，**不得用于真实部署**。`http` 已按 #257 接入：POST `PAIRING_RELATIONS_GATEWAY_URL + /_internal/relations/<kind>`，Bearer 使用 `GATEWAY_RELATIONS_INBOUND_TOKEN`，JSON 顶层恰好 `kind/envelope/meta`。URL 必须是无凭证/路径/query/fragment 的 http(s) origin，token 至少 32 位可打印 ASCII；缺失或非法时拒绝启动。此跳是可信容器网络/loopback，不套用 peer 的公网 HTTPS 策略。默认 TLS 验证；不重定向、不重试、10 秒超时、请求与响应各 ≤16 KiB；仅透传 200/201/202/400/403/404/409/410/422/429 且 body 是 JSON 对象，其余或网络异常由入站处理器返回 503。模式不是 `none` 时启动打 WARNING，`/health` 返回 `{"ok": true, "relations_gateway": "<mode>"}`（#249 review 3）。网关客户端抛出的异常只按原因码记日志（`not_configured`、`recorder_write_failed` 等），绝不包含请求或响应 body（#249 review 4）。
 
 fedgate 路由规则：
 
@@ -213,10 +213,36 @@ make federation-down  # 只 down -v 该项目
 
 `make up PAIRING=1`（任一 HS）在主栈里起 `pairing` 服务（profile `pairing`）：镜像 `PAIRING_IMAGE`（与 `gateway/Dockerfile` 同一 python:3.12-slim digest）、只读挂载 `server/pairing`、状态在 `pairing-data` 卷（`/data/pairing.db`）、宿主端口只绑 `127.0.0.1:${BOTVILLE_PAIRING_PORT:-8090}`，不挂 docker socket。`make down/ps/logs/config` 恒带 `--profile pairing`。
 
-- 三个 token：`PAIRING_ADMIN_TOKEN`、`PAIRING_SERVICE_TOKEN`、`PAIRING_RELATIONS_SEND_TOKEN`，在 `server/compose/.env.example` 与根 `.env.example` 中均为 `<change-me>`，由 `init.sh` 生成 64 位 hex 并检查两两不同（相同直接退出，不打印值）。网关侧接收 service/send token 的变量名属 B 线（`gateway/.env.example`），本 PR 不往 gateway 服务透传。
+- 三个 token：`PAIRING_ADMIN_TOKEN`、`PAIRING_SERVICE_TOKEN`、`PAIRING_RELATIONS_SEND_TOKEN`，在 `server/compose/.env.example` 与根 `.env.example` 中均为 `<change-me>`，由 `init.sh` 生成 64 位 hex 并检查两两不同（相同直接退出，不打印值）。网关使用 `PAIRING_RELATIONS_SEND_TOKEN` 发送；反向使用独立 `GATEWAY_RELATIONS_INBOUND_TOKEN`，不要复用 token（均不打印）。
 - `PAIRING_SERVER_NAME` 取 `BOTVILLE_SERVER_NAME`：必须是真实 DNS 名，默认的 `localhost` 会让服务拒绝启动（fail-closed）。
 - `PAIRING_API_URL` 默认 `https://<BOTVILLE_SERVER_NAME>/_matrix/pairing`；`PAIRING_RELATIONS_GATEWAY` 默认 `none`，`PAIRING_RELATIONS_ALLOW_PRIVATE` 默认 `false`。
 - 尚未接入（后续）：主栈的 fedgate 与 Synapse `federation_domain_whitelist` include。要接上需要：共享卷（pairing 读写、synapse 以 `:ro` 挂到 `/hs`）、pairing 的 `PAIRING_HS_WHITELIST_PATH=/hs/federation-whitelist.yaml`、synapse 增加 `--config-path /hs/federation-whitelist.yaml`（homeserver.yaml 里不要再写同名键）。在接入之前，主栈 pairing 只提供管理/事实/发送接口，不改变 HS 的联邦行为。
+
+### 官方栈按需启用本地关系 HTTP（A-R5，默认关闭）
+
+这只是接线说明，不自动部署。默认 `PAIRING_RELATIONS_GATEWAY=none`、
+`GATEWAY_RELATIONS_INBOUND_BIND=`、`GATEWAY_PAIRING_RELATIONS_URL=`；网关不监听内部端口，出站 worker 也未配置。
+在受信任的 compose 网络内按需设置（以下不含凭证值）：
+
+- `GATEWAY_RELATIONS_INBOUND_BIND=0.0.0.0:8091`（**容器内**监听，不添加宿主 ports）
+- `PAIRING_RELATIONS_GATEWAY=http`
+- `PAIRING_RELATIONS_GATEWAY_URL=http://gateway:8091`（pairing → 网关）
+- `GATEWAY_PAIRING_RELATIONS_URL=http://pairing:8090`（网关 → pairing **进程**，不是 `PAIRING_API_URL`）
+- 两个独立凭证：`GATEWAY_RELATIONS_INBOUND_TOKEN`、`PAIRING_RELATIONS_SEND_TOKEN`。
+  init.sh 从 server/compose 示例占位生成前者（后者已有），只写本地 .env，不打印值。
+  直接使用 gateway 示例时请自行在本地填凭证，不要把占位符当可用值。
+- 运维自行启用 `PAIRING=1 GATEWAY=1`，配置有效的 DNS server_name、persona/关系存储等网关前置项。
+  顺序不强制依赖，暂时不可用时 fail-closed；网络恢复后由网关 outbox 重试。
+- 宿主机运行请把 BIND 改为 loopback，使用不同端口。compose 不发布内部监听端口，
+  pairing 的原有管理端口仍只绑 `127.0.0.1`；没有 docker socket。
+- `PAIRING_RELATIONS_ALLOW_PRIVATE` 仍默认 false，peer 目标策略未放宽。
+  网关侧对字面 loopback URL 的校验以 #257 为准；推荐使用容器服务名，不为此放宽 peer 策略。
+
+联邦 compose 继续使用 test-recorder，不改双服 e2e：该栈测试 HMAC/nonce/fedgate 门禁，
+若改用真实网关，还需 persona、存储与业务状态夹具，属独立验收范围。
+新增本地 bridge 测试直接把 HTTP 客户端连到真实 #257 `InboundServer`（loopback 临时端口），
+验证 request 持久化、重放与 revoke；其余传输故障、限长和状态码由 HTTP stub 测试覆盖。
+#256 的其它 nit/建议（401 文案、旧 init 生成测试、notify 策略、WARNING 单测、未设 send token HTTP 用例）留后续，不顺手修改。
 
 ### 环境变量
 
@@ -239,7 +265,7 @@ pairing 服务：
 | `PAIRING_RELATIONS_ALLOW_PRIVATE` | `false` | A-R4：`true` 时出站目标可以是 http / 私有 / 环回地址（每次 AUDIT WARNING）；仅测试栈（联邦 CI 栈的 hs-b 解析到 172.30.81.x，因此设为 `true`） |
 | `PAIRING_HS_WHITELIST_PATH` | 空（关闭） | 绝对路径；设置后渲染 Synapse `federation_domain_whitelist` include（A-R2，见「HS 白名单与重启」） |
 | `PAIRING_HS_RESTART_MARKER` | `<PAIRING_HS_WHITELIST_PATH>.restart-required` | 「需要重启」标记的绝对路径；须先设 `PAIRING_HS_WHITELIST_PATH`，且不能与它相同 |
-| `PAIRING_RELATIONS_GATEWAY` | `none` | A-R3 入站关系消息交给谁：`none`（一律 503）、`test-recorder`（仅测试/CI）；`http` 保留，配了拒绝启动 |
+| `PAIRING_RELATIONS_GATEWAY` | `none` | A-R3 入站关系消息交给谁：`none`（一律 503）、`test-recorder`（仅测试/CI）；`http`（需 URL / inbound token；见下节） |
 | `PAIRING_RELATIONS_TEST_RECORD` | 空 | `test-recorder` 的输出文件（必须是绝对路径，否则拒绝启动） |
 
 fedgate：
