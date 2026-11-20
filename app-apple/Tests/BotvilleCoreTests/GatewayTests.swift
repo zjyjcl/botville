@@ -87,16 +87,12 @@ final class GatewayTests: XCTestCase {
 
     func testHTTPClientBuildsCapabilityCardAndActionRequests() async throws {
         let recorder = RequestRecorder()
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [GatewayURLProtocol.self]
-        GatewayURLProtocol.recorder = recorder
         defer { GatewayURLProtocol.recorder = nil }
-        let client = try HTTPGatewayClient(
-            baseURL: URL(string: "https://gateway.example.test/base")!, token: "token",
-            session: URLSession(configuration: configuration))
+        let client = try pairedClient(recording: recorder)
         recorder.enqueue(status: 200, body: manifestJSON)
         _ = try await client.capabilities(locale: "zh-CN", appVersion: "0.1.0")
         let first = try XCTUnwrap(recorder.requests.first)
+        XCTAssertEqual(first.httpMethod, "GET")
         XCTAssertEqual(first.url?.path, "/base/v1/capabilities")
         let queryNames = try XCTUnwrap(
             URLComponents(url: try XCTUnwrap(first.url), resolvingAgainstBaseURL: false)?.queryItems?.map(
@@ -104,7 +100,7 @@ final class GatewayTests: XCTestCase {
             ).sorted())
         XCTAssertEqual(queryNames, ["app_version", "locale"])
         XCTAssertNil(first.value(forHTTPHeaderField: "X-Card-Schema-Version"))
-        XCTAssertEqual(first.value(forHTTPHeaderField: "Authorization"), "Bearer token")
+        XCTAssertTrue(first.value(forHTTPHeaderField: "Authorization") == "MatrixOpenID test-openid")
 
         let card = try decodeCard(cardJSON)
         recorder.enqueue(status: 200, body: cardPageJSON)
@@ -127,6 +123,67 @@ final class GatewayTests: XCTestCase {
         XCTAssertEqual(
             recorder.requests.last?.value(forHTTPHeaderField: "Idempotency-Key"),
             action.value(forHTTPHeaderField: "Idempotency-Key"))
+    }
+
+    @MainActor
+    func testReloadDynamicContentPublishesManifestWhenCardsFail() async throws {
+        let recorder = RequestRecorder()
+        defer { GatewayURLProtocol.recorder = nil }
+        let client = try pairedClient(recording: recorder)
+        recorder.enqueue(status: 200, body: memoryManifestJSON)
+        recorder.enqueue(status: 404, body: "{}")
+        var appliedManifest: GatewayCapabilityManifest?
+
+        let cards = try await client.reloadDynamicContent(
+            locale: "zh-CN", appVersion: "1.0", selectedCapability: nil
+        ) { manifest in
+            appliedManifest = manifest
+            return true
+        }
+
+        XCTAssertEqual(appliedManifest, try decodeManifest(memoryManifestJSON))
+        XCTAssertTrue(MemoryPresentationPolicy.isMemoryManagementAvailable(in: appliedManifest))
+        XCTAssertNil(cards)
+        XCTAssertEqual(recorder.requests.map(\.url?.path), ["/base/v1/capabilities", "/base/v1/cards"])
+    }
+
+    @MainActor
+    func testReloadDynamicContentKeepsLatestCardsBehavior() async throws {
+        let recorder = RequestRecorder()
+        defer { GatewayURLProtocol.recorder = nil }
+        let client = try pairedClient(recording: recorder)
+        recorder.enqueue(status: 200, body: manifestJSON)
+        recorder.enqueue(status: 200, body: cardPageJSON)
+        var appliedManifest: GatewayCapabilityManifest?
+
+        let cards = try await client.reloadDynamicContent(
+            locale: "zh-CN", appVersion: "1.0", selectedCapability: nil
+        ) { manifest in
+            appliedManifest = manifest
+            return true
+        }
+
+        XCTAssertEqual(appliedManifest, try decodeManifest(manifestJSON))
+        XCTAssertEqual(cards, [try decodeCard(cardJSON)])
+        XCTAssertEqual(recorder.requests.map(\.url?.path), ["/base/v1/capabilities", "/base/v1/cards"])
+    }
+
+    func testCapabilitiesOpenIDRoutingIsExact() throws {
+        let client = try HTTPGatewayClient(
+            baseURL: URL(string: "https://gateway.example.test/base")!, token: "site-credential")
+        let capabilities = try client.request(["capabilities"])
+        XCTAssertNil(capabilities.value(forHTTPHeaderField: "Authorization"))
+        XCTAssertTrue(try client.isOpenIDRequest(capabilities))
+        for (method, path) in [
+            ("POST", "capabilities"), ("GET", "capabilities/"), ("GET", "capabilities/child"),
+            ("GET", "capabilitiesx"), ("GET", "cards"), ("GET", "relations"),
+            ("GET", "personas/sample/relations"), ("POST", "personas/sample/relations"),
+            ("GET", "personas/sample/relations/sample"), ("POST", "personas/sample/relations/sample/approve"),
+        ] {
+            var request = URLRequest(url: try XCTUnwrap(URL(string: "https://gateway.example.test/base/v1/" + path)))
+            request.httpMethod = method
+            XCTAssertFalse(try client.isOpenIDRequest(request), "\(method) \(path)")
+        }
     }
 
     func testCookieExchangeHasNoAuthorizationAndBaseURLRejectsUnsafeShapes() async throws {
@@ -283,6 +340,19 @@ final class GatewayTests: XCTestCase {
         XCTAssertEqual(recorder.requests.count, before)
     }
 
+    private func pairedClient(recording recorder: RequestRecorder) throws -> HTTPGatewayClient {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GatewayURLProtocol.self]
+        GatewayURLProtocol.recorder = recorder
+        let provider = MatrixOpenIDTokenProvider {
+            MatrixOpenIDToken(accessToken: "test-openid", tokenType: "Bearer",
+                              matrixServerName: "example.invalid", expiresInSeconds: 3600)
+        }
+        return try HTTPGatewayClient(
+            baseURL: "https://gateway.example.test/base", token: "site-credential",
+            session: URLSession(configuration: configuration), openIDProvider: provider)
+    }
+
     private func decodeManifest(_ text: String) throws -> GatewayCapabilityManifest {
         try JSONDecoder.gateway.decode(GatewayCapabilityManifest.self, from: Data(text.utf8))
     }
@@ -389,6 +459,9 @@ private func XCTAssertGatewayError(
 
 private let manifestJSON = """
     {"manifest_version":"1","contract_version":"0.5.0","generated_at":"2026-11-03T12:00:00Z","capabilities":[]}
+    """
+private let memoryManifestJSON = """
+    {"manifest_version":"1","contract_version":"0.5.0","generated_at":"2026-11-03T12:00:00Z","capabilities":[{"id":"memory.manage","module":"memory","version":"1","title":"Memory","summary":"","status":"enabled","entry":{"type":"native","deep_link":"botville://memories"},"scopes":[]}]}
     """
 private let cardJSON = """
     {"id":"c","card_schema_version":"1.0.0","type":"approval","title":"x","fallback_text":"f","priority":"normal","risk":"low","status":"active","blocks":[],"actions":[{"id":"deny","label":"Deny","kind":"deny","style":"secondary"},{"id":"approve","label":"Approve","kind":"approve","style":"primary","risk":"high"}],"source":{"module":"x"},"expires_at":"2099-01-01T00:00:00Z","revision":7}

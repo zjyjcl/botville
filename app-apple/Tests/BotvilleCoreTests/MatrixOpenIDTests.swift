@@ -29,7 +29,7 @@ final class MatrixOpenIDTests: XCTestCase {
         let provider = MatrixOpenIDTokenProvider { self.credential() }
         let (client, recorder) = try transport(provider)
         _ = try await client.momentsRequest()
-        _ = try await client.responseData(for: client.request(["capabilities"]))
+        _ = try await client.responseData(for: client.request(["cards"]))
         let requests = recorder.requests
         XCTAssertEqual(requests[0].url?.path, "/_botville/gateway/v1/moments")
         // Boolean assertions intentionally never print credential values on failure.
@@ -41,7 +41,7 @@ final class MatrixOpenIDTests: XCTestCase {
     func testPathSegmentsAndQueryWithBasePrefixes() async throws {
         for base in ["https://gateway.test", "https://gateway.test/v1", "https://gateway.test/_botville/gateway", "https://gateway.test/_botville/gateway/v1/"] {
             let (client, recorder) = try transport(MatrixOpenIDTokenProvider { self.credential() }, base: base)
-            for (path, expected) in [(["moments"], true), (["moments", "id", "comments"], true), (["momentsx"], false), (["capabilities"], false), (["cards"], false), (["context", "assemble"], false)] {
+            for (path, expected) in [(["moments"], true), (["moments", "id", "comments"], true), (["momentsx"], false), (["capabilities"], true), (["cards"], false), (["context", "assemble"], false)] {
                 let request = try client.request(path, query: [URLQueryItem(name: "x", value: "moments")])
                 XCTAssertEqual(try client.isOpenIDRequest(request), expected)
                 _ = try await client.responseData(for: request)
@@ -351,10 +351,11 @@ final class MatrixOpenIDTests: XCTestCase {
         }
     }
 
-    func testNonMomentsInternalErrorNeverRetriesEvenWithIdempotencyKey() async throws {
+    func testNonOpenIDInternalErrorNeverRetriesEvenWithIdempotencyKey() async throws {
         for path in [["capabilities"], ["cards"], ["cards", "id", "actions", "open"],
                      ["capabilities", "id", "session-tokens"], ["context", "assemble"], ["momentsx"]] {
-            for method in ["GET", "get", "POST"] {
+            let methods = path == ["capabilities"] ? ["POST"] : ["GET", "get", "POST"]
+            for method in methods {
                 let waits = OpenIDWaits()
                 let (client, recorder) = try transport(sleep: { await waits.record($0) })
                 recorder.statuses = [500, 200]
@@ -410,6 +411,8 @@ final class MatrixOpenIDTests: XCTestCase {
     func testMissingProviderDoesNotSend() async throws {
         let (client, recorder) = try transport()
         do { _ = try await client.momentsRequest(); XCTFail("Expected missing provider") }
+        catch { XCTAssertTrue(error as? MatrixOpenIDError == .providerUnavailable) }
+        do { _ = try await client.capabilities(); XCTFail("Expected missing provider") }
         catch { XCTAssertTrue(error as? MatrixOpenIDError == .providerUnavailable) }
         XCTAssertTrue(recorder.requests.isEmpty)
     }
