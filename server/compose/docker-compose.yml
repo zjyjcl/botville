@@ -335,6 +335,12 @@ services:
       # .env.example -> openssl rand -hex 32). The gateway refuses to start
       # with an empty/placeholder token or HMAC secret (fail closed), so the
       # :- empty defaults only keep `compose config` working before init.
+      # Optional private relation listener; empty BIND is disabled.
+      # No host port is published for this listener.
+      GATEWAY_RELATIONS_INBOUND_BIND: ${GATEWAY_RELATIONS_INBOUND_BIND:-}
+      GATEWAY_RELATIONS_INBOUND_TOKEN: ${GATEWAY_RELATIONS_INBOUND_TOKEN:-}
+      GATEWAY_PAIRING_RELATIONS_URL: ${GATEWAY_PAIRING_RELATIONS_URL:-}
+      PAIRING_RELATIONS_SEND_TOKEN: ${PAIRING_RELATIONS_SEND_TOKEN:-}
       GATEWAY_AUTH_TOKEN: ${BOTVILLE_GATEWAY_AUTH_TOKEN:-}
       GATEWAY_HMAC_SECRET: ${BOTVILLE_GATEWAY_HMAC_SECRET:-}
       GATEWAY_MATRIX_TRANSPORT: ${GATEWAY_MATRIX_TRANSPORT:-memory}
@@ -474,12 +480,10 @@ services:
     #                                     (/v1/pairing/internal/*)
     #       PAIRING_RELATIONS_SEND_TOKEN  outbound relation send only
     #                                     (/v1/pairing/internal/relations/*)
-    #     The gateway will read facts with the service token and send
-    #     relations with the send token; its env names are B line's
-    #     (gateway/), so nothing is passed to the gateway service here yet.
-    #   - PAIRING_RELATIONS_GATEWAY stays `none` (inbound relations answer
-    #     503); `http` is reserved and refused until the gateway's inbound
-    #     endpoint exists. test-recorder is CI-only.
+    #     The gateway uses the send token for its outbound worker (#257).
+    #   - Inbound relation delivery stays off (none) until explicitly enabled:
+    #     set mode http, PAIRING_RELATIONS_GATEWAY_URL and the inbound token.
+    #     gateway BIND stays empty by default. No internal host port is exposed.
     #   - Outbound relation targets must be https with public addresses;
     #     PAIRING_RELATIONS_ALLOW_PRIVATE=true (test stacks only) lets
     #     private/loopback targets through with an AUDIT warning.
@@ -506,6 +510,8 @@ services:
       # public 443 gate's /_matrix/pairing prefix. Override in .env when the
       # public host differs from the server_name.
       PAIRING_API_URL: ${PAIRING_API_URL:-https://${BOTVILLE_SERVER_NAME:-localhost}/_matrix/pairing}
+      PAIRING_RELATIONS_GATEWAY_URL: ${PAIRING_RELATIONS_GATEWAY_URL:-}
+      GATEWAY_RELATIONS_INBOUND_TOKEN: ${GATEWAY_RELATIONS_INBOUND_TOKEN:-}
       PAIRING_RELATIONS_GATEWAY: ${PAIRING_RELATIONS_GATEWAY:-none}
       PAIRING_RELATIONS_ALLOW_PRIVATE: ${PAIRING_RELATIONS_ALLOW_PRIVATE:-false}
     ports:
