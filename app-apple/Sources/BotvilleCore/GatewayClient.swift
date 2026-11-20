@@ -53,6 +53,19 @@ public extension GatewayClient {
     func writeMemoryFact(_ fact: MemoryFactWrite, idempotencyKey: String? = nil) async throws
         -> Memory
     { throw GatewayClientError.invalidResponse }
+
+    /// Publish the manifest first. A stale refresh or a failed card fetch
+    /// returns nil so the caller can keep its current cards.
+    @MainActor
+    func reloadDynamicContent(
+        locale: String?, appVersion: String?, selectedCapability: GatewayCapability?,
+        applyManifest: (GatewayCapabilityManifest) -> Bool
+    ) async throws -> [GatewayCard]? {
+        let manifest = try await capabilities(locale: locale, appVersion: appVersion)
+        guard applyManifest(manifest) else { return nil }
+        return try? await cards(
+            capabilityID: selectedCapability?.id, cardTypes: selectedCapability?.entry.cardTypes)
+    }
 }
 
 public enum GatewayClientError: Error, Equatable, LocalizedError {
@@ -472,7 +485,8 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
         guard let first = segments.first else { return false }
         // Contract 0.6.0 authenticates owner reads/writes and group-room management;
         // 0.7.0 adds the owner-only POST rooms/lookup.
-        return first == "moments" || first == "memories"
+        return (segments == ["capabilities"] && method.caseInsensitiveCompare("GET") == .orderedSame)
+            || first == "moments" || first == "memories"
             || (first == "personas" && method.caseInsensitiveCompare("GET") == .orderedSame
                 && (segments.count == 1 || (segments.count == 2 && !segments[1].isEmpty)))
             || (first == "personas" && (method.caseInsensitiveCompare("GET") == .orderedSame
@@ -507,10 +521,13 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
             let base = URLComponents(url: baseURL, resolvingAgainstBaseURL: false),
             candidate.scheme == base.scheme, candidate.host == base.host,
             candidate.port == base.port,
+            let capabilitiesURL = try self.request(["capabilities"]).url,
             let momentsURL = try self.request(["moments"]).url,
             let memoriesURL = try self.request(["memories"]).url,
             let personasURL = try self.request(["personas"]).url,
             let personas = URLComponents(url: personasURL, resolvingAgainstBaseURL: false)?
+                .percentEncodedPath,
+            let capabilities = URLComponents(url: capabilitiesURL, resolvingAgainstBaseURL: false)?
                 .percentEncodedPath,
             let moments = URLComponents(url: momentsURL, resolvingAgainstBaseURL: false)?
                 .percentEncodedPath,
@@ -518,19 +535,21 @@ public final class HTTPGatewayClient: GatewayClient, @unchecked Sendable {
                 .percentEncodedPath
         else { throw GatewayClientError.invalidResponse }
         let path = candidate.percentEncodedPath
-        let personaSegments: [String]
-        if path == personas {
-            personaSegments = ["personas"]
+        let segments: [String]
+        if path == capabilities {
+            segments = ["capabilities"]
+        } else if path == personas {
+            segments = ["personas"]
         } else if path.hasPrefix(personas + "/") {
             let suffix = path.dropFirst(personas.count + 1)
-            personaSegments = ["personas"] + suffix.split(separator: "/", omittingEmptySubsequences: false)
+            segments = ["personas"] + suffix.split(separator: "/", omittingEmptySubsequences: false)
                 .map { String($0).removingPercentEncoding ?? "" }
         } else {
-            personaSegments = []
+            segments = []
         }
         return path == moments || path.hasPrefix(moments + "/") || path == memories
             || path.hasPrefix(memories + "/")
-            || Self.isOpenIDPath(personaSegments, method: request.httpMethod ?? "GET")
+            || Self.isOpenIDPath(segments, method: request.httpMethod ?? "GET")
     }
 
     func responseData(for request: URLRequest) async throws -> Data {
