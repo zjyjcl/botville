@@ -1693,7 +1693,7 @@ mark_peer_active 或一次 delivered:true 恢复 active。未知服务器无本�
 访问 127.0.0.1）；容器名 `pairing` 默认允许。令牌与 URL 均非空才已配置。
 反方向（pairing 把入站关系交给网关）只用 `GATEWAY_RELATIONS_INBOUND_BIND` /
 `GATEWAY_RELATIONS_INBOUND_TOKEN`，网关不得猜测或把这对变量透传给 pairing。
-pairing 的 `PAIRING_RELATIONS_GATEWAY=http` 目前仍拒绝启动。
+pairing 的 `PAIRING_RELATIONS_GATEWAY=http` 在配置了 `PAIRING_RELATIONS_GATEWAY_URL` 与本令牌后可启动；默认仍为 `none`，BIND 为空则不监听。
 POST `{URL}/v1/pairing/internal/relations/<kind>`，`Authorization: Bearer` 使用
 `PAIRING_RELATIONS_SEND_TOKEN`，body 恰好 `{destination,request_id,payload}`，urllib 超时默认 10s 可注入。pairing 返回按
 `{delivered, peer_status, peer_body}` 读取对端业务结果。outbox 与触发它的变更同事务；
