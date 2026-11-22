@@ -63,14 +63,15 @@ final class DynamicUIModel: ObservableObject {
         notice = nil
         defer { if currentGeneration == generation { loading = false } }
         do {
-            let nextManifest = try await client.capabilities(
-                locale: locale, appVersion: appVersion)
+            let nextCards = try await client.reloadDynamicContent(
+                locale: locale, appVersion: appVersion, selectedCapability: selectedCapability
+            ) { nextManifest in
+                guard currentGeneration == generation else { return false }
+                manifest = nextManifest
+                return true
+            }
             guard currentGeneration == generation else { return }
-            manifest = nextManifest
-            let nextCards = try await client.cards(
-                capabilityID: selectedCapability?.id, cardTypes: selectedCapability?.entry.cardTypes)
-            guard currentGeneration == generation else { return }
-            cards = nextCards
+            if let nextCards { cards = nextCards }
         } catch {
             guard currentGeneration == generation else { return }
             notice = manifest == nil ? "暂时无法获取网关功能。会话入口仍可使用；可切回示例数据查看动态界面。" : "刷新失败，保留本次会话中上次成功加载的内容。"
