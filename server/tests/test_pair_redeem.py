@@ -9,6 +9,8 @@ Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
 """
 
 import base64
+import contextlib
+import io
 import json
 import logging
 import os
@@ -1454,6 +1456,7 @@ class DeadlineAndConcurrencyTests(unittest.TestCase):
 
 
 class R2RegressionTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("openssl"), "openssl executable required")
     def test_https_issuer_real_tls(self):
         """Real TLS constructor+handshake+verified cert, including on 3.12."""
         seen = {}
@@ -1478,7 +1481,7 @@ class R2RegressionTests(unittest.TestCase):
             cert, key = root / 'cert.pem', root / 'key.pem'
             config.write_text('[req]\ndistinguished_name=dn\nx509_extensions=ext\n'
                               'prompt=no\n[dn]\nCN=localhost\n[ext]\n'
-                              'subjectAltName=DNS:localhost\nbasicConstraints=CA:TRUE\n'.replace('\n', '\n'))
+                              'subjectAltName=DNS:localhost\nbasicConstraints=CA:TRUE\n')
             subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048',
                             '-nodes', '-days', '1', '-config', str(config),
                             '-keyout', str(key), '-out', str(cert)], check=True,
@@ -1510,13 +1513,18 @@ class R2RegressionTests(unittest.TestCase):
     def test_main_ipv6_address_tuple(self):
         import pair_redeem.__main__ as entry
         server = mock.Mock(server_address=('::1', 8092, 0, 0))
+        captured = io.StringIO()
         with mock.patch.object(entry, 'PairRedeemStore'), \
                 mock.patch.object(entry, 'SynapseRegistrationTokenIssuer'), \
                 mock.patch.object(entry, 'start_pruner'), \
-                mock.patch.object(entry.PairRedeemApp, 'make_server', return_value=server):
+                mock.patch.object(entry.PairRedeemApp, 'make_server',
+                                  return_value=server), \
+                mock.patch.object(entry.sys, 'stderr', captured):
             entry.main({ENV_BIND: '[::1]:8092'})
         server.serve_forever.assert_called_once()
         server.server_close.assert_called_once()
+        self.assertEqual(captured.getvalue(),
+                         'pair_redeem listening on ::1:8092\n')
 
     def test_xff_mapped_and_mapped_proxy_network(self):
         proxies = redeem_service.parse_trusted_proxies('::ffff:172.18.0.0/108')
@@ -1697,6 +1705,38 @@ class R2HttpRegressionTests(PairRedeemTestCase):
         self.assertNotIn(secret, output)
         self.assertNotIn('password', output)
         self.assertIn('<unknown>', output)
+        self.assertRegex('\n'.join(captured.output),
+                         r'127\.0\.0\.1 POST <unknown> 404')
+
+    def _assert_malformed_request_is_answered(self, payload, status, forbidden):
+        host, port = self.server.server_address[:2]
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr),                 self.assertLogs('pair_redeem', level='INFO') as captured:
+            header, body, sock = raw_http(host, port, payload, timeout=2)
+            sock.close()
+        err = stderr.getvalue()
+        self.assertTrue(header.startswith('HTTP/1.1 %s' % status), header)
+        self.assertNotIn('Traceback', err)
+        self.assertNotIn('AttributeError', err)
+        output = '\n'.join(captured.output)
+        for item in forbidden:
+            self.assertNotIn(item, output)
+            self.assertNotIn(item, err)
+        self.assertIn(' <unknown> %s' % status, output)
+        self.assertIn('127.0.0.1', output)
+
+    def test_malformed_request_line_returns_400_without_traceback(self):
+        self._assert_malformed_request_is_answered(
+            b'BOGUS\r\n\r\n', '400', ['BOGUS'])
+        self._assert_malformed_request_is_answered(
+            b'GET /x HTTP/9.9\r\nHost: h\r\n\r\n', '505',
+            ['HTTP/9.9', '/x'])
+
+    def test_overlong_request_line_returns_414_without_traceback(self):
+        # One byte over BaseHTTPRequestHandler's 65536-byte request-line cap.
+        payload = b'GET /' + (b'A' * 65533)
+        self._assert_malformed_request_is_answered(
+            payload, '414', ['A' * 32])
 
 
 if __name__ == "__main__":

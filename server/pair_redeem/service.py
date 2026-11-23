@@ -1056,10 +1056,26 @@ def _handler_for(app):
             log.info("HTTP parser event")
 
         def log_request(self, code="-", size="-"):
-            method = self.command if self.command in ("GET", "POST", "HEAD") else "OTHER"
-            path = (self.path or "").split("?", 1)[0]
+            # parse_request / REQUEST_URI_TOO_LONG may call send_error
+            # before self.path (and sometimes a usable command) exists.
+            method = getattr(self, "command", None)
+            method = method if method in ("GET", "POST", "HEAD") else "OTHER"
+            path = (getattr(self, "path", "") or "").split("?", 1)[0]
             endpoint = path if path in (REDEEM_PATH, "/health") else "<unknown>"
-            log.info("%s %s %s", method, endpoint, str(code))
+            try:
+                status = int(code)
+            except (TypeError, ValueError):
+                status = code
+            # Peer address is not a secret; keep it for abuse tracing.
+            log.info("%s %s %s %s", self.address_string(), method, endpoint, status)
+
+        def send_error(self, code, message=None, explain=None):
+            # parse_request leaves the default HTTP/0.9 version on a bad
+            # request line, which would omit the status line. Always emit
+            # a real HTTP/1.1 error so the 400/414/505 is visible.
+            if getattr(self, "request_version", "HTTP/0.9") in ("HTTP/0.9", "", None):
+                self.request_version = "HTTP/1.1"
+            return BaseHTTPRequestHandler.send_error(self, code, message, explain)
 
         def log_error(self, fmt, *args):
             self.log_message(fmt, *args)
