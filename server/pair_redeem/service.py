@@ -18,6 +18,7 @@ import socket
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -43,6 +44,12 @@ RATE_WINDOW_SECONDS = 60
 # operators may raise BOTVILLE_PAIR_REDEEM_ISSUER_TIMEOUT_SECONDS if needed.
 ISSUER_TIMEOUT_SECONDS = 2
 REQUEST_TIMEOUT_SECONDS = 5
+# Total wall-clock budget for one HTTP request (r2 suggestion 7).
+# Per-recv timeout alone cannot bound a slow drip (one byte every few seconds).
+REQUEST_DEADLINE_SECONDS = 10
+# Cap concurrent handler threads so ThreadingHTTPServer cannot grow without
+# bound (r2 suggestion 7). Excess connections get 503 + Connection: close.
+MAX_CONCURRENT_DEFAULT = 32
 PRUNE_INTERVAL_SECONDS = 3600.0
 # Cap in-memory rate-limit maps so a spoofed-XFF flood cannot grow them
 # without bound (r2 A3 leftover).
@@ -75,6 +82,9 @@ ENV_SYNAPSE_URL = "BOTVILLE_PAIR_REDEEM_SYNAPSE_URL"
 ENV_SYNAPSE_ADMIN_TOKEN = "BOTVILLE_PAIR_REDEEM_SYNAPSE_ADMIN_TOKEN"
 ENV_AUTH_EXPIRES_MS = "BOTVILLE_PAIR_REDEEM_TOKEN_EXPIRES_IN_MS"
 ENV_ISSUER_TIMEOUT = "BOTVILLE_PAIR_REDEEM_ISSUER_TIMEOUT_SECONDS"
+ENV_REQUEST_TIMEOUT = "BOTVILLE_PAIR_REDEEM_REQUEST_TIMEOUT_SECONDS"
+ENV_REQUEST_DEADLINE = "BOTVILLE_PAIR_REDEEM_REQUEST_DEADLINE_SECONDS"
+ENV_MAX_CONCURRENT = "BOTVILLE_PAIR_REDEEM_MAX_CONCURRENT"
 
 
 class ConfigError(Exception):
@@ -230,6 +240,112 @@ def parse_bind(raw, default="127.0.0.1:8092"):
         raise ConfigError("%s port is not an integer" % ENV_BIND)
 
 
+def allow_bind_host(host):
+    """Loopback, unspecified (0.0.0.0/::), or private. Reject public binds."""
+    if host in ("localhost",):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_unspecified or ip.is_loopback or ip.is_private
+
+
+def _is_http_trusted_ip(ip):
+    """HTTP (cleartext) admin calls: loopback or RFC1918/ULA only.
+
+    Link-local (169.254.0.0/16, fe80::/10) is excluded so an admin
+    token cannot be sent to cloud metadata endpoints.
+    """
+    if ip.is_loopback:
+        return True
+    if ip.is_private and not ip.is_link_local:
+        return True
+    return False
+
+
+def _is_docker_service_host(host):
+    if not host or "." in host or ":" in host or "%" in host:
+        return False
+    if host[0] == "-" or host[-1] == "-":
+        return False
+    return all(c.isalnum() or c == "-" for c in host) and len(host) <= 63
+
+
+def require_admin_token(token):
+    """Reject empty/whitespace/control tokens. Never include the value."""
+    if not isinstance(token, str) or not token:
+        raise ConfigError("%s is missing" % ENV_SYNAPSE_ADMIN_TOKEN)
+    if any(ch.isspace() or ord(ch) < 0x20 or ch == "\x7f" for ch in token):
+        raise ConfigError("%s contains whitespace or control characters"
+                          % ENV_SYNAPSE_ADMIN_TOKEN)
+    return token
+
+
+def validate_synapse_admin_url(raw, resolve=False):
+    """Return a canonical base URL, or raise ConfigError.
+
+    https is allowed for any host (redirects are still refused at request
+    time). http is only allowed for loopback, RFC1918/ULA literals, or a
+    single-label docker-compose service name; when resolve=True the
+    resolved addresses must also be trusted. Userinfo is rejected so a
+    token cannot be embedded in the URL.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        raise ConfigError("%s is missing" % ENV_SYNAPSE_URL)
+    url = raw.strip().rstrip("/")
+    if any(ch.isspace() or ord(ch) < 0x20 or ch == "\x7f" for ch in url):
+        raise ConfigError("%s is not a valid URL" % ENV_SYNAPSE_URL)
+    try:
+        parts = urllib.parse.urlsplit(url)
+        parts.port
+    except ValueError as exc:
+        raise ConfigError("%s is not a valid URL" % ENV_SYNAPSE_URL) from exc
+    if parts.scheme not in ("http", "https"):
+        raise ConfigError("%s must be an http(s) URL" % ENV_SYNAPSE_URL)
+    if parts.username is not None or parts.password is not None:
+        raise ConfigError("%s must not include userinfo" % ENV_SYNAPSE_URL)
+    host = parts.hostname
+    if not host or parts.query or parts.fragment:
+        raise ConfigError("%s must be an http(s) URL without query or fragment"
+                          % ENV_SYNAPSE_URL)
+    if parts.scheme == "http":
+        try:
+            ip = ipaddress.ip_address(host)
+            if not _is_http_trusted_ip(ip):
+                raise ConfigError(
+                    "%s http URL must target loopback or a private network"
+                    % ENV_SYNAPSE_URL)
+        except ValueError:
+            if host != "localhost" and not _is_docker_service_host(host):
+                raise ConfigError(
+                    "%s http URL must be loopback, a private IP, or a "
+                    "docker-internal service name" % ENV_SYNAPSE_URL)
+        if resolve:
+            _require_resolved_http_trusted(host)
+    return url
+
+
+def _require_resolved_http_trusted(host):
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise IssuerError("http_unavailable") from exc
+    if not infos:
+        raise IssuerError("http_unavailable")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if not _is_http_trusted_ip(ip):
+            raise IssuerError("untrusted_destination")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect so a 3xx cannot leak the admin token."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise IssuerError("redirect_refused")
+
+
 class PairRedeemConfig:
     def __init__(self, ip_limit=IP_LIMIT_DEFAULT,
                  global_limit=GLOBAL_LIMIT_DEFAULT,
@@ -240,6 +356,8 @@ class PairRedeemConfig:
                  synapse_url="", synapse_admin_token="",
                  auth_expires_in_ms=AUTH_EXPIRES_IN_MS,
                  request_timeout=REQUEST_TIMEOUT_SECONDS,
+                 request_deadline=REQUEST_DEADLINE_SECONDS,
+                 max_concurrent=MAX_CONCURRENT_DEFAULT,
                  issuer_timeout=ISSUER_TIMEOUT_SECONDS):
         self.ip_limit = ip_limit
         self.global_limit = global_limit
@@ -252,6 +370,8 @@ class PairRedeemConfig:
         self.synapse_admin_token = synapse_admin_token or ""
         self.auth_expires_in_ms = auth_expires_in_ms
         self.request_timeout = request_timeout
+        self.request_deadline = request_deadline
+        self.max_concurrent = max_concurrent
         self.issuer_timeout = issuer_timeout
 
     @classmethod
@@ -271,6 +391,12 @@ class PairRedeemConfig:
                                         AUTH_EXPIRES_IN_MS),
             issuer_timeout=_env_int(env, ENV_ISSUER_TIMEOUT,
                                     ISSUER_TIMEOUT_SECONDS),
+            request_timeout=_env_int(env, ENV_REQUEST_TIMEOUT,
+                                     REQUEST_TIMEOUT_SECONDS),
+            request_deadline=_env_int(env, ENV_REQUEST_DEADLINE,
+                                      REQUEST_DEADLINE_SECONDS),
+            max_concurrent=_env_int(env, ENV_MAX_CONCURRENT,
+                                    MAX_CONCURRENT_DEFAULT),
         )
 
 
@@ -287,13 +413,8 @@ class SynapseRegistrationTokenIssuer:
     """
 
     def __init__(self, base_url, admin_token, timeout=ISSUER_TIMEOUT_SECONDS):
-        if not base_url or not admin_token:
-            raise ConfigError(
-                "registration token issuer requires %s and %s"
-                % (ENV_SYNAPSE_URL, ENV_SYNAPSE_ADMIN_TOKEN)
-            )
-        self.base_url = base_url.rstrip("/")
-        self._token = admin_token
+        self.base_url = validate_synapse_admin_url(base_url, resolve=False)
+        self._token = require_admin_token(admin_token)
         self.timeout = timeout
 
     def issue(self, expires_in_ms, now=None):
@@ -311,7 +432,15 @@ class SynapseRegistrationTokenIssuer:
                 "Content-Type": "application/json",
             },
         )
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        # Re-check http destinations after DNS so a compose name cannot
+        # later resolve to a public address. Never follow redirects.
+        parts = urllib.parse.urlsplit(self.base_url)
+        if parts.scheme == "http":
+            _require_resolved_http_trusted(parts.hostname)
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            _NoRedirect(),
+        )
         try:
             try:
                 response = opener.open(request, timeout=self.timeout)
@@ -320,8 +449,12 @@ class SynapseRegistrationTokenIssuer:
             with response:
                 status = getattr(response, "status", None) or response.getcode()
                 raw = response.read(4096)
+        except IssuerError:
+            raise
         except Exception:
             raise IssuerError("http_unavailable") from None
+        if 300 <= int(status) < 400:
+            raise IssuerError("redirect_refused")
         if status != 200:
             raise IssuerError("unusable_result")
         try:
@@ -460,8 +593,15 @@ class PairRedeemApp:
     def make_server(self, host=None, port=None):
         host = self.config.bind_host if host is None else host
         port = self.config.bind_port if port is None else port
+        if not allow_bind_host(host):
+            raise ConfigError(
+                "%s host %r is not loopback, private, or unspecified"
+                % (ENV_BIND, host)
+            )
         handler = _handler_for(self)
         handler.timeout = self.config.request_timeout
+        max_concurrent = self.config.max_concurrent
+        deadline = self.config.request_deadline
 
         class Server(ThreadingHTTPServer):
             daemon_threads = True
@@ -469,7 +609,54 @@ class PairRedeemApp:
             # serve_forever does not consult Server.timeout; the
             # per-recv deadline is handler.timeout (set above).
 
+            def __init__(self, addr, handler_cls):
+                ThreadingHTTPServer.__init__(self, addr, handler_cls)
+                self._pair_sema = threading.BoundedSemaphore(max_concurrent)
+                self._pair_deadline = deadline
+
+            def process_request(self, request, client_address):
+                if not self._pair_sema.acquire(blocking=False):
+                    _reject_busy(request)
+                    return
+                try:
+                    ThreadingHTTPServer.process_request(
+                        self, request, client_address)
+                except Exception:
+                    self._pair_sema.release()
+                    raise
+
+            def process_request_thread(self, request, client_address):
+                try:
+                    ThreadingHTTPServer.process_request_thread(
+                        self, request, client_address)
+                finally:
+                    self._pair_sema.release()
+
         return Server((host, port), handler)
+
+
+def _reject_busy(sock):
+    """503 + close when the concurrent-request cap is already full."""
+    body = b'{"error":"temporarily unavailable"}'
+    payload = (
+        b"HTTP/1.1 503 Service Unavailable\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n"
+        b"Connection: close\r\n"
+        b"\r\n" + body
+    )
+    try:
+        sock.sendall(payload)
+    except OSError:
+        pass
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
 
 
 def start_pruner(app, interval=PRUNE_INTERVAL_SECONDS, stop=None):
@@ -539,6 +726,37 @@ def _handler_for(app):
             # Request line only; never interpolate a body or token.
             log.info("%s %s", self.address_string(), fmt % args)
 
+        def handle_one_request(self):
+            self._deadline = time.monotonic() + app.config.request_deadline
+            try:
+                self._arm_socket_timeout()
+                BaseHTTPRequestHandler.handle_one_request(self)
+            except (TimeoutError, socket.timeout):
+                # Mid-line deadline or a timeout that escaped do_POST:
+                # close the connection; do_POST already emits 400 when it can.
+                self.close_connection = True
+
+        def _arm_socket_timeout(self):
+            left = self._deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("request_deadline")
+            cap = self.timeout or REQUEST_TIMEOUT_SECONDS
+            self.connection.settimeout(min(cap, left))
+
+        def _read_exactly(self, length):
+            """Read length bytes, re-arming the total deadline on every chunk."""
+            buf = bytearray()
+            while len(buf) < length:
+                self._arm_socket_timeout()
+                # read1: at most one underlying recv, so a slow drip cannot
+                # reset the socket timeout inside a single buffered read().
+                want = min(2048, length - len(buf))
+                piece = self.rfile.read1(want) if hasattr(self.rfile, "read1") else self.rfile.read(want)
+                if not piece:
+                    break
+                buf.extend(piece)
+            return bytes(buf)
+
         def _client_ip(self):
             return client_ip(self.client_address[0], self.headers,
                              app.config.trusted_proxies)
@@ -592,6 +810,7 @@ def _handler_for(app):
             try:
                 app.check_rate_limit(ip)
                 try:
+                    self._arm_socket_timeout()
                     # Any Transfer-Encoding (including chunked) is rejected
                     # closed; we do not parse chunked bodies.
                     if (self.headers.get("Transfer-Encoding") or "").strip():
@@ -616,7 +835,7 @@ def _handler_for(app):
                         # Do not slurp an oversized body into memory.
                         self._close_unread()
                         self._reject(ip, "body_too_large")
-                    raw = self.rfile.read(length)
+                    raw = self._read_exactly(length)
                     if len(raw) != length:
                         self._close_unread()
                         self._reject(ip, "short_body")
@@ -652,6 +871,18 @@ def _handler_for(app):
                 self._send_json(503, {"error": "temporarily unavailable"})
 
         def do_GET(self):
+            path = self.path.split("?", 1)[0]
+            if path == "/health":
+                # Compose liveness only; not part of the App contract.
+                self.close_connection = True
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             self._method_not_allowed()
 
         def do_PUT(self):

@@ -573,6 +573,35 @@ jobs:
       - name: Swift unit and integration tests
         run: swift test
 
+  pair-redeem-e2e:
+    name: pair-redeem-e2e (synapse, isolated)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Isolated pair_redeem e2e (not a real HTTPS or phone scan)
+        run: make pair-redeem-e2e
+
+      - name: Dump logs
+        if: failure()
+        run: |
+          docker compose -p botville-pair-redeem-e2e \
+            -f server/compose/pair-redeem-e2e.yml \
+            --env-file server/compose/generated/pair-redeem-e2e.env \
+            --profile pair-redeem \
+            logs --no-color || true
+
+      - name: Teardown isolated project
+        if: always()
+        run: |
+          docker compose -p botville-pair-redeem-e2e \
+            -f server/compose/pair-redeem-e2e.yml \
+            --env-file server/compose/generated/pair-redeem-e2e.env \
+            --profile pair-redeem \
+            down -v --remove-orphans || true
+
+
   lint:
     name: lint
     runs-on: ubuntu-latest
@@ -655,6 +684,10 @@ jobs:
             BOTVILLE_HOMESERVER="${hs}" GATEWAY_MATRIX_TRANSPORT="${transport}" \
               docker compose -f server/compose/docker-compose.yml \
               --env-file server/compose/.env --profile "${hs}" --profile pairing config --quiet
+            echo "== docker compose config --profile ${hs} --profile pair-redeem (A-R7)"
+            BOTVILLE_HOMESERVER="${hs}" GATEWAY_MATRIX_TRANSPORT="${transport}" \
+              docker compose -f server/compose/docker-compose.yml \
+              --env-file server/compose/.env --profile "${hs}" --profile pair-redeem config --quiet
           done
           echo "== docker compose config (federation, A2.1)"
           python3 server/scripts/federation-setup.py

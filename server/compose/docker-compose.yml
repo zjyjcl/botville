@@ -53,8 +53,8 @@ name: botville
 # fedgate-a/b are federation-stack names, kept here so the same list serves
 # it — see server/tests/test_compose_noproxy.py).
 x-noproxy-env: &noproxy-env
-  NO_PROXY: "localhost,127.0.0.1,::1,sygnal,postgres,synapse,tuwunel,continuwuity,gateway,admin,synapse-a,synapse-b,pairing-a,pairing-b,fedgate-a,fedgate-b,hs-a,hs-b,.local,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${BOTVILLE_NO_PROXY_EXTRA:+,${BOTVILLE_NO_PROXY_EXTRA}}"
-  no_proxy: "localhost,127.0.0.1,::1,sygnal,postgres,synapse,tuwunel,continuwuity,gateway,admin,synapse-a,synapse-b,pairing-a,pairing-b,fedgate-a,fedgate-b,hs-a,hs-b,.local,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${BOTVILLE_NO_PROXY_EXTRA:+,${BOTVILLE_NO_PROXY_EXTRA}}"
+  NO_PROXY: "localhost,127.0.0.1,::1,sygnal,postgres,synapse,tuwunel,continuwuity,gateway,admin,pair-redeem,synapse-a,synapse-b,pairing-a,pairing-b,fedgate-a,fedgate-b,hs-a,hs-b,.local,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${BOTVILLE_NO_PROXY_EXTRA:+,${BOTVILLE_NO_PROXY_EXTRA}}"
+  no_proxy: "localhost,127.0.0.1,::1,sygnal,postgres,synapse,tuwunel,continuwuity,gateway,admin,pair-redeem,synapse-a,synapse-b,pairing-a,pairing-b,fedgate-a,fedgate-b,hs-a,hs-b,.local,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${BOTVILLE_NO_PROXY_EXTRA:+,${BOTVILLE_NO_PROXY_EXTRA}}"
 
 services:
   postgres:
@@ -527,6 +527,53 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  pair-redeem:
+    # App QR redeem (A-R7 / #128): POST /_botville/pair/redeem.
+    # Optional profile `pair-redeem`, default OFF. `make up` does not start
+    # this service and does not require a Synapse admin token. Enable with
+    # `make up HS=synapse PAIR_REDEEM=1` after setting
+    # BOTVILLE_PAIR_REDEEM_SYNAPSE_ADMIN_TOKEN to a Synapse admin access
+    # token. First cut is Synapse + registration_token only; this is NOT
+    # the federation /v1/pairing/redeem service, and it does not open
+    # pairing inbound or the relations bridge.
+    # Why default off: the process talks to Synapse's admin API with a
+    # privileged token. Leave it unstarted until that token is provided
+    # and the operator explicitly opts in.
+    # Host port is loopback only. Inside the isolated compose network the
+    # process binds 0.0.0.0:8092 so the published loopback port can reach
+    # it; public unicast binds are refused. HTTPS/Caddy edge is later work.
+    # Same pinned python image as `pairing` (no extra digest to keep in
+    # sync). Read-only bind of server/pair_redeem; state in pair-redeem-data.
+    image: ${PAIRING_IMAGE:-docker.io/library/python:3.12-slim@sha256:b18b261e1b4974b4f321451ad5251ded85abb22c2b8b262da527dda1d031ab30}
+    profiles: [pair-redeem]
+    working_dir: /app
+    command: python -m pair_redeem
+    environment:
+      <<: *noproxy-env
+      BOTVILLE_PAIR_REDEEM_BIND: "0.0.0.0:8092"
+      BOTVILLE_PAIR_REDEEM_DB: /data/pair_redeem.db
+      # http://synapse:8008 is docker-internal HTTP, allowed by the
+      # issuer allowlist. Do not point this at a public http URL.
+      BOTVILLE_PAIR_REDEEM_SYNAPSE_URL: ${BOTVILLE_PAIR_REDEEM_SYNAPSE_URL:-http://synapse:8008}
+      BOTVILLE_PAIR_REDEEM_SYNAPSE_ADMIN_TOKEN: ${BOTVILLE_PAIR_REDEEM_SYNAPSE_ADMIN_TOKEN:-}
+      BOTVILLE_PAIR_REDEEM_TRUSTED_PROXIES: ${BOTVILLE_PAIR_REDEEM_TRUSTED_PROXIES:-}
+    ports:
+      - "127.0.0.1:${BOTVILLE_PAIR_REDEEM_PORT:-8092}:8092"
+    volumes:
+      - ../pair_redeem:/app/pair_redeem:ro
+      - pair-redeem-data:/data
+    depends_on:
+      synapse:
+        condition: service_healthy
+        required: false
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8092/health', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
 networks:
   default:
     ipam:
@@ -561,3 +608,8 @@ volumes:
   # `pairing`（`make up PAIRING=1`）挂在 /data。`make down` 不删卷；带
   # `--profile pairing` 的 down -v 会删。删掉就等于和所有对端解除配对。
   pairing-data:
+  # App QR redeem state (A-R7 / #128): pair_redeem.db, optional profile
+  # `pair-redeem` (`make up PAIR_REDEEM=1`) mounted at /data. `make down`
+  # does not delete the volume; `docker compose --profile pair-redeem down -v`
+  # will. This store is not the federation pairing DB.
+  pair-redeem-data:

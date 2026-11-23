@@ -1,11 +1,11 @@
 """Run the App QR redeem server: python -m pair_redeem.
 
-Default bind is 127.0.0.1:8092. Refuses a non-loopback bind so this
-process cannot accidentally publish the endpoint. Compose/edge wiring
-is a later cut.
+Default bind is 127.0.0.1:8092. Public unicast binds are refused.
+0.0.0.0 / private addresses are allowed for an isolated compose
+network; the host port must still be published on 127.0.0.1 only.
+HTTPS/Caddy edge is a later cut.
 """
 
-import ipaddress
 import logging
 import os
 import sys
@@ -15,6 +15,7 @@ from .service import (
     PairRedeemApp,
     PairRedeemConfig,
     SynapseRegistrationTokenIssuer,
+    allow_bind_host,
     start_pruner,
 )
 from .store import PairRedeemStore
@@ -27,13 +28,11 @@ def main(env=None):
         config = PairRedeemConfig.from_env(env)
     except ConfigError as exc:
         raise SystemExit(str(exc))
-    try:
-        if not ipaddress.ip_address(config.bind_host).is_loopback:
-            raise SystemExit(
-                "BOTVILLE_PAIR_REDEEM_BIND must be a loopback address in this build"
-            )
-    except ValueError:
-        raise SystemExit("BOTVILLE_PAIR_REDEEM_BIND host is not a valid IP")
+    if not allow_bind_host(config.bind_host):
+        raise SystemExit(
+            "BOTVILLE_PAIR_REDEEM_BIND must be loopback, private, or "
+            "unspecified (0.0.0.0); public binds are refused"
+        )
     try:
         issuer = SynapseRegistrationTokenIssuer(
             config.synapse_url, config.synapse_admin_token,
