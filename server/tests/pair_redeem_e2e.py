@@ -58,6 +58,8 @@ COMPOSE_FILE = os.path.join(ROOT, "server", "compose", "pair-redeem-e2e.yml")
 OFFICIAL_COMPOSE = os.path.join(ROOT, "server", "compose", "docker-compose.yml")
 GENERATED = os.path.join(ROOT, "server", "compose", "generated", "pair-redeem-e2e")
 ENV_FILE = os.path.join(ROOT, "server", "compose", "generated", "pair-redeem-e2e.env")
+HOMESERVER_FILE = os.path.join(GENERATED, "synapse", "homeserver.yaml")
+LOG_DUMP = os.path.join(GENERATED, "compose-logs.txt")
 TEMPLATE = os.path.join(ROOT, "server", "compose", "synapse", "homeserver.yaml.tmpl")
 HS_PLACEHOLDER = "https://hs.example.org"
 GW_PLACEHOLDER = "https://gw.example.org"
@@ -320,6 +322,40 @@ def compose_logs(service=None):
     return proc.stdout.decode("utf-8", "replace")
 
 
+# Accumulated compose logs so --force-recreate cannot drop earlier
+# container output before the final leak check.
+_captured_logs = []
+
+
+def snapshot_logs(label):
+    """Collect current logs into the buffer and the on-disk dump for CI."""
+    redeem_logs = compose_logs("pair-redeem")
+    all_logs = compose_logs()
+    _captured_logs.append((label, redeem_logs, all_logs))
+    try:
+        os.makedirs(GENERATED, mode=0o700, exist_ok=True)
+        with open(LOG_DUMP, "a", encoding="utf-8") as fh:
+            fh.write("\n===== %s pair-redeem =====\n" % label)
+            fh.write(redeem_logs)
+            fh.write("\n===== %s all =====\n" % label)
+            fh.write(all_logs)
+        os.chmod(LOG_DUMP, 0o600)
+    except OSError:
+        pass
+    return redeem_logs, all_logs
+
+
+def recreate_pair_redeem(env_map):
+    """Write env, snapshot logs, then force-recreate pair-redeem only."""
+    snapshot_logs("before-recreate")
+    write_env(env_map)
+    proc = run(
+        compose_cmd(True) + ["up", "-d", "--force-recreate", "--no-deps",
+                             "pair-redeem"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    return proc
+
+
 def assert_no_secrets(blobs, secrets_list, label):
     for item in secrets_list:
         if not item:
@@ -366,7 +402,7 @@ def main():
         "PAIR_REDEEM_E2E_CONFIG": GENERATED,
     }
     os.makedirs(GENERATED, mode=0o700, exist_ok=True)
-    render_homeserver(env_map, os.path.join(GENERATED, "synapse", "homeserver.yaml"))
+    render_homeserver(env_map, HOMESERVER_FILE)
     write_env(env_map)
 
     synapse = "http://127.0.0.1:%d" % SYNAPSE_PORT
@@ -376,8 +412,19 @@ def main():
     issued_reg_tokens = []
 
     def teardown():
+        try:
+            if started:
+                snapshot_logs("teardown")
+        except Exception:
+            pass
         run(compose_cmd(True) + ["down", "-v", "--remove-orphans"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Drop generated secrets; leave LOG_DUMP for CI failure dump.
+        for path in (ENV_FILE, HOMESERVER_FILE):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     def handle_sig(_signum, _frame):
         teardown()
@@ -486,6 +533,7 @@ def main():
 
         step("enabled: redeem succeeds and registration_token registers a user",
              enable_and_redeem_success)
+        snapshot_logs("after-success-redeem")
 
         def negatives():
             used = issued_codes[0]
@@ -516,11 +564,7 @@ def main():
 
             # Rate limit: lower the IP cap and recreate.
             env_map["BOTVILLE_PAIR_REDEEM_IP_LIMIT"] = "2"
-            write_env(env_map)
-            proc = run(
-                compose_cmd(True) + ["up", "-d", "--force-recreate", "--no-deps",
-                                     "pair-redeem"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            proc = recreate_pair_redeem(env_map)
             expect(proc.returncode == 0, "recreate for rate limit failed")
             wait_http("http://127.0.0.1:%d/health" % REDEEM_PORT, timeout=60)
             # Two attempts consume the cap (used + unknown both count).
@@ -536,11 +580,7 @@ def main():
         def issuer_failure_rolls_back():
             env_map["BOTVILLE_PAIR_REDEEM_IP_LIMIT"] = "10"
             env_map["BOTVILLE_PAIR_REDEEM_SYNAPSE_ADMIN_TOKEN"] = "invalid-admin-token-not-a-secret"
-            write_env(env_map)
-            proc = run(
-                compose_cmd(True) + ["up", "-d", "--force-recreate", "--no-deps",
-                                     "pair-redeem"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            proc = recreate_pair_redeem(env_map)
             expect(proc.returncode == 0, "recreate with bad token failed")
             wait_http("http://127.0.0.1:%d/health" % REDEEM_PORT, timeout=60)
             pending = make_code(5)
@@ -555,17 +595,20 @@ def main():
         step("issuer failure does not consume the code", issuer_failure_rolls_back)
 
         def no_secret_leak():
-            redeem_logs = compose_logs("pair-redeem")
-            all_logs = compose_logs()
+            snapshot_logs("final")
+            redeem_logs = [blob for _, blob, _ in _captured_logs]
+            all_logs = [blob for _, _, blob in _captured_logs]
             events = audit_events()
             event_text = json.dumps(events, ensure_ascii=False)
             # pair_redeem logs + audit must not contain codes, issued
-            # registration tokens, or the admin token.
+            # registration tokens, or the admin token. Include snapshots
+            # taken before each --force-recreate so success-stage logs
+            # are not dropped with the old container.
             redeem_secrets = list(issued_codes) + list(issued_reg_tokens)
             redeem_secrets.append(admin_token)
             redeem_secrets.append(env_map["BOTVILLE_PAIR_REDEEM_SYNAPSE_ADMIN_TOKEN"])
             assert_no_secrets(
-                [redeem_logs, event_text],
+                redeem_logs + [event_text],
                 [s for s in redeem_secrets if s],
                 "pair_redeem logs/audit")
             # Other containers (especially Synapse) may log a token they
@@ -576,7 +619,7 @@ def main():
             stack_secrets.append(shared)
             stack_secrets.append(postgres_pw)
             assert_no_secrets(
-                [all_logs], [s for s in stack_secrets if s],
+                all_logs, [s for s in stack_secrets if s],
                 "compose logs")
             for ev in events:
                 detail = ev.get("detail") or {}

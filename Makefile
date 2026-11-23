@@ -171,6 +171,11 @@ init:
 # account (one-time token from the container logs; see
 # server/scripts/bootstrap-continuwuity.sh).
 up:
+ifneq ($(PAIR_REDEEM_PROFILE),)
+ifneq ($(HS),synapse)
+	$(error PAIR_REDEEM=1 is Synapse-only in this cut; HS=$(HS) is not supported)
+endif
+endif
 	BOTVILLE_APPSERVICE_URL=$(APPSERVICE_URL) bash server/scripts/init.sh
 ifneq ($(GATEWAY_PROFILE),)
 	bash server/scripts/gateway-preflight.sh $(ENV_FILE)

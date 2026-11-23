@@ -586,6 +586,12 @@ jobs:
       - name: Dump logs
         if: failure()
         run: |
+          if [ -f server/compose/generated/pair-redeem-e2e/compose-logs.txt ]; then
+            echo "===== saved compose logs (captured before teardown) ====="
+            cat server/compose/generated/pair-redeem-e2e/compose-logs.txt
+          else
+            echo "===== no saved compose log file ====="
+          fi
           docker compose -p botville-pair-redeem-e2e \
             -f server/compose/pair-redeem-e2e.yml \
             --env-file server/compose/generated/pair-redeem-e2e.env \

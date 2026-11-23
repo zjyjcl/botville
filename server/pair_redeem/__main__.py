@@ -42,7 +42,13 @@ def main(env=None):
     store = PairRedeemStore(config.store_path)
     app = PairRedeemApp(store, issuer, config)
     start_pruner(app)
-    server = app.make_server()
+    try:
+        server = app.make_server()
+    except OSError as exc:
+        raise SystemExit(
+            "pair_redeem failed to bind %s:%s: %s"
+            % (config.bind_host, config.bind_port, exc)
+        )
     host, port = server.server_address
     # Do not print any token or path that might include a secret.
     sys.stderr.write("pair_redeem listening on %s:%s\n" % (host, port))

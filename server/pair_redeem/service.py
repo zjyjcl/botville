@@ -11,10 +11,12 @@ This module does not import or call the federation pairing redeem path.
 """
 
 import collections
+import http.client
 import ipaddress
 import json
 import logging
 import socket
+import ssl
 import threading
 import time
 import urllib.error
@@ -192,14 +194,22 @@ def client_ip(direct, headers, trusted_proxies):
     """Same rule as A2.1 pairing: honour X-Forwarded-For only if the
     direct peer is in the trusted-proxy set; use the last hop."""
     try:
-        address = ipaddress.ip_address(direct)
+        raw = ipaddress.ip_address(direct)
+        address = _canonical_ip(raw)
     except ValueError:
         return direct
     for network in trusted_proxies:
-        if address in network:
+        try:
+            matched = address in network
+        except TypeError:
+            matched = False
+        if matched:
             forwarded = (headers.get("X-Forwarded-For") or "").split(",")
             last = forwarded[-1].strip() if forwarded else ""
-            return last or direct
+            return last or str(address)
+    # Unpack IPv4-mapped peers so rate-limit buckets match the embedded IPv4.
+    if getattr(raw, "ipv4_mapped", None) is not None:
+        return str(address)
     return direct
 
 
@@ -240,23 +250,52 @@ def parse_bind(raw, default="127.0.0.1:8092"):
         raise ConfigError("%s port is not an integer" % ENV_BIND)
 
 
+def _canonical_ip(ip):
+    """Unpack IPv4-mapped IPv6 so classifiers see the embedded IPv4.
+
+    Python treats the whole ::ffff:0:0/96 prefix as private, which would
+    otherwise let ::ffff:8.8.8.8 and ::ffff:169.254.169.254 through the
+    http-target and bind allowlists. Same idea as
+    server/pairing/relations.py _non_public.
+    """
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return mapped if mapped is not None else ip
+
+
 def allow_bind_host(host):
-    """Loopback, unspecified (0.0.0.0/::), or private. Reject public binds."""
+    """Loopback, unspecified (0.0.0.0/::), or private. Reject public binds.
+
+    Link-local is refused (cloud metadata). IPv4-mapped IPv6 is unpacked
+    before the check so ::ffff:8.8.8.8 cannot slip through as 'private'.
+    """
     if host in ("localhost",):
         return True
     try:
-        ip = ipaddress.ip_address(host)
+        ip = _canonical_ip(ipaddress.ip_address(host))
     except ValueError:
         return False
+    if ip.is_link_local:
+        return False
     return ip.is_unspecified or ip.is_loopback or ip.is_private
+
+
+def _bind_address_family(host):
+    """AF_INET6 for IPv6 literals (::, ::1); AF_INET otherwise."""
+    try:
+        ip = _canonical_ip(ipaddress.ip_address(host))
+    except ValueError:
+        return socket.AF_INET
+    return socket.AF_INET6 if ip.version == 6 else socket.AF_INET
 
 
 def _is_http_trusted_ip(ip):
     """HTTP (cleartext) admin calls: loopback or RFC1918/ULA only.
 
     Link-local (169.254.0.0/16, fe80::/10) is excluded so an admin
-    token cannot be sent to cloud metadata endpoints.
+    token cannot be sent to cloud metadata endpoints. IPv4-mapped
+    IPv6 is unpacked first.
     """
+    ip = _canonical_ip(ip)
     if ip.is_loopback:
         return True
     if ip.is_private and not ip.is_link_local:
@@ -282,14 +321,14 @@ def require_admin_token(token):
     return token
 
 
-def validate_synapse_admin_url(raw, resolve=False):
+def validate_synapse_admin_url(raw):
     """Return a canonical base URL, or raise ConfigError.
 
     https is allowed for any host (redirects are still refused at request
-    time). http is only allowed for loopback, RFC1918/ULA literals, or a
-    single-label docker-compose service name; when resolve=True the
-    resolved addresses must also be trusted. Userinfo is rejected so a
-    token cannot be embedded in the URL.
+    time). http is only allowed for loopback, RFC1918/ULA literals (after
+    unpacking IPv4-mapped IPv6), or a single-label docker-compose service
+    name. Resolved addresses are pinned at request time, not here.
+    Userinfo is rejected so a token cannot be embedded in the URL.
     """
     if not isinstance(raw, str) or not raw.strip():
         raise ConfigError("%s is missing" % ENV_SYNAPSE_URL)
@@ -321,22 +360,199 @@ def validate_synapse_admin_url(raw, resolve=False):
                 raise ConfigError(
                     "%s http URL must be loopback, a private IP, or a "
                     "docker-internal service name" % ENV_SYNAPSE_URL)
-        if resolve:
-            _require_resolved_http_trusted(host)
     return url
 
 
-def _require_resolved_http_trusted(host):
-    try:
-        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-    except socket.gaierror as exc:
-        raise IssuerError("http_unavailable") from exc
-    if not infos:
+def _getaddrinfo_with_deadline(host, port, deadline):
+    """DNS lookup that cannot run past the issuer total deadline."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
         raise IssuerError("http_unavailable")
+    box = []
+
+    def lookup():
+        try:
+            box.append(socket.getaddrinfo(host, port, type=socket.SOCK_STREAM))
+        except Exception as exc:
+            box.append(exc)
+
+    thread = threading.Thread(target=lookup, name="pair-redeem-dns", daemon=True)
+    thread.start()
+    thread.join(remaining)
+    if thread.is_alive():
+        raise IssuerError("http_unavailable")
+    if not box:
+        raise IssuerError("http_unavailable")
+    if isinstance(box[0], Exception):
+        raise IssuerError("http_unavailable") from box[0]
+    if not box[0]:
+        raise IssuerError("http_unavailable")
+    return box[0]
+
+
+def _resolved_connect_ips(host, port, scheme, deadline):
+    """Resolve once, validate http targets, return unique connect IPs."""
+    infos = _getaddrinfo_with_deadline(host, port, deadline)
+    ips = []
+    seen = set()
     for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if not _is_http_trusted_ip(ip):
+        ip = _canonical_ip(ipaddress.ip_address(info[4][0]))
+        text = str(ip)
+        if text in seen:
+            continue
+        seen.add(text)
+        if scheme == "http" and not _is_http_trusted_ip(ip):
             raise IssuerError("untrusted_destination")
+        ips.append(text)
+    if not ips:
+        raise IssuerError("http_unavailable")
+    return ips
+
+
+def _connect_pinned(ips, port, deadline, source_address=None):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("issuer_deadline")
+    last_exc = None
+    for ip in ips:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("issuer_deadline")
+        try:
+            sock = socket.create_connection((ip, port), left, source_address)
+        except OSError as exc:
+            last_exc = exc
+            continue
+        left = deadline - time.monotonic()
+        if left <= 0:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            raise TimeoutError("issuer_deadline")
+        sock.settimeout(left)
+        return sock
+    if last_exc is not None:
+        raise last_exc
+    raise OSError("no resolved addresses")
+
+
+class _DeadlineHTTPConnection(http.client.HTTPConnection):
+    """Connect to pre-validated IPs; Host header stays the original name."""
+
+    def __init__(self, host, port=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+                 source_address=None, blocksize=8192, *, resolved_ips=None,
+                 deadline=None, sockets=None):
+        http.client.HTTPConnection.__init__(
+            self, host, port=port, timeout=timeout,
+            source_address=source_address, blocksize=blocksize)
+        self._resolved_ips = list(resolved_ips or [])
+        self._deadline = deadline
+        self._sockets = sockets
+
+    def connect(self):
+        self.sock = _connect_pinned(
+            self._resolved_ips, self.port, self._deadline, self.source_address)
+        if self._sockets is not None:
+            self._sockets.append(self.sock)
+
+
+class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
+    """Same IP pin as HTTP; SNI and cert checks use the original hostname."""
+
+    def __init__(self, host, port=None, key_file=None, cert_file=None,
+                 timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None,
+                 *, context=None, check_hostname=None, blocksize=8192,
+                 resolved_ips=None, deadline=None, sockets=None):
+        http.client.HTTPSConnection.__init__(
+            self, host, port=port, key_file=key_file, cert_file=cert_file,
+            timeout=timeout, source_address=source_address, context=context,
+            check_hostname=check_hostname, blocksize=blocksize)
+        self._resolved_ips = list(resolved_ips or [])
+        self._deadline = deadline
+        self._sockets = sockets
+
+    def connect(self):
+        sock = _connect_pinned(
+            self._resolved_ips, self.port, self._deadline, self.source_address)
+        left = self._deadline - time.monotonic()
+        if left <= 0:
+            sock.close()
+            raise TimeoutError("issuer_deadline")
+        sock.settimeout(left)
+        context = self._context
+        if context is None:
+            context = ssl.create_default_context()
+        # server_hostname=self.host keeps SNI on the original name, not the IP.
+        self.sock = context.wrap_socket(sock, server_hostname=self.host)
+        left = self._deadline - time.monotonic()
+        if left <= 0:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            raise TimeoutError("issuer_deadline")
+        self.sock.settimeout(left)
+        if self._sockets is not None:
+            self._sockets.append(self.sock)
+
+
+def _admin_opener(resolved_ips, deadline, sockets):
+    def http_class(*args, **kwargs):
+        kwargs["resolved_ips"] = resolved_ips
+        kwargs["deadline"] = deadline
+        kwargs["sockets"] = sockets
+        return _DeadlineHTTPConnection(*args, **kwargs)
+
+    def https_class(*args, **kwargs):
+        kwargs["resolved_ips"] = resolved_ips
+        kwargs["deadline"] = deadline
+        kwargs["sockets"] = sockets
+        return _DeadlineHTTPSConnection(*args, **kwargs)
+
+    class HTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(http_class, req)
+
+    class HTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(https_class, req)
+
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _NoRedirect(),
+        HTTPHandler(),
+        HTTPSHandler(),
+    )
+
+
+def _read_response_with_deadline(response, limit, deadline):
+    """Read at most limit bytes under a total deadline, not per-recv only.
+
+    Always go through HTTPResponse.read() so chunked/decoded bodies stay
+    intact; the watchdog on the issuer socket is the hard cap if a single
+    read loops internally.
+    """
+    buf = bytearray()
+    fp = getattr(response, "fp", None)
+    while len(buf) < limit:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise IssuerError("http_unavailable")
+        sock = None
+        if fp is not None:
+            raw = getattr(fp, "raw", None)
+            sock = getattr(raw, "_sock", None) if raw is not None else None
+        if sock is not None:
+            try:
+                sock.settimeout(left)
+            except OSError:
+                raise IssuerError("http_unavailable") from None
+        piece = response.read(min(256, limit - len(buf)))
+        if not piece:
+            break
+        buf.extend(piece)
+    return bytes(buf)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -413,7 +629,7 @@ class SynapseRegistrationTokenIssuer:
     """
 
     def __init__(self, base_url, admin_token, timeout=ISSUER_TIMEOUT_SECONDS):
-        self.base_url = validate_synapse_admin_url(base_url, resolve=False)
+        self.base_url = validate_synapse_admin_url(base_url)
         self._token = require_admin_token(admin_token)
         self.timeout = timeout
 
@@ -432,27 +648,52 @@ class SynapseRegistrationTokenIssuer:
                 "Content-Type": "application/json",
             },
         )
-        # Re-check http destinations after DNS so a compose name cannot
-        # later resolve to a public address. Never follow redirects.
+        # Resolve once, pin the connect IP, and keep the original Host
+        # (and HTTPS SNI) so a second DNS lookup cannot rebind mid-request.
+        # The timeout is a total deadline (DNS + connect + response), not
+        # just a per-recv socket timeout.
         parts = urllib.parse.urlsplit(self.base_url)
-        if parts.scheme == "http":
-            _require_resolved_http_trusted(parts.hostname)
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({}),
-            _NoRedirect(),
-        )
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        deadline = time.monotonic() + float(self.timeout)
+        sockets = []
+
+        def _kill_issuer_sockets():
+            for sock in list(sockets):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+        timer = threading.Timer(max(0.001, deadline - time.monotonic()),
+                                _kill_issuer_sockets)
+        timer.daemon = True
+        timer.start()
         try:
+            resolved_ips = _resolved_connect_ips(
+                parts.hostname, port, parts.scheme, deadline)
+            opener = _admin_opener(resolved_ips, deadline, sockets)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise IssuerError("http_unavailable")
             try:
-                response = opener.open(request, timeout=self.timeout)
-            except urllib.error.HTTPError as exc:
-                response = exc
-            with response:
-                status = getattr(response, "status", None) or response.getcode()
-                raw = response.read(4096)
-        except IssuerError:
-            raise
-        except Exception:
-            raise IssuerError("http_unavailable") from None
+                try:
+                    response = opener.open(request, timeout=remaining)
+                except urllib.error.HTTPError as exc:
+                    response = exc
+                with response:
+                    status = getattr(response, "status", None) or response.getcode()
+                    raw = _read_response_with_deadline(response, 4096, deadline)
+            except IssuerError:
+                raise
+            except Exception:
+                raise IssuerError("http_unavailable") from None
+        finally:
+            timer.cancel()
+            _kill_issuer_sockets()
         if 300 <= int(status) < 400:
             raise IssuerError("redirect_refused")
         if status != 200:
@@ -601,18 +842,20 @@ class PairRedeemApp:
         handler = _handler_for(self)
         handler.timeout = self.config.request_timeout
         max_concurrent = self.config.max_concurrent
-        deadline = self.config.request_deadline
+        family = _bind_address_family(host)
 
         class Server(ThreadingHTTPServer):
             daemon_threads = True
             allow_reuse_address = True
+            address_family = family
             # serve_forever does not consult Server.timeout; the
-            # per-recv deadline is handler.timeout (set above).
+            # per-recv deadline is handler.timeout (set above). The
+            # total request deadline is armed in handle_one_request.
 
             def __init__(self, addr, handler_cls):
                 ThreadingHTTPServer.__init__(self, addr, handler_cls)
                 self._pair_sema = threading.BoundedSemaphore(max_concurrent)
-                self._pair_deadline = deadline
+                self.handler_started = threading.Event()
 
             def process_request(self, request, client_address):
                 if not self._pair_sema.acquire(blocking=False):
@@ -717,24 +960,154 @@ def parse_redeem_request(raw, content_type, content_length=None):
     return code, name
 
 
+def _strip_request_query(text):
+    """Drop ?query from anything that looks like a request line or path."""
+    s = str(text)
+    out = []
+    i = 0
+    while True:
+        q = s.find("?", i)
+        if q < 0:
+            out.append(s[i:])
+            break
+        out.append(s[i:q])
+        j = q + 1
+        while j < len(s) and not s[j].isspace():
+            j += 1
+        i = j
+    return "".join(out)
+
+
+class _DeadlineRFile:
+    """rfile wrapper that re-arms the total deadline on every recv.
+
+    readline/read pull modest chunks (one underlying recv via read1) so a
+    slow drip cannot reset a per-recv timeout, but a complete request
+    already in the kernel is buffered in user space. That avoids a TCP
+    RST on close when an unread leftover body remains only in the kernel.
+    """
+
+    def __init__(self, rfile, arm):
+        self._rfile = rfile
+        self._arm = arm
+        self._buf = bytearray()
+
+    def _pull(self, want):
+        self._arm()
+        want = max(1, int(want))
+        if hasattr(self._rfile, "read1"):
+            return self._rfile.read1(want)
+        return self._rfile.read(want)
+
+    def readline(self, limit=-1):
+        cap = 65537 if limit is None or limit < 0 else limit
+        while b"\n" not in self._buf and len(self._buf) < cap:
+            piece = self._pull(min(8192, cap - len(self._buf)))
+            if not piece:
+                break
+            self._buf.extend(piece)
+        if b"\n" in self._buf:
+            idx = self._buf.index(b"\n") + 1
+            if idx > cap:
+                idx = cap
+        else:
+            idx = min(len(self._buf), cap)
+        line = bytes(self._buf[:idx])
+        del self._buf[:idx]
+        return line
+
+    def read(self, n=-1):
+        if n is None or n < 0:
+            self._arm()
+            rest = bytes(self._buf) + self._rfile.read(n)
+            self._buf.clear()
+            return rest
+        while len(self._buf) < n:
+            piece = self._pull(min(2048, n - len(self._buf)))
+            if not piece:
+                break
+            self._buf.extend(piece)
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
+        return out
+
+    def read1(self, n=-1):
+        if self._buf:
+            if n is None or n < 0:
+                n = len(self._buf)
+            out = bytes(self._buf[:n])
+            del self._buf[:n]
+            return out
+        return self._pull(2048 if n is None or n < 0 else n)
+
+    def __getattr__(self, name):
+        return getattr(self._rfile, name)
+
+
 def _handler_for(app):
     class PairRedeemHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         timeout = REQUEST_TIMEOUT_SECONDS
 
+        def _safe_requestline(self):
+            raw = self.requestline or ""
+            parts = raw.split()
+            if len(parts) >= 2:
+                method = parts[0]
+                path = parts[1].split("?", 1)[0]
+                version = parts[2] if len(parts) > 2 else ""
+                return " ".join(x for x in (method, path, version) if x)
+            return _strip_request_query(raw) or "-"
+
         def log_message(self, fmt, *args):
-            # Request line only; never interpolate a body or token.
-            log.info("%s %s", self.address_string(), fmt % args)
+            # Never interpolate a body, token, or raw query string (a
+            # client might put a redeem code in ?code=).
+            try:
+                text = fmt % args if args else str(fmt)
+            except (TypeError, ValueError):
+                text = " ".join(str(x) for x in (fmt,) + args)
+            log.info("%s %s", self.address_string(), _strip_request_query(text))
+
+        def log_request(self, code="-", size="-"):
+            self.log_message('"%s" %s', self._safe_requestline(), str(code))
+
+        def log_error(self, fmt, *args):
+            self.log_message(fmt, *args)
 
         def handle_one_request(self):
+            started = getattr(self.server, "handler_started", None)
+            if started is not None:
+                started.set()
             self._deadline = time.monotonic() + app.config.request_deadline
+            if not isinstance(self.rfile, _DeadlineRFile):
+                self.rfile = _DeadlineRFile(self.rfile, self._arm_socket_timeout)
+
+            def _kill_request_socket():
+                self.close_connection = True
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    self.connection.close()
+                except OSError:
+                    pass
+
+            left = self._deadline - time.monotonic()
+            timer = threading.Timer(max(0.0, left), _kill_request_socket)
+            timer.daemon = True
+            timer.start()
             try:
                 self._arm_socket_timeout()
                 BaseHTTPRequestHandler.handle_one_request(self)
-            except (TimeoutError, socket.timeout):
-                # Mid-line deadline or a timeout that escaped do_POST:
-                # close the connection; do_POST already emits 400 when it can.
+            except (TimeoutError, socket.timeout, ConnectionResetError,
+                    ConnectionAbortedError, BrokenPipeError, OSError):
+                # Mid-line deadline, watchdog close, or a timeout that
+                # escaped do_POST: drop the connection. do_POST already
+                # emits 400 when it can.
                 self.close_connection = True
+            finally:
+                timer.cancel()
 
         def _arm_socket_timeout(self):
             left = self._deadline - time.monotonic()
@@ -808,6 +1181,12 @@ def _handler_for(app):
                 return
             ip = self._client_ip()
             try:
+                if "?" in (self.path or ""):
+                    # Contract puts the code in the JSON body. A query
+                    # string is rejected so it cannot be processed or
+                    # logged raw.
+                    self._close_unread()
+                    self._reject(ip, "invalid_request")
                 app.check_rate_limit(ip)
                 try:
                     self._arm_socket_timeout()
