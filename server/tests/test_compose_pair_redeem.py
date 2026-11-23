@@ -164,7 +164,9 @@ class PairRedeemEdgeCaddyfileTests(unittest.TestCase):
             if ln.strip() and not ln.strip().startswith("#"))
         self.assertIn("request>headers>Authorization delete", active)
         self.assertIn("request>headers>Cookie delete", active)
-        self.assertIn(r"request>uri regexp \?.*$", active)
+        # Site access log and the global default/error logger both need
+        # the regexp; `query delete` is still banned on active lines.
+        self.assertGreaterEqual(active.count(r"request>uri regexp \?.*$"), 2)
         self.assertNotIn("query delete", active)
 
 

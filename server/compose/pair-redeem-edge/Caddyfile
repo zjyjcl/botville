@@ -14,10 +14,23 @@
 # settings, and production certificates do not belong in this repository.
 # Issuance API/UI/CLI is out of this PR and must never be exposed on a
 # public edge or offered without authentication.
-
 {
 	auto_https off
 	admin off
+	# Site `log` below is the access log only. Error logs
+	# (`http.log.error.log0`, for example a 502 when the backend
+	# is down) use the default logger and would keep the raw URI
+	# query unless this global filter also strips `?...`.
+	# Authorization and Cookie are already REDACTED by Caddy in
+	# error logs; do not weaken that.
+	log {
+		format filter {
+			wrap json
+			fields {
+				request>uri regexp \?.*$
+			}
+		}
+	}
 }
 
 # Listen on 8443 only (no HTTP :80). The official compose service publishes

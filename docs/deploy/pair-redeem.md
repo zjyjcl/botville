@@ -33,7 +33,7 @@ make pair-redeem-e2e
 2. 把 `cert.pem` 和 `key.pem` 放到 `BOTVILLE_PAIR_REDEEM_EDGE_CERT_DIR`（默认 `server/compose/generated/pair-redeem-edge`）。`init.sh` **不会**生成证书。本地或自签证书只用于本机试验，**不能**代替公网 CA 证书，也**不能**当作真机扫码验收材料，不要把生产证书提交进仓库。
 3. `make up HS=synapse PAIR_REDEEM=1 PAIR_REDEEM_EDGE=1`。必须同时打开两个 profile（Makefile 已检查；官方 compose 里 edge `depends_on` pair-redeem）。宿主机端口只绑 `127.0.0.1:${BOTVILLE_PAIR_REDEEM_EDGE_PORT:-8443}`。Caddy 按地址监听 `:8443`，不按主机名分流。
 
-默认 `BOTVILLE_PAIR_REDEEM_TRUSTED_PROXIES` 为空：pair_redeem 不采信 `X-Forwarded-For`，限速键是直连对端。经 edge 进来时直连对端就是 edge 容器，所有客户端会共用一个 per-IP 桶，`IP_LIMIT` 实际变成全局桶。公网或隧道场景应把 `TRUSTED_PROXIES` 设为 **edge 的固定 IP/CIDR**（不要填真实公网域名）。Caddy 会把真实客户端追加为 `X-Forwarded-For` 的最后一个值，pair_redeem 在直连地址命中名单时取最后一个。本机 loopback 试验可以继续留空。不要把空默认改成需要真实公网地址的值。
+默认 `BOTVILLE_PAIR_REDEEM_TRUSTED_PROXIES` 为空：pair_redeem 不采信 `X-Forwarded-For`，限速键是直连对端。经 edge 进来时直连对端就是 edge 容器，所有客户端会共用一个 per-IP 桶，`IP_LIMIT` 实际变成全局桶。若要把限速键改成「edge 前面那一跳」，把 `TRUSTED_PROXIES` 设为 **edge 的固定 IP/CIDR**（不要填真实公网域名）。这只在 edge 是首跳（客户端直接连 edge）时，才会把真实客户端当作 XFF 的最后一跳。若前面还有公网或隧道反代，Caddy 默认会用直连对端（隧道/反代）覆盖客户端自报的 `X-Forwarded-For`；即便在 edge 上再配 `trusted_proxies` 把前置反代传来的 XFF 传给上游，pair_redeem 仍取最后一个 hop，得到的是前置反代而不是手机或真实用户，限速仍是「每隧道一个桶」。本机 loopback 试验可以继续留空。不要把空默认改成需要真实公网地址的值；也不要指望只改 `TRUSTED_PROXIES` 就能在隧道场景按真实用户限速。
 
 Edge **只**把以下精确路径反代到 compose 内网的 `pair-redeem:8092`（pair_redeem 在内网仍是 HTTP）：
 

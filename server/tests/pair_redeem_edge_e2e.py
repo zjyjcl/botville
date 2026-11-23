@@ -21,7 +21,8 @@ Coverage:
      federation redeem, gateway, or pair_redeem subpaths.
   5. Edge logs contain no redeem code, registration_token, or admin token.
   6. A request with `?code=` (and Authorization/Cookie) does not put
-     those values in edge access / compose logs.
+     those values in edge access / compose logs, including the 502
+     error-log path when pair-redeem is stopped.
 
 Run: PYTHONDONTWRITEBYTECODE=1 python3 server/tests/pair_redeem_edge_e2e.py
   or: make pair-redeem-edge-e2e
@@ -531,6 +532,23 @@ def main():
 
         step("denied internal paths stay at the edge 404", denied_paths)
 
+        def assert_edge_logs_omit_sentinels(edge_logs, context):
+            for secret, label in (
+                (QUERY_SENTINEL, "query"),
+                (AUTH_SENTINEL, "authorization"),
+                (COOKIE_SENTINEL, "cookie"),
+            ):
+                if secret in edge_logs:
+                    raise Failure(
+                        "pair-redeem-edge logs leaked %s (%s)" % (
+                            label, context))
+            if "/health" not in edge_logs:
+                raise Failure(
+                    "edge logs dropped the path along with the query (%s)" %
+                    context)
+            if "?code=" in edge_logs:
+                raise Failure("edge logs kept a query string (%s)" % context)
+
         def access_log_omits_query():
             https_edge(
                 "GET", "/health?code=%s" % QUERY_SENTINEL,
@@ -541,19 +559,47 @@ def main():
             https_edge("POST", REDEEM_PATH + "?code=%s" % QUERY_SENTINEL,
                        body={"code": "not-the-sentinel"})
             snapshot_logs("after-query")
-            edge_logs = compose_logs("pair-redeem-edge")
-            for secret, label in (
-                (QUERY_SENTINEL, "query"),
-                (AUTH_SENTINEL, "authorization"),
-                (COOKIE_SENTINEL, "cookie"),
-            ):
-                if secret in edge_logs:
-                    raise Failure("pair-redeem-edge logs leaked %s" % label)
-            if "/health" not in edge_logs:
-                raise Failure("edge logs dropped the path along with the query")
+            assert_edge_logs_omit_sentinels(
+                compose_logs("pair-redeem-edge"), "200 access log")
 
         step("access log omits query string, authorization, and cookie",
              access_log_omits_query)
+
+        def error_log_omits_query_on_502():
+            stop = run(
+                compose_cmd("pair-redeem", "pair-redeem-edge") + [
+                    "stop", "pair-redeem"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            expect(stop.returncode == 0,
+                   "failed to stop pair-redeem for 502 probe")
+            try:
+                status, _, _, _ = https_edge(
+                    "GET", "/health?code=%s" % QUERY_SENTINEL,
+                    extra_headers={
+                        "Authorization": "Bearer %s" % AUTH_SENTINEL,
+                        "Cookie": "session=%s" % COOKIE_SENTINEL,
+                    })
+                expect(status == 502,
+                       "expected 502 when pair-redeem is down, got %s" %
+                       status)
+                snapshot_logs("after-502")
+                assert_edge_logs_omit_sentinels(
+                    compose_logs("pair-redeem-edge"), "502 error log")
+            finally:
+                start = run(
+                    compose_cmd("pair-redeem", "pair-redeem-edge") + [
+                        "start", "pair-redeem"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if start.returncode != 0:
+                    raise Failure(
+                        "failed to restart pair-redeem after 502 probe")
+                wait_http(
+                    "https://127.0.0.1:%d/health" % EDGE_PORT,
+                    timeout=90, expect_status=200,
+                    ssl_context=mock_ssl_context())
+
+        step("error log omits query string when upstream returns 502",
+             error_log_omits_query_on_502)
 
         def logs_have_no_secrets():
             snapshot_logs("after-cases")
