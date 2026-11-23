@@ -5,6 +5,8 @@ return. Audit rows never contain a code or an auth token. Retention
 follows A2.1 store.prune(): 30 days, unused and unexpired codes are kept.
 """
 
+from contextlib import contextmanager
+
 import base64
 import hashlib
 import json
@@ -97,6 +99,7 @@ def require_code(code):
 class PairRedeemStore:
     def __init__(self, path=":memory:"):
         self._lock = threading.Lock()
+        self._request = threading.local()
         self._conn = sqlite3.connect(path, check_same_thread=False,
                                      isolation_level=None)
         self._conn.row_factory = sqlite3.Row
@@ -105,7 +108,7 @@ class PairRedeemStore:
         self._conn.executescript(SCHEMA)
 
     def close(self):
-        with self._lock:
+        with self._locked():
             self._conn.close()
 
     def issue(self, hs, code, gw=None, fp=None, now=None,
@@ -127,7 +130,7 @@ class PairRedeemStore:
         digest = code_sha256(code)
         detail = {"id": None, "code_sha256": digest, "hs": hs,
                   "has_gw": gw is not None, "exp": exp, "result": "issued"}
-        with self._lock:
+        with self._locked():
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 cur = self._conn.execute(
@@ -148,9 +151,10 @@ class PairRedeemStore:
         """Revoke an unused code. Already used/revoked/unknown is a no-op
         success for the caller to interpret; returns the new status or None."""
         now = time.time() if now is None else now
-        with self._lock:
+        with self._locked():
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                self.check_request_deadline()
                 row = self._get_locked(digest)
                 if row is None:
                     self._conn.execute("ROLLBACK")
@@ -174,13 +178,50 @@ class PairRedeemStore:
         return "revoked"
 
     def get(self, digest):
-        with self._lock:
+        with self._locked():
             return self._row_to_dict(self._get_locked(digest))
 
     def _get_locked(self, digest):
         return self._conn.execute(
             "SELECT * FROM codes WHERE code_sha256 = ?", (digest,)
         ).fetchone()
+
+    def current_request_deadline(self):
+        return getattr(self._request, "deadline", None)
+
+    def check_request_deadline(self):
+        deadline = self.current_request_deadline()
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("request_deadline")
+
+    @contextmanager
+    def request_scope(self, deadline):
+        previous = self.current_request_deadline()
+        self._request.deadline = deadline
+        try:
+            yield
+        finally:
+            self._request.deadline = previous
+
+    @contextmanager
+    def _locked(self):
+        deadline = self.current_request_deadline()
+        if deadline is None:
+            self._lock.acquire()
+        else:
+            left = deadline - time.monotonic()
+            if left <= 0 or not self._lock.acquire(timeout=left):
+                raise TimeoutError("request_deadline")
+        try:
+            self.check_request_deadline()
+            # SQLite also has a separate cross-process busy wait. Cap it
+            # to the same remaining budget, not its usual five seconds.
+            budget = 5000 if deadline is None else max(
+                1, int((deadline - time.monotonic()) * 1000))
+            self._conn.execute("PRAGMA busy_timeout = %d" % budget)
+            yield
+        finally:
+            self._lock.release()
 
     @staticmethod
     def _row_to_dict(row):
@@ -198,9 +239,10 @@ class PairRedeemStore:
         written to the store or to the audit row.
         """
         now = time.time() if now is None else now
-        with self._lock:
+        with self._locked():
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                self.check_request_deadline()
                 row = self._get_locked(digest)
                 if row is None:
                     self._insert_event_locked("rejected", {
@@ -238,6 +280,7 @@ class PairRedeemStore:
                     # Fail closed without consuming the row (no new errcode).
                     self._conn.execute("ROLLBACK")
                     return "unavailable", None
+                self.check_request_deadline()
                 updated = self._conn.execute(
                     "UPDATE codes SET status = 'used', used_at = ?,"
                     " device_display_name = ? "
@@ -252,7 +295,9 @@ class PairRedeemStore:
                     }, now)
                     self._conn.execute("COMMIT")
                     return "used", None
+                self.check_request_deadline()
                 auth = issuer(expires_in_ms)
+                self.check_request_deadline()
                 if (not isinstance(auth, dict)
                         or auth.get("type") != "registration_token"
                         or not auth.get("token")
@@ -266,6 +311,7 @@ class PairRedeemStore:
                     "auth_type": "registration_token",
                     "expires_in_ms": int(auth["expires_in_ms"]),
                 }, now)
+                self.check_request_deadline()
                 self._conn.execute("COMMIT")
                 result = {
                     "v": "1",
@@ -290,7 +336,7 @@ class PairRedeemStore:
 
     def record_event(self, kind, detail, now=None):
         now = time.time() if now is None else now
-        with self._lock:
+        with self._locked():
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 event_id = self._insert_event_locked(kind, detail, now)
@@ -301,7 +347,7 @@ class PairRedeemStore:
         return event_id
 
     def update_event_suppressed(self, event_id, suppressed):
-        with self._lock:
+        with self._locked():
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 row = self._conn.execute(
@@ -339,7 +385,7 @@ class PairRedeemStore:
         return cur.lastrowid
 
     def events(self, kind=None):
-        with self._lock:
+        with self._locked():
             if kind is None:
                 rows = self._conn.execute(
                     "SELECT id, at, kind, detail FROM events ORDER BY id"
@@ -359,7 +405,7 @@ class PairRedeemStore:
     def prune(self, now=None, older_than_days=PRUNE_DEFAULT_DAYS):
         now = time.time() if now is None else now
         cutoff = now - older_than_days * 86400.0
-        with self._lock:
+        with self._locked():
             codes = self._conn.execute(
                 "DELETE FROM codes WHERE "
                 "(status != 'unused' AND COALESCE(used_at, revoked_at, issued_at) < ?) "

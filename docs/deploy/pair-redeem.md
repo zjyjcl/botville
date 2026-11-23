@@ -21,6 +21,12 @@
 make pair-redeem-e2e
 ```
 
-会使用独立 compose 项目 `botville-pair-redeem-e2e`（端口 `127.0.0.1:18208` / `127.0.0.1:18292`），不改 `server/compose/.env` 或默认 `botville` 项目，结束后 `down -v` 自己的项目。它会验收默认关闭 / 显式启用、真实 Synapse `registration_token` 可注册、重复兑换/过期/作废/限流/签发失败回滚，以及日志与审计不含明文兑换码、registration_token 或 admin token。
+会使用独立 compose 项目 `botville-pair-redeem-e2e`（端口 `127.0.0.1:18208` / `127.0.0.1:18292`），不改 `server/compose/.env` 或默认 `botville` 项目，结束后 `down -v` 自己的项目。它会验收默认关闭 / 显式启用、真实 Synapse `registration_token` 可注册、重复兑换/过期/作废/限流/签发失败回滚，以及 pair_redeem 自身日志与审计不含明文兑换码、registration_token 或 admin token。全部 compose 日志另外检查兑换码、admin token 与栈秘密，但不承诺 Synapse 自身不会记录其签发的 registration_token。
 
 这仍是隔离测试，不能代替真实 HTTPS 入口或真机扫码。
+
+### 处理时限与启用前检查
+
+显式 `PAIR_REDEEM=1` 前必须先填入非空、有效的 Synapse admin token；`docker compose up -d` 成功不代表服务健康，空 token 会被进程拒绝，应检查 `/health`，不要将 crash-loop 当作启动成功。
+
+请求 deadline 同时限制 store 锁等待与 issuer 总时限。取得事务锁后、更新 used 前、调用 issuer 前以及提交前均检查 deadline，超时回滚，不再启动签发。无法原子保证数据库提交与客户端收到响应：提交后网络断开仍可能丢失响应；已经发往 Synapse 的 HTTP 调用无法撤销，超时回滚可能留下未交付的短期 registration_token。本刀不引入 token 恢复/撤销或新契约。

@@ -411,7 +411,13 @@ def main():
     issued_codes = []
     issued_reg_tokens = []
 
+    torn_down = False
+
     def teardown():
+        nonlocal torn_down
+        if torn_down:
+            return
+        torn_down = True
         try:
             if started:
                 snapshot_logs("teardown")

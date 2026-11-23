@@ -182,7 +182,12 @@ def parse_trusted_proxies(raw):
         if not item:
             continue
         try:
-            networks.append(ipaddress.ip_network(item, strict=False))
+            network = ipaddress.ip_network(item, strict=False)
+            if (network.version == 6 and network.prefixlen >= 96
+                    and network.network_address.ipv4_mapped is not None):
+                network = ipaddress.ip_network((
+                    network.network_address.ipv4_mapped, network.prefixlen - 96))
+            networks.append(network)
         except ValueError as exc:
             raise ConfigError(
                 "%s entry %r is not a valid IP or CIDR" % (ENV_TRUSTED_PROXIES, item)
@@ -206,7 +211,12 @@ def client_ip(direct, headers, trusted_proxies):
         if matched:
             forwarded = (headers.get("X-Forwarded-For") or "").split(",")
             last = forwarded[-1].strip() if forwarded else ""
-            return last or str(address)
+            if last:
+                try:
+                    return str(_canonical_ip(ipaddress.ip_address(last)))
+                except ValueError:
+                    pass
+            return str(address)
     # Unpack IPv4-mapped peers so rate-limit buckets match the embedded IPv4.
     if getattr(raw, "ipv4_mapped", None) is not None:
         return str(address)
@@ -296,6 +306,8 @@ def _is_http_trusted_ip(ip):
     IPv6 is unpacked first.
     """
     ip = _canonical_ip(ip)
+    if ip.is_unspecified:
+        return False
     if ip.is_loopback:
         return True
     if ip.is_private and not ip.is_link_local:
@@ -460,14 +472,13 @@ class _DeadlineHTTPConnection(http.client.HTTPConnection):
 class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
     """Same IP pin as HTTP; SNI and cert checks use the original hostname."""
 
-    def __init__(self, host, port=None, key_file=None, cert_file=None,
+    def __init__(self, host, port=None,
                  timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None,
-                 *, context=None, check_hostname=None, blocksize=8192,
+                 *, context=None, blocksize=8192,
                  resolved_ips=None, deadline=None, sockets=None):
         http.client.HTTPSConnection.__init__(
-            self, host, port=port, key_file=key_file, cert_file=cert_file,
-            timeout=timeout, source_address=source_address, context=context,
-            check_hostname=check_hostname, blocksize=blocksize)
+            self, host, port=port, timeout=timeout,
+            source_address=source_address, context=context, blocksize=blocksize)
         self._resolved_ips = list(resolved_ips or [])
         self._deadline = deadline
         self._sockets = sockets
@@ -633,7 +644,7 @@ class SynapseRegistrationTokenIssuer:
         self._token = require_admin_token(admin_token)
         self.timeout = timeout
 
-    def issue(self, expires_in_ms, now=None):
+    def issue(self, expires_in_ms, now=None, deadline=None):
         now = time.time() if now is None else now
         expiry_time = int(now * 1000) + int(expires_in_ms)
         body = json.dumps({
@@ -654,7 +665,10 @@ class SynapseRegistrationTokenIssuer:
         # just a per-recv socket timeout.
         parts = urllib.parse.urlsplit(self.base_url)
         port = parts.port or (443 if parts.scheme == "https" else 80)
-        deadline = time.monotonic() + float(self.timeout)
+        issuer_deadline = time.monotonic() + float(self.timeout)
+        deadline = min(deadline, issuer_deadline) if deadline is not None else issuer_deadline
+        if deadline <= time.monotonic():
+            raise TimeoutError("request_deadline")
         sockets = []
 
         def _kill_issuer_sockets():
@@ -808,6 +822,10 @@ class PairRedeemApp:
         expires_in_ms = self.config.auth_expires_in_ms
 
         def _issue(expires):
+            self.store.check_request_deadline()
+            if isinstance(self.issuer, SynapseRegistrationTokenIssuer):
+                return self.issuer.issue(
+                    expires, now=now, deadline=self.store.current_request_deadline())
             return self.issuer.issue(expires, now=now)
 
         digest = code_sha256(code)
@@ -889,6 +907,7 @@ def _reject_busy(sock):
         b"\r\n" + body
     )
     try:
+        sock.settimeout(0.1)
         sock.sendall(payload)
     except OSError:
         pass
@@ -958,24 +977,6 @@ def parse_redeem_request(raw, content_type, content_length=None):
         # Lone surrogates pass json.loads but fail sqlite3 UTF-8 binding.
         raise PairRedeemError("BV_PAIR_INVALID") from None
     return code, name
-
-
-def _strip_request_query(text):
-    """Drop ?query from anything that looks like a request line or path."""
-    s = str(text)
-    out = []
-    i = 0
-    while True:
-        q = s.find("?", i)
-        if q < 0:
-            out.append(s[i:])
-            break
-        out.append(s[i:q])
-        j = q + 1
-        while j < len(s) and not s[j].isspace():
-            j += 1
-        i = j
-    return "".join(out)
 
 
 class _DeadlineRFile:
@@ -1049,27 +1050,16 @@ def _handler_for(app):
         protocol_version = "HTTP/1.1"
         timeout = REQUEST_TIMEOUT_SECONDS
 
-        def _safe_requestline(self):
-            raw = self.requestline or ""
-            parts = raw.split()
-            if len(parts) >= 2:
-                method = parts[0]
-                path = parts[1].split("?", 1)[0]
-                version = parts[2] if len(parts) > 2 else ""
-                return " ".join(x for x in (method, path, version) if x)
-            return _strip_request_query(raw) or "-"
-
         def log_message(self, fmt, *args):
-            # Never interpolate a body, token, or raw query string (a
-            # client might put a redeem code in ?code=).
-            try:
-                text = fmt % args if args else str(fmt)
-            except (TypeError, ValueError):
-                text = " ".join(str(x) for x in (fmt,) + args)
-            log.info("%s %s", self.address_string(), _strip_request_query(text))
+            # Parser errors may contain arbitrary request-line/path bytes.
+            # Never interpolate them, even for malformed HTTP.
+            log.info("HTTP parser event")
 
         def log_request(self, code="-", size="-"):
-            self.log_message('"%s" %s', self._safe_requestline(), str(code))
+            method = self.command if self.command in ("GET", "POST", "HEAD") else "OTHER"
+            path = (self.path or "").split("?", 1)[0]
+            endpoint = path if path in (REDEEM_PATH, "/health") else "<unknown>"
+            log.info("%s %s %s", method, endpoint, str(code))
 
         def log_error(self, fmt, *args):
             self.log_message(fmt, *args)
@@ -1099,7 +1089,8 @@ def _handler_for(app):
             timer.start()
             try:
                 self._arm_socket_timeout()
-                BaseHTTPRequestHandler.handle_one_request(self)
+                with app.store.request_scope(self._deadline):
+                    BaseHTTPRequestHandler.handle_one_request(self)
             except (TimeoutError, socket.timeout, ConnectionResetError,
                     ConnectionAbortedError, BrokenPipeError, OSError):
                 # Mid-line deadline, watchdog close, or a timeout that
@@ -1181,13 +1172,13 @@ def _handler_for(app):
                 return
             ip = self._client_ip()
             try:
+                app.check_rate_limit(ip)
                 if "?" in (self.path or ""):
                     # Contract puts the code in the JSON body. A query
                     # string is rejected so it cannot be processed or
                     # logged raw.
                     self._close_unread()
                     self._reject(ip, "invalid_request")
-                app.check_rate_limit(ip)
                 try:
                     self._arm_socket_timeout()
                     # Any Transfer-Encoding (including chunked) is rejected
@@ -1235,6 +1226,8 @@ def _handler_for(app):
                     self._reject(ip, "invalid_request")
                 payload = app.redeem(code, name, ip)
                 self._send_json(200, payload)
+            except TimeoutError:
+                self.close_connection = True
             except PairRedeemError as exc:
                 self._send_error_body(exc)
             except IssuerError:

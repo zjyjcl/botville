@@ -49,7 +49,7 @@ def main(env=None):
             "pair_redeem failed to bind %s:%s: %s"
             % (config.bind_host, config.bind_port, exc)
         )
-    host, port = server.server_address
+    host, port = server.server_address[:2]
     # Do not print any token or path that might include a secret.
     sys.stderr.write("pair_redeem listening on %s:%s\n" % (host, port))
     sys.stderr.flush()

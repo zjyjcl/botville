@@ -13,6 +13,11 @@ import json
 import logging
 import os
 import socket
+import shutil
+import ssl
+import subprocess
+import tempfile
+from unittest import mock
 import sys
 import threading
 import time
@@ -1296,54 +1301,12 @@ class DeadlineAndConcurrencyTests(unittest.TestCase):
         return store, server
 
     def test_total_deadline_bounds_slow_drip(self):
-        store, server = self._serve(request_timeout=5, request_deadline=1)
-        host, port = "127.0.0.1", server.server_address[1]
         header = (
             "POST " + REDEEM_PATH + " HTTP/1.1\r\n"
-            "Host: 127.0.0.1\r\n"
-            "Content-Type: application/json\r\n"
-            "Content-Length: 40\r\n"
-            "Connection: keep-alive\r\n"
-            "\r\n"
+            "Host: localhost\r\nContent-Type: application/json\r\n"
+            "Content-Length: 40\r\nConnection: keep-alive\r\n\r\n"
         ).encode("ascii")
-        sock = socket.create_connection((host, port), timeout=5)
-        try:
-            sock.sendall(header)
-            started = time.monotonic()
-            # One byte every 0.4s stays under the 5s per-recv cap but
-            # should trip the 1s total deadline.
-            for _ in range(8):
-                time.sleep(0.4)
-                try:
-                    sock.sendall(b"{")
-                except OSError:
-                    break
-            sock.settimeout(2)
-            data = b""
-            closed = False
-            while True:
-                try:
-                    piece = sock.recv(4096)
-                except socket.timeout:
-                    piece = b""
-                except ConnectionResetError:
-                    closed = True
-                    piece = b""
-                if not piece:
-                    break
-                data += piece
-            elapsed = time.monotonic() - started
-            self.assertLess(elapsed, 3.0)
-            # Server closed (reset or FIN), optionally with a 400 + close.
-            if data:
-                self.assertIn(b"Connection: close", data)
-            else:
-                self.assertTrue(closed or elapsed < 3.0)
-        finally:
-            sock.close()
-            server.shutdown()
-            server.server_close()
-            store.close()
+        self._slow_drip_and_expect_timeout([header] + [b"{"] * 8)
 
     def test_over_capacity_returns_503_and_closes(self):
         store, server = self._serve(max_concurrent=1, request_timeout=5,
@@ -1391,7 +1354,6 @@ class DeadlineAndConcurrencyTests(unittest.TestCase):
         host, port = "127.0.0.1", server.server_address[1]
         sock = socket.create_connection((host, port), timeout=5)
         try:
-            started = time.monotonic()
             for chunk in chunks:
                 try:
                     sock.sendall(chunk)
@@ -1405,23 +1367,24 @@ class DeadlineAndConcurrencyTests(unittest.TestCase):
                 try:
                     piece = sock.recv(4096)
                 except socket.timeout:
-                    piece = b""
+                    self.fail("slow-drip connection was not closed")
                 except ConnectionResetError:
                     closed = True
                     piece = b""
                 if not piece:
+                    closed = True
                     break
                 data += piece
-            elapsed = time.monotonic() - started
-            self.assertLess(elapsed, 3.0)
+            self.assertTrue(closed, "deadline must close the connection")
             if data:
                 self.assertIn(b"Connection: close", data)
-            else:
-                self.assertTrue(closed or elapsed < 3.0)
         finally:
             sock.close()
         # Concurrency slot must be released after the drip is aborted.
         try:
+            self.assertTrue(server._pair_sema.acquire(timeout=2),
+                            "deadline must release the concurrency slot")
+            server._pair_sema.release()
             header, body, probe = raw_http(
                 host, port,
                 ("GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n"
@@ -1487,6 +1450,253 @@ class DeadlineAndConcurrencyTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             store.close()
+
+
+
+class R2RegressionTests(unittest.TestCase):
+    def test_https_issuer_real_tls(self):
+        """Real TLS constructor+handshake+verified cert, including on 3.12."""
+        seen = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers['Content-Length']))
+                seen['host'] = self.headers['Host']
+                seen['auth'] = self.headers['Authorization']
+                raw = b'{"token":"tls-test-registration-token"}'
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / 'openssl.cnf'
+            cert, key = root / 'cert.pem', root / 'key.pem'
+            config.write_text('[req]\ndistinguished_name=dn\nx509_extensions=ext\n'
+                              'prompt=no\n[dn]\nCN=localhost\n[ext]\n'
+                              'subjectAltName=DNS:localhost\nbasicConstraints=CA:TRUE\n'.replace('\n', '\n'))
+            subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048',
+                            '-nodes', '-days', '1', '-config', str(config),
+                            '-keyout', str(key), '-out', str(cert)], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(str(cert), str(key))
+            context.set_servername_callback(lambda sock, name, ctx: seen.update(sni=name))
+            client_context = ssl.create_default_context(cafile=str(cert))
+            server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+            worker = threading.Thread(target=server.serve_forever,
+                                      kwargs={'poll_interval': .01}, daemon=True)
+            worker.start()
+            try:
+                with mock.patch('ssl._create_default_https_context',
+                                return_value=client_context):
+                    issuer = SynapseRegistrationTokenIssuer(
+                        'https://localhost:%s' % server.server_port,
+                        'fixture-admin-not-a-secret')
+                    result = issuer.issue(1000)
+                self.assertEqual(result['token'], 'tls-test-registration-token')
+                self.assertEqual(seen['sni'], 'localhost')
+                self.assertEqual(seen['host'], 'localhost:%s' % server.server_port)
+                self.assertEqual(seen['auth'], 'Bearer fixture-admin-not-a-secret')
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_main_ipv6_address_tuple(self):
+        import pair_redeem.__main__ as entry
+        server = mock.Mock(server_address=('::1', 8092, 0, 0))
+        with mock.patch.object(entry, 'PairRedeemStore'), \
+                mock.patch.object(entry, 'SynapseRegistrationTokenIssuer'), \
+                mock.patch.object(entry, 'start_pruner'), \
+                mock.patch.object(entry.PairRedeemApp, 'make_server', return_value=server):
+            entry.main({ENV_BIND: '[::1]:8092'})
+        server.serve_forever.assert_called_once()
+        server.server_close.assert_called_once()
+
+    def test_xff_mapped_and_mapped_proxy_network(self):
+        proxies = redeem_service.parse_trusted_proxies('::ffff:172.18.0.0/108')
+        self.assertEqual(str(proxies[0]), '172.16.0.0/12')
+        self.assertEqual(client_ip('::ffff:172.18.0.1',
+                                  {'X-Forwarded-For': '::ffff:1.2.3.4'}, proxies),
+                         '1.2.3.4')
+
+    def test_unspecified_admin_target_refused(self):
+        for host in ('0.0.0.0', '[::]', '[::ffff:0.0.0.0]'):
+            with self.subTest(host=host), self.assertRaises(ConfigError):
+                validate_synapse_admin_url('http://' + host)
+        self.assertTrue(allow_bind_host('0.0.0.0'))
+
+    def test_new_config_limits(self):
+        keys = (redeem_service.ENV_REQUEST_TIMEOUT,
+                redeem_service.ENV_REQUEST_DEADLINE,
+                redeem_service.ENV_MAX_CONCURRENT)
+        config = PairRedeemConfig.from_env(dict(zip(keys, ('7', '11', '3'))))
+        self.assertEqual((config.request_timeout, config.request_deadline,
+                          config.max_concurrent), (7, 11, 3))
+        for key in keys:
+            for invalid in ('0', '-1', 'nope'):
+                with self.subTest(key=key, value=invalid), self.assertRaises(ConfigError):
+                    PairRedeemConfig.from_env({key: invalid})
+
+    @unittest.skipUnless(shutil.which("make"), "make executable required")
+    def test_make_non_synapse_guard(self):
+        proc = subprocess.run(['make', '-n', 'up', 'HS=tuwunel', 'PAIR_REDEEM=1'],
+                              cwd=str(REPO_ROOT), stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(b'Synapse-only', proc.stdout)
+
+    def test_expired_transaction_rolls_back(self):
+        store = PairRedeemStore(':memory:')
+        code = make_code(74)
+        store.issue(HS, code)
+        calls = []
+        def issuer(expires):
+            calls.append(1)
+            time.sleep(.15)
+            return {'type': 'registration_token', 'token': 'fixture', 'expires_in_ms': 1000}
+        try:
+            with store.request_scope(time.monotonic() + .05), self.assertRaises(TimeoutError):
+                store.redeem_atomic(code_sha256(code), DEVICE, '127.0.0.1',
+                                    issuer=issuer, expires_in_ms=1000)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(store.get(code_sha256(code))['status'], 'unused')
+            self.assertEqual(store.events(kind='redeemed'), [])
+        finally:
+            store.close()
+
+    def test_live_issuer_uses_remaining_request_budget(self):
+        stop = threading.Event()
+        contacted = threading.Event()
+
+        class SlowIssuer(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers['Content-Length']))
+                contacted.set()
+                self.send_response(200)
+                self.send_header('Content-Length', '100')
+                self.end_headers()
+                try:
+                    while not stop.wait(.05):
+                        self.wfile.write(b'x')
+                        self.wfile.flush()
+                except OSError:
+                    pass
+
+        backend = ThreadingHTTPServer(('127.0.0.1', 0), SlowIssuer)
+        threading.Thread(target=backend.serve_forever,
+                         kwargs={'poll_interval': .01}, daemon=True).start()
+        store = PairRedeemStore(':memory:')
+        code = make_code(77)
+        store.issue(HS, code)
+        issuer = SynapseRegistrationTokenIssuer(
+            'http://127.0.0.1:%s' % backend.server_port, 'fixture-admin', timeout=5)
+        app = PairRedeemApp(store, issuer, PairRedeemConfig(
+            request_deadline=.5, max_concurrent=1))
+        server = app.make_server('127.0.0.1', 0)
+        threading.Thread(target=server.serve_forever,
+                         kwargs={'poll_interval': .01}, daemon=True).start()
+        sock = socket.create_connection(server.server_address[:2], timeout=3)
+        raw = json.dumps({'code': code, 'device_display_name': DEVICE}).encode()
+        try:
+            sock.sendall(('POST %s HTTP/1.1\r\nHost: localhost\r\n'
+                          'Content-Type: application/json\r\nContent-Length: %s\r\n'
+                          'Connection: close\r\n\r\n' % (REDEEM_PATH, len(raw))).encode() + raw)
+            self.assertTrue(contacted.wait(2))
+            try:
+                self.assertEqual(sock.recv(4096), b'')
+            except ConnectionResetError:
+                pass
+            self.assertTrue(server._pair_sema.acquire(timeout=2))
+            server._pair_sema.release()
+            self.assertEqual(store.get(code_sha256(code))['status'], 'unused')
+            self.assertEqual(store.events(kind='redeemed'), [])
+        finally:
+            stop.set()
+            sock.close()
+            server.shutdown()
+            server.server_close()
+            backend.shutdown()
+            backend.server_close()
+            store.close()
+
+    def test_queued_request_deadline_releases_slot_without_issuer(self):
+        store = PairRedeemStore(':memory:')
+        code = make_code(75)
+        store.issue(HS, code)
+        issuer = FakeIssuer()
+        app = PairRedeemApp(store, issuer, PairRedeemConfig(
+            request_deadline=.3, max_concurrent=1))
+        server = app.make_server('127.0.0.1', 0)
+        thread = threading.Thread(target=server.serve_forever,
+                                  kwargs={'poll_interval': .01}, daemon=True)
+        thread.start()
+        sock = socket.create_connection(server.server_address[:2], timeout=3)
+        raw = json.dumps({'code': code, 'device_display_name': DEVICE}).encode()
+        store._lock.acquire()
+        try:
+            sock.sendall(('POST %s HTTP/1.1\r\nHost: localhost\r\n'
+                          'Content-Type: application/json\r\nContent-Length: %s\r\n'
+                          'Connection: close\r\n\r\n' % (REDEEM_PATH, len(raw))).encode() + raw)
+            self.assertTrue(server.handler_started.wait(2))
+            try:
+                self.assertEqual(sock.recv(4096), b'')
+            except ConnectionResetError:
+                pass
+            # The store is STILL locked here: old implementation kept its
+            # handler/slot blocked until the lock was released.
+            self.assertTrue(server._pair_sema.acquire(timeout=2))
+            server._pair_sema.release()
+            self.assertEqual(issuer.calls, 0)
+        finally:
+            store._lock.release()
+            sock.close()
+            server.shutdown()
+            server.server_close()
+        try:
+            self.assertEqual(store.get(code_sha256(code))['status'], 'unused')
+        finally:
+            store.close()
+
+
+class R2HttpRegressionTests(PairRedeemTestCase):
+    def test_query_rejection_counts_toward_rate_limit(self):
+        self.app.config.ip_limit = 1
+        self.app.ip_limiter = redeem_service.RateLimiter(1, 60)
+        host, port = self.server.server_address[:2]
+        request = ('POST %s?code=fixture HTTP/1.1\r\nHost: localhost\r\n'
+                   'Content-Length: 2\r\nConnection: close\r\n\r\n{}' % REDEEM_PATH).encode()
+        statuses = []
+        for _ in range(3):
+            header, _, sock = raw_http(host, port, request)
+            sock.close()
+            statuses.append(header.split()[1])
+        self.assertEqual(statuses, ['400', '429', '429'])
+        self.assertEqual(len(self.store.events(kind='rejected')), 1)
+        self.assertEqual(len(self.store.events(kind='rate_limited')), 1)
+
+    def test_unknown_sensitive_path_is_not_logged(self):
+        secret = make_code(76)
+        host, port = self.server.server_address[:2]
+        with self.assertLogs('pair_redeem', level='INFO') as captured:
+            for path in (REDEEM_PATH + '/' + secret, '/user:password@' + secret):
+                header, _, sock = raw_http(host, port,
+                    ('POST %s HTTP/1.1\r\nHost: localhost\r\n'
+                     'Content-Length: 0\r\nConnection: close\r\n\r\n' % path).encode())
+                sock.close()
+                self.assertTrue(header.startswith('HTTP/1.1 404'))
+        output = '\n'.join(captured.output)
+        self.assertNotIn(secret, output)
+        self.assertNotIn('password', output)
+        self.assertIn('<unknown>', output)
 
 
 if __name__ == "__main__":
