@@ -843,7 +843,6 @@ jobs:
               # Optional HTTPS edge: default off. Cert dir is a local
               # path placeholder; init.sh does not generate certificates.
               "BOTVILLE_PAIR_REDEEM_EDGE_PORT": "8443",
-              "BOTVILLE_PAIR_REDEEM_EDGE_HOST": "localhost",
               "BOTVILLE_PAIR_REDEEM_EDGE_CERT_DIR": "./generated/pair-redeem-edge",
               "BOTVILLE_GATEWAY_HMAC_SECRET": "<change-me>",
               # Persona engine pass-through (B line PR2): off / empty by

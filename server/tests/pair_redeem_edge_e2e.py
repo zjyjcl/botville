@@ -20,6 +20,8 @@ Coverage:
   4. Denied paths return the edge 404 and do not reach Synapse admin,
      federation redeem, gateway, or pair_redeem subpaths.
   5. Edge logs contain no redeem code, registration_token, or admin token.
+  6. A request with `?code=` (and Authorization/Cookie) does not put
+     those values in edge access / compose logs.
 
 Run: PYTHONDONTWRITEBYTECODE=1 python3 server/tests/pair_redeem_edge_e2e.py
   or: make pair-redeem-edge-e2e
@@ -76,6 +78,9 @@ SYNAPSE_PORT = 18408
 REDEEM_PORT = 18492
 EDGE_PORT = 18443
 REDEEM_PATH = "/_botville/pair/redeem"
+QUERY_SENTINEL = "EDGELOGQUERYSECRET"
+AUTH_SENTINEL = "EDGELOGAUTHSECRET"
+COOKIE_SENTINEL = "EDGELOGCOOKIESECRET"
 
 # Paths that must not be reachable through the public edge.
 DENIED_PATHS = (
@@ -204,9 +209,12 @@ def mock_ssl_context():
     return ssl._create_unverified_context()
 
 
-def http_json(method, url, body=None, token=None, timeout=10, ssl_context=None):
+def http_json(method, url, body=None, token=None, timeout=10, ssl_context=None,
+              extra_headers=None):
     data = None if body is None else json.dumps(body).encode("utf-8")
     headers = {}
+    if extra_headers:
+        headers.update(extra_headers)
     if data is not None:
         headers["Content-Type"] = "application/json"
     if token:
@@ -230,11 +238,11 @@ def http_json(method, url, body=None, token=None, timeout=10, ssl_context=None):
         return exc.code, parsed, dict(exc.headers), raw
 
 
-def https_edge(method, path, body=None, timeout=10):
+def https_edge(method, path, body=None, timeout=10, extra_headers=None):
     url = "https://127.0.0.1:%d%s" % (EDGE_PORT, path)
     return http_json(
         method, url, body=body, timeout=timeout,
-        ssl_context=mock_ssl_context())
+        ssl_context=mock_ssl_context(), extra_headers=extra_headers)
 
 
 def register_admin(synapse, shared_secret, username, password):
@@ -523,6 +531,30 @@ def main():
 
         step("denied internal paths stay at the edge 404", denied_paths)
 
+        def access_log_omits_query():
+            https_edge(
+                "GET", "/health?code=%s" % QUERY_SENTINEL,
+                extra_headers={
+                    "Authorization": "Bearer %s" % AUTH_SENTINEL,
+                    "Cookie": "session=%s" % COOKIE_SENTINEL,
+                })
+            https_edge("POST", REDEEM_PATH + "?code=%s" % QUERY_SENTINEL,
+                       body={"code": "not-the-sentinel"})
+            snapshot_logs("after-query")
+            edge_logs = compose_logs("pair-redeem-edge")
+            for secret, label in (
+                (QUERY_SENTINEL, "query"),
+                (AUTH_SENTINEL, "authorization"),
+                (COOKIE_SENTINEL, "cookie"),
+            ):
+                if secret in edge_logs:
+                    raise Failure("pair-redeem-edge logs leaked %s" % label)
+            if "/health" not in edge_logs:
+                raise Failure("edge logs dropped the path along with the query")
+
+        step("access log omits query string, authorization, and cookie",
+             access_log_omits_query)
+
         def logs_have_no_secrets():
             snapshot_logs("after-cases")
             blobs = "".join(_captured_logs)
@@ -530,6 +562,7 @@ def main():
             if admin_token:
                 secrets_list.append(admin_token)
             secrets_list.extend([postgres_pw, macaroon, form, shared, admin_password])
+            secrets_list.extend([QUERY_SENTINEL, AUTH_SENTINEL, COOKIE_SENTINEL])
             assert_no_secrets(blobs, secrets_list, "edge e2e compose logs")
 
         step("logs omit codes, tokens, and admin credentials",

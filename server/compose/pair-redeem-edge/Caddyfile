@@ -44,7 +44,12 @@
 			fields {
 				request>headers>Authorization delete
 				request>headers>Cookie delete
-				request>uri query delete
+				# `request>uri query delete` is a no-op on Caddy 2.11.9:
+				# caddy adapt yields {"filter":"query","actions":null}, and
+				# `query { delete * }` still leaves the query in the access
+				# log. A regexp with an empty replacement strips `?...`
+				# and keeps the path.
+				request>uri regexp \?.*$
 			}
 		}
 	}

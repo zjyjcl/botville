@@ -589,6 +589,11 @@ services:
     # federation inbound, the relations bridge, or secret stores.
     # Local or mock TLS is not public HTTPS and not a phone-scan test.
     # Examples use localhost / example.org only.
+    # Enable together with the pair-redeem profile: this service
+    # required-depends on pair-redeem, so a bare
+    # `docker compose --profile pair-redeem-edge up` without
+    # --profile pair-redeem will not start. `make up` already
+    # requires PAIR_REDEEM=1 when PAIR_REDEEM_EDGE=1.
     image: ${CADDY_IMAGE:-docker.io/library/caddy:2.11.9-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0}
     profiles: [pair-redeem-edge]
     environment:
@@ -601,7 +606,6 @@ services:
     depends_on:
       pair-redeem:
         condition: service_healthy
-        required: false
     healthcheck:
       test: ["CMD", "wget", "-q", "--no-check-certificate", "-O", "/dev/null", "https://127.0.0.1:8443/health"]
       interval: 10s

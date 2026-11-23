@@ -113,11 +113,10 @@ class ComposePairRedeemTests(unittest.TestCase):
                     key, value = line.split("=", 1)
                     values[key] = value
             self.assertEqual(values.get("BOTVILLE_PAIR_REDEEM_EDGE_PORT"), "8443")
-            self.assertEqual(values.get("BOTVILLE_PAIR_REDEEM_EDGE_HOST"), "localhost")
             self.assertEqual(
                 values.get("BOTVILLE_PAIR_REDEEM_EDGE_CERT_DIR"),
                 "./generated/pair-redeem-edge")
-            self.assertNotIn("example.com", values.get("BOTVILLE_PAIR_REDEEM_EDGE_HOST", ""))
+            self.assertNotIn("BOTVILLE_PAIR_REDEEM_EDGE_HOST", values)
 
 
 class PairRedeemEdgeCaddyfileTests(unittest.TestCase):
@@ -157,9 +156,16 @@ class PairRedeemEdgeCaddyfileTests(unittest.TestCase):
         self.assertNotIn("example.com", joined)
 
     def test_logs_drop_auth_and_query(self):
-        self.assertIn("request>headers>Authorization delete", self.text)
-        self.assertIn("request>headers>Cookie delete", self.text)
-        self.assertIn("request>uri query delete", self.text)
+        # Active (non-comment) lines only: the broken `query delete`
+        # wording may still appear in comments explaining why it is
+        # not used. Behavior is covered by the live access-log test.
+        active = "\n".join(
+            ln.strip() for ln in self.text.splitlines()
+            if ln.strip() and not ln.strip().startswith("#"))
+        self.assertIn("request>headers>Authorization delete", active)
+        self.assertIn("request>headers>Cookie delete", active)
+        self.assertIn(r"request>uri regexp \?.*$", active)
+        self.assertNotIn("query delete", active)
 
 
 
