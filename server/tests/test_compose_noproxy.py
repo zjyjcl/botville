@@ -58,11 +58,13 @@ ALL_PROFILES = [
     "--profile", "tuwunel",
     "--profile", "continuwuity",
     "--profile", "gateway",
+    "--profile", "pair-redeem",
 ]
 
 # Every service the main compose file must merge x-noproxy-env into.
 TARGET_SERVICES = (
     "postgres", "synapse", "tuwunel", "continuwuity", "sygnal", "gateway",
+    "pair-redeem",
 )
 
 # Every service the federation compose file must merge x-noproxy-env into
@@ -78,7 +80,7 @@ EXPECTED_DEFAULT_ENTRIES = frozenset((
     "sygnal", "postgres", "synapse", "tuwunel", "continuwuity",
     # gateway (A2.2 `gateway` profile), admin (reserved, not yet in
     # compose) and the federation stack's services (PR2 keeps the same list).
-    "gateway", "admin",
+    "gateway", "admin", "pair-redeem",
     "synapse-a", "synapse-b", "pairing-a", "pairing-b",
     "fedgate-a", "fedgate-b",
     # fedgate network aliases peers resolve server_name to (pairing key fetch).

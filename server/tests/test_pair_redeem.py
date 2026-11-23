@@ -9,9 +9,17 @@ Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
 """
 
 import base64
+import contextlib
+import io
 import json
+import logging
 import os
 import socket
+import shutil
+import ssl
+import subprocess
+import tempfile
+from unittest import mock
 import sys
 import threading
 import time
@@ -37,6 +45,9 @@ from pair_redeem.service import (  # noqa: E402
     ENV_SYNAPSE_URL,
     ENV_TRUSTED_PROXIES,
     ISSUER_TIMEOUT_SECONDS,
+    allow_bind_host,
+    require_admin_token,
+    validate_synapse_admin_url,
     ERROR_STATUS,
     ERROR_TEXT,
     MAX_BODY_BYTES,
@@ -528,6 +539,20 @@ class IsolationAndConfigTests(unittest.TestCase):
             client_ip("127.0.0.1", {"X-Forwarded-For": ""}, proxies),
             "127.0.0.1")
 
+    def test_client_ip_unpacks_ipv4_mapped(self):
+        from ipaddress import ip_network
+        proxies = [ip_network("127.0.0.1/32")]
+        self.assertEqual(
+            client_ip("::ffff:127.0.0.1",
+                      {"X-Forwarded-For": "198.51.100.2"},
+                      proxies),
+            "198.51.100.2")
+        self.assertEqual(
+            client_ip("::ffff:192.0.2.1",
+                      {"X-Forwarded-For": "203.0.113.9"},
+                      proxies),
+            "192.0.2.1")
+
     def test_config_env_keys_and_defaults(self):
         config = PairRedeemConfig.from_env({
             ENV_BIND: "127.0.0.1:0",
@@ -972,6 +997,746 @@ class TimeoutTests(unittest.TestCase):
             sock.close()
 
 
+
+
+
+class HealthAndBindTests(PairRedeemTestCase):
+    def test_health_is_200_and_other_gets_stay_405(self):
+        url = self.base + "/health"
+        with urllib.request.urlopen(url, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(), b"ok")
+        status, body, _ = self.post(
+            {"code": make_code(1), "device_display_name": DEVICE})
+        # POST still works after a health check.
+        self.assertIn(status, (400, 429, 200))
+        host, port = "127.0.0.1", self.server.server_address[1]
+        header, _, sock = raw_http(
+            host, port,
+            ("GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+             % REDEEM_PATH).encode("ascii"))
+        sock.close()
+        self.assertTrue(header.startswith("HTTP/1.1 405"), header)
+
+
+class AdminUrlAndTokenTests(unittest.TestCase):
+    def test_allow_bind_host(self):
+        self.assertTrue(allow_bind_host("127.0.0.1"))
+        self.assertTrue(allow_bind_host("localhost"))
+        self.assertTrue(allow_bind_host("0.0.0.0"))
+        self.assertTrue(allow_bind_host("10.0.0.4"))
+        self.assertTrue(allow_bind_host("172.18.0.2"))
+        self.assertTrue(allow_bind_host("::1"))
+        self.assertTrue(allow_bind_host("::"))
+        self.assertTrue(allow_bind_host("::ffff:10.0.0.4"))
+        self.assertFalse(allow_bind_host("8.8.8.8"))
+        self.assertFalse(allow_bind_host("example.org"))
+        self.assertFalse(allow_bind_host("169.254.169.254"))
+        self.assertFalse(allow_bind_host("::ffff:8.8.8.8"))
+        self.assertFalse(allow_bind_host("::ffff:169.254.169.254"))
+
+    def test_validate_http_url_allowlist(self):
+        self.assertEqual(
+            validate_synapse_admin_url("http://127.0.0.1:8008/"),
+            "http://127.0.0.1:8008")
+        self.assertEqual(
+            validate_synapse_admin_url("http://synapse:8008"),
+            "http://synapse:8008")
+        self.assertEqual(
+            validate_synapse_admin_url("https://hs.example.org"),
+            "https://hs.example.org")
+        with self.assertRaises(ConfigError):
+            validate_synapse_admin_url("http://example.org")
+        with self.assertRaises(ConfigError):
+            validate_synapse_admin_url("http://8.8.8.8")
+        with self.assertRaises(ConfigError):
+            validate_synapse_admin_url("http://169.254.169.254")
+        with self.assertRaises(ConfigError):
+            validate_synapse_admin_url("http://[::ffff:8.8.8.8]:8008")
+        with self.assertRaises(ConfigError):
+            validate_synapse_admin_url("http://[::ffff:169.254.169.254]")
+        with self.assertRaises(ConfigError):
+            validate_synapse_admin_url("http://user:pass@127.0.0.1:8008")
+        with self.assertRaises(ConfigError):
+            validate_synapse_admin_url("")
+        with self.assertRaises(ConfigError):
+            validate_synapse_admin_url("ftp://127.0.0.1")
+
+    def test_require_admin_token_rejects_blank_and_hides_value(self):
+        self.assertEqual(require_admin_token("ok-token"), "ok-token")
+        with self.assertRaises(ConfigError) as caught:
+            require_admin_token("")
+        self.assertNotIn("ok-token", str(caught.exception))
+        with self.assertRaises(ConfigError) as caught:
+            require_admin_token("has space")
+        self.assertNotIn("has space", str(caught.exception))
+
+    def test_issuer_rejects_http_public_url_before_network(self):
+        with self.assertRaises(ConfigError):
+            SynapseRegistrationTokenIssuer(
+                "http://example.org", "fixture-admin-token-not-a-secret")
+
+    def test_issuer_refuses_redirect_and_hides_token(self):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                self.send_response(302)
+                self.send_header("Location", "https://evil.example.org/steal")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.05},
+            daemon=True)
+        thread.start()
+        token = "fixture-admin-token-SHOULD-NOT-LEAK"
+        try:
+            issuer = SynapseRegistrationTokenIssuer(
+                "http://127.0.0.1:%s" % server.server_address[1],
+                token)
+            with self.assertRaises(IssuerError) as caught:
+                issuer.issue(1000, now=1_800_000_000)
+            self.assertEqual(str(caught.exception), "redirect_refused")
+            self.assertNotIn(token, str(caught.exception))
+            self.assertNotIn("evil.example.org", str(caught.exception))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_issuer_pins_resolved_ip_and_keeps_host_header(self):
+        seen = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                seen["host"] = self.headers.get("Host")
+                body = b'{"token":"pinned-reg-token"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.05},
+            daemon=True)
+        thread.start()
+        port = server.server_address[1]
+        alias = "synapse-e2e"
+        real_getaddrinfo = socket.getaddrinfo
+
+        def fake_getaddrinfo(host, svc, *args, **kwargs):
+            if host == alias:
+                return real_getaddrinfo("127.0.0.1", svc, *args, **kwargs)
+            return real_getaddrinfo(host, svc, *args, **kwargs)
+
+        try:
+            socket.getaddrinfo = fake_getaddrinfo
+            issuer = SynapseRegistrationTokenIssuer(
+                "http://%s:%s" % (alias, port),
+                "fixture-admin-token-not-a-secret")
+            result = issuer.issue(1000, now=1_800_000_000)
+            self.assertEqual(result["token"], "pinned-reg-token")
+            self.assertTrue(
+                seen.get("host") == alias or
+                seen.get("host") == "%s:%s" % (alias, port),
+                seen)
+        finally:
+            socket.getaddrinfo = real_getaddrinfo
+            server.shutdown()
+            server.server_close()
+
+    def test_issuer_parses_chunked_admin_response(self):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                body = b'{"token":"chunked-reg-token"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                # Two chunks so a raw fp.read would not be valid JSON.
+                self.wfile.write(b"%x\r\n" % 10)
+                self.wfile.write(body[:10])
+                self.wfile.write(b"\r\n%x\r\n" % (len(body) - 10))
+                self.wfile.write(body[10:])
+                self.wfile.write(b"\r\n0\r\n\r\n")
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.05},
+            daemon=True)
+        thread.start()
+        try:
+            issuer = SynapseRegistrationTokenIssuer(
+                "http://127.0.0.1:%s" % server.server_address[1],
+                "fixture-admin-token-not-a-secret")
+            result = issuer.issue(1000, now=1_800_000_000)
+            self.assertEqual(result["token"], "chunked-reg-token")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_issuer_total_deadline_bounds_slow_drip(self):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                payload = (
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: 20\r\n"
+                    b"\r\n"
+                    b'{"token":"0123456"}'
+                )
+                try:
+                    for idx in range(len(payload)):
+                        self.wfile.write(payload[idx:idx + 1])
+                        self.wfile.flush()
+                        time.sleep(0.8)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.05},
+            daemon=True)
+        thread.start()
+        try:
+            issuer = SynapseRegistrationTokenIssuer(
+                "http://127.0.0.1:%s" % server.server_address[1],
+                "fixture-admin-token-not-a-secret",
+                timeout=2)
+            started = time.monotonic()
+            with self.assertRaises(IssuerError):
+                issuer.issue(1000, now=1_800_000_000)
+            self.assertLess(time.monotonic() - started, 5.0)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_issuer_rejects_http_mapped_public_at_resolve(self):
+        real_getaddrinfo = socket.getaddrinfo
+
+        def fake_getaddrinfo(host, svc, *args, **kwargs):
+            if host == "synapse":
+                return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "",
+                         ("::ffff:8.8.8.8", 8008, 0, 0))]
+            return real_getaddrinfo(host, svc, *args, **kwargs)
+
+        try:
+            socket.getaddrinfo = fake_getaddrinfo
+            issuer = SynapseRegistrationTokenIssuer(
+                "http://synapse:8008", "fixture-admin-token-not-a-secret")
+            with self.assertRaises(IssuerError) as caught:
+                issuer.issue(1000, now=1_800_000_000)
+            self.assertEqual(str(caught.exception), "untrusted_destination")
+        finally:
+            socket.getaddrinfo = real_getaddrinfo
+
+    def test_ipv6_loopback_bind_starts(self):
+        store = PairRedeemStore(":memory:")
+        try:
+            app = PairRedeemApp(store, FakeIssuer(), PairRedeemConfig(
+                ip_limit=10, global_limit=60, bind_host="::1", bind_port=0))
+            try:
+                server = app.make_server("::1", 0)
+            except OSError as exc:
+                self.skipTest("IPv6 loopback not available: %s" % exc)
+            thread = threading.Thread(
+                target=server.serve_forever, kwargs={"poll_interval": 0.05},
+                daemon=True)
+            thread.start()
+            try:
+                self.assertEqual(server.address_family, socket.AF_INET6)
+                host, port = server.server_address[:2]
+                sock = socket.create_connection((host, port), timeout=2)
+                sock.sendall(
+                    b"GET /health HTTP/1.1\r\nHost: localhost\r\n"
+                    b"Connection: close\r\n\r\n")
+                data = b""
+                while True:
+                    piece = sock.recv(4096)
+                    if not piece:
+                        break
+                    data += piece
+                sock.close()
+                self.assertTrue(data.startswith(b"HTTP/1.1 200"), data)
+            finally:
+                server.shutdown()
+                server.server_close()
+        finally:
+            store.close()
+
+
+class DeadlineAndConcurrencyTests(unittest.TestCase):
+    def _serve(self, **config_kw):
+        store = PairRedeemStore(":memory:")
+        issuer = FakeIssuer()
+        now = 1_800_000_000
+        config = PairRedeemConfig(
+            ip_limit=100, global_limit=100, bind_host="127.0.0.1",
+            bind_port=0, **config_kw)
+        app = PairRedeemApp(store, issuer, config, clock=lambda: now)
+        server = app.make_server("127.0.0.1", 0)
+        thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.05},
+            daemon=True)
+        thread.start()
+        return store, server
+
+    def test_total_deadline_bounds_slow_drip(self):
+        header = (
+            "POST " + REDEEM_PATH + " HTTP/1.1\r\n"
+            "Host: localhost\r\nContent-Type: application/json\r\n"
+            "Content-Length: 40\r\nConnection: keep-alive\r\n\r\n"
+        ).encode("ascii")
+        self._slow_drip_and_expect_timeout([header] + [b"{"] * 8)
+
+    def test_over_capacity_returns_503_and_closes(self):
+        store, server = self._serve(max_concurrent=1, request_timeout=5,
+                                    request_deadline=5)
+        host, port = "127.0.0.1", server.server_address[1]
+        holder = socket.create_connection((host, port), timeout=5)
+        try:
+            holder.sendall((
+                "POST " + REDEEM_PATH + " HTTP/1.1\r\n"
+                "Host: 127.0.0.1\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: 40\r\n"
+                "Connection: keep-alive\r\n"
+                "\r\n"
+                "{"
+            ).encode("ascii"))
+            self.assertTrue(
+                server.handler_started.wait(2),
+                "holder must occupy the concurrency slot before the probe")
+            header, body, sock = raw_http(
+                host, port,
+                ("GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                 "Connection: close\r\n\r\n").encode("ascii"),
+                timeout=2)
+            try:
+                self.assertTrue(header.startswith("HTTP/1.1 503"), header)
+                headers = _http_header_map(header)
+                self.assertEqual(headers.get("connection"), "close")
+                err = json.loads(body.decode("utf-8"))
+                self.assertNotIn("errcode", err)
+                self.assertEqual(err.get("error"), "temporarily unavailable")
+            finally:
+                sock.close()
+        finally:
+            holder.close()
+            server.shutdown()
+            server.server_close()
+            store.close()
+
+    def _slow_drip_and_expect_timeout(self, chunks, request_deadline=1,
+                                      per_byte=0.4):
+        store, server = self._serve(request_timeout=5,
+                                    request_deadline=request_deadline,
+                                    max_concurrent=1)
+        host, port = "127.0.0.1", server.server_address[1]
+        sock = socket.create_connection((host, port), timeout=5)
+        try:
+            for chunk in chunks:
+                try:
+                    sock.sendall(chunk)
+                except OSError:
+                    break
+                time.sleep(per_byte)
+            sock.settimeout(2)
+            data = b""
+            closed = False
+            while True:
+                try:
+                    piece = sock.recv(4096)
+                except socket.timeout:
+                    self.fail("slow-drip connection was not closed")
+                except ConnectionResetError:
+                    closed = True
+                    piece = b""
+                if not piece:
+                    closed = True
+                    break
+                data += piece
+            self.assertTrue(closed, "deadline must close the connection")
+            if data:
+                self.assertIn(b"Connection: close", data)
+        finally:
+            sock.close()
+        # Concurrency slot must be released after the drip is aborted.
+        try:
+            self.assertTrue(server._pair_sema.acquire(timeout=2),
+                            "deadline must release the concurrency slot")
+            server._pair_sema.release()
+            header, body, probe = raw_http(
+                host, port,
+                ("GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                 "Connection: close\r\n\r\n").encode("ascii"),
+                timeout=2)
+            try:
+                self.assertTrue(header.startswith("HTTP/1.1 200"), header)
+            finally:
+                probe.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            store.close()
+
+    def test_total_deadline_bounds_slow_drip_request_line(self):
+        line = ("POST " + REDEEM_PATH + " HTTP/1.1\r\n").encode("ascii")
+        self._slow_drip_and_expect_timeout([line[i:i + 1] for i in range(len(line))])
+
+    def test_total_deadline_bounds_slow_drip_headers(self):
+        prefix = ("POST " + REDEEM_PATH + " HTTP/1.1\r\n").encode("ascii")
+        headers = (
+            "Host: 127.0.0.1\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: 40\r\n"
+            "Connection: keep-alive\r\n"
+        ).encode("ascii")
+        chunks = [prefix] + [headers[i:i + 1] for i in range(len(headers))]
+        self._slow_drip_and_expect_timeout(chunks)
+
+    def test_request_line_query_is_rejected_and_not_logged(self):
+        store, server = self._serve(request_timeout=5, request_deadline=5)
+        host, port = "127.0.0.1", server.server_address[1]
+        secret = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        handler = logging.Handler()
+        records = []
+
+        def emit(record):
+            records.append(record.getMessage())
+
+        handler.emit = emit
+        log = logging.getLogger("pair_redeem")
+        log.addHandler(handler)
+        log.setLevel(logging.INFO)
+        try:
+            header, body, sock = raw_http(
+                host, port,
+                ("POST %s?code=%s HTTP/1.1\r\n"
+                 "Host: 127.0.0.1\r\n"
+                 "Content-Type: application/json\r\n"
+                 "Content-Length: 2\r\n"
+                 "Connection: close\r\n\r\n{}"
+                 % (REDEEM_PATH, secret)).encode("ascii"),
+                timeout=2)
+            try:
+                self.assertTrue(header.startswith("HTTP/1.1 400"), header)
+                joined = "\n".join(records)
+                self.assertNotIn(secret, joined)
+                self.assertNotIn("code=", joined)
+            finally:
+                sock.close()
+        finally:
+            log.removeHandler(handler)
+            server.shutdown()
+            server.server_close()
+            store.close()
+
+
+
+class R2RegressionTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("openssl"), "openssl executable required")
+    def test_https_issuer_real_tls(self):
+        """Real TLS constructor+handshake+verified cert, including on 3.12."""
+        seen = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers['Content-Length']))
+                seen['host'] = self.headers['Host']
+                seen['auth'] = self.headers['Authorization']
+                raw = b'{"token":"tls-test-registration-token"}'
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / 'openssl.cnf'
+            cert, key = root / 'cert.pem', root / 'key.pem'
+            config.write_text('[req]\ndistinguished_name=dn\nx509_extensions=ext\n'
+                              'prompt=no\n[dn]\nCN=localhost\n[ext]\n'
+                              'subjectAltName=DNS:localhost\nbasicConstraints=CA:TRUE\n')
+            subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048',
+                            '-nodes', '-days', '1', '-config', str(config),
+                            '-keyout', str(key), '-out', str(cert)], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(str(cert), str(key))
+            context.set_servername_callback(lambda sock, name, ctx: seen.update(sni=name))
+            client_context = ssl.create_default_context(cafile=str(cert))
+            server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+            worker = threading.Thread(target=server.serve_forever,
+                                      kwargs={'poll_interval': .01}, daemon=True)
+            worker.start()
+            try:
+                with mock.patch('ssl._create_default_https_context',
+                                return_value=client_context):
+                    issuer = SynapseRegistrationTokenIssuer(
+                        'https://localhost:%s' % server.server_port,
+                        'fixture-admin-not-a-secret')
+                    result = issuer.issue(1000)
+                self.assertEqual(result['token'], 'tls-test-registration-token')
+                self.assertEqual(seen['sni'], 'localhost')
+                self.assertEqual(seen['host'], 'localhost:%s' % server.server_port)
+                self.assertEqual(seen['auth'], 'Bearer fixture-admin-not-a-secret')
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_main_ipv6_address_tuple(self):
+        import pair_redeem.__main__ as entry
+        server = mock.Mock(server_address=('::1', 8092, 0, 0))
+        captured = io.StringIO()
+        with mock.patch.object(entry, 'PairRedeemStore'), \
+                mock.patch.object(entry, 'SynapseRegistrationTokenIssuer'), \
+                mock.patch.object(entry, 'start_pruner'), \
+                mock.patch.object(entry.PairRedeemApp, 'make_server',
+                                  return_value=server), \
+                mock.patch.object(entry.sys, 'stderr', captured):
+            entry.main({ENV_BIND: '[::1]:8092'})
+        server.serve_forever.assert_called_once()
+        server.server_close.assert_called_once()
+        self.assertEqual(captured.getvalue(),
+                         'pair_redeem listening on ::1:8092\n')
+
+    def test_xff_mapped_and_mapped_proxy_network(self):
+        proxies = redeem_service.parse_trusted_proxies('::ffff:172.18.0.0/108')
+        self.assertEqual(str(proxies[0]), '172.16.0.0/12')
+        self.assertEqual(client_ip('::ffff:172.18.0.1',
+                                  {'X-Forwarded-For': '::ffff:1.2.3.4'}, proxies),
+                         '1.2.3.4')
+
+    def test_unspecified_admin_target_refused(self):
+        for host in ('0.0.0.0', '[::]', '[::ffff:0.0.0.0]'):
+            with self.subTest(host=host), self.assertRaises(ConfigError):
+                validate_synapse_admin_url('http://' + host)
+        self.assertTrue(allow_bind_host('0.0.0.0'))
+
+    def test_new_config_limits(self):
+        keys = (redeem_service.ENV_REQUEST_TIMEOUT,
+                redeem_service.ENV_REQUEST_DEADLINE,
+                redeem_service.ENV_MAX_CONCURRENT)
+        config = PairRedeemConfig.from_env(dict(zip(keys, ('7', '11', '3'))))
+        self.assertEqual((config.request_timeout, config.request_deadline,
+                          config.max_concurrent), (7, 11, 3))
+        for key in keys:
+            for invalid in ('0', '-1', 'nope'):
+                with self.subTest(key=key, value=invalid), self.assertRaises(ConfigError):
+                    PairRedeemConfig.from_env({key: invalid})
+
+    @unittest.skipUnless(shutil.which("make"), "make executable required")
+    def test_make_non_synapse_guard(self):
+        proc = subprocess.run(['make', '-n', 'up', 'HS=tuwunel', 'PAIR_REDEEM=1'],
+                              cwd=str(REPO_ROOT), stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(b'Synapse-only', proc.stdout)
+
+    def test_expired_transaction_rolls_back(self):
+        store = PairRedeemStore(':memory:')
+        code = make_code(74)
+        store.issue(HS, code)
+        calls = []
+        def issuer(expires):
+            calls.append(1)
+            time.sleep(.15)
+            return {'type': 'registration_token', 'token': 'fixture', 'expires_in_ms': 1000}
+        try:
+            with store.request_scope(time.monotonic() + .05), self.assertRaises(TimeoutError):
+                store.redeem_atomic(code_sha256(code), DEVICE, '127.0.0.1',
+                                    issuer=issuer, expires_in_ms=1000)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(store.get(code_sha256(code))['status'], 'unused')
+            self.assertEqual(store.events(kind='redeemed'), [])
+        finally:
+            store.close()
+
+    def test_live_issuer_uses_remaining_request_budget(self):
+        stop = threading.Event()
+        contacted = threading.Event()
+
+        class SlowIssuer(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers['Content-Length']))
+                contacted.set()
+                self.send_response(200)
+                self.send_header('Content-Length', '100')
+                self.end_headers()
+                try:
+                    while not stop.wait(.05):
+                        self.wfile.write(b'x')
+                        self.wfile.flush()
+                except OSError:
+                    pass
+
+        backend = ThreadingHTTPServer(('127.0.0.1', 0), SlowIssuer)
+        threading.Thread(target=backend.serve_forever,
+                         kwargs={'poll_interval': .01}, daemon=True).start()
+        store = PairRedeemStore(':memory:')
+        code = make_code(77)
+        store.issue(HS, code)
+        issuer = SynapseRegistrationTokenIssuer(
+            'http://127.0.0.1:%s' % backend.server_port, 'fixture-admin', timeout=5)
+        app = PairRedeemApp(store, issuer, PairRedeemConfig(
+            request_deadline=.5, max_concurrent=1))
+        server = app.make_server('127.0.0.1', 0)
+        threading.Thread(target=server.serve_forever,
+                         kwargs={'poll_interval': .01}, daemon=True).start()
+        sock = socket.create_connection(server.server_address[:2], timeout=3)
+        raw = json.dumps({'code': code, 'device_display_name': DEVICE}).encode()
+        try:
+            sock.sendall(('POST %s HTTP/1.1\r\nHost: localhost\r\n'
+                          'Content-Type: application/json\r\nContent-Length: %s\r\n'
+                          'Connection: close\r\n\r\n' % (REDEEM_PATH, len(raw))).encode() + raw)
+            self.assertTrue(contacted.wait(2))
+            try:
+                self.assertEqual(sock.recv(4096), b'')
+            except ConnectionResetError:
+                pass
+            self.assertTrue(server._pair_sema.acquire(timeout=2))
+            server._pair_sema.release()
+            self.assertEqual(store.get(code_sha256(code))['status'], 'unused')
+            self.assertEqual(store.events(kind='redeemed'), [])
+        finally:
+            stop.set()
+            sock.close()
+            server.shutdown()
+            server.server_close()
+            backend.shutdown()
+            backend.server_close()
+            store.close()
+
+    def test_queued_request_deadline_releases_slot_without_issuer(self):
+        store = PairRedeemStore(':memory:')
+        code = make_code(75)
+        store.issue(HS, code)
+        issuer = FakeIssuer()
+        app = PairRedeemApp(store, issuer, PairRedeemConfig(
+            request_deadline=.3, max_concurrent=1))
+        server = app.make_server('127.0.0.1', 0)
+        thread = threading.Thread(target=server.serve_forever,
+                                  kwargs={'poll_interval': .01}, daemon=True)
+        thread.start()
+        sock = socket.create_connection(server.server_address[:2], timeout=3)
+        raw = json.dumps({'code': code, 'device_display_name': DEVICE}).encode()
+        store._lock.acquire()
+        try:
+            sock.sendall(('POST %s HTTP/1.1\r\nHost: localhost\r\n'
+                          'Content-Type: application/json\r\nContent-Length: %s\r\n'
+                          'Connection: close\r\n\r\n' % (REDEEM_PATH, len(raw))).encode() + raw)
+            self.assertTrue(server.handler_started.wait(2))
+            try:
+                self.assertEqual(sock.recv(4096), b'')
+            except ConnectionResetError:
+                pass
+            # The store is STILL locked here: old implementation kept its
+            # handler/slot blocked until the lock was released.
+            self.assertTrue(server._pair_sema.acquire(timeout=2))
+            server._pair_sema.release()
+            self.assertEqual(issuer.calls, 0)
+        finally:
+            store._lock.release()
+            sock.close()
+            server.shutdown()
+            server.server_close()
+        try:
+            self.assertEqual(store.get(code_sha256(code))['status'], 'unused')
+        finally:
+            store.close()
+
+
+class R2HttpRegressionTests(PairRedeemTestCase):
+    def test_query_rejection_counts_toward_rate_limit(self):
+        self.app.config.ip_limit = 1
+        self.app.ip_limiter = redeem_service.RateLimiter(1, 60)
+        host, port = self.server.server_address[:2]
+        request = ('POST %s?code=fixture HTTP/1.1\r\nHost: localhost\r\n'
+                   'Content-Length: 2\r\nConnection: close\r\n\r\n{}' % REDEEM_PATH).encode()
+        statuses = []
+        for _ in range(3):
+            header, _, sock = raw_http(host, port, request)
+            sock.close()
+            statuses.append(header.split()[1])
+        self.assertEqual(statuses, ['400', '429', '429'])
+        self.assertEqual(len(self.store.events(kind='rejected')), 1)
+        self.assertEqual(len(self.store.events(kind='rate_limited')), 1)
+
+    def test_unknown_sensitive_path_is_not_logged(self):
+        secret = make_code(76)
+        host, port = self.server.server_address[:2]
+        with self.assertLogs('pair_redeem', level='INFO') as captured:
+            for path in (REDEEM_PATH + '/' + secret, '/user:password@' + secret):
+                header, _, sock = raw_http(host, port,
+                    ('POST %s HTTP/1.1\r\nHost: localhost\r\n'
+                     'Content-Length: 0\r\nConnection: close\r\n\r\n' % path).encode())
+                sock.close()
+                self.assertTrue(header.startswith('HTTP/1.1 404'))
+        output = '\n'.join(captured.output)
+        self.assertNotIn(secret, output)
+        self.assertNotIn('password', output)
+        self.assertIn('<unknown>', output)
+        self.assertRegex('\n'.join(captured.output),
+                         r'127\.0\.0\.1 POST <unknown> 404')
+
+    def _assert_malformed_request_is_answered(self, payload, status, forbidden):
+        host, port = self.server.server_address[:2]
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr),                 self.assertLogs('pair_redeem', level='INFO') as captured:
+            header, body, sock = raw_http(host, port, payload, timeout=2)
+            sock.close()
+        err = stderr.getvalue()
+        self.assertTrue(header.startswith('HTTP/1.1 %s' % status), header)
+        self.assertNotIn('Traceback', err)
+        self.assertNotIn('AttributeError', err)
+        output = '\n'.join(captured.output)
+        for item in forbidden:
+            self.assertNotIn(item, output)
+            self.assertNotIn(item, err)
+        self.assertIn(' <unknown> %s' % status, output)
+        self.assertIn('127.0.0.1', output)
+
+    def test_malformed_request_line_returns_400_without_traceback(self):
+        self._assert_malformed_request_is_answered(
+            b'BOGUS\r\n\r\n', '400', ['BOGUS'])
+        self._assert_malformed_request_is_answered(
+            b'GET /x HTTP/9.9\r\nHost: h\r\n\r\n', '505',
+            ['HTTP/9.9', '/x'])
+
+    def test_overlong_request_line_returns_414_without_traceback(self):
+        # One byte over BaseHTTPRequestHandler's 65536-byte request-line cap.
+        payload = b'GET /' + (b'A' * 65533)
+        self._assert_malformed_request_is_answered(
+            payload, '414', ['A' * 32])
 
 
 if __name__ == "__main__":

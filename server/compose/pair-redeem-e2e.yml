@@ -1,0 +1,99 @@
+# Isolated App QR redeem e2e stack (A-R7 / #128).
+#
+# Used only by `make pair-redeem-e2e` / server/tests/pair_redeem_e2e.py
+# with project name `botville-pair-redeem-e2e`. It does not replace the
+# official server/compose/docker-compose.yml optional `pair-redeem`
+# profile, and it must never be pointed at a live 8845 or a public port.
+#
+# This is an isolated-environment test, not a real HTTPS entry or phone
+# camera scan. Host ports bind 127.0.0.1 only. Image pins stay in sync
+# with the official compose file.
+#
+# postgres + synapse always start; pair-redeem is behind an explicit
+# profile so the test can prove default-off (port closed) vs enabled.
+
+x-noproxy-env: &noproxy-env
+  HTTP_PROXY: ""
+  HTTPS_PROXY: ""
+  http_proxy: ""
+  https_proxy: ""
+  NO_PROXY: "localhost,127.0.0.1,::1,postgres,synapse,pair-redeem,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+  no_proxy: "localhost,127.0.0.1,::1,postgres,synapse,pair-redeem,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-docker.io/library/postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab}
+    environment:
+      <<: *noproxy-env
+      POSTGRES_USER: ${POSTGRES_USER:-botville}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in the e2e env file}
+      POSTGRES_DB: ${POSTGRES_DB:-synapse}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-botville} -d ${POSTGRES_DB:-synapse}"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+
+  synapse:
+    image: ${SYNAPSE_IMAGE:-docker.io/matrixdotorg/synapse:v1.164.1@sha256:fa4aa980f279bcf26d4e7ecc2a2c9a701c73f2ebe8841da9bdcf3b2fdf693d75}
+    environment:
+      <<: *noproxy-env
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        python -m synapse.app.homeserver --config-path /config/homeserver.yaml
+        --generate-keys --keys-directory /data &&
+        exec python -m synapse.app.homeserver --config-path /config/homeserver.yaml
+        --keys-directory /data
+    ports:
+      - "127.0.0.1:${BOTVILLE_HTTP_PORT:-18208}:8008"
+    volumes:
+      - ${PAIR_REDEEM_E2E_CONFIG}/synapse:/config:ro
+      - synapse-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8008/health', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  pair-redeem:
+    image: ${PAIRING_IMAGE:-docker.io/library/python:3.12-slim@sha256:b18b261e1b4974b4f321451ad5251ded85abb22c2b8b262da527dda1d031ab30}
+    profiles: [pair-redeem]
+    working_dir: /app
+    command: python -m pair_redeem
+    environment:
+      <<: *noproxy-env
+      BOTVILLE_PAIR_REDEEM_BIND: "0.0.0.0:8092"
+      BOTVILLE_PAIR_REDEEM_DB: /data/pair_redeem.db
+      BOTVILLE_PAIR_REDEEM_SYNAPSE_URL: ${BOTVILLE_PAIR_REDEEM_SYNAPSE_URL:-http://synapse:8008}
+      BOTVILLE_PAIR_REDEEM_SYNAPSE_ADMIN_TOKEN: ${BOTVILLE_PAIR_REDEEM_SYNAPSE_ADMIN_TOKEN:-}
+      BOTVILLE_PAIR_REDEEM_IP_LIMIT: ${BOTVILLE_PAIR_REDEEM_IP_LIMIT:-10}
+      BOTVILLE_PAIR_REDEEM_GLOBAL_LIMIT: ${BOTVILLE_PAIR_REDEEM_GLOBAL_LIMIT:-60}
+    ports:
+      - "127.0.0.1:${BOTVILLE_PAIR_REDEEM_PORT:-18292}:8092"
+    volumes:
+      - ../pair_redeem:/app/pair_redeem:ro
+      - pair-redeem-data:/data
+    depends_on:
+      synapse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8092/health', timeout=5)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  postgres-data:
+  synapse-data:
+  pair-redeem-data:

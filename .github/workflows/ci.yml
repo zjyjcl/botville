@@ -573,6 +573,37 @@ jobs:
       - name: Swift unit and integration tests
         run: swift test
 
+  pair-redeem-e2e:
+    name: pair-redeem-e2e (synapse, isolated)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python 3.12 issuer HTTPS regression (local mock TLS only)
+        run: |
+          docker run --rm --network none \
+            -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=server/tests \
+            -v "$PWD:/repo:ro" -w /repo \
+            docker.io/library/python:3.12-slim@sha256:b18b261e1b4974b4f321451ad5251ded85abb22c2b8b262da527dda1d031ab30 \
+            python -m unittest test_pair_redeem.R2RegressionTests.test_https_issuer_real_tls -v
+
+      - name: Isolated pair_redeem e2e (not a real HTTPS or phone scan)
+        run: make pair-redeem-e2e
+
+      - name: Dump logs
+        if: failure()
+        run: |
+          if [ -f server/compose/generated/pair-redeem-e2e/compose-logs.txt ]; then
+            echo "===== saved compose logs (captured before teardown) ====="
+            cat server/compose/generated/pair-redeem-e2e/compose-logs.txt
+          else
+            echo "===== no saved compose log file ====="
+          fi
+      # The e2e script captures logs before down -v and removes its
+      # generated secret env. Do not retry compose using that deleted env.
+
+
   lint:
     name: lint
     runs-on: ubuntu-latest
@@ -655,6 +686,10 @@ jobs:
             BOTVILLE_HOMESERVER="${hs}" GATEWAY_MATRIX_TRANSPORT="${transport}" \
               docker compose -f server/compose/docker-compose.yml \
               --env-file server/compose/.env --profile "${hs}" --profile pairing config --quiet
+            echo "== docker compose config --profile ${hs} --profile pair-redeem (A-R7)"
+            BOTVILLE_HOMESERVER="${hs}" GATEWAY_MATRIX_TRANSPORT="${transport}" \
+              docker compose -f server/compose/docker-compose.yml \
+              --env-file server/compose/.env --profile "${hs}" --profile pair-redeem config --quiet
           done
           echo "== docker compose config (federation, A2.1)"
           python3 server/scripts/federation-setup.py
@@ -771,6 +806,12 @@ jobs:
               "PAIRING_RELATIONS_GATEWAY_URL": "",
               "PAIRING_RELATIONS_GATEWAY": "none",
               "PAIRING_RELATIONS_ALLOW_PRIVATE": "false",
+              # Optional pair-redeem profile: default off. Admin token stays
+              # empty; init.sh does not generate a Synapse access token.
+              "BOTVILLE_PAIR_REDEEM_PORT": "8092",
+              "BOTVILLE_PAIR_REDEEM_SYNAPSE_URL": "http://synapse:8008",
+              "BOTVILLE_PAIR_REDEEM_SYNAPSE_ADMIN_TOKEN": "",
+              "BOTVILLE_PAIR_REDEEM_TRUSTED_PROXIES": "",
               "BOTVILLE_GATEWAY_HMAC_SECRET": "<change-me>",
               # Persona engine pass-through (B line PR2): off / empty by
               # default; init.sh generates none of them (the API key is
