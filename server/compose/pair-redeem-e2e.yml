@@ -104,7 +104,7 @@ services:
     ports:
       - "127.0.0.1:${BOTVILLE_PAIR_REDEEM_EDGE_PORT:-18443}:8443"
     volumes:
-      - ${PAIR_REDEEM_EDGE_CADDYFILE}:/etc/caddy/Caddyfile:ro
+      - ${PAIR_REDEEM_EDGE_CADDYFILE:-./pair-redeem-edge/Caddyfile}:/etc/caddy/Caddyfile:ro
       - ${PAIR_REDEEM_E2E_CONFIG}/certs:/certs:ro
     depends_on:
       pair-redeem:
