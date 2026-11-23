@@ -804,6 +804,12 @@ jobs:
               "PAIRING_RELATIONS_GATEWAY_URL": "",
               "PAIRING_RELATIONS_GATEWAY": "none",
               "PAIRING_RELATIONS_ALLOW_PRIVATE": "false",
+              # Optional pair-redeem profile: default off. Admin token stays
+              # empty; init.sh does not generate a Synapse access token.
+              "BOTVILLE_PAIR_REDEEM_PORT": "8092",
+              "BOTVILLE_PAIR_REDEEM_SYNAPSE_URL": "http://synapse:8008",
+              "BOTVILLE_PAIR_REDEEM_SYNAPSE_ADMIN_TOKEN": "",
+              "BOTVILLE_PAIR_REDEEM_TRUSTED_PROXIES": "",
               "BOTVILLE_GATEWAY_HMAC_SECRET": "<change-me>",
               # Persona engine pass-through (B line PR2): off / empty by
               # default; init.sh generates none of them (the API key is
