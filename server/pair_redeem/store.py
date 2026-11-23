@@ -31,7 +31,9 @@ CREATE TABLE IF NOT EXISTS codes (
     hs                  TEXT NOT NULL,
     gw                  TEXT,
     fp                  TEXT,
-    exp                 REAL NOT NULL,
+    exp                 REAL NOT NULL,  -- wall-clock seconds; REAL so
+    -- int/float clocks compare uniformly. SQLite numeric affinity still
+    -- reads older INTEGER rows written by earlier schemas.
     status              TEXT NOT NULL CHECK (status IN ('unused', 'used', 'revoked')),
     auth_type           TEXT NOT NULL CHECK (auth_type IN ('registration_token')),
     issued_at           REAL NOT NULL,
@@ -48,7 +50,7 @@ CREATE TABLE IF NOT EXISTS events (
 """
 
 
-_CODE_ALPHABET = set(string.ascii_letters + string.digits + "-_")
+CODE_ALPHABET = set(string.ascii_letters + string.digits + "-_")
 
 
 def code_sha256(code):
@@ -84,7 +86,7 @@ def require_code(code):
     """43-character canonical base64url (32 bytes), same alphabet as the contract."""
     if not isinstance(code, str) or len(code) != 43:
         raise ValueError("code must be 43-character base64url")
-    if any(c not in _CODE_ALPHABET for c in code):
+    if any(c not in CODE_ALPHABET for c in code):
         raise ValueError("code must be 43-character base64url")
     raw = base64.urlsafe_b64decode(code + "=")
     if base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=") != code:
@@ -300,18 +302,26 @@ class PairRedeemStore:
 
     def update_event_suppressed(self, event_id, suppressed):
         with self._lock:
-            row = self._conn.execute(
-                "SELECT detail FROM events WHERE id = ?", (event_id,)
-            ).fetchone()
-            if row is None:
-                return
-            payload = json.loads(row["detail"])
-            payload["suppressed"] = int(suppressed)
-            self._conn.execute(
-                "UPDATE events SET detail = ? WHERE id = ?",
-                (json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                 event_id),
-            )
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT detail FROM events WHERE id = ?", (event_id,)
+                ).fetchone()
+                if row is None:
+                    self._conn.execute("ROLLBACK")
+                    return
+                payload = json.loads(row["detail"])
+                payload["suppressed"] = int(suppressed)
+                self._conn.execute(
+                    "UPDATE events SET detail = ? WHERE id = ?",
+                    (json.dumps(payload, ensure_ascii=False,
+                                separators=(",", ":")),
+                     event_id),
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def _insert_event_locked(self, kind, detail, now):
         if kind not in AUDIT_KINDS:

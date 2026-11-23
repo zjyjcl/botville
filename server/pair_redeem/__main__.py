@@ -36,7 +36,8 @@ def main(env=None):
         raise SystemExit("BOTVILLE_PAIR_REDEEM_BIND host is not a valid IP")
     try:
         issuer = SynapseRegistrationTokenIssuer(
-            config.synapse_url, config.synapse_admin_token)
+            config.synapse_url, config.synapse_admin_token,
+            timeout=config.issuer_timeout)
     except ConfigError as exc:
         raise SystemExit(str(exc))
     store = PairRedeemStore(config.store_path)

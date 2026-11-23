@@ -15,7 +15,6 @@ import ipaddress
 import json
 import logging
 import socket
-import sqlite3
 import threading
 import time
 import urllib.error
@@ -23,6 +22,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .store import (
+    CODE_ALPHABET,
     PairRedeemStore,
     code_sha256,
 )
@@ -32,18 +32,22 @@ log = logging.getLogger("pair_redeem")
 REDEEM_PATH = "/_botville/pair/redeem"
 MAX_BODY_BYTES = 64 * 1024
 CODE_PATTERN_LEN = 43
-_CODE_ALPHABET = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
 DEVICE_NAME_MIN = 1
 DEVICE_NAME_MAX = 128
 AUTH_EXPIRES_IN_MS = 600000
 IP_LIMIT_DEFAULT = 10
 GLOBAL_LIMIT_DEFAULT = 60
 RATE_WINDOW_SECONDS = 60
-# Issuer HTTP runs inside the store write lock (see redeem_atomic). Keep
-# this short so a stuck Synapse fails fast instead of stalling the process.
+# Issuer HTTP runs inside the store write lock (see redeem_atomic). Default
+# stays short so a stuck Synapse fails fast instead of stalling the process;
+# operators may raise BOTVILLE_PAIR_REDEEM_ISSUER_TIMEOUT_SECONDS if needed.
 ISSUER_TIMEOUT_SECONDS = 2
 REQUEST_TIMEOUT_SECONDS = 5
 PRUNE_INTERVAL_SECONDS = 3600.0
+# Cap in-memory rate-limit maps so a spoofed-XFF flood cannot grow them
+# without bound (r2 A3 leftover).
+RATE_BUCKET_MAX_KEYS = 4096
+RATE_AUDIT_MAX_KEYS = 4096
 
 ERROR_STATUS = {
     "BV_PAIR_INVALID": 400,
@@ -70,6 +74,7 @@ ENV_STORE = "BOTVILLE_PAIR_REDEEM_DB"
 ENV_SYNAPSE_URL = "BOTVILLE_PAIR_REDEEM_SYNAPSE_URL"
 ENV_SYNAPSE_ADMIN_TOKEN = "BOTVILLE_PAIR_REDEEM_SYNAPSE_ADMIN_TOKEN"
 ENV_AUTH_EXPIRES_MS = "BOTVILLE_PAIR_REDEEM_TOKEN_EXPIRES_IN_MS"
+ENV_ISSUER_TIMEOUT = "BOTVILLE_PAIR_REDEEM_ISSUER_TIMEOUT_SECONDS"
 
 
 class ConfigError(Exception):
@@ -105,17 +110,35 @@ class RateLimiter:
         self._lock = threading.Lock()
 
     def _trim(self, key, now):
-        hits = self._hits.setdefault(key, collections.deque())
+        hits = self._hits.get(key)
+        if hits is None:
+            return None
         while hits and hits[0] <= now - self._window:
             hits.popleft()
+        if not hits:
+            self._hits.pop(key, None)
+            return None
         return hits
+
+    def _evict_overflow_locked(self):
+        overflow = len(self._hits) - RATE_BUCKET_MAX_KEYS
+        if overflow <= 0:
+            return
+        # Prefer evicting per-IP buckets; keep the global key.
+        oldest = [
+            (key, hits) for key, hits in self._hits.items()
+            if key != "global" and hits
+        ]
+        oldest.sort(key=lambda item: item[1][0])
+        for key, _ in oldest[:overflow]:
+            self._hits.pop(key, None)
 
     def peek(self, key, now=None):
         """Return (allowed, retry_after_ms) without recording a hit."""
         now = time.monotonic() if now is None else now
         with self._lock:
             hits = self._trim(key, now)
-            if len(hits) >= self._limit:
+            if hits is not None and len(hits) >= self._limit:
                 retry = max(1, int(((hits[0] + self._window) - now) * 1000 + 0.999))
                 return False, retry
             return True, None
@@ -124,7 +147,11 @@ class RateLimiter:
         now = time.monotonic() if now is None else now
         with self._lock:
             hits = self._trim(key, now)
+            if hits is None:
+                hits = collections.deque()
+                self._hits[key] = hits
             hits.append(now)
+            self._evict_overflow_locked()
 
     def check(self, key, now=None):
         """Return (allowed, retry_after_ms). Denied requests are not recorded."""
@@ -212,7 +239,8 @@ class PairRedeemConfig:
                  store_path=":memory:",
                  synapse_url="", synapse_admin_token="",
                  auth_expires_in_ms=AUTH_EXPIRES_IN_MS,
-                 request_timeout=REQUEST_TIMEOUT_SECONDS):
+                 request_timeout=REQUEST_TIMEOUT_SECONDS,
+                 issuer_timeout=ISSUER_TIMEOUT_SECONDS):
         self.ip_limit = ip_limit
         self.global_limit = global_limit
         self.rate_window = rate_window
@@ -224,6 +252,7 @@ class PairRedeemConfig:
         self.synapse_admin_token = synapse_admin_token or ""
         self.auth_expires_in_ms = auth_expires_in_ms
         self.request_timeout = request_timeout
+        self.issuer_timeout = issuer_timeout
 
     @classmethod
     def from_env(cls, env):
@@ -240,6 +269,8 @@ class PairRedeemConfig:
             synapse_admin_token=env.get(ENV_SYNAPSE_ADMIN_TOKEN, ""),
             auth_expires_in_ms=_env_int(env, ENV_AUTH_EXPIRES_MS,
                                         AUTH_EXPIRES_IN_MS),
+            issuer_timeout=_env_int(env, ENV_ISSUER_TIMEOUT,
+                                    ISSUER_TIMEOUT_SECONDS),
         )
 
 
@@ -332,39 +363,66 @@ class PairRedeemApp:
                 return
         retries = [value for value in (ip_retry, global_retry) if value]
         # Take the later of the triggered layers' retry instants (max of
-        # the delays). That is the earliest time at which *both* layers
-        # will accept a retry; using min would still 429 on the other layer.
+        # the delays). pairing-qr.md §4.5's "earliest retry" means the
+        # earliest time at which *both* layers will accept a retry;
+        # using min would still 429 on the other layer.
         retry_after_ms = max(retries) if retries else 1
         self._record_rate_limited(ip, retry_after_ms)
         raise PairRedeemError("BV_PAIR_RATE_LIMITED",
                               retry_after_ms=retry_after_ms)
 
+    def _evict_rate_audit_locked(self, now, keep=None):
+        """Drop expired (and overflow) audit keys. Return pending flushes."""
+        window = self.config.rate_window
+        stale = [key for key, rec in self._rate_audit.items()
+                 if key != keep and (now - rec["at"]) >= window]
+        flush = []
+        for key in stale:
+            rec = self._rate_audit.pop(key)
+            if rec.get("event_id") is not None:
+                flush.append((rec["event_id"], rec["suppressed"]))
+        overflow = len(self._rate_audit) - RATE_AUDIT_MAX_KEYS
+        if overflow > 0:
+            oldest = [
+                (key, rec) for key, rec in self._rate_audit.items()
+                if key != keep
+            ]
+            oldest.sort(key=lambda item: item[1]["at"])
+            for key, rec in oldest[:overflow]:
+                self._rate_audit.pop(key, None)
+                if rec.get("event_id") is not None:
+                    flush.append((rec["event_id"], rec["suppressed"]))
+        return flush
+
     def _record_rate_limited(self, ip, retry_after_ms):
         """Write at most one rate_limited audit per IP per window; count the rest.
 
-        A flood of 429s must not grow the events table without bound (A3).
+        In-window repeats stay in memory and are flushed onto the previous
+        event only when the window rolls (r2 A3). A new window always
+        starts at suppressed=0 so the count does not inherit (r2 §3.2).
         """
         now = self.clock()
+        flush_items = []
+        start_new = False
         with self._rate_audit_lock:
             previous = self._rate_audit.get(ip)
             if previous is not None and (now - previous["at"]) < self.config.rate_window:
                 previous["suppressed"] += 1
-                event_id = previous.get("event_id")
-                suppressed = previous["suppressed"]
-                start_new = False
+                flush_items.extend(self._evict_rate_audit_locked(now, keep=ip))
             else:
-                event_id = None
-                suppressed = 0 if previous is None else previous["suppressed"]
+                if previous is not None and previous.get("event_id") is not None:
+                    flush_items.append((previous["event_id"], previous["suppressed"]))
                 start_new = True
                 self._rate_audit[ip] = {"at": now, "suppressed": 0, "event_id": None}
+                flush_items.extend(self._evict_rate_audit_locked(now, keep=ip))
+        for event_id, suppressed in flush_items:
+            self.store.update_event_suppressed(event_id, suppressed)
         if not start_new:
-            if event_id is not None:
-                self.store.update_event_suppressed(event_id, suppressed)
             return
         event_id = self.store.record_event("rate_limited", {
             "ip": ip, "result": "rate_limited",
             "retry_after_ms": retry_after_ms,
-            "suppressed": suppressed,
+            "suppressed": 0,
         }, now=now)
         with self._rate_audit_lock:
             current = self._rate_audit.get(ip)
@@ -408,7 +466,8 @@ class PairRedeemApp:
         class Server(ThreadingHTTPServer):
             daemon_threads = True
             allow_reuse_address = True
-            timeout = self.config.request_timeout
+            # serve_forever does not consult Server.timeout; the
+            # per-recv deadline is handler.timeout (set above).
 
         return Server((host, port), handler)
 
@@ -426,7 +485,7 @@ def start_pruner(app, interval=PRUNE_INTERVAL_SECONDS, stop=None):
                 counts = app.store.prune(now=app.clock())
                 if any(counts.values()):
                     log.info("pruned old pair-redeem rows: %s", counts)
-            except (sqlite3.Error, Exception) as exc:
+            except Exception as exc:
                 log.warning("pair_redeem prune failed: %s", exc)
             if stop is None:
                 time.sleep(interval)
@@ -459,10 +518,15 @@ def parse_redeem_request(raw, content_type, content_length=None):
     name = body.get("device_display_name")
     if not isinstance(code, str) or not isinstance(name, str):
         raise PairRedeemError("BV_PAIR_INVALID")
-    if len(code) != CODE_PATTERN_LEN or any(c not in _CODE_ALPHABET for c in code):
+    if len(code) != CODE_PATTERN_LEN or any(c not in CODE_ALPHABET for c in code):
         raise PairRedeemError("BV_PAIR_INVALID")
     if not (DEVICE_NAME_MIN <= len(name) <= DEVICE_NAME_MAX):
         raise PairRedeemError("BV_PAIR_INVALID")
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        # Lone surrogates pass json.loads but fail sqlite3 UTF-8 binding.
+        raise PairRedeemError("BV_PAIR_INVALID") from None
     return code, name
 
 
@@ -482,6 +546,11 @@ def _handler_for(app):
         def _send_json(self, status, payload, retry_after_ms=None):
             raw = json.dumps(payload, ensure_ascii=False,
                              separators=(",", ":")).encode("utf-8")
+            if status >= 400:
+                # All error responses close the connection. Per-path
+                # _close_unread() is easy to miss (r2 S1: the 429 early
+                # exit left keep-alive open with an unread body).
+                self.close_connection = True
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
@@ -489,14 +558,14 @@ def _handler_for(app):
                 seconds = retry_after_ms // 1000
                 if seconds >= 1:
                     self.send_header("Retry-After", str(seconds))
-            # Unread bodies on HTTP/1.1 keep-alive would poison the next
-            # request (S1). close_connection is set by those reject paths.
             if self.close_connection:
                 self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(raw)
 
         def _send_error_body(self, exc):
+            # Unconditionally close, matching A2.1 pairing _error.
+            self.close_connection = True
             body = {"errcode": exc.errcode, "error": exc.error}
             if exc.errcode == "BV_PAIR_RATE_LIMITED":
                 body["retry_after_ms"] = int(exc.retry_after_ms or 1)
@@ -528,10 +597,16 @@ def _handler_for(app):
                     if (self.headers.get("Transfer-Encoding") or "").strip():
                         self._close_unread()
                         self._reject(ip, "transfer_encoding")
-                    length_raw = self.headers.get("Content-Length")
-                    if length_raw is None:
+                    length_values = self.headers.get_all("Content-Length") or []
+                    if not length_values:
                         self._close_unread()
                         self._reject(ip, "missing_length")
+                    length_raw = length_values[0]
+                    # Repeated or comma-joined Content-Length is a CL.CL
+                    # smuggling surface; reject closed rather than picking one.
+                    if len(length_values) > 1 or "," in length_raw:
+                        self._close_unread()
+                        self._reject(ip, "duplicate_length")
                     try:
                         length = int(length_raw)
                     except (TypeError, ValueError):
@@ -565,10 +640,16 @@ def _handler_for(app):
             except PairRedeemError as exc:
                 self._send_error_body(exc)
             except IssuerError:
-                self._send_json(503, {
-                    "errcode": "M_UNKNOWN",
-                    "error": "temporarily unavailable",
-                })
+                app.store.record_event("rejected", {
+                    "ip": ip, "result": "rejected", "reason": "issuer_failed",
+                }, now=app.clock())
+                # 5xx is allowed to be off-contract (§4.4). Do not invent
+                # an errcode (e.g. M_UNKNOWN) the App might treat as
+                # non-retryable; the HTTP status carries the retry hint.
+                self._send_json(503, {"error": "temporarily unavailable"})
+            except Exception:
+                log.exception("pair_redeem handler failed")
+                self._send_json(503, {"error": "temporarily unavailable"})
 
         def do_GET(self):
             self._method_not_allowed()

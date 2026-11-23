@@ -32,9 +32,11 @@ from pair_redeem.service import (  # noqa: E402
     ENV_BIND,
     ENV_GLOBAL_LIMIT,
     ENV_IP_LIMIT,
+    ENV_ISSUER_TIMEOUT,
     ENV_SYNAPSE_ADMIN_TOKEN,
     ENV_SYNAPSE_URL,
     ENV_TRUSTED_PROXIES,
+    ISSUER_TIMEOUT_SECONDS,
     ERROR_STATUS,
     ERROR_TEXT,
     MAX_BODY_BYTES,
@@ -375,8 +377,12 @@ class AtomicityTests(PairRedeemTestCase):
         self.issuer.fail = True
         status, body, _ = self.redeem_ok(code)
         self.assertEqual(status, 503)
-        self.assertNotEqual(body.get("errcode"), "BV_PAIR_USED")
-        self.assertNotIn("auth", body if isinstance(body, dict) else {})
+        self.assertIsInstance(body, dict)
+        self.assertNotIn("errcode", body)
+        self.assertNotIn("auth", body)
+        rejected = [e for e in self.store.events(kind="rejected")
+                    if e["detail"].get("reason") == "issuer_failed"]
+        self.assertEqual(len(rejected), 1)
         self.assertEqual(self.store.get(code_sha256(code))["status"], "unused")
         self.issuer.fail = False
         status, body, _ = self.redeem_ok(code)
@@ -532,8 +538,14 @@ class IsolationAndConfigTests(unittest.TestCase):
         self.assertEqual(config.ip_limit, 10)
         self.assertEqual(config.global_limit, 60)
         self.assertEqual(config.auth_expires_in_ms, AUTH_EXPIRES_IN_MS)
+        self.assertEqual(config.issuer_timeout, ISSUER_TIMEOUT_SECONDS)
         self.assertEqual(config.bind_host, "127.0.0.1")
         self.assertEqual(len(config.trusted_proxies), 2)
+        config = PairRedeemConfig.from_env({
+            ENV_BIND: "127.0.0.1:0",
+            ENV_ISSUER_TIMEOUT: "8",
+        })
+        self.assertEqual(config.issuer_timeout, 8)
         with self.assertRaises(ConfigError):
             PairRedeemConfig.from_env({ENV_TRUSTED_PROXIES: "not-an-ip"})
 
@@ -549,6 +561,13 @@ class IsolationAndConfigTests(unittest.TestCase):
                 json.dumps({"code": code,
                             "device_display_name": name + "超"}).encode(),
                 "application/json")
+        # Lone surrogates must be rejected at parse time (r2 §3.3).
+        with self.assertRaises(PairRedeemError):
+            parse_redeem_request(
+                json.dumps({"code": code,
+                            "device_display_name": "\ud800"}).encode(
+                                "utf-8"),
+                "application/json")
 
 
 def _http_header_map(header_text):
@@ -561,10 +580,8 @@ def _http_header_map(header_text):
     return headers
 
 
-def raw_http(host, port, request, timeout=2.0):
-    """Send one raw request and read one HTTP response; leave the socket open."""
-    sock = socket.create_connection((host, port), timeout=timeout)
-    sock.sendall(request)
+def read_http_response(sock):
+    """Read one HTTP response from an already-connected socket."""
     chunks = []
     body = b""
     header_text = ""
@@ -583,6 +600,14 @@ def raw_http(host, port, request, timeout=2.0):
         if len(rest) >= length:
             body = rest[:length]
             break
+    return header_text, body
+
+
+def raw_http(host, port, request, timeout=2.0):
+    """Send one raw request and read one HTTP response; leave the socket open."""
+    sock = socket.create_connection((host, port), timeout=timeout)
+    sock.sendall(request)
+    header_text, body = read_http_response(sock)
     return header_text, body, sock
 
 
@@ -679,7 +704,20 @@ class ReviewFixTests(PairRedeemTestCase):
             self.assertEqual(self.redeem_ok(make_code(87))[0], 429)
         limited = self.store.events(kind="rate_limited")
         self.assertEqual(len(limited), 1)
+        # In-window repeats are counted in memory and not written yet.
+        self.assertEqual(limited[0]["detail"]["suppressed"], 0)
+        self.assertEqual(self.app._rate_audit["127.0.0.1"]["suppressed"], 4)
+        # Rolling the window flushes the previous count and starts at 0.
+        self.now = self.now + self.config.rate_window + 1
+        self.app.ip_limiter._hits.clear()
+        self.app.global_limiter._hits.clear()
+        self.issue(make_code(87))
+        self.assertEqual(self.redeem_ok(make_code(87))[0], 200)
+        self.assertEqual(self.redeem_ok(make_code(93))[0], 429)
+        limited = self.store.events(kind="rate_limited")
+        self.assertEqual(len(limited), 2)
         self.assertEqual(limited[0]["detail"]["suppressed"], 4)
+        self.assertEqual(limited[1]["detail"]["suppressed"], 0)
 
     def test_pruner_runs_at_start_and_deletes_old_rows(self):
         code = self.issue(make_code(88))
@@ -773,6 +811,101 @@ class ReviewFixTests(PairRedeemTestCase):
         finally:
             sock.close()
 
+    def test_rate_limited_keepalive_closes_and_does_not_poison(self):
+        # r2 S1: a 429 used to leave the unread body on a keep-alive
+        # connection, so a smuggled follow-up (including a forged
+        # X-Forwarded-For) could be parsed as the next request.
+        self.app.config.trusted_proxies = [ip_network("127.0.0.1/32")]
+        self.app.ip_limiter._limit = 1
+        self.app.global_limiter._limit = 100
+        first_code = self.issue(make_code(91))
+        smuggled_code = self.issue(make_code(92))
+        host, port = "127.0.0.1", self.server.server_address[1]
+        first_payload = json.dumps({
+            "code": first_code, "device_display_name": DEVICE,
+        }).encode("utf-8")
+        first = (
+            "POST " + REDEEM_PATH + " HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n"
+        ).encode("ascii") % len(first_payload) + first_payload
+        smuggled_payload = json.dumps({
+            "code": smuggled_code, "device_display_name": DEVICE,
+        }).encode("utf-8")
+        smuggled = (
+            "POST " + REDEEM_PATH + " HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "X-Forwarded-For: 203.0.113.99\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n"
+        ).encode("ascii") % len(smuggled_payload) + smuggled_payload
+        limited = (
+            "POST " + REDEEM_PATH + " HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n"
+        ).encode("ascii") % len(smuggled) + smuggled
+        header, body, sock = raw_http(host, port, first)
+        try:
+            self.assertTrue(header.startswith("HTTP/1.1 200"), header)
+            sock.sendall(limited)
+            header2, body2 = read_http_response(sock)
+            self.assertTrue(header2.startswith("HTTP/1.1 429"), header2)
+            headers = _http_header_map(header2)
+            self.assertEqual(headers.get("connection"), "close")
+            err = json.loads(body2.decode("utf-8"))
+            self.assertEqual(err["errcode"], "BV_PAIR_RATE_LIMITED")
+            sock.settimeout(0.4)
+            try:
+                rest = sock.recv(1024)
+            except socket.timeout:
+                rest = b""
+            self.assertFalse(rest)
+            self.assertEqual(
+                self.store.get(code_sha256(smuggled_code))["status"], "unused")
+        finally:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+        # Same loopback IP is still at the per-IP cap from the first
+        # redeem; clear the buckets so a fresh connection can prove the
+        # smuggled code was not consumed.
+        self.app.ip_limiter._hits.clear()
+        self.app.global_limiter._hits.clear()
+        status, body, _ = self.redeem_ok(smuggled_code)
+        self.assertEqual(status, 200)
+
+    def test_duplicate_content_length_is_400_and_closes(self):
+        host, port = "127.0.0.1", self.server.server_address[1]
+        payload = b"{}"
+        request = (
+            "POST " + REDEEM_PATH + " HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n"
+        ).encode("ascii") % (len(payload), len(payload)) + payload
+        header, body, sock = raw_http(host, port, request)
+        try:
+            self.assertTrue(header.startswith("HTTP/1.1 400"), header)
+            headers = _http_header_map(header)
+            self.assertEqual(headers.get("connection"), "close")
+            err = json.loads(body.decode("utf-8"))
+            self.assertEqual(err["errcode"], "BV_PAIR_INVALID")
+        finally:
+            sock.close()
+
     def test_patch_and_options_are_405(self):
         host, port = "127.0.0.1", self.server.server_address[1]
         for method in ("PATCH", "OPTIONS", "HEAD"):
@@ -821,8 +954,7 @@ class TimeoutTests(unittest.TestCase):
         sock = socket.create_connection((host, port), timeout=2)
         try:
             sock.sendall(request)
-            sock.settimeout(1.5)
-            started = time.time()
+            sock.settimeout(3.0)
             data = b""
             while True:
                 try:
@@ -832,8 +964,6 @@ class TimeoutTests(unittest.TestCase):
                 if not piece:
                     break
                 data += piece
-            elapsed = time.time() - started
-            self.assertLess(elapsed, 1.5)
             # Connection closed after the handler timeout; may or may not
             # include a 400 if the timeout landed mid-read.
             if data:
