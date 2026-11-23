@@ -13,8 +13,16 @@
 #                        # profile, pairing-data volume; loopback 8090), any HS
 #   make up PAIR_REDEEM=1 # also start App QR redeem (A-R7, `pair-redeem`
 #                        # profile, loopback 8092). Synapse only; default off.
+#   make up PAIR_REDEEM=1 PAIR_REDEEM_EDGE=1
+#                        # also start the optional HTTPS edge (A-R8,
+#                        # `pair-redeem-edge`, loopback 8443). Requires
+#                        # PAIR_REDEEM=1, Synapse, and cert.pem/key.pem.
+#                        # Default off; not a public deploy or phone scan.
 #   make pair-redeem-e2e # isolated Synapse + pair_redeem e2e (own compose
 #                        # project; not a real HTTPS or phone scan)
+#   make pair-redeem-edge-e2e # isolated HTTPS edge e2e (own compose
+#                        # project, mock TLS only; not public HTTPS or
+#                        # a phone scan)
 #   make gateway-hs-smoke # OpenID userinfo + startup whoami against a real HS
 #                        # (stack already up with GATEWAY=1 on synapse or tuwunel)
 #   make smoke           # run server/tests/smoke.py against the running stack
@@ -148,12 +156,21 @@ PAIRING_PROFILE := $(if $(filter 1 true yes,$(PAIRING)),--profile pairing,)
 PAIR_REDEEM ?=
 PAIR_REDEEM_PROFILE := $(if $(filter 1 true yes,$(PAIR_REDEEM)),--profile pair-redeem,)
 
+# Optional HTTPS edge in front of pair-redeem (A-R8 / #128):
+# PAIR_REDEEM_EDGE=1 (also true/yes) on `up` adds --profile pair-redeem-edge.
+# Default off: `make up` does not start it and does not require a cert or
+# public domain. Requires PAIR_REDEEM=1 and HS=synapse. Host port is
+# loopback only. `down`, `ps`, `logs` and `config` always carry the
+# profile, like pair-redeem. Local/mock TLS is not public HTTPS.
+PAIR_REDEEM_EDGE ?=
+PAIR_REDEEM_EDGE_PROFILE := $(if $(filter 1 true yes,$(PAIR_REDEEM_EDGE)),--profile pair-redeem-edge,)
+
 # Backup/restore/e2e knobs (A1.1).
 E2E_PHASE ?= seed
 E2E_STATE ?= backups/e2e-state.json
 
 .PHONY: init up down logs smoke ps config gateway-preflight backup restore backup-gateway restore-gateway \
-	e2e push-e2e appservice-e2e gateway-hs-smoke federation-e2e federation-down pair-redeem-e2e
+	e2e push-e2e appservice-e2e gateway-hs-smoke federation-e2e federation-down pair-redeem-e2e pair-redeem-edge-e2e
 
 init:
 	bash server/scripts/init.sh
@@ -176,6 +193,24 @@ ifneq ($(HS),synapse)
 	$(error PAIR_REDEEM=1 is Synapse-only in this cut; HS=$(HS) is not supported)
 endif
 endif
+ifneq ($(PAIR_REDEEM_EDGE_PROFILE),)
+ifeq ($(PAIR_REDEEM_PROFILE),)
+	$(error PAIR_REDEEM_EDGE=1 requires PAIR_REDEEM=1)
+endif
+ifneq ($(HS),synapse)
+	$(error PAIR_REDEEM_EDGE=1 is Synapse-only in this cut; HS=$(HS) is not supported)
+endif
+	@cert_dir="$${BOTVILLE_PAIR_REDEEM_EDGE_CERT_DIR:-}"; \
+	if [ -z "$$cert_dir" ] && [ -f "$(ENV_FILE)" ]; then \
+		cert_dir=$$(sed -n 's/^BOTVILLE_PAIR_REDEEM_EDGE_CERT_DIR=//p' "$(ENV_FILE)" | tail -n 1); \
+	fi; \
+	if [ -z "$$cert_dir" ]; then cert_dir=server/compose/generated/pair-redeem-edge; \
+	elif [ "$${cert_dir#/}" = "$$cert_dir" ]; then cert_dir=server/compose/$$cert_dir; fi; \
+	if [ ! -f "$$cert_dir/cert.pem" ] || [ ! -f "$$cert_dir/key.pem" ]; then \
+		echo "make up: PAIR_REDEEM_EDGE=1 needs cert.pem and key.pem in $$cert_dir (operator-supplied or local mock TLS; not a public CA, not a phone scan)" >&2; \
+		exit 1; \
+	fi
+endif
 	BOTVILLE_APPSERVICE_URL=$(APPSERVICE_URL) bash server/scripts/init.sh
 ifneq ($(GATEWAY_PROFILE),)
 	bash server/scripts/gateway-preflight.sh $(ENV_FILE)
@@ -192,7 +227,7 @@ endif
 		esac; \
 		rm -f $(APPSERVICE_URL_MARKER); \
 	fi
-	$(GATEWAY_HS_ENV) $(COMPOSE) --profile $(HS) $(PUSH_PROFILE) $(PAIRING_PROFILE) $(PAIR_REDEEM_PROFILE) $(GATEWAY_PROFILE) up -d
+	$(GATEWAY_HS_ENV) $(COMPOSE) --profile $(HS) $(PUSH_PROFILE) $(PAIRING_PROFILE) $(PAIR_REDEEM_PROFILE) $(PAIR_REDEEM_EDGE_PROFILE) $(GATEWAY_PROFILE) up -d
 ifneq ($(PUSH_PROFILE),)
 	$(COMPOSE) --profile $(HS) --profile push up -d --force-recreate --no-deps sygnal
 endif
@@ -217,17 +252,17 @@ gateway-preflight:
 config:
 	@test -f $(ENV_FILE) || { echo "make config: $(ENV_FILE) not found; run 'make up' (or bash server/scripts/init.sh) first, or pass ENV_FILE=..." >&2; exit 1; }
 	bash server/scripts/gateway-preflight.sh $(ENV_FILE)
-	$(GATEWAY_HS_ENV) $(COMPOSE) --profile $(HS) --profile push --profile pairing --profile pair-redeem --profile gateway config --quiet
-	@echo "compose config OK ($(HS) + push + pairing + pair-redeem + gateway)"
+	$(GATEWAY_HS_ENV) $(COMPOSE) --profile $(HS) --profile push --profile pairing --profile pair-redeem --profile pair-redeem-edge --profile gateway config --quiet
+	@echo "compose config OK ($(HS) + push + pairing + pair-redeem + pair-redeem-edge + gateway)"
 
 down:
-	$(COMPOSE) --profile $(HS) --profile push --profile pairing --profile pair-redeem --profile gateway down --remove-orphans
+	$(COMPOSE) --profile $(HS) --profile push --profile pairing --profile pair-redeem --profile pair-redeem-edge --profile gateway down --remove-orphans
 
 logs:
-	$(COMPOSE) --profile $(HS) --profile push --profile pairing --profile pair-redeem --profile gateway logs -f --tail=200
+	$(COMPOSE) --profile $(HS) --profile push --profile pairing --profile pair-redeem --profile pair-redeem-edge --profile gateway logs -f --tail=200
 
 ps:
-	$(COMPOSE) --profile $(HS) --profile push --profile pairing --profile pair-redeem --profile gateway ps
+	$(COMPOSE) --profile $(HS) --profile push --profile pairing --profile pair-redeem --profile pair-redeem-edge --profile gateway ps
 
 smoke: init
 	python3 server/tests/smoke.py \
@@ -340,6 +375,15 @@ FED_COMPOSE := docker compose -p botville-fed -f $(FED_COMPOSE_FILE) --env-file 
 # The script always `down -v` that project in a finally block.
 pair-redeem-e2e:
 	PYTHONDONTWRITEBYTECODE=1 python3 server/tests/pair_redeem_e2e.py
+
+# Isolated optional HTTPS edge e2e (A-R8). Own compose project
+# `botville-pair-redeem-edge-e2e`, loopback ports only, throwaway mock
+# TLS certificates generated at test time and deleted afterwards.
+# Does not use or modify server/compose/.env or the default `botville`
+# project. This is not a real public HTTPS entry or phone-scan test.
+# The script always `down -v` that project in a finally block.
+pair-redeem-edge-e2e:
+	PYTHONDONTWRITEBYTECODE=1 python3 server/tests/pair_redeem_edge_e2e.py
 
 federation-e2e:
 	bash server/scripts/federation-certs.sh

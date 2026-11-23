@@ -9,16 +9,19 @@
 # camera scan. Host ports bind 127.0.0.1 only. Image pins stay in sync
 # with the official compose file.
 #
-# postgres + synapse always start; pair-redeem is behind an explicit
-# profile so the test can prove default-off (port closed) vs enabled.
+# postgres + synapse always start; pair-redeem and pair-redeem-edge
+# are behind explicit profiles so tests can prove default-off
+# (ports closed) vs enabled. pair-redeem-edge is used by
+# `make pair-redeem-edge-e2e` with a separate project and ports.
+# Isolated/mock TLS is not public HTTPS and not a phone scan.
 
 x-noproxy-env: &noproxy-env
   HTTP_PROXY: ""
   HTTPS_PROXY: ""
   http_proxy: ""
   https_proxy: ""
-  NO_PROXY: "localhost,127.0.0.1,::1,postgres,synapse,pair-redeem,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
-  no_proxy: "localhost,127.0.0.1,::1,postgres,synapse,pair-redeem,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+  NO_PROXY: "localhost,127.0.0.1,::1,postgres,synapse,pair-redeem,pair-redeem-edge,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+  no_proxy: "localhost,127.0.0.1,::1,postgres,synapse,pair-redeem,pair-redeem-edge,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
 
 services:
   postgres:
@@ -88,6 +91,26 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8092/health', timeout=5)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  pair-redeem-edge:
+    image: ${CADDY_IMAGE:-docker.io/library/caddy:2.11.9-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0}
+    profiles: [pair-redeem-edge]
+    environment:
+      <<: *noproxy-env
+    ports:
+      - "127.0.0.1:${BOTVILLE_PAIR_REDEEM_EDGE_PORT:-18443}:8443"
+    volumes:
+      - ${PAIR_REDEEM_EDGE_CADDYFILE}:/etc/caddy/Caddyfile:ro
+      - ${PAIR_REDEEM_E2E_CONFIG}/certs:/certs:ro
+    depends_on:
+      pair-redeem:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--no-check-certificate", "-O", "/dev/null", "https://127.0.0.1:8443/health"]
       interval: 5s
       timeout: 5s
       retries: 12

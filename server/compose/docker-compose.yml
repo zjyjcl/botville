@@ -53,8 +53,8 @@ name: botville
 # fedgate-a/b are federation-stack names, kept here so the same list serves
 # it — see server/tests/test_compose_noproxy.py).
 x-noproxy-env: &noproxy-env
-  NO_PROXY: "localhost,127.0.0.1,::1,sygnal,postgres,synapse,tuwunel,continuwuity,gateway,admin,pair-redeem,synapse-a,synapse-b,pairing-a,pairing-b,fedgate-a,fedgate-b,hs-a,hs-b,.local,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${BOTVILLE_NO_PROXY_EXTRA:+,${BOTVILLE_NO_PROXY_EXTRA}}"
-  no_proxy: "localhost,127.0.0.1,::1,sygnal,postgres,synapse,tuwunel,continuwuity,gateway,admin,pair-redeem,synapse-a,synapse-b,pairing-a,pairing-b,fedgate-a,fedgate-b,hs-a,hs-b,.local,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${BOTVILLE_NO_PROXY_EXTRA:+,${BOTVILLE_NO_PROXY_EXTRA}}"
+  NO_PROXY: "localhost,127.0.0.1,::1,sygnal,postgres,synapse,tuwunel,continuwuity,gateway,admin,pair-redeem,pair-redeem-edge,synapse-a,synapse-b,pairing-a,pairing-b,fedgate-a,fedgate-b,hs-a,hs-b,.local,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${BOTVILLE_NO_PROXY_EXTRA:+,${BOTVILLE_NO_PROXY_EXTRA}}"
+  no_proxy: "localhost,127.0.0.1,::1,sygnal,postgres,synapse,tuwunel,continuwuity,gateway,admin,pair-redeem,pair-redeem-edge,synapse-a,synapse-b,pairing-a,pairing-b,fedgate-a,fedgate-b,hs-a,hs-b,.local,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${BOTVILLE_NO_PROXY_EXTRA:+,${BOTVILLE_NO_PROXY_EXTRA}}"
 
 services:
   postgres:
@@ -541,7 +541,8 @@ services:
     # and the operator explicitly opts in.
     # Host port is loopback only. Inside the isolated compose network the
     # process binds 0.0.0.0:8092 so the published loopback port can reach
-    # it; public unicast binds are refused. HTTPS/Caddy edge is later work.
+    # it; public unicast binds are refused. Optional HTTPS edge is a
+    # separate profile (`PAIR_REDEEM_EDGE=1`); see pair-redeem-edge.
     # Same pinned python image as `pairing` (no extra digest to keep in
     # sync). Read-only bind of server/pair_redeem; state in pair-redeem-data.
     image: ${PAIRING_IMAGE:-docker.io/library/python:3.12-slim@sha256:b18b261e1b4974b4f321451ad5251ded85abb22c2b8b262da527dda1d031ab30}
@@ -568,6 +569,41 @@ services:
         required: false
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8092/health', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  pair-redeem-edge:
+    # Optional HTTPS edge for App QR redeem (A-R8 / #128). Default OFF:
+    # `make up` does not start it and does not require a certificate or
+    # public domain. Enable with
+    # `make up HS=synapse PAIR_REDEEM=1 PAIR_REDEEM_EDGE=1` after placing
+    # operator-supplied cert.pem and key.pem in
+    # BOTVILLE_PAIR_REDEEM_EDGE_CERT_DIR (default ./generated/pair-redeem-edge,
+    # relative to this compose file). init.sh does not generate certificates.
+    # Host port is loopback only. This edge reverse-proxies only
+    # POST /_botville/pair/redeem and GET /health to pair-redeem.
+    # It must not expose Synapse, the gateway, admin APIs, issuance,
+    # federation inbound, the relations bridge, or secret stores.
+    # Local or mock TLS is not public HTTPS and not a phone-scan test.
+    # Examples use localhost / example.org only.
+    image: ${CADDY_IMAGE:-docker.io/library/caddy:2.11.9-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0}
+    profiles: [pair-redeem-edge]
+    environment:
+      <<: *noproxy-env
+    ports:
+      - "127.0.0.1:${BOTVILLE_PAIR_REDEEM_EDGE_PORT:-8443}:8443"
+    volumes:
+      - ./pair-redeem-edge/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${BOTVILLE_PAIR_REDEEM_EDGE_CERT_DIR:-./generated/pair-redeem-edge}:/certs:ro
+    depends_on:
+      pair-redeem:
+        condition: service_healthy
+        required: false
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--no-check-certificate", "-O", "/dev/null", "https://127.0.0.1:8443/health"]
       interval: 10s
       timeout: 5s
       retries: 12
