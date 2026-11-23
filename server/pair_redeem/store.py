@@ -5,12 +5,15 @@ return. Audit rows never contain a code or an auth token. Retention
 follows A2.1 store.prune(): 30 days, unused and unexpired codes are kept.
 """
 
+import base64
 import hashlib
 import json
 import logging
 import sqlite3
+import string
 import threading
 import time
+import urllib.parse
 
 log = logging.getLogger("pair_redeem.store")
 
@@ -28,7 +31,7 @@ CREATE TABLE IF NOT EXISTS codes (
     hs                  TEXT NOT NULL,
     gw                  TEXT,
     fp                  TEXT,
-    exp                 INTEGER NOT NULL,
+    exp                 REAL NOT NULL,
     status              TEXT NOT NULL CHECK (status IN ('unused', 'used', 'revoked')),
     auth_type           TEXT NOT NULL CHECK (auth_type IN ('registration_token')),
     issued_at           REAL NOT NULL,
@@ -45,9 +48,48 @@ CREATE TABLE IF NOT EXISTS events (
 """
 
 
+_CODE_ALPHABET = set(string.ascii_letters + string.digits + "-_")
+
+
 def code_sha256(code):
     """Hex sha256 of the 43-character code string (utf-8)."""
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+def _has_ctrl_or_space(value):
+    return any(ch.isspace() or ord(ch) < 0x20 or ch == "\x7f" for ch in value)
+
+
+def require_https_url(value, what):
+    """hs/gw: canonical https URL, no userinfo/query/fragment. Rejects // suffix."""
+    if not isinstance(value, str) or not value.startswith("https://"):
+        raise ValueError("%s must be an https:// URL" % what)
+    if _has_ctrl_or_space(value) or "%" in value:
+        raise ValueError("%s must be a canonical https:// URL" % what)
+    if value.endswith("//"):
+        raise ValueError("%s must not end with //" % what)
+    try:
+        parts = urllib.parse.urlsplit(value)
+        parts.port
+    except ValueError as exc:
+        raise ValueError("%s is not a valid URL" % what) from exc
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("%s must not include userinfo" % what)
+    if not parts.hostname or parts.query or parts.fragment:
+        raise ValueError("%s must be an https URL without query or fragment" % what)
+    return value
+
+
+def require_code(code):
+    """43-character canonical base64url (32 bytes), same alphabet as the contract."""
+    if not isinstance(code, str) or len(code) != 43:
+        raise ValueError("code must be 43-character base64url")
+    if any(c not in _CODE_ALPHABET for c in code):
+        raise ValueError("code must be 43-character base64url")
+    raw = base64.urlsafe_b64decode(code + "=")
+    if base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=") != code:
+        raise ValueError("code must be canonical base64url")
+    return code
 
 
 class PairRedeemStore:
@@ -74,12 +116,12 @@ class PairRedeemStore:
         """
         if auth_type not in ALLOWED_AUTH_TYPES:
             raise ValueError("this build only issues registration_token")
-        if not hs or not isinstance(hs, str):
-            raise ValueError("hs is required")
-        if hs.endswith("//"):
-            raise ValueError("hs must not end with //")
+        require_https_url(hs, "hs")
+        require_code(code)
+        if gw is not None:
+            require_https_url(gw, "gw")
         now = time.time() if now is None else now
-        exp = int(now) + int(ttl_seconds)
+        exp = float(now) + float(ttl_seconds)
         digest = code_sha256(code)
         detail = {"id": None, "code_sha256": digest, "hs": hs,
                   "has_gw": gw is not None, "exp": exp, "result": "issued"}
@@ -182,7 +224,7 @@ class PairRedeemStore:
                     }, now)
                     self._conn.execute("COMMIT")
                     return "revoked", None
-                if int(now) >= int(row["exp"]):
+                if now >= row["exp"]:
                     self._insert_event_locked("rejected", {
                         "id": row["id"], "code_sha256": digest, "ip": client_ip,
                         "result": "rejected", "reason": "expired",
@@ -249,11 +291,27 @@ class PairRedeemStore:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                self._insert_event_locked(kind, detail, now)
+                event_id = self._insert_event_locked(kind, detail, now)
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
+        return event_id
+
+    def update_event_suppressed(self, event_id, suppressed):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT detail FROM events WHERE id = ?", (event_id,)
+            ).fetchone()
+            if row is None:
+                return
+            payload = json.loads(row["detail"])
+            payload["suppressed"] = int(suppressed)
+            self._conn.execute(
+                "UPDATE events SET detail = ? WHERE id = ?",
+                (json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                 event_id),
+            )
 
     def _insert_event_locked(self, kind, detail, now):
         if kind not in AUDIT_KINDS:
@@ -262,14 +320,13 @@ class PairRedeemStore:
         # Belt-and-braces: never persist secrets even if a caller slips.
         for key in ("code", "token", "auth", "admin_token", "secret"):
             payload.pop(key, None)
-        if isinstance(payload.get("auth"), dict):
-            payload["auth"] = {"type": payload["auth"].get("type")}
-        self._conn.execute(
+        cur = self._conn.execute(
             "INSERT INTO events (at, kind, detail) VALUES (?, ?, ?)",
             (float(now), kind, json.dumps(payload, ensure_ascii=False,
                                           separators=(",", ":"),
                                           default=str)),
         )
+        return cur.lastrowid
 
     def events(self, kind=None):
         with self._lock:

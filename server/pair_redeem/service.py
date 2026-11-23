@@ -14,6 +14,8 @@ import collections
 import ipaddress
 import json
 import logging
+import socket
+import sqlite3
 import threading
 import time
 import urllib.error
@@ -21,7 +23,6 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .store import (
-    CODE_TTL_SECONDS,
     PairRedeemStore,
     code_sha256,
 )
@@ -38,6 +39,11 @@ AUTH_EXPIRES_IN_MS = 600000
 IP_LIMIT_DEFAULT = 10
 GLOBAL_LIMIT_DEFAULT = 60
 RATE_WINDOW_SECONDS = 60
+# Issuer HTTP runs inside the store write lock (see redeem_atomic). Keep
+# this short so a stuck Synapse fails fast instead of stalling the process.
+ISSUER_TIMEOUT_SECONDS = 2
+REQUEST_TIMEOUT_SECONDS = 5
+PRUNE_INTERVAL_SECONDS = 3600.0
 
 ERROR_STATUS = {
     "BV_PAIR_INVALID": 400,
@@ -205,7 +211,8 @@ class PairRedeemConfig:
                  bind_host="127.0.0.1", bind_port=8092,
                  store_path=":memory:",
                  synapse_url="", synapse_admin_token="",
-                 auth_expires_in_ms=AUTH_EXPIRES_IN_MS):
+                 auth_expires_in_ms=AUTH_EXPIRES_IN_MS,
+                 request_timeout=REQUEST_TIMEOUT_SECONDS):
         self.ip_limit = ip_limit
         self.global_limit = global_limit
         self.rate_window = rate_window
@@ -216,6 +223,7 @@ class PairRedeemConfig:
         self.synapse_url = (synapse_url or "").rstrip("/")
         self.synapse_admin_token = synapse_admin_token or ""
         self.auth_expires_in_ms = auth_expires_in_ms
+        self.request_timeout = request_timeout
 
     @classmethod
     def from_env(cls, env):
@@ -239,9 +247,15 @@ class SynapseRegistrationTokenIssuer:
     """Mint a one-shot Synapse registration token via the admin API.
 
     Mock this in tests. The live client is opt-in and never logs tokens.
+
+    The contract requires issuing the token in the same transaction as
+    marking the code used (read → mark used → issue → audit → commit,
+    roll back on failure). That HTTP call therefore runs under the
+    store's BEGIN IMMEDIATE plus the process write lock; a long timeout
+    would stall every redeem and rate-limit audit. Fail fast instead.
     """
 
-    def __init__(self, base_url, admin_token, timeout=10):
+    def __init__(self, base_url, admin_token, timeout=ISSUER_TIMEOUT_SECONDS):
         if not base_url or not admin_token:
             raise ConfigError(
                 "registration token issuer requires %s and %s"
@@ -304,6 +318,8 @@ class PairRedeemApp:
         self.global_limiter = RateLimiter(self.config.global_limit,
                                           self.config.rate_window)
         self._rate_lock = threading.Lock()
+        self._rate_audit_lock = threading.Lock()
+        self._rate_audit = {}
 
     def check_rate_limit(self, ip, now_mono=None):
         now = time.monotonic() if now_mono is None else now_mono
@@ -315,20 +331,52 @@ class PairRedeemApp:
                 self.global_limiter.commit("global", now=now)
                 return
         retries = [value for value in (ip_retry, global_retry) if value]
+        # Take the later of the triggered layers' retry instants (max of
+        # the delays). That is the earliest time at which *both* layers
+        # will accept a retry; using min would still 429 on the other layer.
         retry_after_ms = max(retries) if retries else 1
-        self.store.record_event("rate_limited", {
-            "ip": ip, "result": "rate_limited",
-            "retry_after_ms": retry_after_ms,
-        }, now=self.clock())
+        self._record_rate_limited(ip, retry_after_ms)
         raise PairRedeemError("BV_PAIR_RATE_LIMITED",
                               retry_after_ms=retry_after_ms)
+
+    def _record_rate_limited(self, ip, retry_after_ms):
+        """Write at most one rate_limited audit per IP per window; count the rest.
+
+        A flood of 429s must not grow the events table without bound (A3).
+        """
+        now = self.clock()
+        with self._rate_audit_lock:
+            previous = self._rate_audit.get(ip)
+            if previous is not None and (now - previous["at"]) < self.config.rate_window:
+                previous["suppressed"] += 1
+                event_id = previous.get("event_id")
+                suppressed = previous["suppressed"]
+                start_new = False
+            else:
+                event_id = None
+                suppressed = 0 if previous is None else previous["suppressed"]
+                start_new = True
+                self._rate_audit[ip] = {"at": now, "suppressed": 0, "event_id": None}
+        if not start_new:
+            if event_id is not None:
+                self.store.update_event_suppressed(event_id, suppressed)
+            return
+        event_id = self.store.record_event("rate_limited", {
+            "ip": ip, "result": "rate_limited",
+            "retry_after_ms": retry_after_ms,
+            "suppressed": suppressed,
+        }, now=now)
+        with self._rate_audit_lock:
+            current = self._rate_audit.get(ip)
+            if current is not None and current.get("event_id") is None:
+                current["event_id"] = event_id
 
     def redeem(self, code, device_display_name, client_ip, now=None):
         now = self.clock() if now is None else now
         expires_in_ms = self.config.auth_expires_in_ms
 
-        def _issue(_expires):
-            return self.issuer.issue(expires_in_ms, now=now)
+        def _issue(expires):
+            return self.issuer.issue(expires, now=now)
 
         digest = code_sha256(code)
         try:
@@ -355,12 +403,39 @@ class PairRedeemApp:
         host = self.config.bind_host if host is None else host
         port = self.config.bind_port if port is None else port
         handler = _handler_for(self)
+        handler.timeout = self.config.request_timeout
 
         class Server(ThreadingHTTPServer):
             daemon_threads = True
             allow_reuse_address = True
+            timeout = self.config.request_timeout
 
         return Server((host, port), handler)
+
+
+def start_pruner(app, interval=PRUNE_INTERVAL_SECONDS, stop=None):
+    """Retention loop equivalent to A2.1 pairing start_pruner.
+
+    Prune once at startup, then every ``interval`` seconds. Daemon thread;
+    failures are logged and never fatal. ``stop`` is an optional Event
+    for tests.
+    """
+    def run():
+        while True:
+            try:
+                counts = app.store.prune(now=app.clock())
+                if any(counts.values()):
+                    log.info("pruned old pair-redeem rows: %s", counts)
+            except (sqlite3.Error, Exception) as exc:
+                log.warning("pair_redeem prune failed: %s", exc)
+            if stop is None:
+                time.sleep(interval)
+            elif stop.wait(interval):
+                return
+
+    thread = threading.Thread(target=run, name="pair-redeem-pruner", daemon=True)
+    thread.start()
+    return thread
 
 
 def parse_redeem_request(raw, content_type, content_length=None):
@@ -394,6 +469,7 @@ def parse_redeem_request(raw, content_type, content_length=None):
 def _handler_for(app):
     class PairRedeemHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        timeout = REQUEST_TIMEOUT_SECONDS
 
         def log_message(self, fmt, *args):
             # Request line only; never interpolate a body or token.
@@ -413,6 +489,10 @@ def _handler_for(app):
                 seconds = retry_after_ms // 1000
                 if seconds >= 1:
                     self.send_header("Retry-After", str(seconds))
+            # Unread bodies on HTTP/1.1 keep-alive would poison the next
+            # request (S1). close_connection is set by those reject paths.
+            if self.close_connection:
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(raw)
 
@@ -423,6 +503,10 @@ def _handler_for(app):
             self._send_json(exc.status, body,
                             retry_after_ms=exc.retry_after_ms)
 
+        def _close_unread(self):
+            """Stop reusing this connection when the request body is unfinished."""
+            self.close_connection = True
+
         def _reject(self, ip, reason="invalid_request"):
             app.store.record_event("rejected", {
                 "ip": ip, "result": "rejected", "reason": reason,
@@ -432,30 +516,49 @@ def _handler_for(app):
         def do_POST(self):
             path = self.path.split("?", 1)[0]
             if path != REDEEM_PATH:
+                self._close_unread()
                 self.send_error(404)
                 return
             ip = self._client_ip()
             try:
                 app.check_rate_limit(ip)
                 try:
+                    # Any Transfer-Encoding (including chunked) is rejected
+                    # closed; we do not parse chunked bodies.
+                    if (self.headers.get("Transfer-Encoding") or "").strip():
+                        self._close_unread()
+                        self._reject(ip, "transfer_encoding")
                     length_raw = self.headers.get("Content-Length")
                     if length_raw is None:
+                        self._close_unread()
                         self._reject(ip, "missing_length")
                     try:
                         length = int(length_raw)
                     except (TypeError, ValueError):
+                        self._close_unread()
                         self._reject(ip, "bad_length")
                     if length < 0 or length > MAX_BODY_BYTES:
                         # Do not slurp an oversized body into memory.
+                        self._close_unread()
                         self._reject(ip, "body_too_large")
                     raw = self.rfile.read(length)
                     if len(raw) != length:
+                        self._close_unread()
                         self._reject(ip, "short_body")
-                    code, name = parse_redeem_request(
-                        raw, self.headers.get("Content-Type"), length)
+                    try:
+                        code, name = parse_redeem_request(
+                            raw, self.headers.get("Content-Type"), length)
+                    except PairRedeemError:
+                        # Body was fully read; keep-alive is safe. Still
+                        # audit the illegal request (§4.6 / A1).
+                        self._reject(ip, "invalid_request")
                 except PairRedeemError:
                     raise
+                except (TimeoutError, socket.timeout):
+                    self._close_unread()
+                    self._reject(ip, "timeout")
                 except Exception:
+                    self._close_unread()
                     self._reject(ip, "invalid_request")
                 payload = app.redeem(code, name, ip)
                 self._send_json(200, payload)
@@ -476,7 +579,14 @@ def _handler_for(app):
         def do_DELETE(self):
             self._method_not_allowed()
 
+        def __getattr__(self, name):
+            # PATCH/OPTIONS/HEAD and any other verb: 405, not the default 501.
+            if name.startswith("do_"):
+                return self._method_not_allowed
+            raise AttributeError(name)
+
         def _method_not_allowed(self):
+            self._close_unread()
             path = self.path.split("?", 1)[0]
             if path != REDEEM_PATH:
                 self.send_error(404)
@@ -484,4 +594,3 @@ def _handler_for(app):
             self.send_error(405)
 
     return PairRedeemHandler
-

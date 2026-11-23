@@ -5,6 +5,7 @@ process cannot accidentally publish the endpoint. Compose/edge wiring
 is a later cut.
 """
 
+import ipaddress
 import logging
 import os
 import sys
@@ -14,6 +15,7 @@ from .service import (
     PairRedeemApp,
     PairRedeemConfig,
     SynapseRegistrationTokenIssuer,
+    start_pruner,
 )
 from .store import PairRedeemStore
 
@@ -26,7 +28,6 @@ def main(env=None):
     except ConfigError as exc:
         raise SystemExit(str(exc))
     try:
-        import ipaddress
         if not ipaddress.ip_address(config.bind_host).is_loopback:
             raise SystemExit(
                 "BOTVILLE_PAIR_REDEEM_BIND must be a loopback address in this build"
@@ -40,6 +41,7 @@ def main(env=None):
         raise SystemExit(str(exc))
     store = PairRedeemStore(config.store_path)
     app = PairRedeemApp(store, issuer, config)
+    start_pruner(app)
     server = app.make_server()
     host, port = server.server_address
     # Do not print any token or path that might include a secret.
