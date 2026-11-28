@@ -603,6 +603,28 @@ jobs:
       # The e2e script captures logs before down -v and removes its
       # generated secret env. Do not retry compose using that deleted env.
 
+  pair-redeem-edge-e2e:
+    name: pair-redeem-edge-e2e (synapse, isolated mock TLS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Isolated HTTPS edge e2e (mock TLS only; not public HTTPS or a phone scan)
+        run: make pair-redeem-edge-e2e
+
+      - name: Dump logs
+        if: failure()
+        run: |
+          if [ -f server/compose/generated/pair-redeem-edge-e2e/compose-logs.txt ]; then
+            echo "===== saved compose logs (captured before teardown) ====="
+            cat server/compose/generated/pair-redeem-edge-e2e/compose-logs.txt
+          else
+            echo "===== no saved compose log file ====="
+          fi
+      # Teardown deletes generated certs and the secret env. Leave log
+      # dump for this step; do not retry compose using the deleted env.
+
 
   lint:
     name: lint
@@ -640,6 +662,11 @@ jobs:
             server/pairing/__init__.py server/pairing/store.py server/pairing/service.py \
             server/pairing/fedgate.py server/pairing/validate.py
 
+      # The live pair-redeem-edge access/error-log test skips when the
+      # pinned Caddy or python image is not present. This lint job does
+      # not pull those images (keep lint short). CI behavior coverage
+      # of the log filter is the pair-redeem-edge-e2e job. Do not weaken
+      # the .env.example allowlist to make the live test run here.
       - name: Server tests (stdlib mock; compose probes use Docker when available)
         run: python3 -m unittest discover -s server/tests -p "test_*.py" -v
 
@@ -690,6 +717,12 @@ jobs:
             BOTVILLE_HOMESERVER="${hs}" GATEWAY_MATRIX_TRANSPORT="${transport}" \
               docker compose -f server/compose/docker-compose.yml \
               --env-file server/compose/.env --profile "${hs}" --profile pair-redeem config --quiet
+            if [ "${hs}" = synapse ]; then
+              echo "== docker compose config --profile synapse --profile pair-redeem --profile pair-redeem-edge (A-R8)"
+              BOTVILLE_HOMESERVER="${hs}" GATEWAY_MATRIX_TRANSPORT="${transport}" \
+                docker compose -f server/compose/docker-compose.yml \
+                --env-file server/compose/.env --profile synapse --profile pair-redeem --profile pair-redeem-edge config --quiet
+            fi
           done
           echo "== docker compose config (federation, A2.1)"
           python3 server/scripts/federation-setup.py
@@ -812,6 +845,10 @@ jobs:
               "BOTVILLE_PAIR_REDEEM_SYNAPSE_URL": "http://synapse:8008",
               "BOTVILLE_PAIR_REDEEM_SYNAPSE_ADMIN_TOKEN": "",
               "BOTVILLE_PAIR_REDEEM_TRUSTED_PROXIES": "",
+              # Optional HTTPS edge: default off. Cert dir is a local
+              # path placeholder; init.sh does not generate certificates.
+              "BOTVILLE_PAIR_REDEEM_EDGE_PORT": "8443",
+              "BOTVILLE_PAIR_REDEEM_EDGE_CERT_DIR": "./generated/pair-redeem-edge",
               "BOTVILLE_GATEWAY_HMAC_SECRET": "<change-me>",
               # Persona engine pass-through (B line PR2): off / empty by
               # default; init.sh generates none of them (the API key is
@@ -863,6 +900,7 @@ jobs:
               "CONTINUWUITY_IMAGE": "ghcr.io/continuwuity/continuwuity:v26.9.1@sha256:c9c62bc5c0a641f3f713945c701b069c7bc30d2612b54d4a5de80a5be19d5420",
               "SYGNAL_IMAGE": "docker.io/matrixdotorg/sygnal:v0.17.0@sha256:141f5e72fdf99a28e29ca87f3a46c19ed1cf21d5074aa3ef9df7c067e0c1c46a",
               "PAIRING_IMAGE": "docker.io/library/python:3.12-slim@sha256:b18b261e1b4974b4f321451ad5251ded85abb22c2b8b262da527dda1d031ab30",
+              "CADDY_IMAGE": "docker.io/library/caddy:2.11.9-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0",
           }
 
           problems = []

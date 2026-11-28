@@ -13,6 +13,8 @@ App 扫码兑换：`POST /_botville/pair/redeem`（首版仅 Synapse `registrati
 make up HS=synapse PAIR_REDEEM=1
 ```
 
-并在 `server/compose/.env` 填写 `BOTVILLE_PAIR_REDEEM_SYNAPSE_ADMIN_TOKEN`（`init.sh` 不会生成）。宿主机端口只绑 `127.0.0.1:8092`。这与联邦 `/v1/pairing/redeem` 分开，也不会打开配对入站或 relations 桥。HTTPS/Caddy edge 和管理签发是后续刀。说明见 `docs/deploy/pair-redeem.md`。
+并在 `server/compose/.env` 填写 `BOTVILLE_PAIR_REDEEM_SYNAPSE_ADMIN_TOKEN`（`init.sh` 不会生成）。宿主机端口只绑 `127.0.0.1:8092`。这与联邦 `/v1/pairing/redeem` 分开，也不会打开配对入站或 relations 桥。
 
-隔离环境端到端测试（不是真机扫码 / 不是真实 HTTPS 入口）：`make pair-redeem-e2e`。
+可选 HTTPS edge 默认关闭：`make up HS=synapse PAIR_REDEEM=1 PAIR_REDEEM_EDGE=1`，并把 `cert.pem` / `key.pem` 放到 `BOTVILLE_PAIR_REDEEM_EDGE_CERT_DIR`（`init.sh` 不会生成证书）。宿主机端口只绑 `127.0.0.1:8443`。Edge 只反代 `POST /_botville/pair/redeem` 与 `GET /health`。本地或自签证书不能代替公网 HTTPS 或真机扫码。管理签发 API/UI/CLI 仍是后续刀，且不得暴露到公共 edge。说明见 `docs/deploy/pair-redeem.md`。
+
+隔离环境端到端测试（不是真机扫码 / 不是真实 HTTPS 入口）：`make pair-redeem-e2e`。可选 HTTPS edge 的隔离测试（mock TLS，同样不能代替公网 HTTPS 或真机扫码）：`make pair-redeem-edge-e2e`。

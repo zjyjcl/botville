@@ -3,7 +3,7 @@
 | 项 | 内容 |
 |---|---|
 | 任务 | #128 公网接入（Cloudflare Tunnel / frp / IPv6+DDNS + 管理页配对二维码） |
-| 状态 | **仅决策记录**：edge（Caddy）、接入模块、向导、管理页均未实现，见 #128 PR 拆分 |
+| 状态 | **决策记录仍有效**。可选、默认关闭的兑换 HTTPS edge 已作为独立切片落地（只反代 `POST /_botville/pair/redeem` 与 `GET /health`，见 [pair-redeem.md](pair-redeem.md)）。完整 edge（homeserver 客户端 API、网关主域路径、`.well-known`）、接入模块、向导、管理页仍未实现，见 #128 PR 拆分 |
 | 相关 | [pairing-qr.md](../contracts/pairing-qr.md)（§3.3.1 fp 场景、§11 B1–B6）、[paired-federation.md](paired-federation.md)、[push-sygnal.md](push-sygnal.md) |
 
 所有域名一律用 `example.org` 占位；本文不含任何真实域名、令牌或证书。

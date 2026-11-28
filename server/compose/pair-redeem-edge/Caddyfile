@@ -1,0 +1,69 @@
+# Optional App QR redeem HTTPS edge (A-R8 / #128).
+#
+# Default off in official compose. This file is the allowlist: only the
+# public redeem path and GET /health are reverse-proxied to pair-redeem
+# over the compose network (plain HTTP to pair-redeem:8092).
+# Do not add Synapse, the gateway, admin APIs, issuance, federation
+# inbound, the relations bridge, databases, or secret volumes here.
+#
+# auto_https is off. This cut uses operator-supplied certificate files
+# only and will not request ACME certificates. Local or mock TLS is not
+# a substitute for public HTTPS or a real phone camera scan.
+#
+# Examples use localhost or example.org only. Real domains, Cloudflare
+# settings, and production certificates do not belong in this repository.
+# Issuance API/UI/CLI is out of this PR and must never be exposed on a
+# public edge or offered without authentication.
+{
+	auto_https off
+	admin off
+	# Site `log` below is the access log only. Error logs
+	# (`http.log.error.log0`, for example a 502 when the backend
+	# is down) use the default logger and would keep the raw URI
+	# query unless this global filter also strips `?...`.
+	# Authorization and Cookie are already REDACTED by Caddy in
+	# error logs; do not weaken that.
+	log {
+		format filter {
+			wrap json
+			fields {
+				request>uri regexp \?.*$
+			}
+		}
+	}
+}
+
+# Listen on 8443 only (no HTTP :80). The official compose service publishes
+# the host port on 127.0.0.1. The site is address-only so healthchecks to
+# 127.0.0.1 and calls that use localhost or an operator hostname share the
+# same allowlist. Path matching is exact: `path` would be prefix-based.
+:8443 {
+	tls /certs/cert.pem /certs/key.pem
+
+	@public path_regexp ^/(?:_botville/pair/redeem|health)$
+
+	handle @public {
+		reverse_proxy pair-redeem:8092
+	}
+
+	handle {
+		respond "Not Found" 404
+	}
+
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>headers>Authorization delete
+				request>headers>Cookie delete
+				# `request>uri query delete` is a no-op on Caddy 2.11.9:
+				# caddy adapt yields {"filter":"query","actions":null}, and
+				# `query { delete * }` still leaves the query in the access
+				# log. A regexp with an empty replacement strips `?...`
+				# and keeps the path.
+				request>uri regexp \?.*$
+			}
+		}
+	}
+}

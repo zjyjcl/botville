@@ -55,6 +55,15 @@ compose == `.env.example` 相等检查约束：升级时同时改 `docker-compos
 `server/compose/.env.example` 的 `PAIRING_IMAGE`、CI「placeholders only」白名单里的
 `PAIRING_IMAGE`，并建议与 `gateway/Dockerfile` 的 `FROM` 一起升，保持同一 digest。
 
+可选兑换 HTTPS edge 镜像备注（A-R8 / #128）：`pair-redeem-edge` 服务
+（`make up PAIR_REDEEM_EDGE=1`，默认关闭）用 `${CADDY_IMAGE:-…}`，当前 pin 为
+`docker.io/library/caddy:2.11.9-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0`
+（官方多架构 index digest，2026-11-23 核自 Docker Hub tag API）。升级时同时改
+官方 compose 默认值、`server/compose/.env.example` 的 `CADDY_IMAGE`、CI
+「placeholders only」白名单里的 `CADDY_IMAGE`，以及
+`server/compose/pair-redeem-e2e.yml` 里 `${CADDY_IMAGE:-…}` 的同一默认 digest
+（隔离 e2e 文件不在 CI image-pin 扫描范围内，需手工对齐；不要改成未核实的 digest）。
+
 版本口径与 [compat/homeserver-compat.md](../compat/homeserver-compat.md) §1.2
 一致（Synapse v1.164.1 即 matrix-docker-ansible-deploy defaults 当时停留的参考
 版本；Tuwunel tag 一律带 `v` 前缀，如 v1.9.4——不带 `v` 的 tag 在 GHCR 上不存在）。
