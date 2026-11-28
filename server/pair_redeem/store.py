@@ -84,6 +84,22 @@ def require_https_url(value, what):
     return value
 
 
+FP_PREFIX = "sha256:"
+
+
+def require_fp(value):
+    """fp = 'sha256:' + 43-character canonical base64url (32-byte digest)."""
+    if not isinstance(value, str) or not value.startswith(FP_PREFIX):
+        raise ValueError("fp must be sha256:<43-character base64url>")
+    digest = value[len(FP_PREFIX):]
+    if len(digest) != 43 or any(c not in CODE_ALPHABET for c in digest):
+        raise ValueError("fp must be sha256:<43-character base64url>")
+    raw = base64.urlsafe_b64decode(digest + "=")
+    if len(raw) != 32 or base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=") != digest:
+        raise ValueError("fp must be sha256:<43-character base64url>")
+    return value
+
+
 def require_code(code):
     """43-character canonical base64url (32 bytes), same alphabet as the contract."""
     if not isinstance(code, str) or len(code) != 43:
@@ -125,6 +141,8 @@ class PairRedeemStore:
         require_code(code)
         if gw is not None:
             require_https_url(gw, "gw")
+        if fp is not None:
+            require_fp(fp)
         now = time.time() if now is None else now
         exp = float(now) + float(ttl_seconds)
         digest = code_sha256(code)

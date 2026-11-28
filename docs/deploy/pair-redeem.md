@@ -13,7 +13,7 @@
 3. 启动：`make up HS=synapse PAIR_REDEEM=1`。宿主机端口只绑 `127.0.0.1:${BOTVILLE_PAIR_REDEEM_PORT:-8092}`。
 4. 本服务不打开联邦配对入站，也不打开 relations 跨服桥。
 
-首版只支持 Synapse + `registration_token`（新账号）。`login_token`、管理签发 API/UI/CLI、面向公网的完整 edge（homeserver / 网关 / Cloudflare）、8845 实装都还没有。可选 HTTPS edge 见下一节，默认关闭。
+首版只支持 Synapse + `registration_token`（新账号）。可选管理签发见下文，默认关闭。`login_token`、管理 Web UI、一次性管理 token、面向公网的完整 edge（homeserver / 网关 / Cloudflare）、8845 实装都还没有。可选 HTTPS edge 见下一节，默认关闭。
 
 ## 隔离环境测试
 
@@ -40,7 +40,7 @@ Edge **只**把以下精确路径反代到 compose 内网的 `pair-redeem:8092`�
 - `POST /_botville/pair/redeem`（公开兑换，契约不变）
 - `GET /health`（进程健康检查，不含密钥）
 
-其它路径由 edge 直接返回 404，包括但不限于：`/_synapse/admin/*`、联邦 `POST /v1/pairing/redeem`、网关 `/_botville/gateway/*`、签发/管理面、`/_botville/pair/redeem/` 的子路径。不要把 pair_redeem 的宿主机 8092 端口、Synapse、网关、数据库或密钥挂到公共 edge。管理签发 API/UI/CLI 不在本切片；以后做了也**永远不得**暴露到公共 edge，也不可无鉴权签发。
+其它路径由 edge 直接返回 404，包括但不限于：`/_synapse/admin/*`、联邦 `POST /v1/pairing/redeem`、网关 `/_botville/gateway/*`、签发/管理面（含 `POST /_botville/pair/issue`）、`/_botville/pair/redeem/` 的子路径。不要把 pair_redeem 的宿主机 8092 端口、Synapse、网关、数据库或密钥挂到公共 edge。管理签发**永远不得**暴露到公共 edge，也不可无鉴权签发。
 
 面向 App / 公网的 homeserver 与 gateway URL 必须是 `https://`，文档和示例只用占位域名 `example.org`（例如 `hs=https://hs.example.org`、`gw=https://example.org/_botville/gateway`）。不要把可被当成生产可用的明文 `http://` 写进公网 URL。内网里的 `http://synapse:8008` 和 `http://pair-redeem:8092` 只走 compose 网络，不对外发布。
 
@@ -53,6 +53,21 @@ make pair-redeem-edge-e2e
 ```
 
 使用独立 compose 项目 `botville-pair-redeem-edge-e2e`（端口 `127.0.0.1:18408` / `127.0.0.1:18492` / `127.0.0.1:18443`），测试时生成一次性自签证书，结束后 `down -v` 自己的项目并删除证书和秘密环境文件。它会验收默认关闭、开启后的合法路由、以及内部路径不能从 edge 到达。这仍是隔离/mock TLS，不能代替公网 HTTPS 或真机扫码。
+
+## 可选管理签发（默认关闭）
+
+给 App 扫码准备 `registration_token` 配对 URI。本刀只提供**鉴权后的签发能力**：
+
+- HTTP：`POST /_botville/pair/issue`（JSON：必填 `hs`，可选 `gw` / `fp` / `auth_type`）
+- 本机 CLI：`python -m pair_redeem issue --hs https://hs.example.org`（可选 `--gw`、`--fp`；token 只从环境变量读取，不进 argv）
+
+默认关闭。`BOTVILLE_PAIR_REDEEM_ISSUE_TOKEN` 留空（`init.sh` **不会**生成）时，该路由返回 404，与未提供的路径相同。显式启用：先按上文启用 `PAIR_REDEEM=1`，再把该变量设为至少 32 个字符、且**必须不同于** `BOTVILLE_PAIR_REDEEM_SYNAPSE_ADMIN_TOKEN` 的值。请求头为 `Authorization: Bearer <token>`。错误或缺 token 时不要把 token、兑换码或完整 URI 写进日志。
+
+`hs` / `gw` 必须是 `https://`（示例域名只用 `example.org`）。本机签发 API 走 loopback 上的 HTTP（宿主机端口仍只绑 `127.0.0.1`）；这不是给手机用的公网入口。手机扫码兑换走二维码里的 `hs` + `POST /_botville/pair/redeem`，需要公网 HTTPS（或已单独启用的可选 edge）。本地或自签证书、以及本 CLI 打到 loopback **不能**代替公网 HTTPS，也**不能**当作真机扫码验收。
+
+成功响应只返回一次配对 URI（`botville://pair?v=1&hs=…&code=…&exp=…`，可选 `gw` / `fp`）和 `exp` / `auth_type`。明文 `code` 只出现在这条 URI 里，库中只存 `sha256(code)`。不要把 URI 或 token 提交进仓库，也不要重定向到会长期保留的日志文件。
+
+本刀**不**做：管理 Web UI、管理员 Matrix 登录、一次性短 TTL 管理 token、签发记录列表/筛选/批量作废、`login_token`（包括「本人从已登录设备发起」）。作废仍可通过现有 store 接口在测试里使用，没有管理面 API。公共 edge 的允许列表不得加入 `/_botville/pair/issue`。
 
 ### 处理时限与启用前检查
 

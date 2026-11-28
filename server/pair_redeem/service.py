@@ -24,6 +24,18 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from .issue import (
+    ENV_ISSUE_TOKEN,
+    ISSUE_PATH,
+    IssueConfigError,
+    IssueError,
+    bearer_token,
+    issue_authorized,
+    issue_code,
+    parse_issue_request,
+    public_issue_payload,
+    validate_issue_token,
+)
 from .store import (
     CODE_ALPHABET,
     PairRedeemStore,
@@ -585,7 +597,8 @@ class PairRedeemConfig:
                  request_timeout=REQUEST_TIMEOUT_SECONDS,
                  request_deadline=REQUEST_DEADLINE_SECONDS,
                  max_concurrent=MAX_CONCURRENT_DEFAULT,
-                 issuer_timeout=ISSUER_TIMEOUT_SECONDS):
+                 issuer_timeout=ISSUER_TIMEOUT_SECONDS,
+                 issue_token=""):
         self.ip_limit = ip_limit
         self.global_limit = global_limit
         self.rate_window = rate_window
@@ -600,6 +613,11 @@ class PairRedeemConfig:
         self.request_deadline = request_deadline
         self.max_concurrent = max_concurrent
         self.issuer_timeout = issuer_timeout
+        try:
+            self.issue_token = validate_issue_token(
+                issue_token or "", self.synapse_admin_token)
+        except IssueConfigError as exc:
+            raise ConfigError(str(exc)) from exc
 
     @classmethod
     def from_env(cls, env):
@@ -624,6 +642,7 @@ class PairRedeemConfig:
                                       REQUEST_DEADLINE_SECONDS),
             max_concurrent=_env_int(env, ENV_MAX_CONCURRENT,
                                     MAX_CONCURRENT_DEFAULT),
+            issue_token=env.get(ENV_ISSUE_TOKEN, ""),
         )
 
 
@@ -1061,7 +1080,7 @@ def _handler_for(app):
             method = getattr(self, "command", None)
             method = method if method in ("GET", "POST", "HEAD") else "OTHER"
             path = (getattr(self, "path", "") or "").split("?", 1)[0]
-            endpoint = path if path in (REDEEM_PATH, "/health") else "<unknown>"
+            endpoint = path if path in (REDEEM_PATH, ISSUE_PATH, "/health") else "<unknown>"
             try:
                 status = int(code)
             except (TypeError, ValueError):
@@ -1182,6 +1201,9 @@ def _handler_for(app):
 
         def do_POST(self):
             path = self.path.split("?", 1)[0]
+            if path == ISSUE_PATH:
+                self._do_issue()
+                return
             if path != REDEEM_PATH:
                 self._close_unread()
                 self.send_error(404)
@@ -1258,8 +1280,69 @@ def _handler_for(app):
                 log.exception("pair_redeem handler failed")
                 self._send_json(503, {"error": "temporarily unavailable"})
 
+        def _do_issue(self):
+            # Default off: do not advertise the route when the token is unset.
+            if not app.config.issue_token:
+                self._close_unread()
+                self.send_error(404)
+                return
+            if "?" in (self.path or ""):
+                self._close_unread()
+                self._send_json(400, {"error": "invalid request"})
+                return
+            provided = bearer_token(self.headers)
+            if not issue_authorized(provided, app.config.issue_token):
+                self._close_unread()
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            try:
+                if (self.headers.get("Transfer-Encoding") or "").strip():
+                    self._close_unread()
+                    raise IssueError(400, "invalid request")
+                length_values = self.headers.get_all("Content-Length") or []
+                if not length_values:
+                    self._close_unread()
+                    raise IssueError(400, "invalid request")
+                length_raw = length_values[0]
+                if len(length_values) > 1 or "," in length_raw:
+                    self._close_unread()
+                    raise IssueError(400, "invalid request")
+                try:
+                    length = int(length_raw)
+                except (TypeError, ValueError):
+                    self._close_unread()
+                    raise IssueError(400, "invalid request")
+                if length < 0 or length > MAX_BODY_BYTES:
+                    self._close_unread()
+                    raise IssueError(400, "invalid request")
+                raw = self._read_exactly(length)
+                if len(raw) != length:
+                    self._close_unread()
+                    raise IssueError(400, "invalid request")
+                fields = parse_issue_request(
+                    raw, self.headers.get("Content-Type"))
+                result = issue_code(
+                    app.store, fields["hs"], gw=fields["gw"],
+                    fp=fields["fp"], now=int(app.clock()))
+                self._send_json(200, public_issue_payload(result))
+            except IssueError as exc:
+                self._send_json(exc.status, {"error": exc.error})
+            except ValueError:
+                self._send_json(400, {"error": "invalid request"})
+            except (TimeoutError, socket.timeout):
+                self.close_connection = True
+            except Exception:
+                log.exception("pair_redeem issue handler failed")
+                self._send_json(503, {"error": "temporarily unavailable"})
+
         def do_GET(self):
             path = self.path.split("?", 1)[0]
+            if path == ISSUE_PATH:
+                if not app.config.issue_token:
+                    self.send_error(404)
+                    return
+                self.send_error(405)
+                return
             if path == "/health":
                 # Compose liveness only; not part of the App contract.
                 self.close_connection = True
@@ -1288,6 +1371,9 @@ def _handler_for(app):
         def _method_not_allowed(self):
             self._close_unread()
             path = self.path.split("?", 1)[0]
+            if path == ISSUE_PATH and app.config.issue_token:
+                self.send_error(405)
+                return
             if path != REDEEM_PATH:
                 self.send_error(404)
                 return

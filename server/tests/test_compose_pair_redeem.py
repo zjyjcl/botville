@@ -74,6 +74,7 @@ class ComposePairRedeemTests(unittest.TestCase):
                     key, value = line.split("=", 1)
                     values[key] = value
             self.assertEqual(values.get("BOTVILLE_PAIR_REDEEM_SYNAPSE_ADMIN_TOKEN"), "")
+            self.assertEqual(values.get("BOTVILLE_PAIR_REDEEM_ISSUE_TOKEN"), "")
             self.assertEqual(values.get("BOTVILLE_PAIR_REDEEM_SYNAPSE_URL"),
                              "http://synapse:8008")
             self.assertEqual(values.get("BOTVILLE_PAIR_REDEEM_PORT"), "8092")
@@ -116,6 +117,7 @@ class ComposePairRedeemTests(unittest.TestCase):
             self.assertEqual(
                 values.get("BOTVILLE_PAIR_REDEEM_EDGE_CERT_DIR"),
                 "./generated/pair-redeem-edge")
+            self.assertEqual(values.get("BOTVILLE_PAIR_REDEEM_ISSUE_TOKEN"), "")
             self.assertNotIn("BOTVILLE_PAIR_REDEEM_EDGE_HOST", values)
 
 
@@ -142,6 +144,7 @@ class PairRedeemEdgeCaddyfileTests(unittest.TestCase):
         self.assertNotIn("/_synapse/", self.text)
         self.assertNotIn("/v1/pairing/redeem", self.text)
         self.assertNotIn("/_botville/gateway", self.text)
+        self.assertNotIn("/_botville/pair/issue", self.text)
 
     def test_examples_stay_placeholder_domains(self):
         # Comments may mention example.org or warn that Cloudflare config
