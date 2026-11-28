@@ -170,20 +170,59 @@ def parse_issue_request(raw, content_type):
     return {"hs": hs, "gw": gw, "fp": fp, "auth_type": "registration_token"}
 
 
+def _assert_issued_uri(uri, hs, code, exp, gw=None, fp=None):
+    """Require the built URI to parse back to exactly the stored fields.
+
+    This is a local check so pair_redeem does not import
+    pairing_qr_contract (that module is not mounted in the compose
+    image). A raw `&` in hs/gw would already have been rejected.
+    """
+    prefix = "botville://pair?"
+    if not isinstance(uri, str) or not uri.startswith(prefix):
+        raise ValueError("issued uri mismatch")
+    items = urllib.parse.parse_qsl(
+        uri[len(prefix):], keep_blank_values=True, strict_parsing=True)
+    got = {}
+    for key, value in items:
+        if key in got:
+            raise ValueError("issued uri mismatch")
+        got[key] = value
+    expected = {
+        "v": "1",
+        "hs": hs,
+        "code": code,
+        "exp": str(int(exp)),
+    }
+    if gw is not None:
+        expected["gw"] = gw
+    if fp is not None:
+        expected["fp"] = fp
+    if got != expected:
+        raise ValueError("issued uri mismatch")
+
+
 def issue_code(store, hs, gw=None, fp=None, now=None, code=None):
     """Persist sha256(code) and return the one-time URI payload.
 
     ``code`` is only injectable for tests. Production callers pass None
     so a fresh CSPRNG value is used. The plaintext is not stored.
+
+    The URI is built and checked against the intended fields *before*
+    the row is written, so a bad concatenation cannot be stored and
+    then returned. ``now`` is floored to an int so URI exp and the
+    store exp stay identical.
     """
     now = int(time.time() if now is None else now)
     if code is None:
         code = generate_code()
+    exp_int = now + int(CODE_TTL_SECONDS)
+    uri = build_pair_uri(hs, code, exp_int, gw=gw, fp=fp)
+    _assert_issued_uri(uri, hs, code, exp_int, gw=gw, fp=fp)
     record_id, digest, exp = store.issue(
         hs, code, gw=gw, fp=fp, now=now, ttl_seconds=CODE_TTL_SECONDS,
         auth_type="registration_token")
-    exp_int = int(exp)
-    uri = build_pair_uri(hs, code, exp_int, gw=gw, fp=fp)
+    if int(exp) != exp_int:
+        raise ValueError("issued exp mismatch")
     return {
         "uri": uri,
         "exp": exp_int,
@@ -251,8 +290,13 @@ def issue_via_http(url, token, hs, gw=None, fp=None, timeout=10):
             "Authorization": "Bearer %s" % token,
         },
     )
+    # Lazy import: service.py imports this module at load time. Reuse
+    # the same ProxyHandler({}) + _NoRedirect() policy as the Synapse
+    # admin client so http_proxy and 3xx cannot leak the Bearer token.
+    from .service import direct_opener
+    opener = direct_opener()
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as resp:
+        with opener.open(request, timeout=timeout) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
             return resp.status, payload
     except urllib.error.HTTPError as exc:

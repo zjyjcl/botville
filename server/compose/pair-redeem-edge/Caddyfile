@@ -12,8 +12,9 @@
 #
 # Examples use localhost or example.org only. Real domains, Cloudflare
 # settings, and production certificates do not belong in this repository.
-# Issuance API/UI/CLI is out of this PR and must never be exposed on a
-# public edge or offered without authentication.
+# Issuance (POST /_botville/pair/issue) exists on pair-redeem but is
+# default off and must never be added to this allowlist or offered
+# without authentication.
 {
 	auto_https off
 	admin off

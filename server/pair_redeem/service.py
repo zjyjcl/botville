@@ -579,10 +579,28 @@ def _read_response_with_deadline(response, limit, deadline):
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Refuse every redirect so a 3xx cannot leak the admin token."""
+    """Refuse every redirect so a 3xx cannot leak the admin token.
+
+    Returning None tells urllib not to follow and not to copy
+    Authorization onto a new request. Callers treat a 3xx status as
+    failure (the Synapse issuer maps it to IssuerError("redirect_refused")).
+    """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise IssuerError("redirect_refused")
+        return None
+
+
+def direct_opener():
+    """Same proxy/redirect policy as _admin_opener, without IP pinning.
+
+    ProxyHandler({}) ignores http_proxy. _NoRedirect() refuses 3xx
+    follows. The loopback issue CLI uses this so a Bearer token cannot
+    be sent to a proxy or a Location hop.
+    """
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _NoRedirect(),
+    )
 
 
 class PairRedeemConfig:
@@ -1160,7 +1178,8 @@ def _handler_for(app):
             return client_ip(self.client_address[0], self.headers,
                              app.config.trusted_proxies)
 
-        def _send_json(self, status, payload, retry_after_ms=None):
+        def _send_json(self, status, payload, retry_after_ms=None,
+                       cache_control=None):
             raw = json.dumps(payload, ensure_ascii=False,
                              separators=(",", ":")).encode("utf-8")
             if status >= 400:
@@ -1171,6 +1190,8 @@ def _handler_for(app):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
+            if cache_control:
+                self.send_header("Cache-Control", cache_control)
             if retry_after_ms is not None:
                 seconds = retry_after_ms // 1000
                 if seconds >= 1:
@@ -1280,19 +1301,33 @@ def _handler_for(app):
                 log.exception("pair_redeem handler failed")
                 self._send_json(503, {"error": "temporarily unavailable"})
 
+        def _audit_issue_rejected(self, ip, reason):
+            # Same audit shape as redeem _reject: reason only, no token.
+            app.store.record_event("rejected", {
+                "ip": ip, "result": "rejected", "reason": reason,
+            }, now=app.clock())
+
         def _do_issue(self):
             # Default off: do not advertise the route when the token is unset.
             if not app.config.issue_token:
                 self._close_unread()
                 self.send_error(404)
                 return
+            ip = self._client_ip()
+            try:
+                app.check_rate_limit(ip)
+            except PairRedeemError as exc:
+                self._send_error_body(exc)
+                return
             if "?" in (self.path or ""):
                 self._close_unread()
+                self._audit_issue_rejected(ip, "invalid_request")
                 self._send_json(400, {"error": "invalid request"})
                 return
             provided = bearer_token(self.headers)
             if not issue_authorized(provided, app.config.issue_token):
                 self._close_unread()
+                self._audit_issue_rejected(ip, "unauthorized")
                 self._send_json(401, {"error": "unauthorized"})
                 return
             try:
@@ -1324,10 +1359,15 @@ def _handler_for(app):
                 result = issue_code(
                     app.store, fields["hs"], gw=fields["gw"],
                     fp=fields["fp"], now=int(app.clock()))
-                self._send_json(200, public_issue_payload(result))
+                self._send_json(
+                    200, public_issue_payload(result),
+                    cache_control="no-store")
             except IssueError as exc:
+                if exc.status == 400:
+                    self._audit_issue_rejected(ip, "invalid_request")
                 self._send_json(exc.status, {"error": exc.error})
             except ValueError:
+                self._audit_issue_rejected(ip, "invalid_request")
                 self._send_json(400, {"error": "invalid request"})
             except (TimeoutError, socket.timeout):
                 self.close_connection = True

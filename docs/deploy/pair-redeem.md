@@ -63,6 +63,8 @@ make pair-redeem-edge-e2e
 
 默认关闭。`BOTVILLE_PAIR_REDEEM_ISSUE_TOKEN` 留空（`init.sh` **不会**生成）时，该路由返回 404，与未提供的路径相同。显式启用：先按上文启用 `PAIR_REDEEM=1`，再把该变量设为至少 32 个字符、且**必须不同于** `BOTVILLE_PAIR_REDEEM_SYNAPSE_ADMIN_TOKEN` 的值。请求头为 `Authorization: Bearer <token>`。错误或缺 token 时不要把 token、兑换码或完整 URI 写进日志。
 
+本切片用的是**长期环境变量 token**，不是 `docs/contracts/pairing-qr.md` §4.1 所写的「一次性、短 TTL 管理 token」。一次性管理 token 留给后续，本刀尚未实现。
+
 `hs` / `gw` 必须是 `https://`（示例域名只用 `example.org`）。本机签发 API 走 loopback 上的 HTTP（宿主机端口仍只绑 `127.0.0.1`）；这不是给手机用的公网入口。手机扫码兑换走二维码里的 `hs` + `POST /_botville/pair/redeem`，需要公网 HTTPS（或已单独启用的可选 edge）。本地或自签证书、以及本 CLI 打到 loopback **不能**代替公网 HTTPS，也**不能**当作真机扫码验收。
 
 成功响应只返回一次配对 URI（`botville://pair?v=1&hs=…&code=…&exp=…`，可选 `gw` / `fp`）和 `exp` / `auth_type`。明文 `code` 只出现在这条 URI 里，库中只存 `sha256(code)`。不要把 URI 或 token 提交进仓库，也不要重定向到会长期保留的日志文件。

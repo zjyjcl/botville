@@ -144,7 +144,15 @@ class PairRedeemEdgeCaddyfileTests(unittest.TestCase):
         self.assertNotIn("/_synapse/", self.text)
         self.assertNotIn("/v1/pairing/redeem", self.text)
         self.assertNotIn("/_botville/gateway", self.text)
-        self.assertNotIn("/_botville/pair/issue", self.text)
+        # Comments may mention /_botville/pair/issue to say it stays off
+        # the allowlist; only active lines must not include that path.
+        active = "\n".join(
+            ln.strip() for ln in self.text.splitlines()
+            if ln.strip() and not ln.strip().startswith("#"))
+        self.assertNotIn("/_botville/pair/issue", active)
+        self.assertIn(
+            r"@public path_regexp ^/(?:_botville/pair/redeem|health)$",
+            active)
 
     def test_examples_stay_placeholder_domains(self):
         # Comments may mention example.org or warn that Cloudflare config

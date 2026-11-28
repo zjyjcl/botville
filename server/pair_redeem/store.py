@@ -65,10 +65,17 @@ def _has_ctrl_or_space(value):
 
 
 def require_https_url(value, what):
-    """hs/gw: canonical https URL, no userinfo/query/fragment. Rejects // suffix."""
+    """hs/gw: canonical https URL, no userinfo/query/fragment. Rejects // suffix.
+
+    Also reject `&`, `?`, and `#` in the raw string. `build_pair_uri`
+    concatenates these values into a `botville://pair?` query; a raw `&`
+    in the path would let parse_pair_uri see an injected `gw` or `fp`.
+    `=` in a path is kept (the parser splits on the first `=` only).
+    """
     if not isinstance(value, str) or not value.startswith("https://"):
         raise ValueError("%s must be an https:// URL" % what)
-    if _has_ctrl_or_space(value) or "%" in value:
+    if _has_ctrl_or_space(value) or "%" in value or any(
+            ch in value for ch in "&?#"):
         raise ValueError("%s must be a canonical https:// URL" % what)
     if value.endswith("//"):
         raise ValueError("%s must not end with //" % what)
