@@ -65,10 +65,17 @@ def _has_ctrl_or_space(value):
 
 
 def require_https_url(value, what):
-    """hs/gw: canonical https URL, no userinfo/query/fragment. Rejects // suffix."""
+    """hs/gw: canonical https URL, no userinfo/query/fragment. Rejects // suffix.
+
+    Also reject `&`, `?`, and `#` in the raw string. `build_pair_uri`
+    concatenates these values into a `botville://pair?` query; a raw `&`
+    in the path would let parse_pair_uri see an injected `gw` or `fp`.
+    `=` in a path is kept (the parser splits on the first `=` only).
+    """
     if not isinstance(value, str) or not value.startswith("https://"):
         raise ValueError("%s must be an https:// URL" % what)
-    if _has_ctrl_or_space(value) or "%" in value:
+    if _has_ctrl_or_space(value) or "%" in value or any(
+            ch in value for ch in "&?#"):
         raise ValueError("%s must be a canonical https:// URL" % what)
     if value.endswith("//"):
         raise ValueError("%s must not end with //" % what)
@@ -81,6 +88,22 @@ def require_https_url(value, what):
         raise ValueError("%s must not include userinfo" % what)
     if not parts.hostname or parts.query or parts.fragment:
         raise ValueError("%s must be an https URL without query or fragment" % what)
+    return value
+
+
+FP_PREFIX = "sha256:"
+
+
+def require_fp(value):
+    """fp = 'sha256:' + 43-character canonical base64url (32-byte digest)."""
+    if not isinstance(value, str) or not value.startswith(FP_PREFIX):
+        raise ValueError("fp must be sha256:<43-character base64url>")
+    digest = value[len(FP_PREFIX):]
+    if len(digest) != 43 or any(c not in CODE_ALPHABET for c in digest):
+        raise ValueError("fp must be sha256:<43-character base64url>")
+    raw = base64.urlsafe_b64decode(digest + "=")
+    if len(raw) != 32 or base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=") != digest:
+        raise ValueError("fp must be sha256:<43-character base64url>")
     return value
 
 
@@ -125,6 +148,8 @@ class PairRedeemStore:
         require_code(code)
         if gw is not None:
             require_https_url(gw, "gw")
+        if fp is not None:
+            require_fp(fp)
         now = time.time() if now is None else now
         exp = float(now) + float(ttl_seconds)
         digest = code_sha256(code)

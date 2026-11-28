@@ -845,6 +845,7 @@ jobs:
               "BOTVILLE_PAIR_REDEEM_SYNAPSE_URL": "http://synapse:8008",
               "BOTVILLE_PAIR_REDEEM_SYNAPSE_ADMIN_TOKEN": "",
               "BOTVILLE_PAIR_REDEEM_TRUSTED_PROXIES": "",
+              "BOTVILLE_PAIR_REDEEM_ISSUE_TOKEN": "",
               # Optional HTTPS edge: default off. Cert dir is a local
               # path placeholder; init.sh does not generate certificates.
               "BOTVILLE_PAIR_REDEEM_EDGE_PORT": "8443",
