@@ -164,6 +164,20 @@ class IssueUriTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_plus_in_hs_path_is_accepted(self):
+        # r2 nit: the local URI check must not treat '+' as space, which
+        # would reject a path the frozen contract still accepts.
+        hs = "https://hs.example.org/x+y"
+        require_https_url(hs, "hs")
+        store = PairRedeemStore(":memory:")
+        try:
+            result = issue_code(store, hs, now=1_800_000_000)
+            parsed = contract.parse_pair_uri(result["uri"])
+            self.assertEqual(parsed["hs"], hs)
+            self.assertEqual(store.get(result["code_sha256"])["hs"], hs)
+        finally:
+            store.close()
+
     def test_generate_code_is_43_char_base64url(self):
         code = generate_code()
         self.assertEqual(len(code), 43)

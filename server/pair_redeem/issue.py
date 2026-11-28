@@ -8,8 +8,9 @@ never be added to the public HTTPS edge allowlist, and it must
 never issue without authentication.
 
 First cut: registration_token only (pairing-qr.md §11 B4). No
-login_token, no web UI, no one-time CLI bootstrap token, no
-list/filter/batch revoke. Those stay later work.
+login_token, no web UI, and no one-time CLI bootstrap token.
+List/filter/bulk-revoke live in issue_admin.py and reuse this
+token. Those other items stay later work.
 
 Plaintext code appears once, in the returned URI. Logs and audit
 rows store sha256(code) only.
@@ -35,6 +36,8 @@ from .store import (
 )
 
 ISSUE_PATH = "/_botville/pair/issue"
+# List/revoke path constants live in issue_admin.py so this module
+# stays the issuance helper.
 ENV_ISSUE_TOKEN = "BOTVILLE_PAIR_REDEEM_ISSUE_TOKEN"
 ISSUE_TOKEN_MIN_LEN = 32
 # Known JSON fields for the admin issue body. auth_type is optional and
@@ -180,11 +183,19 @@ def _assert_issued_uri(uri, hs, code, exp, gw=None, fp=None):
     prefix = "botville://pair?"
     if not isinstance(uri, str) or not uri.startswith(prefix):
         raise ValueError("issued uri mismatch")
-    items = urllib.parse.parse_qsl(
-        uri[len(prefix):], keep_blank_values=True, strict_parsing=True)
+    # Split like pairing_qr_contract: only '&' and the first '='.
+    # parse_qsl would turn a literal '+' in hs/gw into a space and
+    # reject a URL the frozen contract accepts. '%' is already
+    # rejected by require_https_url, so no percent-decoding here.
+    query = uri[len(prefix):]
+    if not query:
+        raise ValueError("issued uri mismatch")
     got = {}
-    for key, value in items:
-        if key in got:
+    for item in query.split("&"):
+        if "=" not in item:
+            raise ValueError("issued uri mismatch")
+        key, value = item.split("=", 1)
+        if not key or key in got:
             raise ValueError("issued uri mismatch")
         got[key] = value
     expected = {

@@ -6,10 +6,13 @@ A2.1 federation endpoint ``/v1/pairing/redeem``. First cut
 ``login_token`` stays in the contract enum but is not issued or redeemed
 here.
 
-Admin issuance: POST /_botville/pair/issue, default off until
-``BOTVILLE_PAIR_REDEEM_ISSUE_TOKEN`` is set. Never expose this path on
-the public HTTPS edge, and never issue without authentication. There is
-no web UI and no login_token issuance in this cut.
+Admin issuance: POST /_botville/pair/issue, plus list and bulk-revoke
+at POST /_botville/pair/issue/list and POST /_botville/pair/issue/revoke,
+default off until ``BOTVILLE_PAIR_REDEEM_ISSUE_TOKEN`` is set. Never
+expose these paths on the public HTTPS edge, and never offer them
+without authentication. There is no web UI and no login_token issuance
+in this cut. List/revoke responses never include a plaintext code or
+pairing URI.
 
 Standard library only. The HTTP server binds 127.0.0.1 by default; this
 package does not deploy an edge, open a public port, or talk to a live

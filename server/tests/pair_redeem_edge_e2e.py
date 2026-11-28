@@ -89,6 +89,8 @@ DENIED_PATHS = (
     "/_botville/pair/redeem/",
     "/_botville/pair/redeem/admin",
     "/_botville/pair/issue",
+    "/_botville/pair/issue/list",
+    "/_botville/pair/issue/revoke",
     "/health/extra",
     "/_synapse/admin/v1/register",
     "/_synapse/admin/v1/registration_tokens/new",

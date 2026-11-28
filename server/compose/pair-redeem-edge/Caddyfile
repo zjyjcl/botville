@@ -12,9 +12,10 @@
 #
 # Examples use localhost or example.org only. Real domains, Cloudflare
 # settings, and production certificates do not belong in this repository.
-# Issuance (POST /_botville/pair/issue) exists on pair-redeem but is
-# default off and must never be added to this allowlist or offered
-# without authentication.
+# Issuance and its admin list/revoke routes (POST /_botville/pair/issue,
+# /_botville/pair/issue/list, /_botville/pair/issue/revoke) exist on
+# pair-redeem but are default off and must never be added to this
+# allowlist or offered without authentication.
 {
 	auto_https off
 	admin off

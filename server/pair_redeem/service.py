@@ -36,6 +36,15 @@ from .issue import (
     public_issue_payload,
     validate_issue_token,
 )
+from .issue_admin import (
+    ISSUE_LIST_PATH,
+    ISSUE_REVOKE_PATH,
+    parse_list_request,
+    parse_revoke_request,
+    public_list_payload,
+)
+
+ISSUE_ADMIN_PATHS = frozenset({ISSUE_PATH, ISSUE_LIST_PATH, ISSUE_REVOKE_PATH})
 from .store import (
     CODE_ALPHABET,
     PairRedeemStore,
@@ -1098,7 +1107,9 @@ def _handler_for(app):
             method = getattr(self, "command", None)
             method = method if method in ("GET", "POST", "HEAD") else "OTHER"
             path = (getattr(self, "path", "") or "").split("?", 1)[0]
-            endpoint = path if path in (REDEEM_PATH, ISSUE_PATH, "/health") else "<unknown>"
+            endpoint = path if path in (
+                REDEEM_PATH, ISSUE_PATH, ISSUE_LIST_PATH,
+                ISSUE_REVOKE_PATH, "/health") else "<unknown>"
             try:
                 status = int(code)
             except (TypeError, ValueError):
@@ -1222,8 +1233,8 @@ def _handler_for(app):
 
         def do_POST(self):
             path = self.path.split("?", 1)[0]
-            if path == ISSUE_PATH:
-                self._do_issue()
+            if path in ISSUE_ADMIN_PATHS:
+                self._do_issue_admin(path)
                 return
             if path != REDEEM_PATH:
                 self._close_unread()
@@ -1307,8 +1318,35 @@ def _handler_for(app):
                 "ip": ip, "result": "rejected", "reason": reason,
             }, now=app.clock())
 
-        def _do_issue(self):
-            # Default off: do not advertise the route when the token is unset.
+        def _read_issue_admin_body(self):
+            if (self.headers.get("Transfer-Encoding") or "").strip():
+                self._close_unread()
+                raise IssueError(400, "invalid request")
+            length_values = self.headers.get_all("Content-Length") or []
+            if not length_values:
+                self._close_unread()
+                raise IssueError(400, "invalid request")
+            length_raw = length_values[0]
+            if len(length_values) > 1 or "," in length_raw:
+                self._close_unread()
+                raise IssueError(400, "invalid request")
+            try:
+                length = int(length_raw)
+            except (TypeError, ValueError):
+                self._close_unread()
+                raise IssueError(400, "invalid request")
+            if length < 0 or length > MAX_BODY_BYTES:
+                self._close_unread()
+                raise IssueError(400, "invalid request")
+            raw = self._read_exactly(length)
+            if len(raw) != length:
+                self._close_unread()
+                raise IssueError(400, "invalid request")
+            return raw
+
+        def _do_issue_admin(self, path):
+            # Default off: do not advertise admin routes when the token
+            # is unset. Same 404 as an unknown path, including /issue.
             if not app.config.issue_token:
                 self._close_unread()
                 self.send_error(404)
@@ -1331,37 +1369,40 @@ def _handler_for(app):
                 self._send_json(401, {"error": "unauthorized"})
                 return
             try:
-                if (self.headers.get("Transfer-Encoding") or "").strip():
-                    self._close_unread()
-                    raise IssueError(400, "invalid request")
-                length_values = self.headers.get_all("Content-Length") or []
-                if not length_values:
-                    self._close_unread()
-                    raise IssueError(400, "invalid request")
-                length_raw = length_values[0]
-                if len(length_values) > 1 or "," in length_raw:
-                    self._close_unread()
-                    raise IssueError(400, "invalid request")
-                try:
-                    length = int(length_raw)
-                except (TypeError, ValueError):
-                    self._close_unread()
-                    raise IssueError(400, "invalid request")
-                if length < 0 or length > MAX_BODY_BYTES:
-                    self._close_unread()
-                    raise IssueError(400, "invalid request")
-                raw = self._read_exactly(length)
-                if len(raw) != length:
-                    self._close_unread()
-                    raise IssueError(400, "invalid request")
-                fields = parse_issue_request(
-                    raw, self.headers.get("Content-Type"))
-                result = issue_code(
-                    app.store, fields["hs"], gw=fields["gw"],
-                    fp=fields["fp"], now=int(app.clock()))
-                self._send_json(
-                    200, public_issue_payload(result),
-                    cache_control="no-store")
+                raw = self._read_issue_admin_body()
+                now = app.clock()
+                if path == ISSUE_PATH:
+                    fields = parse_issue_request(
+                        raw, self.headers.get("Content-Type"))
+                    result = issue_code(
+                        app.store, fields["hs"], gw=fields["gw"],
+                        fp=fields["fp"], now=int(now))
+                    self._send_json(
+                        200, public_issue_payload(result),
+                        cache_control="no-store")
+                    return
+                if path == ISSUE_LIST_PATH:
+                    fields = parse_list_request(
+                        raw, self.headers.get("Content-Type"))
+                    rows = app.store.list_codes(
+                        status=fields["status"], hs=fields["hs"],
+                        expired=fields["expired"], limit=fields["limit"],
+                        after_id=fields["after_id"], now=now)
+                    self._send_json(
+                        200, public_list_payload(rows, fields["limit"], now),
+                        cache_control="no-store")
+                    return
+                if path == ISSUE_REVOKE_PATH:
+                    fields = parse_revoke_request(
+                        raw, self.headers.get("Content-Type"))
+                    results = app.store.revoke_ids(fields["ids"], now=now)
+                    self._send_json(
+                        200, {"results": results},
+                        cache_control="no-store")
+                    return
+                # Unreachable: do_POST only calls this for known admin paths.
+                self._close_unread()
+                self.send_error(404)
             except IssueError as exc:
                 if exc.status == 400:
                     self._audit_issue_rejected(ip, "invalid_request")
@@ -1377,7 +1418,7 @@ def _handler_for(app):
 
         def do_GET(self):
             path = self.path.split("?", 1)[0]
-            if path == ISSUE_PATH:
+            if path in ISSUE_ADMIN_PATHS:
                 if not app.config.issue_token:
                     self.send_error(404)
                     return
@@ -1411,7 +1452,7 @@ def _handler_for(app):
         def _method_not_allowed(self):
             self._close_unread()
             path = self.path.split("?", 1)[0]
-            if path == ISSUE_PATH and app.config.issue_token:
+            if path in ISSUE_ADMIN_PATHS and app.config.issue_token:
                 self.send_error(405)
                 return
             if path != REDEEM_PATH:

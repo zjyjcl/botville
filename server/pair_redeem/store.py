@@ -202,6 +202,118 @@ class PairRedeemStore:
                 raise
         return "revoked"
 
+    def list_codes(self, status=None, hs=None, expired=None, limit=50,
+                   after_id=None, now=None):
+        """Return newest-first rows for the admin list API.
+
+        Does not include code_sha256. ``after_id`` is a cursor: only rows
+        with a smaller id are returned. ``expired`` filters unused rows
+        whose exp is at or before ``now`` (or the opposite when false).
+        """
+        if status is not None and status not in ALLOWED_STATUS:
+            raise ValueError("unknown status")
+        if hs is not None:
+            require_https_url(hs, "hs")
+        if expired is not None and not isinstance(expired, bool):
+            raise ValueError("expired must be a bool")
+        try:
+            if isinstance(limit, bool):
+                raise ValueError("invalid limit")
+            limit = int(limit)
+        except (TypeError, ValueError):
+            raise ValueError("invalid limit") from None
+        if limit < 1 or limit > 100:
+            raise ValueError("invalid limit")
+        if after_id is not None:
+            try:
+                if isinstance(after_id, bool):
+                    raise ValueError("invalid after_id")
+                after_id = int(after_id)
+            except (TypeError, ValueError):
+                raise ValueError("invalid after_id") from None
+            if after_id < 1:
+                raise ValueError("invalid after_id")
+        now = time.time() if now is None else now
+        clauses = []
+        args = []
+        if status is not None:
+            clauses.append("status = ?")
+            args.append(status)
+        if hs is not None:
+            clauses.append("hs = ?")
+            args.append(hs)
+        if expired is True:
+            clauses.append("status = 'unused' AND exp <= ?")
+            args.append(float(now))
+        elif expired is False:
+            clauses.append("NOT (status = 'unused' AND exp <= ?)")
+            args.append(float(now))
+        if after_id is not None:
+            clauses.append("id < ?")
+            args.append(after_id)
+        sql = (
+            "SELECT id, hs, gw, fp, exp, status, auth_type, issued_at, "
+            "used_at, revoked_at, device_display_name FROM codes"
+        )
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
+        with self._locked():
+            rows = self._conn.execute(sql, tuple(args)).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def revoke_ids(self, record_ids, now=None, operator=None):
+        """Revoke unused codes by id in one transaction.
+
+        Each id yields one result in request order: ``revoked`` (this
+        call), ``already_revoked``, ``used``, or ``not_found``. Used
+        rows stay used. Does not accept a digest or a plaintext code.
+        """
+        now = time.time() if now is None else now
+        results = []
+        with self._locked():
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self.check_request_deadline()
+                for record_id in record_ids:
+                    self.check_request_deadline()
+                    row = self._conn.execute(
+                        "SELECT id, status, code_sha256 FROM codes "
+                        "WHERE id = ?", (record_id,),
+                    ).fetchone()
+                    if row is None:
+                        results.append({"id": record_id, "result": "not_found"})
+                        continue
+                    if row["status"] == "used":
+                        results.append({"id": record_id, "result": "used"})
+                        continue
+                    if row["status"] == "revoked":
+                        results.append(
+                            {"id": record_id, "result": "already_revoked"})
+                        continue
+                    self._conn.execute(
+                        "UPDATE codes SET status = 'revoked', revoked_at = ? "
+                        "WHERE id = ? AND status = 'unused'",
+                        (float(now), record_id),
+                    )
+                    # Audit may include the stored digest (already in the
+                    # issued row) but never a plaintext code, token, or URI.
+                    detail = {
+                        "id": record_id,
+                        "code_sha256": row["code_sha256"],
+                        "result": "revoked",
+                    }
+                    if operator is not None:
+                        detail["operator"] = operator
+                    self._insert_event_locked("revoked", detail, now)
+                    results.append({"id": record_id, "result": "revoked"})
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        return results
+
     def get(self, digest):
         with self._locked():
             return self._row_to_dict(self._get_locked(digest))
