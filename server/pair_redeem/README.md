@@ -17,6 +17,6 @@ make up HS=synapse PAIR_REDEEM=1
 
 可选 HTTPS edge 默认关闭：`make up HS=synapse PAIR_REDEEM=1 PAIR_REDEEM_EDGE=1`，并把 `cert.pem` / `key.pem` 放到 `BOTVILLE_PAIR_REDEEM_EDGE_CERT_DIR`（`init.sh` 不会生成证书）。宿主机端口只绑 `127.0.0.1:8443`。Edge 只反代 `POST /_botville/pair/redeem` 与 `GET /health`。本地或自签证书不能代替公网 HTTPS 或真机扫码。
 
-可选管理签发（`POST /_botville/pair/issue` 与 `python -m pair_redeem issue`）同样默认关闭：把 `BOTVILLE_PAIR_REDEEM_ISSUE_TOKEN` 设为至少 32 字符、且不同于 Synapse admin token 的值后才会提供该路由（`init.sh` 不会生成）。签发必须鉴权，**永远不得**把 `/_botville/pair/issue` 加到公共 edge 的允许列表。本刀没有管理 Web UI，也不签发 `login_token`。说明见 `docs/deploy/pair-redeem.md`。
+可选管理签发（`POST /_botville/pair/issue` 与 `python -m pair_redeem issue`）同样默认关闭：把 `BOTVILLE_PAIR_REDEEM_ISSUE_TOKEN` 设为至少 32 字符、且不同于 Synapse admin token 的值后才会提供该路由（`init.sh` 不会生成）。签发必须鉴权，**永远不得**把 `/_botville/pair/issue` 加到公共 edge 的允许列表。同一 token 还保护 `POST /_botville/pair/issue/list` 与 `POST /_botville/pair/issue/revoke`（默认同样 404）。本刀没有管理 Web UI，也不签发 `login_token`。列表/作废响应不含明文 code 或配对 URI。说明见 `docs/deploy/pair-redeem.md`。
 
 隔离环境端到端测试（不是真机扫码 / 不是真实 HTTPS 入口）：`make pair-redeem-e2e`。可选 HTTPS edge 的隔离测试（mock TLS，同样不能代替公网 HTTPS 或真机扫码）：`make pair-redeem-edge-e2e`。

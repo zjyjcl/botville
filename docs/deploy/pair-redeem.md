@@ -40,7 +40,7 @@ Edge **只**把以下精确路径反代到 compose 内网的 `pair-redeem:8092`�
 - `POST /_botville/pair/redeem`（公开兑换，契约不变）
 - `GET /health`（进程健康检查，不含密钥）
 
-其它路径由 edge 直接返回 404，包括但不限于：`/_synapse/admin/*`、联邦 `POST /v1/pairing/redeem`、网关 `/_botville/gateway/*`、签发/管理面（含 `POST /_botville/pair/issue`）、`/_botville/pair/redeem/` 的子路径。不要把 pair_redeem 的宿主机 8092 端口、Synapse、网关、数据库或密钥挂到公共 edge。管理签发**永远不得**暴露到公共 edge，也不可无鉴权签发。
+其它路径由 edge 直接返回 404，包括但不限于：`/_synapse/admin/*`、联邦 `POST /v1/pairing/redeem`、网关 `/_botville/gateway/*`、签发/管理面（含 `POST /_botville/pair/issue`、`POST /_botville/pair/issue/list`、`POST /_botville/pair/issue/revoke`）、`/_botville/pair/redeem/` 的子路径。不要把 pair_redeem 的宿主机 8092 端口、Synapse、网关、数据库或密钥挂到公共 edge。管理签发**永远不得**暴露到公共 edge，也不可无鉴权签发。
 
 面向 App / 公网的 homeserver 与 gateway URL 必须是 `https://`，文档和示例只用占位域名 `example.org`（例如 `hs=https://hs.example.org`、`gw=https://example.org/_botville/gateway`）。不要把可被当成生产可用的明文 `http://` 写进公网 URL。内网里的 `http://synapse:8008` 和 `http://pair-redeem:8092` 只走 compose 网络，不对外发布。
 
@@ -60,8 +60,9 @@ make pair-redeem-edge-e2e
 
 - HTTP：`POST /_botville/pair/issue`（JSON：必填 `hs`，可选 `gw` / `fp` / `auth_type`）
 - 本机 CLI：`python -m pair_redeem issue --hs https://hs.example.org`（可选 `--gw`、`--fp`；token 只从环境变量读取，不进 argv）
+- 签发记录管理面（无独立 CLI）：`POST /_botville/pair/issue/list`、`POST /_botville/pair/issue/revoke`（约定见下一小节）
 
-默认关闭。`BOTVILLE_PAIR_REDEEM_ISSUE_TOKEN` 留空（`init.sh` **不会**生成）时，该路由返回 404，与未提供的路径相同。显式启用：先按上文启用 `PAIR_REDEEM=1`，再把该变量设为至少 32 个字符、且**必须不同于** `BOTVILLE_PAIR_REDEEM_SYNAPSE_ADMIN_TOKEN` 的值。请求头为 `Authorization: Bearer <token>`。错误或缺 token 时不要把 token、兑换码或完整 URI 写进日志。
+默认关闭。`BOTVILLE_PAIR_REDEEM_ISSUE_TOKEN` 留空（`init.sh` **不会**生成）时，这些路由返回 404，与未提供的路径相同。显式启用：先按上文启用 `PAIR_REDEEM=1`，再把该变量设为至少 32 个字符、且**必须不同于** `BOTVILLE_PAIR_REDEEM_SYNAPSE_ADMIN_TOKEN` 的值。请求头为 `Authorization: Bearer <token>`。错误或缺 token 时不要把 token、兑换码或完整 URI 写进日志。
 
 本切片用的是**长期环境变量 token**，不是 `docs/contracts/pairing-qr.md` §4.1 所写的「一次性、短 TTL 管理 token」。一次性管理 token 留给后续，本刀尚未实现。
 
@@ -69,7 +70,54 @@ make pair-redeem-edge-e2e
 
 成功响应只返回一次配对 URI（`botville://pair?v=1&hs=…&code=…&exp=…`，可选 `gw` / `fp`）和 `exp` / `auth_type`。明文 `code` 只出现在这条 URI 里，库中只存 `sha256(code)`。不要把 URI 或 token 提交进仓库，也不要重定向到会长期保留的日志文件。
 
-本刀**不**做：管理 Web UI、管理员 Matrix 登录、一次性短 TTL 管理 token、签发记录列表/筛选/批量作废、`login_token`（包括「本人从已登录设备发起」）。作废仍可通过现有 store 接口在测试里使用，没有管理面 API。公共 edge 的允许列表不得加入 `/_botville/pair/issue`。
+### 签发记录列表 / 筛选 / 批量作废
+
+`docs/contracts/pairing-qr.md` §8 与 `pairing-redeem.openapi.yaml` 尚未定义管理页或签发/作废管理 API（留给后续管理页 PR）。本切片只补与 `POST /_botville/pair/issue` 风格一致的最小 HTTP 约定，不是大改冻结契约：JSON 对象请求体、不接受 query string、`Authorization: Bearer` 复用同一个 `BOTVILLE_PAIR_REDEEM_ISSUE_TOKEN`（不新增第二套管理令牌）、4xx 响应为 `{"error": "..."}`。未配置该 token 时这两条路由同样 404。成功响应带 `Cache-Control: no-store`。
+
+`POST /_botville/pair/issue/list` 列出签发记录，按 `id` 降序（新的在前）。请求体字段均可选：
+
+- `status`：`unused` / `used` / `revoked`（库中状态；过期但仍未兑换的记录仍是 `unused`）
+- `hs`：精确匹配的 `https://` URL
+- `expired`：布尔。`true` 只返回「`unused` 且 `exp` 已到」的记录，`false` 排除这类记录
+- `limit`：1–100，默认 50
+- `after_id`：正整数游标，只返回 `id` 更小的记录
+
+响应：
+
+```json
+{
+  "items": [
+    {
+      "id": 1,
+      "hs": "https://hs.example.org",
+      "gw": "https://gw.example.org",
+      "fp": null,
+      "exp": 1800000300,
+      "status": "unused",
+      "auth_type": "registration_token",
+      "issued_at": 1800000000,
+      "used_at": null,
+      "revoked_at": null,
+      "device_display_name": null,
+      "expired": false
+    }
+  ],
+  "next_after_id": 1
+}
+```
+
+`next_after_id` 仅在本页恰好返回 `limit` 条时出现，值为本页最后一条的 `id`。响应**不**包含明文 `code`、含 `code` 的配对 URI，也不返回 `code_sha256`。`expired` 是由 `status` 与 `exp` 相对当前时钟算出的派生字段。
+
+`POST /_botville/pair/issue/revoke` 按记录 `id` 批量作废未使用的 code。请求体为 `{"ids": [1, 2, 3]}`（非空，最多 100 个正整数，按请求顺序处理）。响应为同样顺序的 `{"results": [{"id": 1, "result": "revoked"}, ...]}`，其中 `result` 为：
+
+- `revoked`：本请求将 `unused` 置为 `revoked`（随后兑换为 `410 BV_PAIR_REVOKED`）
+- `already_revoked`：该记录已是作废终态
+- `used`：已兑换，终态不可逆，不能作废
+- `not_found`：没有这条记录
+
+作废审计沿用现有 `revoked` 事件；非法/未授权请求写 `rejected`（只记 reason，不记 token / code / URI）。列表成功不另写审计事件。
+
+本刀**不**做：管理 Web UI、管理员 Matrix 登录、一次性短 TTL 管理 token、`login_token`（包括「本人从已登录设备发起」）。公共 edge 的允许列表不得加入 `/_botville/pair/issue`、`/_botville/pair/issue/list` 或 `/_botville/pair/issue/revoke`。
 
 ### 处理时限与启用前检查
 

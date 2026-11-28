@@ -150,6 +150,8 @@ class PairRedeemEdgeCaddyfileTests(unittest.TestCase):
             ln.strip() for ln in self.text.splitlines()
             if ln.strip() and not ln.strip().startswith("#"))
         self.assertNotIn("/_botville/pair/issue", active)
+        self.assertNotIn("/_botville/pair/issue/list", active)
+        self.assertNotIn("/_botville/pair/issue/revoke", active)
         self.assertIn(
             r"@public path_regexp ^/(?:_botville/pair/redeem|health)$",
             active)
